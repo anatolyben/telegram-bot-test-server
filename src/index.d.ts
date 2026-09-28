@@ -70,6 +70,48 @@ export interface PostedMessage {
   caption?: string;
   /** message_id this message replies to. */
   replyTo?: number;
+  /** Forum topic to post in; the message then replies to the topic's creation. */
+  threadId?: number;
+}
+
+export interface NewChat {
+  title?: string;
+  /** Default "supergroup". */
+  type?: "supergroup" | "channel";
+  /** The chat's creator. */
+  ownerId: number;
+  ownerName?: string;
+  /** A supergroup with forum topics. */
+  isForum?: boolean;
+}
+
+export interface BotMembership {
+  /** Default "administrator". "left" removes the bot. */
+  status?: "administrator" | "member" | "left" | "kicked";
+  /** Administrator rights to grant or withhold, e.g. { can_post_messages: false }. */
+  rights?: Record<string, boolean>;
+  /** Who made the change; default the chat's creator. */
+  by?: number;
+}
+
+/** Make the next matching Bot API calls fail. */
+export interface FailureRule {
+  /** Bot API method name, e.g. "sendMessage". */
+  method: string;
+  /** Only calls to this chat. */
+  chatId?: number;
+  /** Only calls from this bot. */
+  botId?: number;
+  /** How many calls fail; default 1. */
+  times?: number;
+  /** Default 400. */
+  errorCode?: number;
+  /** Default "Bad Request". */
+  description?: string;
+  /** Sent as parameters.retry_after, as with a 429. */
+  retryAfter?: number;
+  /** The call takes effect, but the connection closes before it answers. */
+  dropAfterApply?: boolean;
 }
 
 /**
@@ -81,6 +123,49 @@ export interface PostedMessage {
 export interface TelegramBotTestServer {
   /** Base URL to use as the bot's Bot API root, e.g. "http://127.0.0.1:53211". */
   origin: string;
+  /**
+   * Another bot this server answers for, with its own webhook or update queue.
+   * It is in no chat until added with setBotMembership.
+   */
+  addBot(bot: {
+    token: string;
+    username: string;
+    firstName?: string;
+  }): Promise<{ id: number; is_bot: true; username: string }>;
+  /** A group, forum or channel owned by `ownerId`, with no bot in it; returns its id. */
+  createChat(chat: NewChat): Promise<number>;
+  /** The chat, its pinned message ids (newest first) and members. */
+  getChat(chatId: number): Promise<{
+    id: number;
+    type: string;
+    title: string;
+    pinned: number[];
+    members: Array<{ user_id: number; status: string }>;
+  }>;
+  /**
+   * Add, promote, demote or remove a bot, as the chat's owner would. The bot
+   * gets my_chat_member, the chat's other bots chat_member, and a group a
+   * service message when the bot joins or leaves.
+   */
+  setBotMembership(
+    chatId: number,
+    botId: number,
+    membership?: BotMembership,
+  ): Promise<ChatMember>;
+  /** Create a forum topic, with its service message; returns its message_thread_id. */
+  createTopic(
+    chatId: number,
+    name: string,
+    options?: { by?: number },
+  ): Promise<number>;
+  renameTopic(
+    chatId: number,
+    threadId: number,
+    name: string,
+    options?: { by?: number },
+  ): Promise<{ message_thread_id: number; name: string }>;
+  failNext(rule: FailureRule): Promise<unknown>;
+  clearFailures(): Promise<{ ok: true }>;
   /** Create a user; returns their id. */
   createUser(fields?: UserFields): Promise<number>;
   updateProfile(userId: number, fields: UserFields): Promise<unknown>;
@@ -141,8 +226,14 @@ export interface TelegramBotTestServer {
   getCalls(): Promise<{
     calls: Array<{
       method: string;
+      /** The bot that made the call. */
+      bot_id: number;
       params: Record<string, unknown>;
       at: number;
+      /** The error a failure rule answered with. */
+      failed?: number;
+      /** The call took effect and its answer was dropped. */
+      dropped?: true;
     }>;
     unimplemented: string[];
   }>;

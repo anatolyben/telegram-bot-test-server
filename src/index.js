@@ -12,6 +12,14 @@
  * like Telegram — reports the bot's own restrictions back as chat_member
  * updates.
  *
+ * More than one bot: the bot it starts with is the first; tests add others
+ * (POST /_fake/bots). Each bot has its own webhook or update queue, and its
+ * own membership and rights in each chat, and Telegram's rules about them
+ * hold: a bot posts only where it is a member, edits and stops only its own
+ * messages, pins only with the right to, and learns of its own membership
+ * through my_chat_member. Tests can also make the next calls fail
+ * (/_fake/failures), including a call that takes effect but never answers.
+ *
  * Nothing here talks to Telegram.
  */
 import http from "node:http";
@@ -97,7 +105,13 @@ const OBJECT_PARAMS = new Set([
   "media",
   "scope",
   "ephemeral_message_parameters",
+  "options",
+  "entities",
+  "caption_entities",
 ]);
+
+// The media a message can carry, one at a time, and editMessageMedia replaces.
+const MEDIA_KINDS = Object.freeze(["photo", "video", "animation", "document"]);
 
 class TelegramError extends Error {
   constructor(code, description) {
@@ -286,20 +300,45 @@ export async function startTestServer({
   if (unimplementedMode !== "error" && unimplementedMode !== "ok") {
     throw new TypeError('unimplemented must be "error" or "ok"');
   }
-  const botId = Number(String(botToken).split(":")[0]);
-  if (!Number.isSafeInteger(botId)) {
-    throw new TypeError(
-      "Fake Telegram needs a bot token of the form <id>:<secret>",
-    );
+  const users = new Map();
+  // Every bot this server answers for, by token. Each keeps its own webhook,
+  // update queue and commands, as separate bots do on Telegram.
+  const bots = new Map();
+  function addBot({ token, username, firstName }) {
+    const id = Number(String(token).split(":")[0]);
+    if (!Number.isSafeInteger(id) || !String(token).includes(":")) {
+      throw new TypeError(
+        "Fake Telegram needs a bot token of the form <id>:<secret>",
+      );
+    }
+    if (bots.has(token)) return bots.get(token);
+    if (users.has(id)) throw new TypeError(`User ${id} already exists`);
+    const record = {
+      id,
+      is_bot: true,
+      first_name: firstName ?? username,
+      username,
+      photos: [],
+      token,
+      // The update types the bot subscribed to, set by setWebhook or getUpdates.
+      webhook: null,
+      subscription: null,
+      // Updates waiting for getUpdates while no webhook is set, as on Telegram.
+      queue: [],
+      pollWaiters: new Set(),
+      delivery: Promise.resolve(),
+      commands: [],
+    };
+    bots.set(token, record);
+    users.set(id, record);
+    return record;
   }
-  const bot = {
-    id: botId,
-    is_bot: true,
-    first_name: botName,
+  // The bot the server starts with: the one in every configured chat.
+  const bot = addBot({
+    token: botToken,
     username: botUsername,
-    photos: [],
-  };
-  const users = new Map([[bot.id, bot]]);
+    firstName: botName,
+  });
   const files = new Map();
   const chats = new Map();
   // Public channels, groups and bots other accounts link to, by lower-case
@@ -324,15 +363,12 @@ export async function startTestServer({
   const callbackAnswers = new Map();
   // Callback queries awaiting an answer; any other id is refused.
   const openQueries = new Set();
-  let commands = [];
   const calls = [];
   const unimplemented = new Set();
-  let webhook = null;
-  // The update types the bot subscribed to, set by setWebhook or getUpdates.
-  let subscription = null;
-  // Updates waiting for getUpdates while no webhook is set, as on Telegram.
-  const queue = [];
-  const pollWaiters = new Set();
+  // Calls a test asked to fail: the next `times` calls of a method (to one
+  // chat, from one bot, when named) answer the error, or take effect and never
+  // answer.
+  const failures = [];
   // Webhook requests in progress, aborted on stop().
   const inFlight = new Set();
   // Telegram never reuses an update, member or message id, and bots commonly
@@ -341,7 +377,8 @@ export async function startTestServer({
   const startSeconds = Math.floor(Date.now() / 1000);
   let updateId = startSeconds;
   let nextUserId = 7_000_000_000 + startSeconds;
-  let delivery = Promise.resolve();
+  let nextChatId = startSeconds;
+  let nextPollId = BigInt(startSeconds) * 1_000_000n;
 
   for (const config of chatConfigs) {
     const owner = {
@@ -428,7 +465,12 @@ export async function startTestServer({
         ...(chat.user.username ? { username: chat.user.username } : {}),
       };
     }
-    return { id: chat.id, title: chat.title, type: chat.type };
+    return {
+      id: chat.id,
+      title: chat.title,
+      type: chat.type,
+      ...(chat.topics ? { is_forum: true } : {}),
+    };
   }
 
   function memberStatus(chat, userId) {
@@ -440,23 +482,45 @@ export async function startTestServer({
     const member = memberStatus(chat, userId);
     const base = { user: userObject(user), status: member.status };
     if (member.status === "administrator") {
+      // A channel administrator posts and edits; a group administrator pins.
+      const rights =
+        chat.type === "channel"
+          ? {
+              can_manage_chat: true,
+              can_delete_messages: true,
+              can_restrict_members: true,
+              can_promote_members: false,
+              can_change_info: true,
+              can_invite_users: true,
+              can_post_messages: true,
+              can_edit_messages: true,
+              can_post_stories: false,
+              can_edit_stories: false,
+              can_delete_stories: false,
+              can_manage_video_chats: false,
+            }
+          : {
+              can_manage_chat: true,
+              can_delete_messages: true,
+              can_restrict_members: true,
+              can_promote_members: false,
+              can_change_info: true,
+              can_invite_users: true,
+              can_pin_messages: true,
+              can_post_stories: false,
+              can_edit_stories: false,
+              can_delete_stories: false,
+              can_manage_video_chats: false,
+              can_manage_topics: false,
+              can_send_welcome_messages: false,
+            };
       return {
         ...base,
         can_be_edited: false,
         is_anonymous: false,
-        can_manage_chat: true,
-        can_delete_messages: true,
-        can_restrict_members: true,
-        can_promote_members: false,
-        can_change_info: true,
-        can_invite_users: true,
-        can_pin_messages: true,
-        can_post_stories: false,
-        can_edit_stories: false,
-        can_delete_stories: false,
-        can_manage_video_chats: false,
-        can_manage_topics: false,
-        can_send_welcome_messages: false,
+        ...rights,
+        // Rights the owner granted or withheld when promoting.
+        ...(member.rights ?? {}),
       };
     }
     if (member.status === "creator") return { ...base, is_anonymous: false };
@@ -482,6 +546,91 @@ export async function startTestServer({
     );
   }
 
+  /** Whether a member holds an administrator right (a creator holds all). */
+  function hasRight(chat, userId, right) {
+    const member = memberStatus(chat, userId);
+    if (member.status === "creator") return true;
+    if (member.status !== "administrator") return false;
+    return chatMemberObject(chat, userId)[right] === true;
+  }
+
+  function chatKind(chat) {
+    return chat.type === "channel" ? "channel" : "supergroup";
+  }
+
+  /** Refuse a bot's send the way Telegram does when it may not post there. */
+  function requireCanSend(chat, caller) {
+    // A private chat here is with the first bot: users write only to it, and
+    // no other bot may message someone who never wrote to that bot.
+    if (chat.type === "private") {
+      if (caller.id !== bot.id) {
+        throw new TelegramError(
+          403,
+          "Forbidden: bot can't initiate conversation with a user",
+        );
+      }
+      return;
+    }
+    const member = memberStatus(chat, caller.id);
+    if (member.status === "kicked") {
+      throw new TelegramError(
+        403,
+        `Forbidden: bot was kicked from the ${chatKind(chat)} chat`,
+      );
+    }
+    if (!isInChat(chat, caller.id)) {
+      throw new TelegramError(
+        403,
+        `Forbidden: bot is not a member of the ${chatKind(chat)} chat`,
+      );
+    }
+    if (
+      chat.type === "channel" &&
+      !hasRight(chat, caller.id, "can_post_messages")
+    ) {
+      throw new TelegramError(
+        400,
+        "Bad Request: need administrator rights in the channel chat",
+      );
+    }
+    if (
+      member.status === "restricted" &&
+      member.permissions?.can_send_messages !== true
+    ) {
+      throw new TelegramError(
+        400,
+        "Bad Request: not enough rights to send text messages to the chat",
+      );
+    }
+  }
+
+  /** A send into a forum names a topic that exists, or none (General). */
+  function requireTopic(chat, threadId) {
+    if (!threadId || !chat.topics) return;
+    if (!chat.topics.has(Number(threadId))) {
+      throw new TelegramError(400, "Bad Request: message thread not found");
+    }
+  }
+
+  /** A group pins with can_pin_messages, a channel with can_edit_messages. */
+  function requirePinRights(chat, caller) {
+    if (chat.type === "private") return;
+    if (!isInChat(chat, caller.id)) {
+      throw new TelegramError(
+        403,
+        `Forbidden: bot is not a member of the ${chatKind(chat)} chat`,
+      );
+    }
+    const right =
+      chat.type === "channel" ? "can_edit_messages" : "can_pin_messages";
+    if (!hasRight(chat, caller.id, right)) {
+      throw new TelegramError(
+        400,
+        "Bad Request: not enough rights to manage pinned messages in the chat",
+      );
+    }
+  }
+
   /** Whether the user may post, given their own and the chat's permissions. */
   function canPost(chat, userId, permission = "can_send_messages") {
     const member = memberStatus(chat, userId);
@@ -500,8 +649,8 @@ export async function startTestServer({
    * Telegram refuses to restrict or remove the chat owner, an administrator
    * or the bot itself.
    */
-  function assertCanModerate(chat, userId, { self } = {}) {
-    if (Number(userId) === bot.id && self) {
+  function assertCanModerate(chat, userId, { self, caller = bot } = {}) {
+    if (Number(userId) === caller.id && self) {
       throw new TelegramError(400, `Bad Request: ${self}`);
     }
     const status = memberStatus(chat, userId).status;
@@ -543,8 +692,8 @@ export async function startTestServer({
     return updateId;
   }
 
-  function allowed(type) {
-    const list = subscription;
+  function allowed(record, type) {
+    const list = record.subscription;
     if (!Array.isArray(list) || list.length === 0) {
       return ![
         "chat_member",
@@ -556,35 +705,54 @@ export async function startTestServer({
   }
 
   /**
-   * Deliver one update: to the webhook in order when one is set, otherwise to
-   * the queue getUpdates reads.
+   * Deliver an update to the bots that receive it: those in the group or
+   * channel it happened in, the bot a private chat is with, or the bots named.
    */
-  function emit(type, payload) {
-    if (!allowed(type)) return Promise.resolve();
+  function emit(type, payload, { to = null, except = null } = {}) {
+    const chatId = payload?.chat?.id ?? payload?.message?.chat?.id;
+    const chat = chatId == null ? null : chats.get(Number(chatId));
+    const recipients =
+      to ??
+      (chat
+        ? [...bots.values()].filter(
+            (record) => record.id !== except && isInChat(chat, record.id),
+          )
+        : [bot]);
+    return Promise.all(
+      recipients.map((record) => emitTo(record, type, payload)),
+    );
+  }
+
+  /**
+   * Deliver one update to one bot: to its webhook in order when one is set,
+   * otherwise to the queue its getUpdates reads.
+   */
+  function emitTo(record, type, payload) {
+    if (!allowed(record, type)) return Promise.resolve();
     const update = { update_id: nextUpdateId(), [type]: payload };
-    if (!webhook?.url) {
-      queue.push(structuredClone(update));
-      wakePollers();
+    if (!record.webhook?.url) {
+      record.queue.push(structuredClone(update));
+      wakePollers(record);
       return Promise.resolve();
     }
-    return deliver(update);
+    return deliver(record, update);
   }
 
-  function wakePollers() {
-    for (const waiter of pollWaiters) waiter.wake();
+  function wakePollers(record) {
+    for (const waiter of record.pollWaiters) waiter.wake();
   }
 
-  function deliver(update) {
+  function deliver(record, update) {
     const type = Object.keys(update).find((key) => key !== "update_id");
     // Serialised now, so later state changes cannot rewrite a sent update.
     const body = JSON.stringify(update);
-    delivery = delivery.then(async () => {
+    record.delivery = record.delivery.then(async () => {
       // The webhook may have been removed while this update waited its turn;
       // it then belongs to getUpdates, as on Telegram.
-      const target = webhook;
+      const target = record.webhook;
       if (!target?.url) {
-        queue.push(JSON.parse(body));
-        wakePollers();
+        record.queue.push(JSON.parse(body));
+        wakePollers(record);
         return;
       }
       const abort = new AbortController();
@@ -613,18 +781,65 @@ export async function startTestServer({
         inFlight.delete(abort);
       }
     });
-    return delivery;
+    return record.delivery;
   }
 
   function emitMemberChange(chat, userId, before, actor, extra = {}) {
-    return emit("chat_member", {
+    return emit(
+      "chat_member",
+      {
+        chat: chatObject(chat),
+        from: userObject(actor),
+        date: now(),
+        old_chat_member: before,
+        new_chat_member: chatMemberObject(chat, userId),
+        ...extra,
+      },
+      // A bot hears of its own membership through my_chat_member alone.
+      { except: users.get(Number(userId))?.is_bot ? Number(userId) : null },
+    );
+  }
+
+  /**
+   * Someone adds, promotes, demotes or removes a bot. Telegram tells that bot
+   * through my_chat_member, the chat's other bots through chat_member, and a
+   * group's members through a service message.
+   */
+  async function setBotMembership(chat, record, { status, rights, actor }) {
+    const before = chatMemberObject(chat, record.id);
+    const wasIn = isInChat(chat, record.id);
+    if (status === "left") chat.members.delete(record.id);
+    else chat.members.set(record.id, { status, ...(rights ? { rights } : {}) });
+    const after = chatMemberObject(chat, record.id);
+    const change = {
       chat: chatObject(chat),
       from: userObject(actor),
       date: now(),
       old_chat_member: before,
-      new_chat_member: chatMemberObject(chat, userId),
-      ...extra,
-    });
+      new_chat_member: after,
+    };
+    await emitTo(record, "my_chat_member", change);
+    await emit("chat_member", change, { except: record.id });
+    const isIn = isInChat(chat, record.id);
+    if (chat.type !== "channel" && wasIn !== isIn) {
+      const service = addMessage(
+        chat,
+        actor,
+        isIn
+          ? { new_chat_members: [userObject(record)] }
+          : { left_chat_member: userObject(record) },
+      );
+      await emit("message", service, { except: record.id });
+    }
+    return after;
+  }
+
+  function requireBot(botId) {
+    const record = [...bots.values()].find(
+      (entry) => entry.id === Number(botId),
+    );
+    if (!record) throw new TelegramError(400, "Bad Request: bot not found");
+    return record;
   }
 
   function addMessage(chat, from, fields) {
@@ -690,45 +905,56 @@ export async function startTestServer({
   }
 
   // ── Bot API ────────────────────────────────────────────────────────────
+  // Each method runs as the bot whose token the request carried.
   const methods = {
-    getMe: () => ({
-      ...userObject(bot),
+    getMe: (_p, caller) => ({
+      ...userObject(caller),
       can_join_groups: true,
       can_read_all_group_messages: true,
       supports_inline_queries: false,
     }),
-    setWebhook: (p) => {
+    setWebhook: (p, caller) => {
       if (!p.url) {
-        webhook = null;
+        caller.webhook = null;
         return true;
       }
-      webhook = { url: String(p.url), secret_token: p.secret_token ?? null };
-      if (Array.isArray(p.allowed_updates)) subscription = p.allowed_updates;
+      caller.webhook = {
+        url: String(p.url),
+        secret_token: p.secret_token ?? null,
+      };
+      if (Array.isArray(p.allowed_updates)) {
+        caller.subscription = p.allowed_updates;
+      }
       // Updates that queued while nobody was listening go to the new webhook.
-      const pending = isTrue(p.drop_pending_updates) ? [] : queue.splice(0);
-      queue.length = 0;
-      for (const update of pending) deliver(update);
+      const pending = isTrue(p.drop_pending_updates)
+        ? []
+        : caller.queue.splice(0);
+      caller.queue.length = 0;
+      for (const update of pending) deliver(caller, update);
       return true;
     },
-    deleteWebhook: (p) => {
-      webhook = null;
-      if (isTrue(p.drop_pending_updates)) queue.length = 0;
+    deleteWebhook: (p, caller) => {
+      caller.webhook = null;
+      if (isTrue(p.drop_pending_updates)) caller.queue.length = 0;
       return true;
     },
-    getWebhookInfo: () => ({
-      url: webhook?.url ?? "",
+    getWebhookInfo: (_p, caller) => ({
+      url: caller.webhook?.url ?? "",
       has_custom_certificate: false,
-      pending_update_count: webhook?.url ? 0 : queue.length,
-      ...(subscription ? { allowed_updates: subscription } : {}),
+      pending_update_count: caller.webhook?.url ? 0 : caller.queue.length,
+      ...(caller.subscription ? { allowed_updates: caller.subscription } : {}),
     }),
-    getUpdates: async (p) => {
-      if (webhook?.url) {
+    getUpdates: async (p, caller) => {
+      const queue = caller.queue;
+      if (caller.webhook?.url) {
         throw new TelegramError(
           409,
           "Conflict: can't use getUpdates method while webhook is active; use deleteWebhook to delete the webhook first",
         );
       }
-      if (Array.isArray(p.allowed_updates)) subscription = p.allowed_updates;
+      if (Array.isArray(p.allowed_updates)) {
+        caller.subscription = p.allowed_updates;
+      }
       const offset = numberParam(p.offset, 0);
       // An offset confirms every update before it: they are gone for good.
       if (offset > 0) {
@@ -743,25 +969,25 @@ export async function startTestServer({
           const waiter = {
             wake: () => {
               clearTimeout(waiter.timer);
-              pollWaiters.delete(waiter);
+              caller.pollWaiters.delete(waiter);
               resolve();
             },
           };
           waiter.timer = setTimeout(waiter.wake, timeoutMs);
-          pollWaiters.add(waiter);
+          caller.pollWaiters.add(waiter);
         });
       }
       return queue.slice(0, limit);
     },
-    setMyCommands: (p) => {
-      commands = Array.isArray(p.commands) ? p.commands : [];
+    setMyCommands: (p, caller) => {
+      caller.commands = Array.isArray(p.commands) ? p.commands : [];
       return true;
     },
-    deleteMyCommands: () => {
-      commands = [];
+    deleteMyCommands: (_p, caller) => {
+      caller.commands = [];
       return true;
     },
-    getMyCommands: () => commands,
+    getMyCommands: (_p, caller) => caller.commands,
     setMyDescription: () => true,
     setMyShortDescription: () => true,
     setChatMenuButton: () => true,
@@ -809,8 +1035,12 @@ export async function startTestServer({
       const id = Number(p.chat_id);
       if (chats.has(id)) {
         const chat = chats.get(id);
+        const pinned = chat.messages.get((chat.pinned ?? [])[0]);
         return {
           ...chatObject(chat),
+          ...(pinned && !pinned.deleted
+            ? { pinned_message: pinned.message }
+            : {}),
           permissions: { ...chat.permissions },
           accent_color_id: 0,
           max_reaction_count: 11,
@@ -875,8 +1105,9 @@ export async function startTestServer({
         file_path: file.file_path,
       };
     },
-    sendMessage: (p) => sendFrom(p, { text: String(p.text ?? "") }),
-    sendPhoto: async (p) => {
+    sendMessage: (p, caller) =>
+      sendFrom(p, caller, { text: String(p.text ?? "") }),
+    sendPhoto: async (p, caller) => {
       const photo =
         typeof p.photo === "string" && files.has(p.photo)
           ? {
@@ -885,14 +1116,14 @@ export async function startTestServer({
               size: files.get(p.photo).data.length,
             }
           : sentFile(p.photo, "photos", "jpg");
-      return sendFrom(p, {
+      return sendFrom(p, caller, {
         photo: photoSizes(photo),
         ...(p.caption ? { caption: String(p.caption) } : {}),
       });
     },
-    sendDocument: (p) => {
+    sendDocument: (p, caller) => {
       const file = sentFile(p.document, "documents", "bin");
-      return sendFrom(p, {
+      return sendFrom(p, caller, {
         document: {
           file_id: file.file_id,
           file_unique_id: file.file_unique_id,
@@ -901,9 +1132,9 @@ export async function startTestServer({
         ...(p.caption ? { caption: String(p.caption) } : {}),
       });
     },
-    sendVideo: (p) => {
+    sendVideo: (p, caller) => {
       const file = sentFile(p.video, "videos", "mp4");
-      return sendFrom(p, {
+      return sendFrom(p, caller, {
         video: {
           file_id: file.file_id,
           file_unique_id: file.file_unique_id,
@@ -915,9 +1146,9 @@ export async function startTestServer({
         ...(p.caption ? { caption: String(p.caption) } : {}),
       });
     },
-    sendAnimation: (p) => {
+    sendAnimation: (p, caller) => {
       const file = sentFile(p.animation, "animations", "mp4");
-      return sendFrom(p, {
+      return sendFrom(p, caller, {
         animation: {
           file_id: file.file_id,
           file_unique_id: file.file_unique_id,
@@ -929,9 +1160,9 @@ export async function startTestServer({
         ...(p.caption ? { caption: String(p.caption) } : {}),
       });
     },
-    sendSticker: (p) => {
+    sendSticker: (p, caller) => {
       const file = sentFile(p.sticker, "stickers", "webp");
-      return sendFrom(p, {
+      return sendFrom(p, caller, {
         sticker: {
           file_id: file.file_id,
           file_unique_id: file.file_unique_id,
@@ -944,17 +1175,186 @@ export async function startTestServer({
         },
       });
     },
-    editMessageText: (p) =>
-      editMessage(p, (message) => {
+    editMessageText: (p, caller) =>
+      editMessage(p, caller, (message) => {
         message.text = String(p.text ?? "");
       }),
-    editMessageReplyMarkup: (p) => editMessage(p, () => {}),
-    editMessageCaption: (p) =>
-      editMessage(p, (message) => {
+    editMessageReplyMarkup: (p, caller) => editMessage(p, caller, () => {}),
+    editMessageCaption: (p, caller) =>
+      editMessage(p, caller, (message) => {
         message.caption = String(p.caption ?? "");
       }),
-    pinChatMessage: () => true,
-    unpinChatMessage: () => true,
+    // The new media is an upload attached as attach://<name>, or the file_id
+    // of a file this server holds.
+    editMessageMedia: (p, caller) => {
+      const input = p.media ?? {};
+      const type = input.type ?? "photo";
+      if (!MEDIA_KINDS.includes(type)) {
+        throw new TelegramError(400, "Bad Request: unsupported media type");
+      }
+      const reference =
+        typeof input.media === "string" && input.media.startsWith("attach://")
+          ? p[input.media.slice("attach://".length)]
+          : input.media;
+      if (
+        !Buffer.isBuffer(reference) &&
+        !(typeof reference === "string" && files.has(reference))
+      ) {
+        throw new TelegramError(
+          400,
+          "Bad Request: wrong file identifier/HTTP URL specified",
+        );
+      }
+      const file = sentFile(
+        reference,
+        `${type}s`,
+        type === "photo" ? "jpg" : "bin",
+      );
+      return editMessage(p, caller, (message) => {
+        delete message.text;
+        delete message.entities;
+        for (const kind of MEDIA_KINDS) delete message[kind];
+        message[type] =
+          type === "photo"
+            ? photoSizes(file)
+            : {
+                file_id: file.file_id,
+                file_unique_id: file.file_unique_id,
+                file_size: file.size,
+              };
+        if (input.caption !== undefined) {
+          message.caption = String(input.caption);
+        } else {
+          delete message.caption;
+        }
+      });
+    },
+    // A poll may carry a photo, uploaded with it as attach://<name>.
+    sendPoll: (p, caller) => {
+      const options = (Array.isArray(p.options) ? p.options : []).map(
+        (option) => ({
+          text:
+            typeof option === "string" ? option : String(option?.text ?? ""),
+          voter_count: 0,
+        }),
+      );
+      if (!p.question) {
+        throw new TelegramError(
+          400,
+          "Bad Request: poll question must be non-empty",
+        );
+      }
+      if (options.length < 2) {
+        throw new TelegramError(
+          400,
+          "Bad Request: poll must have at least 2 option",
+        );
+      }
+      if (options.length > 12) {
+        throw new TelegramError(
+          400,
+          "Bad Request: poll can't have more than 12 options",
+        );
+      }
+      const attached =
+        typeof p.media?.media === "string" &&
+        p.media.media.startsWith("attach://")
+          ? p[p.media.media.slice("attach://".length)]
+          : null;
+      const photo = Buffer.isBuffer(attached) ? registerPhoto(attached) : null;
+      nextPollId += 1n;
+      return sendFrom(p, caller, {
+        poll: {
+          id: String(nextPollId),
+          question: String(p.question),
+          options,
+          total_voter_count: 0,
+          is_closed: false,
+          is_anonymous: String(p.is_anonymous ?? "true") !== "false",
+          type: p.type === "quiz" ? "quiz" : "regular",
+          allows_multiple_answers: isTrue(p.allows_multiple_answers),
+          ...(p.description ? { description: String(p.description) } : {}),
+          ...(photo ? { media: { photo: photoSizes(photo) } } : {}),
+        },
+      });
+    },
+    stopPoll: (p, caller) => {
+      const chat = botChat(p.chat_id);
+      const entry = chat.messages.get(Number(p.message_id));
+      if (!entry || entry.deleted || !entry.message.poll) {
+        throw new TelegramError(
+          400,
+          "Bad Request: message with poll to stop not found",
+        );
+      }
+      if (entry.message.from?.id !== caller.id) {
+        throw new TelegramError(400, "Bad Request: message can't be edited");
+      }
+      if (entry.message.poll.is_closed) {
+        throw new TelegramError(
+          400,
+          "Bad Request: poll has already been closed",
+        );
+      }
+      entry.message.poll.is_closed = true;
+      return entry.message.poll;
+    },
+    forwardMessage: (p, caller) => {
+      const { source, content } = forwardable(p, caller);
+      return sendFrom(
+        { chat_id: p.chat_id, message_thread_id: p.message_thread_id },
+        caller,
+        {
+          ...content,
+          forward_origin:
+            source.chat.type === "channel"
+              ? {
+                  type: "channel",
+                  chat: source.message.chat,
+                  message_id: source.message.message_id,
+                  date: source.message.date,
+                }
+              : {
+                  type: "user",
+                  sender_user: source.message.from,
+                  date: source.message.date,
+                },
+        },
+      );
+    },
+    copyMessage: (p, caller) => {
+      const { content } = forwardable(p, caller);
+      const copy = sendFrom(p, caller, {
+        ...content,
+        ...(p.caption !== undefined ? { caption: String(p.caption) } : {}),
+      });
+      return { message_id: copy.message_id };
+    },
+    pinChatMessage: (p, caller) => {
+      const chat = botChat(p.chat_id);
+      requirePinRights(chat, caller);
+      const id = Number(p.message_id);
+      const entry = chat.messages.get(id);
+      if (!entry || entry.deleted) {
+        throw new TelegramError(400, "Bad Request: message to pin not found");
+      }
+      chat.pinned = [id, ...(chat.pinned ?? []).filter((each) => each !== id)];
+      return true;
+    },
+    unpinChatMessage: (p, caller) => {
+      const chat = botChat(p.chat_id);
+      requirePinRights(chat, caller);
+      const id =
+        p.message_id == null ? (chat.pinned ?? [])[0] : Number(p.message_id);
+      chat.pinned = (chat.pinned ?? []).filter((each) => each !== id);
+      return true;
+    },
+    unpinAllChatMessages: (p, caller) => {
+      const chat = botChat(p.chat_id);
+      requirePinRights(chat, caller);
+      chat.pinned = [];
+      return true;
+    },
     setChatPermissions: (p) => {
       const chat = requireChat(p.chat_id);
       chat.permissions = normalizePermissions(
@@ -963,8 +1363,15 @@ export async function startTestServer({
       );
       return true;
     },
-    leaveChat: () => true,
-    deleteMessage: (p) => {
+    leaveChat: async (p, caller) => {
+      const chat = requireChat(p.chat_id);
+      if (isInChat(chat, caller.id)) {
+        await setBotMembership(chat, caller, { status: "left", actor: caller });
+      }
+      return true;
+    },
+    // A bot deletes its own messages, and others' with can_delete_messages.
+    deleteMessage: (p, caller) => {
       const chat = botChat(p.chat_id);
       const entry = chat.messages.get(Number(p.message_id));
       if (!entry || entry.deleted) {
@@ -972,6 +1379,13 @@ export async function startTestServer({
           400,
           "Bad Request: message to delete not found",
         );
+      }
+      if (
+        chat.type !== "private" &&
+        entry.message.from?.id !== caller.id &&
+        !hasRight(chat, caller.id, "can_delete_messages")
+      ) {
+        throw new TelegramError(400, "Bad Request: message can't be deleted");
       }
       entry.deleted = true;
       return true;
@@ -990,11 +1404,11 @@ export async function startTestServer({
       }
       return true;
     },
-    restrictChatMember: (p) => {
+    restrictChatMember: (p, caller) => {
       const chat = requireChat(p.chat_id);
       const userId = Number(p.user_id);
       requireUser(userId);
-      assertCanModerate(chat, userId, { self: "can't restrict self" });
+      assertCanModerate(chat, userId, { self: "can't restrict self", caller });
       const before = chatMemberObject(chat, userId);
       const current = memberStatus(chat, userId);
       const permissions = normalizePermissions(
@@ -1015,23 +1429,23 @@ export async function startTestServer({
           permissions,
         });
       }
-      memberChanged(chat, userId, before, bot);
+      memberChanged(chat, userId, before, caller);
       return true;
     },
-    banChatMember: (p) => {
+    banChatMember: (p, caller) => {
       const chat = requireChat(p.chat_id);
       const userId = Number(p.user_id);
       requireUser(userId);
-      assertCanModerate(chat, userId);
+      assertCanModerate(chat, userId, { caller });
       const before = chatMemberObject(chat, userId);
       chat.members.set(userId, {
         status: "kicked",
         until_date: Number(p.until_date ?? 0),
       });
-      memberChanged(chat, userId, before, bot);
+      memberChanged(chat, userId, before, caller);
       return true;
     },
-    unbanChatMember: (p) => {
+    unbanChatMember: (p, caller) => {
       const chat = requireChat(p.chat_id);
       const userId = Number(p.user_id);
       requireUser(userId);
@@ -1044,17 +1458,17 @@ export async function startTestServer({
       } else {
         // Without only_if_banned, Telegram guarantees the user is not a member
         // afterwards: a current member is removed, keeping any restriction.
-        assertCanModerate(chat, userId);
+        assertCanModerate(chat, userId, { caller });
         if (current.status === "restricted") {
           chat.members.set(userId, { ...current, is_member: false });
         } else if (current.status === "member") {
           chat.members.set(userId, { status: "left" });
         }
       }
-      memberChanged(chat, userId, before, bot);
+      memberChanged(chat, userId, before, caller);
       return true;
     },
-    approveChatJoinRequest: (p) => {
+    approveChatJoinRequest: (p, caller) => {
       const chat = requireChat(p.chat_id);
       const userId = Number(p.user_id);
       if (!chat.joinRequests.has(userId)) {
@@ -1066,7 +1480,7 @@ export async function startTestServer({
       admit(chat, userId);
       // via_join_request is only for requests made without an invite link;
       // every request here came through one, so the link is reported instead.
-      emitMemberChange(chat, userId, before, bot, {
+      emitMemberChange(chat, userId, before, caller, {
         ...(request.invite_link
           ? { invite_link: request.invite_link }
           : { via_join_request: true }),
@@ -1086,12 +1500,12 @@ export async function startTestServer({
       }
       return true;
     },
-    createChatInviteLink: (p) => {
+    createChatInviteLink: (p, caller) => {
       const chat = requireChat(p.chat_id);
       const link = `https://t.me/+fake${randomBytes(9).toString("base64url")}`;
       const invite = {
         invite_link: link,
-        creator: userObject(bot),
+        creator: userObject(caller),
         creates_join_request: String(p.creates_join_request) === "true",
         is_primary: false,
         is_revoked: false,
@@ -1100,13 +1514,16 @@ export async function startTestServer({
       chat.inviteLinks.set(link, invite);
       return invite;
     },
-    exportChatInviteLink: (p) => {
+    exportChatInviteLink: (p, caller) => {
       const chat = requireChat(p.chat_id);
       // A new primary link revokes the previous one.
       for (const invite of chat.inviteLinks.values()) {
         if (invite.is_primary) invite.is_revoked = true;
       }
-      const invite = methods.createChatInviteLink({ chat_id: p.chat_id });
+      const invite = methods.createChatInviteLink(
+        { chat_id: p.chat_id },
+        caller,
+      );
       invite.is_primary = true;
       return invite.invite_link;
     },
@@ -1140,7 +1557,7 @@ export async function startTestServer({
       : undefined;
   }
 
-  function sendFrom(p, fields) {
+  function sendFrom(p, caller, fields) {
     // Message.reply_markup only ever carries an inline keyboard; reply
     // keyboards and ForceReply are shown to the user, not echoed back.
     const markup = inlineMarkup(p.reply_markup);
@@ -1149,9 +1566,17 @@ export async function startTestServer({
     // find and press it like any message, and reuses it as ephemeral_message_id.
     const receiverId = p.ephemeral_message_parameters?.receiver_user_id;
     const chat = botChat(p.chat_id);
-    const message = addMessage(chat, bot, {
+    requireCanSend(chat, caller);
+    requireTopic(chat, p.message_thread_id);
+    const message = addMessage(chat, caller, {
       ...fields,
       ...(markup ? { reply_markup: markup } : {}),
+      ...(p.message_thread_id && chat.topics
+        ? {
+            message_thread_id: Number(p.message_thread_id),
+            is_topic_message: true,
+          }
+        : {}),
       ...(receiverId != null
         ? { receiver_user: userObject(requireUser(receiverId)) }
         : {}),
@@ -1160,19 +1585,47 @@ export async function startTestServer({
     return message;
   }
 
-  /** Apply a bot edit to a stored message, as Telegram does. */
+  /** The message a forward or copy reads, when the bot can see it. */
+  function forwardable(p, caller) {
+    const sourceChat = botChat(p.from_chat_id);
+    const entry = sourceChat.messages.get(Number(p.message_id));
+    if (
+      !entry ||
+      entry.deleted ||
+      (sourceChat.type !== "private" && !isInChat(sourceChat, caller.id))
+    ) {
+      throw new TelegramError(400, "Bad Request: message to forward not found");
+    }
+    const {
+      message_id: _id,
+      from: _from,
+      chat: _chat,
+      date: _date,
+      edit_date: _edited,
+      reply_markup: _markup,
+      reply_to_message: _reply,
+      receiver_user: _receiver,
+      ephemeral_message_id: _ephemeral,
+      forward_origin: _origin,
+      message_thread_id: _thread,
+      is_topic_message: _topic,
+      ...content
+    } = structuredClone(entry.message);
+    return { source: { chat: sourceChat, message: entry.message }, content };
+  }
+
   /**
    * Apply a bot edit to a stored message, as Telegram does: only the bot's own
    * messages can be edited, an edit without reply_markup removes the inline
    * keyboard, and an edit that changes nothing is refused.
    */
-  function editMessage(p, apply) {
+  function editMessage(p, caller, apply) {
     const chat = botChat(p.chat_id);
     const entry = chat.messages.get(Number(p.message_id));
     if (!entry || entry.deleted) {
       throw new TelegramError(400, "Bad Request: message to edit not found");
     }
-    if (entry.message.from.id !== bot.id) {
+    if (entry.message.from.id !== caller.id) {
       throw new TelegramError(400, "Bad Request: message can't be edited");
     }
     const previous = structuredClone(entry.message);
@@ -1182,7 +1635,12 @@ export async function startTestServer({
     if (markup) edited.reply_markup = markup;
     else delete edited.reply_markup;
     const same = (message) =>
-      JSON.stringify([message.text, message.caption, message.reply_markup]);
+      JSON.stringify([
+        message.text,
+        message.caption,
+        message.reply_markup,
+        ...MEDIA_KINDS.map((kind) => message[kind]),
+      ]);
     if (same(edited) === same(previous)) {
       throw new TelegramError(
         400,
@@ -1194,9 +1652,136 @@ export async function startTestServer({
     return edited;
   }
 
+  /** A group, forum or channel with its owner and no bot in it yet. */
+  function createChat({
+    title,
+    type,
+    owner_id: ownerId,
+    owner_name,
+    is_forum,
+  }) {
+    if (type !== undefined && !["supergroup", "channel"].includes(type)) {
+      throw new TelegramError(400, 'type must be "supergroup" or "channel"');
+    }
+    const kind = type ?? "supergroup";
+    const owner = Number(ownerId);
+    if (!Number.isSafeInteger(owner) || owner <= 0) {
+      throw new TelegramError(400, "chat needs an owner_id");
+    }
+    if (!users.has(owner)) {
+      users.set(owner, {
+        id: owner,
+        is_bot: false,
+        first_name: owner_name ?? "Chat Owner",
+        bio: "",
+        photos: [],
+      });
+    }
+    nextChatId += 1;
+    const chat = {
+      id: -(1_000_000_000_000 + nextChatId),
+      title: String(title ?? (kind === "channel" ? "Channel" : "Group")),
+      type: kind,
+      members: new Map([[owner, { status: "creator" }]]),
+      messages: new Map(),
+      nextMessageId: startSeconds - 1_700_000_000,
+      inviteLinks: new Map(),
+      joinRequests: new Map(),
+      permissions: { ...ALL_PERMISSIONS },
+      // A forum keeps its topics by thread id.
+      ...(kind === "supergroup" && isTrue(is_forum)
+        ? { topics: new Map() }
+        : {}),
+    };
+    chats.set(chat.id, chat);
+    return chat;
+  }
+
+  function creatorOf(chat) {
+    return [...chat.members.entries()].find(
+      ([, member]) => member.status === "creator",
+    )?.[0];
+  }
+
   // ── Test controls (/_fake/*) ───────────────────────────────────────────
   async function control(method, parts, body) {
     const [resource, id, sub, subId] = parts;
+    if (resource === "bots" && !id && method === "POST") {
+      try {
+        return userObject(
+          addBot({
+            token: String(body.token ?? ""),
+            username: body.username,
+            firstName: body.first_name,
+          }),
+        );
+      } catch (error) {
+        throw new TelegramError(400, error.message);
+      }
+    }
+    if (resource === "bots" && !id && method === "GET") {
+      return [...bots.values()].map((record) => ({
+        ...userObject(record),
+        webhook: record.webhook ? { url: record.webhook.url } : null,
+      }));
+    }
+    if (resource === "chats" && !id && method === "POST") {
+      return chatObject(createChat(body));
+    }
+    if (resource === "chats" && id && !sub && method === "GET") {
+      const chat = requireChat(id);
+      return {
+        ...chatObject(chat),
+        pinned: [...(chat.pinned ?? [])],
+        members: [...chat.members.entries()].map(([userId, member]) => ({
+          user_id: userId,
+          status: member.status,
+        })),
+      };
+    }
+    if (resource === "chats" && id && sub === "bots" && method === "POST") {
+      // The owner (or `by`) adds, promotes, demotes or removes a bot.
+      const chat = requireChat(id);
+      const record = requireBot(body.bot_id);
+      const status = body.status ?? "administrator";
+      if (!["administrator", "member", "left", "kicked"].includes(status)) {
+        throw new TelegramError(
+          400,
+          'status must be "administrator", "member", "left" or "kicked"',
+        );
+      }
+      return setBotMembership(chat, record, {
+        status,
+        rights: body.rights ?? null,
+        actor: requireUser(body.by ?? creatorOf(chat)),
+      });
+    }
+    if (resource === "failures" && method === "POST") {
+      if (typeof body.method !== "string" || body.method === "") {
+        throw new TelegramError(
+          400,
+          "a failure needs the method it applies to",
+        );
+      }
+      const rule = {
+        method: body.method,
+        chat_id: body.chat_id == null ? null : String(body.chat_id),
+        bot_id: body.bot_id == null ? null : Number(body.bot_id),
+        remaining: Math.max(1, numberParam(body.times, 1)),
+        error_code: numberParam(body.error_code, 400),
+        description: String(body.description ?? "Bad Request"),
+        retry_after:
+          body.retry_after == null ? null : numberParam(body.retry_after, 1),
+        drop_after_apply: body.drop_after_apply === true,
+      };
+      failures.push(rule);
+      return rule;
+    }
+    if (resource === "failures" && method === "GET") return failures;
+    if (resource === "failures" && method === "DELETE") {
+      failures.length = 0;
+      return { ok: true };
+    }
     if (resource === "users" && method === "POST" && !id) {
       const user = {
         id: nextUserId++,
@@ -1255,6 +1840,12 @@ export async function startTestServer({
       }
       if (sub === "members" && method === "GET" && subId) {
         return chatMemberObject(chat, subId);
+      }
+      if (sub === "topics") {
+        if (!chat.topics) {
+          throw new TelegramError(400, "Bad Request: the chat is not a forum");
+        }
+        return topicControl(chat, method, subId, parts[4], body);
       }
       if (sub === "join-requests" && method === "GET") {
         return [...chat.joinRequests.keys()];
@@ -1365,11 +1956,55 @@ export async function startTestServer({
     if (resource === "calls" && method === "GET") {
       return { calls, unimplemented: [...unimplemented] };
     }
-    if (resource === "webhook" && method === "GET") return webhook;
+    if (resource === "webhook" && method === "GET") return bot.webhook;
     throw new TelegramError(
       404,
       `Unknown fake control ${method} /${parts.join("/")}`,
     );
+  }
+
+  /**
+   * The owner (or `by`) creates or renames a forum topic. Telegram posts a
+   * service message for each, and a topic's id is its creation message's id.
+   */
+  async function topicControl(chat, method, threadId, action, body) {
+    if (method === "GET" && !threadId) {
+      return [...chat.topics.entries()].map(([id, topic]) => ({
+        message_thread_id: id,
+        name: topic.name,
+      }));
+    }
+    const actor = requireUser(body.by ?? creatorOf(chat));
+    const name = body.name == null ? null : String(body.name).trim();
+    if (name !== null && (name === "" || name.length > 128)) {
+      throw new TelegramError(400, "Bad Request: TOPIC_TITLE_EMPTY");
+    }
+    if (method === "POST" && !threadId) {
+      if (name === null) {
+        throw new TelegramError(400, "Bad Request: TOPIC_TITLE_EMPTY");
+      }
+      const message = addMessage(chat, actor, {
+        forum_topic_created: { name, icon_color: 7322096 },
+        is_topic_message: true,
+      });
+      message.message_thread_id = message.message_id;
+      chat.topics.set(message.message_id, { name });
+      await emit("message", message);
+      return { message_thread_id: message.message_id, name };
+    }
+    if (method === "POST" && threadId && action === "edit") {
+      const topic = chat.topics.get(Number(threadId));
+      if (!topic) throw new TelegramError(400, "Bad Request: TOPIC_ID_INVALID");
+      if (name !== null) topic.name = name;
+      const message = addMessage(chat, actor, {
+        forum_topic_edited: { name: topic.name },
+        message_thread_id: Number(threadId),
+        is_topic_message: true,
+      });
+      await emit("message", message);
+      return { message_thread_id: Number(threadId), name: topic.name };
+    }
+    throw new TelegramError(404, `Unknown topic control ${method}`);
   }
 
   /**
@@ -1392,13 +2027,21 @@ export async function startTestServer({
     }
     const queryId = randomBytes(8).readBigUInt64BE().toString();
     openQueries.add(queryId);
-    await emit("callback_query", {
-      id: queryId,
-      from: userObject(user),
-      message: entry.message,
-      chat_instance: String(chat.id),
-      data: String(data ?? ""),
-    });
+    // Only the bot that sent the message hears its buttons pressed.
+    const sender = [...bots.values()].find(
+      (record) => record.id === entry.message.from?.id,
+    );
+    await emit(
+      "callback_query",
+      {
+        id: queryId,
+        from: userObject(user),
+        message: entry.message,
+        chat_instance: String(chat.id),
+        data: String(data ?? ""),
+      },
+      { to: sender ? [sender] : [bot] },
+    );
     const deadline = Date.now() + 10_000;
     while (Date.now() < deadline) {
       if (callbackAnswers.has(queryId)) {
@@ -1480,9 +2123,11 @@ export async function startTestServer({
       photo_base64: photoBase64,
       caption,
       reply_to: replyTo,
+      message_thread_id: threadId,
     },
   ) {
     const user = requireUser(userId);
+    requireTopic(chat, threadId);
     const permission = photoBase64 ? "can_send_photos" : "can_send_messages";
     if (!canPost(chat, userId, permission)) {
       throw new TelegramError(403, "CHAT_WRITE_FORBIDDEN");
@@ -1500,10 +2145,21 @@ export async function startTestServer({
     } else {
       fields.text = String(text ?? "");
     }
-    const replied = replyTo != null ? chat.messages.get(Number(replyTo)) : null;
+    // A message in a topic that answers nothing replies to the topic's
+    // creation message, which is how a bot learns the topic's name.
+    const replied =
+      replyTo != null
+        ? chat.messages.get(Number(replyTo))
+        : threadId
+          ? chat.messages.get(Number(threadId))
+          : null;
     if (replied) {
       const { reply_to_message: _nested, ...original } = replied.message;
       fields.reply_to_message = original;
+    }
+    if (threadId && chat.topics) {
+      fields.message_thread_id = Number(threadId);
+      fields.is_topic_message = true;
     }
     if (fields.text) {
       const entities = messageEntities(fields.text);
@@ -1541,7 +2197,7 @@ export async function startTestServer({
       const file = url.pathname.match(/^\/file\/bot([^/]+)\/(.+)$/);
       if (file) {
         const entry = [...files.values()].find((f) => f.file_path === file[2]);
-        if (!entry || file[1] !== botToken) {
+        if (!entry || !bots.has(file[1])) {
           response.writeHead(404).end();
           return;
         }
@@ -1562,7 +2218,8 @@ export async function startTestServer({
         });
         return;
       }
-      if (call[1] !== botToken) {
+      const caller = bots.get(call[1]);
+      if (!caller) {
         send(response, 401, {
           ok: false,
           error_code: 401,
@@ -1583,7 +2240,29 @@ export async function startTestServer({
         });
         return;
       }
-      calls.push({ method, params: summarize(params), at: Date.now() });
+      const failure = takeFailure(method, caller, params);
+      calls.push({
+        method,
+        bot_id: caller.id,
+        params: summarize(params),
+        at: Date.now(),
+        ...(failure
+          ? failure.drop_after_apply
+            ? { dropped: true }
+            : { failed: failure.error_code }
+          : {}),
+      });
+      if (failure && !failure.drop_after_apply) {
+        send(response, failure.error_code, {
+          ok: false,
+          error_code: failure.error_code,
+          description: failure.description,
+          ...(failure.retry_after != null
+            ? { parameters: { retry_after: failure.retry_after } }
+            : {}),
+        });
+        return;
+      }
       // Bot API method names are case-insensitive.
       const handler = methodsByLowerName.get(method.toLowerCase());
       if (!handler) {
@@ -1605,7 +2284,13 @@ export async function startTestServer({
         return;
       }
       try {
-        send(response, 200, { ok: true, result: await handler(params) });
+        const result = await handler(params, caller);
+        // The call took effect, but its answer is lost on the way back.
+        if (failure?.drop_after_apply) {
+          request.socket.destroy();
+          return;
+        }
+        send(response, 200, { ok: true, result });
       } catch (error) {
         if (!(error instanceof TelegramError)) throw error;
         send(response, error.code, {
@@ -1623,6 +2308,20 @@ export async function startTestServer({
       });
     }
   });
+
+  function takeFailure(method, caller, params) {
+    const index = failures.findIndex(
+      (rule) =>
+        rule.method.toLowerCase() === method.toLowerCase() &&
+        (rule.chat_id === null || rule.chat_id === String(params.chat_id)) &&
+        (rule.bot_id === null || rule.bot_id === caller.id),
+    );
+    if (index < 0) return null;
+    const rule = failures[index];
+    rule.remaining -= 1;
+    if (rule.remaining <= 0) failures.splice(index, 1);
+    return rule;
+  }
 
   function summarize(params) {
     const out = {};
@@ -1652,6 +2351,43 @@ export async function startTestServer({
 
   return {
     origin,
+    addBot: ({ token, username, firstName } = {}) =>
+      act("POST", "bots", { token, username, first_name: firstName }),
+    createChat: async ({ title, type, ownerId, ownerName, isForum } = {}) =>
+      (
+        await act("POST", "chats", {
+          title,
+          type,
+          owner_id: ownerId,
+          owner_name: ownerName,
+          is_forum: isForum,
+        })
+      ).id,
+    getChat: (chatId) => act("GET", `chats/${chatId}`),
+    setBotMembership: (chatId, botId, { status, rights, by } = {}) =>
+      act("POST", `chats/${chatId}/bots`, {
+        bot_id: botId,
+        status,
+        rights,
+        by,
+      }),
+    createTopic: async (chatId, name, { by } = {}) =>
+      (await act("POST", `chats/${chatId}/topics`, { name, by }))
+        .message_thread_id,
+    renameTopic: (chatId, threadId, name, { by } = {}) =>
+      act("POST", `chats/${chatId}/topics/${threadId}/edit`, { name, by }),
+    failNext: (rule) =>
+      act("POST", "failures", {
+        method: rule.method,
+        chat_id: rule.chatId,
+        bot_id: rule.botId,
+        times: rule.times,
+        error_code: rule.errorCode,
+        description: rule.description,
+        retry_after: rule.retryAfter,
+        drop_after_apply: rule.dropAfterApply === true,
+      }),
+    clearFailures: () => act("DELETE", "failures"),
     createUser: async (fields = {}) => (await act("POST", "users", fields)).id,
     updateProfile: (userId, fields) =>
       act("POST", `users/${userId}/profile`, fields),
@@ -1680,6 +2416,9 @@ export async function startTestServer({
                 : {}),
               ...(message.caption ? { caption: message.caption } : {}),
               ...(message.replyTo != null ? { reply_to: message.replyTo } : {}),
+              ...(message.threadId != null
+                ? { message_thread_id: message.threadId }
+                : {}),
             };
       return (
         await act("POST", `chats/${chatId}/messages`, {
@@ -1715,7 +2454,7 @@ export async function startTestServer({
     getCalls: () => act("GET", "calls"),
     stop: () =>
       new Promise((resolve) => {
-        wakePollers();
+        for (const record of bots.values()) wakePollers(record);
         for (const abort of inFlight) abort.abort();
         server.close(() => resolve());
         server.closeAllConnections();
