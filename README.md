@@ -158,6 +158,10 @@ The details a moderation bot depends on, each covered by a test:
   `message is not modified`; an edit without `reply_markup` removes the inline keyboard, after which
   its buttons can no longer be pressed.
 - **Private chats.** The bot cannot message a user who has not written to it first (403).
+- **Ephemeral messages.** A send with `ephemeral_message_parameters` (Bot API 10.2) returns a message
+  with `receiver_user` and `ephemeral_message_id`. Unlike Telegram, which gives it `message_id` 0, it
+  keeps an ordinary message id, so tests can find it in the chat and press its buttons. The
+  `editEphemeralMessage…` and `deleteEphemeralMessage` methods are not modelled.
 - **Callback queries.** Answering a query that was never sent fails.
 - **Invite links.** Exporting a new primary link revokes the previous one; joining through a
   revoked link fails.

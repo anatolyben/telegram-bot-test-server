@@ -96,6 +96,7 @@ const OBJECT_PARAMS = new Set([
   "commands",
   "media",
   "scope",
+  "ephemeral_message_parameters",
 ]);
 
 class TelegramError extends Error {
@@ -1143,10 +1144,20 @@ export async function startTestServer({
     // Message.reply_markup only ever carries an inline keyboard; reply
     // keyboards and ForceReply are shown to the user, not echoed back.
     const markup = inlineMarkup(p.reply_markup);
-    return addMessage(botChat(p.chat_id), bot, {
+    // An ephemeral message (Bot API 10.2) is shown to one member only. Telegram
+    // gives it message_id 0; here it keeps the chat's message id, so tests can
+    // find and press it like any message, and reuses it as ephemeral_message_id.
+    const receiverId = p.ephemeral_message_parameters?.receiver_user_id;
+    const chat = botChat(p.chat_id);
+    const message = addMessage(chat, bot, {
       ...fields,
       ...(markup ? { reply_markup: markup } : {}),
+      ...(receiverId != null
+        ? { receiver_user: userObject(requireUser(receiverId)) }
+        : {}),
     });
+    if (receiverId != null) message.ephemeral_message_id = message.message_id;
+    return message;
   }
 
   /** Apply a bot edit to a stored message, as Telegram does. */

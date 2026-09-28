@@ -1,6 +1,6 @@
 {
   "name": "telegram-bot-test-server",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A local, in-memory fake of the Telegram Bot API for testing group bots: members, restrictions, join requests, invite links, webhooks and callback buttons",
   "license": "MIT",
   "author": "Anatoly Ben",
