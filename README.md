@@ -242,8 +242,7 @@ pnpm test
 
 ## Status
 
-This is an early-stage project with a deliberately small scope. It was extracted from the test suite
-of a production group bot, and the public API may still change.
+This is an early-stage project with a deliberately small scope, and the public API may still change.
 
 ## License
 
