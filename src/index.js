@@ -1313,6 +1313,44 @@ export async function startTestServer({
       const user = requireUser(body.user_id);
       return pressButton(requireChat(id), user, Number(subId), body.data);
     }
+    if (
+      resource === "chats" &&
+      id &&
+      sub === "guest-bot-reply" &&
+      method === "POST"
+    ) {
+      // Guest mode (Bot API 10.0): a user calls a bot that is not a member of
+      // the chat, and its answer is posted in the chat as that bot, with
+      // guest_bot_caller_user naming the user who called it.
+      const chat = requireChat(id);
+      const caller = requireUser(body.caller_user_id);
+      const username = String(body.bot_username ?? "").replace(/^@/, "");
+      if (!/^[A-Za-z][A-Za-z0-9_]{3,31}$/.test(username)) {
+        throw new TelegramError(400, "guest bot needs a valid bot_username");
+      }
+      let guestBot = [...users.values()].find(
+        (user) => user.is_bot && user.username === username,
+      );
+      if (!guestBot) {
+        guestBot = {
+          id: nextUserId++,
+          is_bot: true,
+          first_name: username,
+          username,
+          photos: [],
+        };
+        users.set(guestBot.id, guestBot);
+      }
+      const text = String(body.text ?? "");
+      const entities = messageEntities(text);
+      const message = addMessage(chat, guestBot, {
+        text,
+        ...(entities.length > 0 ? { entities } : {}),
+        guest_bot_caller_user: userObject(caller),
+      });
+      await emit("message", message);
+      return { message_id: message.message_id };
+    }
     if (resource === "calls" && method === "GET") {
       return { calls, unimplemented: [...unimplemented] };
     }
@@ -1646,6 +1684,14 @@ export async function startTestServer({
       }),
     sendDirectMessage: async (userId, text) =>
       (await act("POST", `users/${userId}/dm`, { text })).message_id,
+    postGuestBotReply: async (chatId, callerUserId, botUsername, text) =>
+      (
+        await act("POST", `chats/${chatId}/guest-bot-reply`, {
+          caller_user_id: callerUserId,
+          bot_username: botUsername,
+          text,
+        })
+      ).message_id,
     pressDirectButton: (userId, messageId, data) =>
       act("POST", `users/${userId}/dm/${messageId}/callback`, { data }),
     getMessages: (chatId) => act("GET", `chats/${chatId}/messages`),

@@ -106,6 +106,17 @@ export interface TelegramBotTestServer {
     userId: number,
     data: string,
   ): Promise<ButtonAnswer>;
+  /**
+   * A user calls a guest bot (Bot API 10.0 guest mode) that is not a member of
+   * the chat; its answer appears in the chat from that bot, with
+   * guest_bot_caller_user naming the caller. Returns the message_id.
+   */
+  postGuestBotReply(
+    chatId: number,
+    callerUserId: number,
+    botUsername: string,
+    text: string,
+  ): Promise<number>;
   /** The user sends the bot a direct message; returns the message_id. */
   sendDirectMessage(userId: number, text: string): Promise<number>;
   /** The user presses an inline button in their private chat with the bot. */

@@ -86,6 +86,7 @@ response happens after that, so wait for the outcome rather than checking it imm
 | `leave(chatId, userId)`                                               | The user leaves.                                                                                                                              |
 | `post(chatId, userId, text)`                                          | The user posts a message; returns its `message_id`. Also takes `{ text, photo, caption, replyTo }`. Fails if the user is not allowed to post. |
 | `pressButton(chatId, messageId, userId, data)`                        | The user presses an inline button; resolves with the bot's `answerCallbackQuery` answer.                                                      |
+| `postGuestBotReply(chatId, userId, botUsername, text)`                | The user calls a guest bot (Bot API 10.0 guest mode); its answer appears in the group from that bot, with `guest_bot_caller_user` set.        |
 | `sendDirectMessage(userId, text)`                                     | The user messages the bot privately.                                                                                                          |
 | `pressDirectButton(userId, messageId, data)`                          | The user presses a button in their private chat with the bot.                                                                                 |
 | `getMessages(chatId)`, `getMessage(chatId, id)`                       | The chat's messages, and whether one was deleted.                                                                                             |
@@ -205,6 +206,7 @@ The test actions above, over HTTP, for tests written in other languages. All rou
 | `GET chats/:id/join-requests`                 | User ids with a pending join request.                                                                         |
 | `POST invites/:hash/join`                     | The user `{ user_id }` opens `https://t.me/+<hash>`: joins, or files a join request if the link requires one. |
 | `POST invites/:hash/check`                    | Whether the user `{ user_id }` is in the link's chat.                                                         |
+| `POST chats/:id/guest-bot-reply`              | A guest bot answers the user `{ caller_user_id, bot_username, text }` in the group; returns `{ message_id }`. |
 | `POST users/:id/dm`                           | The user sends the bot a direct message `{ text }`.                                                           |
 | `GET users/:id/dm`                            | The private chat's messages, newest first.                                                                    |
 | `POST users/:id/dm/:messageId/callback`       | The user presses a button in the private chat `{ data }`.                                                     |

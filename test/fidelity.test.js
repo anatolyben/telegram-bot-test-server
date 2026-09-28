@@ -327,6 +327,31 @@ describe("messages and buttons", () => {
   });
 });
 
+describe("guest bots", () => {
+  it("posts a guest bot's reply in the group from that bot, naming the user who called it", async () => {
+    const { server, api, member } = await setup();
+    const ann = await member();
+
+    const replyId = await server.postGuestBotReply(
+      GROUP,
+      ann,
+      "@helper_bot",
+      "see example.org",
+    );
+
+    const { message } = await server.getMessage(GROUP, replyId);
+    expect(message).toMatchObject({
+      from: { is_bot: true, username: "helper_bot" },
+      guest_bot_caller_user: { id: ann },
+      entities: [{ type: "url" }],
+    });
+    // The group's own bot can moderate it like any other message.
+    expect(
+      await api("deleteMessage", { chat_id: GROUP, message_id: replyId }),
+    ).toMatchObject({ ok: true });
+  });
+});
+
 describe("Bot API details", () => {
   it("treats method names case-insensitively and remembers the bot's commands", async () => {
     const { api } = await setup();
