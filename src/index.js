@@ -204,6 +204,7 @@ function userObject(user) {
     ...(user.last_name ? { last_name: user.last_name } : {}),
     ...(user.username ? { username: user.username } : {}),
     ...(user.language_code ? { language_code: user.language_code } : {}),
+    ...(user.is_premium === true ? { is_premium: true } : {}),
   };
 }
 
@@ -426,6 +427,13 @@ export async function startTestServer({
   }
   // A member's private chat with the bot, keyed by the member's id.
   const privateChats = new Map();
+  // Business connections (Bot API 7.2+), by id: an account owner connects a
+  // bot to answer their private chats.
+  // https://core.telegram.org/bots/api#businessconnection
+  const businessConnections = new Map();
+  // Every update sent, by update_id, with the bot it went to and its exact
+  // bytes, so a test can have Telegram deliver it again.
+  const sentUpdates = new Map();
   const callbackAnswers = new Map();
   // Callback queries awaiting an answer; any other id is refused.
   const openQueries = new Set();
@@ -632,7 +640,9 @@ export async function startTestServer({
     // A private chat here is with the first bot: users write only to it, and
     // no other bot may message someone who never wrote to that bot.
     if (chat.type === "private") {
-      if (caller.id !== bot.id) {
+      // A business connection gives its bot the owner's private chat
+      // (BusinessConnection.user_chat_id).
+      if (caller.id !== bot.id && !chat.openTo?.has(caller.id)) {
         throw new TelegramError(
           403,
           "Forbidden: bot can't initiate conversation with a user",
@@ -797,24 +807,38 @@ export async function startTestServer({
    * otherwise to the queue its getUpdates reads.
    */
   function emitTo(record, type, payload) {
-    if (!allowed(record, type)) return Promise.resolve();
+    return emitOne(record, type, payload).delivered;
+  }
+
+  /** Send one update to one bot; says which update_id it got, if any. */
+  function emitOne(record, type, payload) {
+    if (!allowed(record, type)) {
+      return { updateId: null, delivered: Promise.resolve() };
+    }
     const update = { update_id: nextUpdateId(), [type]: payload };
+    sentUpdates.set(update.update_id, {
+      record,
+      body: JSON.stringify(update),
+    });
     if (!record.webhook?.url) {
       record.queue.push(structuredClone(update));
       wakePollers(record);
-      return Promise.resolve();
+      return { updateId: update.update_id, delivered: Promise.resolve() };
     }
-    return deliver(record, update);
+    return {
+      updateId: update.update_id,
+      delivered: deliver(record, update),
+    };
   }
 
   function wakePollers(record) {
     for (const waiter of record.pollWaiters) waiter.wake();
   }
 
-  function deliver(record, update) {
+  function deliver(record, update, sentBody = null) {
     const type = Object.keys(update).find((key) => key !== "update_id");
     // Serialised now, so later state changes cannot rewrite a sent update.
-    const body = JSON.stringify(update);
+    const body = sentBody ?? JSON.stringify(update);
     record.delivery = record.delivery.then(async () => {
       // The webhook may have been removed while this update waited its turn;
       // it then belongs to getUpdates, as on Telegram.
@@ -1043,6 +1067,8 @@ export async function startTestServer({
       can_read_all_group_messages: true,
       supports_inline_queries: false,
       supports_join_request_queries: caller.joinRequestQueries,
+      // Every bot here can be connected to a business account.
+      can_connect_to_business: true,
     }),
     setWebhook: (p, caller) => {
       if (!p.url) {
@@ -1248,7 +1274,13 @@ export async function startTestServer({
       };
     },
     sendMessage: (p, caller) =>
-      sendFrom(p, caller, { text: String(p.text ?? "") }),
+      p.business_connection_id
+        ? sendBusinessMessage(p, caller)
+        : sendFrom(p, caller, { text: String(p.text ?? "") }),
+    getBusinessConnection: (p, caller) =>
+      businessConnectionObject(
+        requireBusinessConnection(p.business_connection_id, caller),
+      ),
     sendPhoto: async (p, caller) => {
       const photo =
         typeof p.photo === "string" && files.has(p.photo)
@@ -2111,6 +2143,215 @@ export async function startTestServer({
     }
   }
 
+  // ── Business connections ────────────────────────────────────────────────
+  function businessConnectionObject(connection) {
+    return {
+      id: connection.id,
+      user: userObject(requireUser(connection.ownerId)),
+      user_chat_id: connection.ownerId,
+      date: connection.date,
+      rights: { ...connection.rights },
+      is_enabled: connection.isEnabled,
+    };
+  }
+
+  /**
+   * The caller's connection with that id. Telegram names an unknown one
+   * BUSINESS_CONNECTION_INVALID (400) at the MTProto layer; the Bot API's
+   * exact wording is UNVERIFIED.
+   * https://core.telegram.org/method/messages.sendMessage
+   * https://core.telegram.org/api/bots/connected-business-bots
+   */
+  function requireBusinessConnection(id, caller) {
+    const connection = businessConnections.get(String(id ?? ""));
+    if (!connection || connection.botId !== caller.id) {
+      throw new TelegramError(400, "Bad Request: BUSINESS_CONNECTION_INVALID");
+    }
+    return connection;
+  }
+
+  function businessChat(connection, userId) {
+    const key = Number(userId);
+    if (!connection.chats.has(key)) {
+      connection.chats.set(key, {
+        entries: [],
+        nextMessageId: 1,
+        lastInboundAt: null,
+      });
+    }
+    return connection.chats.get(key);
+  }
+
+  /** A business chat is the owner's private chat with a person. */
+  function businessChatObject(userId) {
+    const user = requireUser(userId);
+    return {
+      id: user.id,
+      type: "private",
+      first_name: user.first_name,
+      ...(user.last_name ? { last_name: user.last_name } : {}),
+      ...(user.username ? { username: user.username } : {}),
+    };
+  }
+
+  function addBusinessMessage(connection, userId, direction, from, fields) {
+    const chat = businessChat(connection, userId);
+    const message = {
+      message_id: chat.nextMessageId++,
+      from: userObject(from),
+      chat: businessChatObject(userId),
+      date: now(),
+      business_connection_id: connection.id,
+      ...fields,
+    };
+    if (message.text) {
+      const entities = messageEntities(message.text);
+      if (entities.length > 0) message.entities = entities;
+    }
+    chat.entries.push({ direction, deleted: false, message });
+    return message;
+  }
+
+  /**
+   * The bot answers in a business chat, as the owner. It needs an enabled
+   * connection with can_reply, and can_reply covers only chats "that had
+   * incoming messages in the last 24 hours"
+   * (https://core.telegram.org/bots/api#businessbotrights); past that,
+   * Telegram answers BUSINESS_PEER_USAGE_MISSING
+   * (https://core.telegram.org/method/messages.sendMessage).
+   */
+  function sendBusinessMessage(p, caller) {
+    const connection = requireBusinessConnection(
+      p.business_connection_id,
+      caller,
+    );
+    // UNVERIFIED: Telegram does not document the error for a disabled
+    // connection; a disabled connection is treated as an invalid one.
+    if (!connection.isEnabled) {
+      throw new TelegramError(400, "Bad Request: BUSINESS_CONNECTION_INVALID");
+    }
+    // BOT_ACCESS_FORBIDDEN is Telegram's error for an operation a business
+    // connection does not allow (connected-business-bots page); that a missing
+    // can_reply right produces it, with 403, is UNVERIFIED.
+    if (connection.rights.can_reply !== true) {
+      throw new TelegramError(403, "Forbidden: BOT_ACCESS_FORBIDDEN");
+    }
+    const userId = Number(p.chat_id);
+    requireUser(userId);
+    const chat = businessChat(connection, userId);
+    if (
+      chat.lastInboundAt == null ||
+      Date.now() - chat.lastInboundAt > 24 * 60 * 60 * 1000
+    ) {
+      throw new TelegramError(400, "Bad Request: BUSINESS_PEER_USAGE_MISSING");
+    }
+    return addBusinessMessage(
+      connection,
+      userId,
+      "bot",
+      requireUser(connection.ownerId),
+      {
+        text: String(p.text ?? ""),
+        sender_business_bot: userObject(caller),
+      },
+    );
+  }
+
+  /**
+   * A test connects a bot to an owner's account, or changes an existing
+   * connection (rights, enabled). Telegram sends the bot business_connection
+   * each time.
+   */
+  function connectBusiness(body) {
+    const existing =
+      body.id != null ? businessConnections.get(String(body.id)) : null;
+    const ownerId = Number(body.owner_id ?? existing?.ownerId);
+    const owner = requireUser(ownerId);
+    if (owner.is_bot) {
+      throw new TelegramError(
+        400,
+        "a business account owner is a user, not a bot",
+      );
+    }
+    const record =
+      body.bot_id != null
+        ? requireBot(body.bot_id)
+        : existing
+          ? requireBot(existing.botId)
+          : bot;
+    const connection = existing ?? {
+      id: String(
+        body.id ?? `fake-business-${randomBytes(9).toString("base64url")}`,
+      ),
+      ownerId,
+      botId: record.id,
+      date: now(),
+      chats: new Map(),
+    };
+    connection.ownerId = ownerId;
+    connection.botId = record.id;
+    connection.rights = { ...(body.rights ?? existing?.rights ?? {}) };
+    connection.isEnabled =
+      body.is_enabled !== undefined
+        ? body.is_enabled === true
+        : (existing?.isEnabled ?? true);
+    businessConnections.set(connection.id, connection);
+    // The owner's private chat with the bot is open to it from now on.
+    const privateChat = messageChat(ownerId);
+    privateChat.openTo ??= new Set();
+    privateChat.openTo.add(record.id);
+    const sent = emitOne(
+      record,
+      "business_connection",
+      businessConnectionObject(connection),
+    );
+    return {
+      connection: businessConnectionObject(connection),
+      update_id: sent.updateId,
+      delivered: sent.delivered,
+    };
+  }
+
+  /**
+   * A message in a business chat: from the person, or from the owner answering
+   * by hand. The bot gets business_message while the connection is enabled.
+   */
+  async function sayInBusinessChat(connectionId, userId, { sender, text }) {
+    const connection = businessConnections.get(String(connectionId));
+    if (!connection) {
+      throw new TelegramError(404, `No business connection ${connectionId}`);
+    }
+    if (sender !== "person" && sender !== "owner") {
+      throw new TelegramError(400, 'sender must be "person" or "owner"');
+    }
+    const from = requireUser(sender === "person" ? userId : connection.ownerId);
+    requireUser(userId);
+    const message = addBusinessMessage(
+      connection,
+      userId,
+      sender === "person" ? "inbound" : "owner",
+      from,
+      { text: String(text ?? "") },
+    );
+    if (sender === "person")
+      businessChat(connection, userId).lastInboundAt = Date.now();
+    let updateId = null;
+    if (connection.isEnabled) {
+      const sent = emitOne(
+        requireBot(connection.botId),
+        "business_message",
+        structuredClone(message),
+      );
+      updateId = sent.updateId;
+      await sent.delivered;
+    }
+    return {
+      message_id: message.message_id,
+      date: message.date,
+      update_id: updateId,
+    };
+  }
+
   /** The message a forward or copy reads, when the bot can see it. */
   function forwardable(p, caller) {
     const sourceChat = botChat(p.from_chat_id);
@@ -2309,10 +2550,61 @@ export async function startTestServer({
       failures.length = 0;
       return { ok: true };
     }
+    if (resource === "business" && id === "connections") {
+      const [, , connectionId, chatsPart, userId, messagesPart] = parts;
+      if (method === "POST" && !connectionId) {
+        const { delivered, ...result } = connectBusiness(body);
+        await delivered;
+        return result;
+      }
+      if (method === "GET" && connectionId && !chatsPart) {
+        const connection = businessConnections.get(String(connectionId));
+        if (!connection) {
+          throw new TelegramError(
+            404,
+            `No business connection ${connectionId}`,
+          );
+        }
+        return businessConnectionObject(connection);
+      }
+      if (chatsPart === "chats" && userId && messagesPart === "messages") {
+        const connection = businessConnections.get(String(connectionId));
+        if (!connection) {
+          throw new TelegramError(
+            404,
+            `No business connection ${connectionId}`,
+          );
+        }
+        if (method === "POST")
+          return sayInBusinessChat(connectionId, userId, body);
+        if (method === "GET") {
+          return [...businessChat(connection, userId).entries]
+            .reverse()
+            .map((entry) => structuredClone(entry));
+        }
+      }
+    }
+    if (
+      resource === "updates" &&
+      id &&
+      sub === "redeliver" &&
+      method === "POST"
+    ) {
+      // Telegram delivers an update again when a webhook did not confirm it;
+      // this sends the same bytes to the same bot.
+      const sent = sentUpdates.get(Number(id));
+      if (!sent) throw new TelegramError(404, `No update ${id}`);
+      if (!sent.record.webhook?.url) {
+        throw new TelegramError(409, `The bot for update ${id} has no webhook`);
+      }
+      await deliver(sent.record, JSON.parse(sent.body), sent.body);
+      return { update_id: Number(id) };
+    }
     if (resource === "users" && method === "POST" && !id) {
       const user = {
         id: nextUserId++,
-        is_bot: false,
+        is_bot: body.is_bot === true,
+        is_premium: body.is_premium === true,
         first_name: body.first_name ?? "Test Member",
         last_name: body.last_name ?? "",
         username: body.username ?? null,
@@ -3150,6 +3442,28 @@ export async function startTestServer({
       }),
     clearFailures: () => act("DELETE", "failures"),
     createUser: async (fields = {}) => (await act("POST", "users", fields)).id,
+    connectBusiness: ({ ownerId, rights, id, isEnabled, botId } = {}) =>
+      act("POST", "business/connections", {
+        owner_id: ownerId,
+        rights,
+        ...(id != null ? { id } : {}),
+        ...(isEnabled !== undefined ? { is_enabled: isEnabled } : {}),
+        ...(botId != null ? { bot_id: botId } : {}),
+      }),
+    getBusinessConnection: (connectionId) =>
+      act("GET", `business/connections/${connectionId}`),
+    sayInBusinessChat: (connectionId, userId, sender, text) =>
+      act(
+        "POST",
+        `business/connections/${connectionId}/chats/${userId}/messages`,
+        { sender, text },
+      ),
+    getBusinessChat: (connectionId, userId) =>
+      act(
+        "GET",
+        `business/connections/${connectionId}/chats/${userId}/messages`,
+      ),
+    redeliverUpdate: (updateId) => act("POST", `updates/${updateId}/redeliver`),
     updateProfile: (userId, fields) =>
       act("POST", `users/${userId}/profile`, fields),
     addProfilePhoto: (userId, bytes) =>

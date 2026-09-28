@@ -66,6 +66,28 @@ export interface UserFields {
   username?: string;
   language_code?: string;
   bio?: string;
+  /** Shown as User.is_bot. Default false. */
+  is_bot?: boolean;
+  /** Shown as User.is_premium. Default false. */
+  is_premium?: boolean;
+}
+
+/** A Bot API BusinessConnection. */
+export interface BusinessConnection {
+  id: string;
+  user: { id: number; [field: string]: unknown };
+  user_chat_id: number;
+  date: number;
+  rights: { can_reply?: boolean; [right: string]: boolean | undefined };
+  is_enabled: boolean;
+}
+
+/** One message in a business chat, as the control API lists it. */
+export interface BusinessChatEntry {
+  /** From the person, the owner by hand, or the bot for the owner. */
+  direction: "inbound" | "owner" | "bot";
+  deleted: boolean;
+  message: Message;
 }
 
 export interface PostedMessage {
@@ -196,6 +218,37 @@ export interface TelegramBotTestServer {
   clearFailures(): Promise<{ ok: true }>;
   /** Create a user; returns their id. */
   createUser(fields?: UserFields): Promise<number>;
+  /**
+   * The owner connects a bot (default the first) to their business account, or,
+   * given the id of an existing connection, changes its rights or enabled
+   * state. The bot gets business_connection; update_id is null when its
+   * allowed_updates leave that out.
+   */
+  connectBusiness(connection: {
+    ownerId: number;
+    rights?: BusinessConnection["rights"];
+    id?: string;
+    isEnabled?: boolean;
+    botId?: number;
+  }): Promise<{ connection: BusinessConnection; update_id: number | null }>;
+  getBusinessConnection(connectionId: string): Promise<BusinessConnection>;
+  /**
+   * The person writes in the owner's business chat, or the owner answers by
+   * hand. The bot gets business_message unless the connection is disabled.
+   */
+  sayInBusinessChat(
+    connectionId: string,
+    userId: number,
+    sender: "person" | "owner",
+    text: string,
+  ): Promise<{ message_id: number; date: number; update_id: number | null }>;
+  /** The business chat with a person, newest first. */
+  getBusinessChat(
+    connectionId: string,
+    userId: number,
+  ): Promise<BusinessChatEntry[]>;
+  /** Deliver an update again, byte for byte, to the webhook it went to. */
+  redeliverUpdate(updateId: number): Promise<{ update_id: number }>;
   updateProfile(userId: number, fields: UserFields): Promise<unknown>;
   addProfilePhoto(userId: number, bytes: Uint8Array): Promise<unknown>;
   /** The user joins a chat directly. */
