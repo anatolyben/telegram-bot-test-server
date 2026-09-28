@@ -92,17 +92,17 @@ describe("Bot API basics", () => {
   it("rejects a method it does not implement, and records it", async () => {
     const { api, control } = await setup();
 
-    const answer = await api("sendDice", { chat_id: GROUP });
+    const answer = await api("sendInvoice", { chat_id: GROUP });
     expect(answer).toMatchObject({ status: 404, ok: false, error_code: 404 });
-    expect(answer.description).toContain("sendDice");
+    expect(answer.description).toContain("sendInvoice");
     expect((await control("GET", "calls")).body.unimplemented).toEqual([
-      "sendDice",
+      "sendInvoice",
     ]);
   });
 
   it("answers true to unimplemented methods only when asked to", async () => {
     const { api } = await setup({ unimplemented: "ok" });
-    expect(await api("sendDice", { chat_id: GROUP })).toMatchObject({
+    expect(await api("sendInvoice", { chat_id: GROUP })).toMatchObject({
       ok: true,
       result: true,
     });

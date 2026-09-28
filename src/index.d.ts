@@ -25,6 +25,11 @@ export interface TelegramBotTestServerOptions {
   botUsername?: string;
   /** Default "Fake Test Bot". */
   botName?: string;
+  /**
+   * The bot is a guard bot: join requests reach it as queries it answers with
+   * answerChatJoinRequestQuery. Default false.
+   */
+  supportsJoinRequestQueries?: boolean;
   /** Supergroups the bot administers. */
   chats?: TestChat[];
   /** Channels, groups and bots that getChat("@username") resolves. */
@@ -72,6 +77,27 @@ export interface PostedMessage {
   replyTo?: number;
   /** Forum topic to post in; the message then replies to the topic's creation. */
   threadId?: number;
+  /** Anything besides a photo; a caption goes with every kind but stickers and video notes. */
+  media?: {
+    type:
+      | "video"
+      | "animation"
+      | "sticker"
+      | "voice"
+      | "audio"
+      | "video_note"
+      | "document";
+    bytes: Uint8Array;
+    fileName?: string;
+    mimeType?: string;
+  };
+  /** Where a forwarded message came from: a user, a hidden user's name, or a channel post. */
+  forwardFrom?: {
+    userId?: number;
+    senderName?: string;
+    chatId?: number;
+    messageId?: number;
+  };
 }
 
 export interface NewChat {
@@ -131,6 +157,8 @@ export interface TelegramBotTestServer {
     token: string;
     username: string;
     firstName?: string;
+    /** A guard bot that gets join requests as queries. */
+    supportsJoinRequestQueries?: boolean;
   }): Promise<{ id: number; is_bot: true; username: string }>;
   /** A group, forum or channel owned by `ownerId`, with no bot in it; returns its id. */
   createChat(chat: NewChat): Promise<number>;
@@ -184,6 +212,34 @@ export interface TelegramBotTestServer {
     userId: number,
     message: string | PostedMessage,
   ): Promise<number>;
+  /** The user posts 2 to 10 photos or videos as one album. */
+  postAlbum(
+    chatId: number,
+    userId: number,
+    items: Array<{
+      type: "photo" | "video";
+      bytes: Uint8Array;
+      caption?: string;
+    }>,
+    options?: { threadId?: number },
+  ): Promise<{ media_group_id: string; message_ids: number[] }>;
+  /** The author edits their message's text or caption; bots get edited_message. */
+  editMessage(
+    chatId: number,
+    messageId: number,
+    userId: number,
+    edit: { text?: string; caption?: string },
+  ): Promise<{ message_id: number; edit_date: number }>;
+  /**
+   * The user sets their reaction on a message, or takes it back with null.
+   * Administrator bots that asked for message_reaction are told.
+   */
+  react(
+    chatId: number,
+    messageId: number,
+    userId: number,
+    emoji: string | null,
+  ): Promise<{ reactions: Record<string, string[]> }>;
   /** The user presses an inline button under a message in a chat. */
   pressButton(
     chatId: number,

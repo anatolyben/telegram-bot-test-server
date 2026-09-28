@@ -108,7 +108,67 @@ const OBJECT_PARAMS = new Set([
   "options",
   "entities",
   "caption_entities",
+  "reaction",
 ]);
+
+// The administrator rights promoteChatMember sets.
+const ADMIN_RIGHTS = Object.freeze([
+  "is_anonymous",
+  "can_manage_chat",
+  "can_delete_messages",
+  "can_manage_video_chats",
+  "can_restrict_members",
+  "can_promote_members",
+  "can_change_info",
+  "can_invite_users",
+  "can_post_stories",
+  "can_edit_stories",
+  "can_delete_stories",
+  "can_post_messages",
+  "can_edit_messages",
+  "can_pin_messages",
+  "can_manage_topics",
+]);
+
+const CHAT_ACTIONS = new Set([
+  "typing",
+  "upload_photo",
+  "record_video",
+  "upload_video",
+  "record_voice",
+  "upload_voice",
+  "upload_document",
+  "choose_sticker",
+  "find_location",
+  "record_video_note",
+  "upload_video_note",
+]);
+
+// sendDice emoji and the highest value each can roll.
+const DICE = Object.freeze({
+  "🎲": 6,
+  "🎯": 6,
+  "🎳": 6,
+  "🏀": 5,
+  "⚽": 5,
+  "🎰": 64,
+});
+
+// What a member can post besides text and photos: the permission it needs,
+// the file's folder and extension, and whether it takes a caption.
+const MEMBER_MEDIA = Object.freeze({
+  video: { permission: "can_send_videos", ext: "mp4", caption: true },
+  animation: {
+    permission: "can_send_other_messages",
+    ext: "mp4",
+    caption: true,
+  },
+  sticker: { permission: "can_send_other_messages", ext: "webp" },
+  voice: { permission: "can_send_voice_notes", ext: "ogg", caption: true },
+  audio: { permission: "can_send_audios", ext: "mp3", caption: true },
+  video_note: { permission: "can_send_video_notes", ext: "mp4" },
+  document: { permission: "can_send_documents", ext: "bin", caption: true },
+});
 
 // The media a message can carry, one at a time, and editMessageMedia replaces.
 const MEDIA_KINDS = Object.freeze(["photo", "video", "animation", "document"]);
@@ -292,6 +352,7 @@ export async function startTestServer({
   botToken,
   botUsername = "fake_test_bot",
   botName = "Fake Test Bot",
+  supportsJoinRequestQueries = false,
   chats: chatConfigs = [],
   publicChats = [],
   unimplemented: unimplementedMode = "error",
@@ -304,7 +365,7 @@ export async function startTestServer({
   // Every bot this server answers for, by token. Each keeps its own webhook,
   // update queue and commands, as separate bots do on Telegram.
   const bots = new Map();
-  function addBot({ token, username, firstName }) {
+  function addBot({ token, username, firstName, joinRequestQueries = false }) {
     const id = Number(String(token).split(":")[0]);
     if (!Number.isSafeInteger(id) || !String(token).includes(":")) {
       throw new TypeError(
@@ -328,6 +389,8 @@ export async function startTestServer({
       pollWaiters: new Set(),
       delivery: Promise.resolve(),
       commands: [],
+      // A guard bot that gets join request queries (Bot API 10.x).
+      joinRequestQueries: joinRequestQueries === true,
     };
     bots.set(token, record);
     users.set(id, record);
@@ -338,7 +401,10 @@ export async function startTestServer({
     token: botToken,
     username: botUsername,
     firstName: botName,
+    joinRequestQueries: supportsJoinRequestQueries,
   });
+  // Join request queries awaiting answerChatJoinRequestQuery, by query id.
+  const joinQueries = new Map();
   const files = new Map();
   const chats = new Map();
   // Public channels, groups and bots other accounts link to, by lower-case
@@ -378,6 +444,7 @@ export async function startTestServer({
   let updateId = startSeconds;
   let nextUserId = 7_000_000_000 + startSeconds;
   let nextChatId = startSeconds;
+  let nextMediaGroupId = BigInt(startSeconds) * 1_000_000n;
   let nextPollId = BigInt(startSeconds) * 1_000_000n;
 
   for (const config of chatConfigs) {
@@ -516,11 +583,13 @@ export async function startTestServer({
             };
       return {
         ...base,
-        can_be_edited: false,
+        // A bot can edit the administrators it promoted.
+        can_be_edited: member.promotedBy != null,
         is_anonymous: false,
         ...rights,
         // Rights the owner granted or withheld when promoting.
         ...(member.rights ?? {}),
+        ...(member.customTitle ? { custom_title: member.customTitle } : {}),
       };
     }
     if (member.status === "creator") return { ...base, is_anonymous: false };
@@ -892,6 +961,67 @@ export async function startTestServer({
     );
   }
 
+  /** The Message field for a stored file of a media type, as the Bot API has it. */
+  function mediaField(type, file, { fileName, mimeType, duration = 1 } = {}) {
+    const base = {
+      file_id: file.file_id,
+      file_unique_id: file.file_unique_id,
+      file_size: file.size,
+    };
+    switch (type) {
+      case "photo":
+        return photoSizes(file);
+      case "video":
+      case "animation":
+        return {
+          ...base,
+          width: 1280,
+          height: 720,
+          duration,
+          mime_type: mimeType ?? "video/mp4",
+          ...(fileName ? { file_name: fileName } : {}),
+        };
+      case "sticker":
+        return {
+          ...base,
+          type: "regular",
+          width: 512,
+          height: 512,
+          is_animated: false,
+          is_video: false,
+        };
+      case "voice":
+        return { ...base, duration, mime_type: mimeType ?? "audio/ogg" };
+      case "audio":
+        return {
+          ...base,
+          duration,
+          mime_type: mimeType ?? "audio/mpeg",
+          ...(fileName ? { file_name: fileName } : {}),
+        };
+      case "video_note":
+        return { ...base, length: 240, duration };
+      default:
+        return {
+          ...base,
+          file_name: fileName ?? "file",
+          mime_type: mimeType ?? "application/octet-stream",
+        };
+    }
+  }
+
+  /** Message fields for one piece of media; an animation is also a document. */
+  function mediaFields(type, file, options) {
+    const fields = { [type]: mediaField(type, file, options) };
+    if (type === "animation") {
+      fields.document = mediaField("document", file, {
+        fileName: options?.fileName ?? "animation.mp4",
+        mimeType: "video/mp4",
+      });
+    }
+    return fields;
+  }
+
   function photoSizes(photo) {
     return [
       {
@@ -912,6 +1042,7 @@ export async function startTestServer({
       can_join_groups: true,
       can_read_all_group_messages: true,
       supports_inline_queries: false,
+      supports_join_request_queries: caller.joinRequestQueries,
     }),
     setWebhook: (p, caller) => {
       if (!p.url) {
@@ -1042,6 +1173,17 @@ export async function startTestServer({
             ? { pinned_message: pinned.message }
             : {}),
           permissions: { ...chat.permissions },
+          ...(chat.description ? { description: chat.description } : {}),
+          ...(chat.photo
+            ? {
+                photo: {
+                  small_file_id: chat.photo.file_id,
+                  small_file_unique_id: chat.photo.file_unique_id,
+                  big_file_id: chat.photo.file_id,
+                  big_file_unique_id: chat.photo.file_unique_id,
+                },
+              }
+            : {}),
           accent_color_id: 0,
           max_reaction_count: 11,
           accepted_gift_types: { ...NO_GIFTS },
@@ -1527,6 +1669,353 @@ export async function startTestServer({
       invite.is_primary = true;
       return invite.invite_link;
     },
+    sendVoice: (p, caller) => sendMedia(p, caller, "voice"),
+    sendAudio: (p, caller) => sendMedia(p, caller, "audio"),
+    sendVideoNote: (p, caller) => sendMedia(p, caller, "video_note"),
+    sendLocation: (p, caller) =>
+      sendFrom(p, caller, { location: coordinates(p) }),
+    sendVenue: (p, caller) => {
+      if (!p.title || !p.address) {
+        throw new TelegramError(
+          400,
+          "Bad Request: venue needs title and address",
+        );
+      }
+      const location = coordinates(p);
+      return sendFrom(p, caller, {
+        venue: { location, title: String(p.title), address: String(p.address) },
+        location,
+      });
+    },
+    sendContact: (p, caller) => {
+      if (!p.phone_number || !p.first_name) {
+        throw new TelegramError(
+          400,
+          "Bad Request: contact needs phone_number and first_name",
+        );
+      }
+      return sendFrom(p, caller, {
+        contact: {
+          phone_number: String(p.phone_number),
+          first_name: String(p.first_name),
+          ...(p.last_name ? { last_name: String(p.last_name) } : {}),
+        },
+      });
+    },
+    sendDice: (p, caller) => {
+      const emoji = p.emoji ?? "🎲";
+      if (!DICE[emoji]) {
+        throw new TelegramError(400, "Bad Request: invalid dice emoji");
+      }
+      return sendFrom(p, caller, {
+        dice: { emoji, value: 1 + Math.floor(Math.random() * DICE[emoji]) },
+      });
+    },
+    sendChatAction: (p, caller) => {
+      const chat = botChat(p.chat_id);
+      if (!CHAT_ACTIONS.has(p.action)) {
+        throw new TelegramError(
+          400,
+          "Bad Request: wrong parameter action in request",
+        );
+      }
+      requireCanSend(chat, caller);
+      return true;
+    },
+    // An album of 2 to 10 photos and videos, or of documents or audios alone.
+    sendMediaGroup: (p, caller) => {
+      const items = Array.isArray(p.media) ? p.media : [];
+      if (items.length < 2 || items.length > 10) {
+        throw new TelegramError(
+          400,
+          "Bad Request: media group must include 2-10 items",
+        );
+      }
+      const types = items.map((item) => item?.type);
+      if (
+        types.some(
+          (type) => !["photo", "video", "document", "audio"].includes(type),
+        )
+      ) {
+        throw new TelegramError(400, "Bad Request: unsupported media type");
+      }
+      for (const alone of ["document", "audio"]) {
+        if (types.includes(alone) && types.some((type) => type !== alone)) {
+          throw new TelegramError(
+            400,
+            `Bad Request: ${alone}s can't be mixed with other media types`,
+          );
+        }
+      }
+      const chat = botChat(p.chat_id);
+      requireCanSend(chat, caller);
+      const mediaGroupId = String(nextMediaGroupId++);
+      return items.map((item) => {
+        const reference =
+          typeof item.media === "string" && item.media.startsWith("attach://")
+            ? p[item.media.slice("attach://".length)]
+            : item.media;
+        const file =
+          typeof reference === "string" && files.has(reference)
+            ? sentFile(reference)
+            : Buffer.isBuffer(reference)
+              ? item.type === "photo"
+                ? registerPhoto(reference)
+                : registerFile(reference, `${item.type}s`, "bin")
+              : null;
+        if (!file) {
+          throw new TelegramError(
+            400,
+            "Bad Request: wrong file identifier/HTTP URL specified",
+          );
+        }
+        return sendFrom(
+          { chat_id: p.chat_id, message_thread_id: p.message_thread_id },
+          caller,
+          {
+            ...mediaFields(item.type, file, {}),
+            ...(item.caption ? { caption: String(item.caption) } : {}),
+            media_group_id: mediaGroupId,
+          },
+        );
+      });
+    },
+    promoteChatMember: async (p, caller) => {
+      const chat = requireChat(p.chat_id);
+      const userId = Number(p.user_id);
+      requireUser(userId);
+      if (!hasRight(chat, caller.id, "can_promote_members")) {
+        throw new TelegramError(400, "Bad Request: not enough rights");
+      }
+      const current = memberStatus(chat, userId);
+      if (current.status === "creator") {
+        throw new TelegramError(400, "Bad Request: USER_CREATOR");
+      }
+      if (!isInChat(chat, userId)) {
+        throw new TelegramError(400, "Bad Request: USER_NOT_PARTICIPANT");
+      }
+      if (
+        current.status === "administrator" &&
+        current.promotedBy !== caller.id
+      ) {
+        throw new TelegramError(400, "Bad Request: CHAT_ADMIN_REQUIRED");
+      }
+      const rights = Object.fromEntries(
+        ADMIN_RIGHTS.map((right) => [right, isTrue(p[right])]),
+      );
+      for (const [right, granted] of Object.entries(rights)) {
+        if (
+          granted &&
+          right !== "is_anonymous" &&
+          right !== "can_manage_chat" &&
+          !hasRight(chat, caller.id, right)
+        ) {
+          throw new TelegramError(400, "Bad Request: RIGHT_FORBIDDEN");
+        }
+      }
+      const before = chatMemberObject(chat, userId);
+      if (Object.values(rights).some(Boolean)) {
+        // Any right implies can_manage_chat, as on Telegram.
+        chat.members.set(userId, {
+          status: "administrator",
+          rights: { ...rights, can_manage_chat: true },
+          promotedBy: caller.id,
+        });
+      } else {
+        chat.members.set(userId, { status: "member" });
+      }
+      await memberChanged(chat, userId, before, caller);
+      return true;
+    },
+    setChatAdministratorCustomTitle: async (p, caller) => {
+      const chat = requireChat(p.chat_id);
+      const userId = Number(p.user_id);
+      const member = memberStatus(chat, userId);
+      if (
+        member.status !== "administrator" ||
+        member.promotedBy !== caller.id
+      ) {
+        throw new TelegramError(
+          400,
+          "Bad Request: not enough rights to change custom title of the user",
+        );
+      }
+      const title = String(p.custom_title ?? "");
+      if (/\p{Extended_Pictographic}/u.test(title)) {
+        throw new TelegramError(
+          400,
+          "Bad Request: ADMIN_RANK_EMOJI_NOT_ALLOWED",
+        );
+      }
+      if ([...title].length > 16) {
+        throw new TelegramError(400, "Bad Request: ADMIN_RANK_INVALID");
+      }
+      const before = chatMemberObject(chat, userId);
+      chat.members.set(userId, { ...member, customTitle: title || undefined });
+      await memberChanged(chat, userId, before, caller);
+      return true;
+    },
+    setChatTitle: async (p, caller) => {
+      const chat = requireChat(p.chat_id);
+      requireInfoRight(chat, caller, "title");
+      const title = String(p.title ?? "").trim();
+      if (!title || title.length > 128) {
+        throw new TelegramError(400, "Bad Request: chat title can't be empty");
+      }
+      if (title === chat.title) {
+        throw new TelegramError(400, "Bad Request: chat title is not modified");
+      }
+      chat.title = title;
+      await emit(
+        "message",
+        addMessage(chat, caller, { new_chat_title: title }),
+        { except: caller.id },
+      );
+      return true;
+    },
+    setChatDescription: (p, caller) => {
+      const chat = requireChat(p.chat_id);
+      requireInfoRight(chat, caller, "description");
+      const description = String(p.description ?? "");
+      if (description.length > 255) {
+        throw new TelegramError(
+          400,
+          "Bad Request: chat description is too long",
+        );
+      }
+      if (description === (chat.description ?? "")) {
+        throw new TelegramError(
+          400,
+          "Bad Request: chat description is not modified",
+        );
+      }
+      chat.description = description || undefined;
+      return true;
+    },
+    setChatPhoto: async (p, caller) => {
+      const chat = requireChat(p.chat_id);
+      requireInfoRight(chat, caller, "photo");
+      if (!Buffer.isBuffer(p.photo)) {
+        throw new TelegramError(
+          400,
+          "Bad Request: there is no photo in the request",
+        );
+      }
+      chat.photo = registerPhoto(p.photo);
+      await emit(
+        "message",
+        addMessage(chat, caller, { new_chat_photo: photoSizes(chat.photo) }),
+        { except: caller.id },
+      );
+      return true;
+    },
+    deleteChatPhoto: async (p, caller) => {
+      const chat = requireChat(p.chat_id);
+      requireInfoRight(chat, caller, "photo");
+      if (!chat.photo) {
+        throw new TelegramError(400, "Bad Request: CHAT_NOT_MODIFIED");
+      }
+      chat.photo = undefined;
+      await emit(
+        "message",
+        addMessage(chat, caller, { delete_chat_photo: true }),
+        { except: caller.id },
+      );
+      return true;
+    },
+    editChatInviteLink: (p, caller) => {
+      const chat = requireChat(p.chat_id);
+      const invite = chat.inviteLinks.get(String(p.invite_link));
+      if (!invite || invite.is_revoked) {
+        throw new TelegramError(400, "Bad Request: INVITE_HASH_EXPIRED");
+      }
+      if (invite.creator.id !== caller.id) {
+        throw new TelegramError(400, "Bad Request: CHAT_ADMIN_REQUIRED");
+      }
+      const createsJoinRequest =
+        p.creates_join_request !== undefined
+          ? isTrue(p.creates_join_request)
+          : invite.creates_join_request;
+      const memberLimit =
+        p.member_limit !== undefined ? p.member_limit : invite.member_limit;
+      if (createsJoinRequest && memberLimit != null) {
+        throw new TelegramError(
+          400,
+          "Bad Request: member limit can't be specified for links requiring administrator approval",
+        );
+      }
+      if (p.name !== undefined) invite.name = String(p.name);
+      if (p.expire_date !== undefined)
+        invite.expire_date = Number(p.expire_date);
+      if (p.member_limit !== undefined)
+        invite.member_limit = Number(p.member_limit);
+      invite.creates_join_request = createsJoinRequest;
+      return { ...invite };
+    },
+    // A bot sets at most one reaction of its own on a message.
+    setMessageReaction: (p, caller) => {
+      const chat = botChat(p.chat_id);
+      const entry = chat.messages.get(Number(p.message_id));
+      if (!entry || entry.deleted) {
+        throw new TelegramError(400, "Bad Request: MESSAGE_ID_INVALID");
+      }
+      const reactions = Array.isArray(p.reaction) ? p.reaction : [];
+      if (reactions.length > 1) {
+        throw new TelegramError(400, "Bad Request: REACTIONS_TOO_MANY");
+      }
+      entry.reactions ??= new Map();
+      if (reactions.length) {
+        entry.reactions.set(
+          caller.id,
+          reactions.map((reaction) => String(reaction.emoji ?? "")),
+        );
+      } else entry.reactions.delete(caller.id);
+      return true;
+    },
+    // Removes a user's reaction; needs can_delete_messages.
+    deleteMessageReaction: async (p, caller) => {
+      const chat = requireChat(p.chat_id);
+      if (!hasRight(chat, caller.id, "can_delete_messages")) {
+        throw new TelegramError(
+          400,
+          "Bad Request: not enough rights to delete reactions",
+        );
+      }
+      const entry = chat.messages.get(Number(p.message_id));
+      if (!entry || entry.deleted) {
+        throw new TelegramError(400, "Bad Request: MESSAGE_ID_INVALID");
+      }
+      const user = requireUser(p.user_id);
+      if (entry.reactions?.has(user.id)) {
+        await changeReaction(chat, entry, user, []);
+      }
+      return true;
+    },
+    // A guard bot answers a join request query: approve, decline, or leave it
+    // to the other administrators.
+    answerChatJoinRequestQuery: (p, caller) => {
+      const id = String(p.chat_join_request_query_id ?? "");
+      const query = joinQueries.get(id);
+      if (!query || query.botId !== caller.id) {
+        throw new TelegramError(
+          400,
+          "Bad Request: query is too old and response timeout expired or query ID is invalid",
+        );
+      }
+      if (!["approve", "decline", "queue"].includes(p.result)) {
+        throw new TelegramError(
+          400,
+          'Bad Request: result must be "approve", "decline" or "queue"',
+        );
+      }
+      joinQueries.delete(id);
+      const target = { chat_id: query.chatId, user_id: query.userId };
+      if (p.result === "approve")
+        methods.approveChatJoinRequest(target, caller);
+      if (p.result === "decline")
+        methods.declineChatJoinRequest(target, caller);
+      return true;
+    },
     revokeChatInviteLink: (p) => {
       const chat = requireChat(p.chat_id);
       const invite = chat.inviteLinks.get(String(p.invite_link));
@@ -1583,6 +2072,43 @@ export async function startTestServer({
     });
     if (receiverId != null) message.ephemeral_message_id = message.message_id;
     return message;
+  }
+
+  /** A bot sends a voice note, audio file or video note. */
+  function sendMedia(p, caller, type) {
+    const file = sentFile(p[type], `${type}s`, MEMBER_MEDIA[type].ext);
+    return sendFrom(p, caller, {
+      ...mediaFields(type, file, {
+        duration: p.duration == null ? 1 : Number(p.duration),
+      }),
+      ...(p.caption && MEMBER_MEDIA[type].caption
+        ? { caption: String(p.caption) }
+        : {}),
+    });
+  }
+
+  function coordinates(p) {
+    const latitude = Number(p.latitude);
+    const longitude = Number(p.longitude);
+    if (
+      !Number.isFinite(latitude) ||
+      !Number.isFinite(longitude) ||
+      Math.abs(latitude) > 90 ||
+      Math.abs(longitude) > 180
+    ) {
+      throw new TelegramError(400, "Bad Request: wrong latitude or longitude");
+    }
+    return { latitude, longitude };
+  }
+
+  /** Changing a chat's title, description or photo needs can_change_info. */
+  function requireInfoRight(chat, caller, what) {
+    if (!hasRight(chat, caller.id, "can_change_info")) {
+      throw new TelegramError(
+        400,
+        `Bad Request: not enough rights to change chat ${what}`,
+      );
+    }
   }
 
   /** The message a forward or copy reads, when the bot can see it. */
@@ -1713,6 +2239,7 @@ export async function startTestServer({
             token: String(body.token ?? ""),
             username: body.username,
             firstName: body.first_name,
+            joinRequestQueries: body.supports_join_request_queries === true,
           }),
         );
       } catch (error) {
@@ -1835,7 +2362,12 @@ export async function startTestServer({
       if (sub === "messages" && method === "GET" && subId) {
         const entry = chat.messages.get(Number(subId));
         return entry
-          ? { exists: true, deleted: entry.deleted, message: entry.message }
+          ? {
+              exists: true,
+              deleted: entry.deleted,
+              message: entry.message,
+              reactions: Object.fromEntries(entry.reactions ?? []),
+            }
           : { exists: false, deleted: false };
       }
       if (sub === "members" && method === "GET" && subId) {
@@ -1904,6 +2436,29 @@ export async function startTestServer({
         await emit("message", message);
         return { message_id: message.message_id };
       }
+    }
+    if (resource === "chats" && id && sub === "albums" && method === "POST") {
+      return postAlbum(requireChat(id), body);
+    }
+    if (
+      resource === "chats" &&
+      id &&
+      sub === "messages" &&
+      subId &&
+      parts[4] === "edit" &&
+      method === "POST"
+    ) {
+      return editByMember(requireChat(id), subId, body);
+    }
+    if (
+      resource === "chats" &&
+      id &&
+      sub === "messages" &&
+      subId &&
+      parts[4] === "reactions" &&
+      method === "POST"
+    ) {
+      return reactByMember(requireChat(id), subId, body);
     }
     if (
       resource === "chats" &&
@@ -2073,14 +2628,35 @@ export async function startTestServer({
         invite_link: { ...invite },
         date: now(),
       });
-      await emit("chat_join_request", {
+      const request = {
         chat: chatObject(chat),
         from: userObject(user),
         user_chat_id: user.id,
         date: now(),
         ...(user.bio ? { bio: user.bio } : {}),
         invite_link: { ...invite },
-      });
+      };
+      // A guard bot in the chat gets the request as a query to answer.
+      const guard = [...bots.values()].find(
+        (record) => record.joinRequestQueries && isInChat(chat, record.id),
+      );
+      const others = [...bots.values()].filter(
+        (record) => record !== guard && isInChat(chat, record.id),
+      );
+      if (guard) {
+        const queryId = randomBytes(8).readBigUInt64BE().toString();
+        joinQueries.set(queryId, {
+          chatId: chat.id,
+          userId: user.id,
+          botId: guard.id,
+        });
+        await emit(
+          "chat_join_request",
+          { ...request, query_id: queryId },
+          { to: [guard] },
+        );
+      }
+      await emit("chat_join_request", request, { to: others });
       return { status: "requested" };
     }
     const before = chatMemberObject(chat, user.id);
@@ -2115,28 +2691,206 @@ export async function startTestServer({
     return { status: "left" };
   }
 
+  /**
+   * Where a member's forwarded message came from: a user, a user who hides
+   * their account (a name only), or a channel post.
+   */
+  function forwardOrigin(from) {
+    const date = now();
+    if (from.chat_id != null) {
+      const source = requireChat(from.chat_id);
+      if (source.type !== "channel") {
+        throw new TelegramError(400, "forward_from.chat_id must be a channel");
+      }
+      const original =
+        from.message_id != null
+          ? source.messages.get(Number(from.message_id))
+          : null;
+      return {
+        type: "channel",
+        chat: chatObject(source),
+        message_id: Number(from.message_id ?? 1),
+        date: original?.message.date ?? date,
+      };
+    }
+    if (from.user_id != null) {
+      return {
+        type: "user",
+        sender_user: userObject(requireUser(from.user_id)),
+        date,
+      };
+    }
+    if (from.sender_name) {
+      return {
+        type: "hidden_user",
+        sender_user_name: String(from.sender_name),
+        date,
+      };
+    }
+    throw new TelegramError(
+      400,
+      "forward_from needs user_id, sender_name, or a channel chat_id",
+    );
+  }
+
+  /** A member posts 2 to 10 photos or videos as one album. */
+  async function postAlbum(
+    chat,
+    { user_id: userId, items, message_thread_id },
+  ) {
+    if (!Array.isArray(items) || items.length < 2 || items.length > 10) {
+      throw new TelegramError(400, "an album needs 2 to 10 items");
+    }
+    const mediaGroupId = String(nextMediaGroupId++);
+    const ids = [];
+    for (const item of items) {
+      if (!["photo", "video"].includes(item?.type)) {
+        throw new TelegramError(400, "album items are photos or videos");
+      }
+      const { message_id: id } = await post(
+        chat,
+        {
+          user_id: userId,
+          media: { type: item.type, base64: item.base64 },
+          caption: item.caption,
+          message_thread_id,
+        },
+        { mediaGroupId },
+      );
+      ids.push(id);
+    }
+    return { media_group_id: mediaGroupId, message_ids: ids };
+  }
+
+  /**
+   * The author edits their message: the bots in the chat get edited_message
+   * with the whole message and its edit_date.
+   */
+  async function editByMember(
+    chat,
+    messageId,
+    { user_id: userId, text, caption },
+  ) {
+    const entry = chat.messages.get(Number(messageId));
+    if (!entry || entry.deleted) {
+      throw new TelegramError(400, "MESSAGE_ID_INVALID");
+    }
+    if (entry.message.from?.id !== Number(userId)) {
+      throw new TelegramError(403, "MESSAGE_AUTHOR_REQUIRED");
+    }
+    const message = entry.message;
+    const field = message.text !== undefined ? "text" : "caption";
+    const value = field === "text" ? text : caption;
+    if (value === undefined || value === null) {
+      throw new TelegramError(400, `the edit needs ${field}`);
+    }
+    if (String(value) === (message[field] ?? "")) {
+      throw new TelegramError(400, "MESSAGE_NOT_MODIFIED");
+    }
+    message[field] = String(value);
+    const entities = messageEntities(message[field]);
+    const entityField = field === "text" ? "entities" : "caption_entities";
+    if (entities.length > 0) message[entityField] = entities;
+    else delete message[entityField];
+    message.edit_date = now();
+    await emit("edited_message", structuredClone(message));
+    return { message_id: message.message_id, edit_date: message.edit_date };
+  }
+
+  /**
+   * A member sets their reaction on a message (one emoji, or none to take it
+   * back). Telegram tells the chat's administrator bots through
+   * message_reaction, when they asked for it in allowed_updates.
+   */
+  async function reactByMember(chat, messageId, { user_id: userId, emoji }) {
+    const user = requireUser(userId);
+    const entry = chat.messages.get(Number(messageId));
+    if (!entry || entry.deleted) {
+      throw new TelegramError(400, "MESSAGE_ID_INVALID");
+    }
+    if (!isInChat(chat, user.id)) {
+      throw new TelegramError(403, "CHAT_WRITE_FORBIDDEN");
+    }
+    return changeReaction(chat, entry, user, emoji ? [String(emoji)] : []);
+  }
+
+  function reactionList(emojis) {
+    return emojis.map((emoji) => ({ type: "emoji", emoji }));
+  }
+
+  async function changeReaction(chat, entry, user, emojis) {
+    entry.reactions ??= new Map();
+    const before = entry.reactions.get(user.id) ?? [];
+    if (emojis.length) entry.reactions.set(user.id, emojis);
+    else entry.reactions.delete(user.id);
+    const admins = [...bots.values()].filter((record) =>
+      ["administrator", "creator"].includes(
+        memberStatus(chat, record.id).status,
+      ),
+    );
+    await emit(
+      "message_reaction",
+      {
+        chat: chatObject(chat),
+        message_id: entry.message.message_id,
+        user: userObject(user),
+        date: now(),
+        old_reaction: reactionList(before),
+        new_reaction: reactionList(emojis),
+      },
+      { to: admins },
+    );
+    return { reactions: Object.fromEntries(entry.reactions) };
+  }
+
   async function post(
     chat,
     {
       user_id: userId,
       text,
       photo_base64: photoBase64,
+      media,
       caption,
       reply_to: replyTo,
       message_thread_id: threadId,
+      forward_from: forwardFrom,
     },
+    { mediaGroupId = null } = {},
   ) {
     const user = requireUser(userId);
     requireTopic(chat, threadId);
-    const permission = photoBase64 ? "can_send_photos" : "can_send_messages";
+    const type = photoBase64 ? "photo" : (media?.type ?? null);
+    if (type && type !== "photo" && !MEMBER_MEDIA[type]) {
+      throw new TelegramError(
+        400,
+        `media type must be photo or one of ${Object.keys(MEMBER_MEDIA).join(", ")}`,
+      );
+    }
+    const permission =
+      type === "photo"
+        ? "can_send_photos"
+        : type
+          ? MEMBER_MEDIA[type].permission
+          : "can_send_messages";
     if (!canPost(chat, userId, permission)) {
       throw new TelegramError(403, "CHAT_WRITE_FORBIDDEN");
     }
     const fields = {};
-    if (photoBase64) {
-      const photo = registerPhoto(Buffer.from(photoBase64, "base64"));
-      fields.photo = photoSizes(photo);
-      if (caption) {
+    if (type) {
+      const bytes = Buffer.from(photoBase64 ?? media.base64 ?? "", "base64");
+      const file =
+        type === "photo"
+          ? registerPhoto(bytes)
+          : registerFile(bytes, `${type}s`, MEMBER_MEDIA[type].ext);
+      Object.assign(
+        fields,
+        mediaFields(type, file, {
+          fileName: media?.file_name,
+          mimeType: media?.mime_type,
+          duration: media?.duration,
+        }),
+      );
+      if (caption && (type === "photo" || MEMBER_MEDIA[type].caption)) {
         fields.caption = String(caption);
         const captionEntities = messageEntities(fields.caption);
         if (captionEntities.length > 0)
@@ -2145,6 +2899,8 @@ export async function startTestServer({
     } else {
       fields.text = String(text ?? "");
     }
+    if (mediaGroupId) fields.media_group_id = mediaGroupId;
+    if (forwardFrom) fields.forward_origin = forwardOrigin(forwardFrom);
     // A message in a topic that answers nothing replies to the topic's
     // creation message, which is how a bot learns the topic's name.
     const replied =
@@ -2351,8 +3107,13 @@ export async function startTestServer({
 
   return {
     origin,
-    addBot: ({ token, username, firstName } = {}) =>
-      act("POST", "bots", { token, username, first_name: firstName }),
+    addBot: ({ token, username, firstName, supportsJoinRequestQueries } = {}) =>
+      act("POST", "bots", {
+        token,
+        username,
+        first_name: firstName,
+        supports_join_request_queries: supportsJoinRequestQueries === true,
+      }),
     createChat: async ({ title, type, ownerId, ownerName, isForum } = {}) =>
       (
         await act("POST", "chats", {
@@ -2414,6 +3175,40 @@ export async function startTestServer({
                     photo_base64: Buffer.from(message.photo).toString("base64"),
                   }
                 : {}),
+              ...(message.media
+                ? {
+                    media: {
+                      type: message.media.type,
+                      base64: Buffer.from(message.media.bytes ?? []).toString(
+                        "base64",
+                      ),
+                      ...(message.media.fileName
+                        ? { file_name: message.media.fileName }
+                        : {}),
+                      ...(message.media.mimeType
+                        ? { mime_type: message.media.mimeType }
+                        : {}),
+                    },
+                  }
+                : {}),
+              ...(message.forwardFrom
+                ? {
+                    forward_from: {
+                      ...(message.forwardFrom.userId != null
+                        ? { user_id: message.forwardFrom.userId }
+                        : {}),
+                      ...(message.forwardFrom.chatId != null
+                        ? { chat_id: message.forwardFrom.chatId }
+                        : {}),
+                      ...(message.forwardFrom.messageId != null
+                        ? { message_id: message.forwardFrom.messageId }
+                        : {}),
+                      ...(message.forwardFrom.senderName
+                        ? { sender_name: message.forwardFrom.senderName }
+                        : {}),
+                    },
+                  }
+                : {}),
               ...(message.caption ? { caption: message.caption } : {}),
               ...(message.replyTo != null ? { reply_to: message.replyTo } : {}),
               ...(message.threadId != null
@@ -2427,6 +3222,27 @@ export async function startTestServer({
         })
       ).message_id;
     },
+    postAlbum: async (chatId, userId, items, { threadId } = {}) =>
+      act("POST", `chats/${chatId}/albums`, {
+        user_id: userId,
+        items: items.map((item) => ({
+          type: item.type,
+          base64: Buffer.from(item.bytes ?? []).toString("base64"),
+          ...(item.caption ? { caption: item.caption } : {}),
+        })),
+        ...(threadId != null ? { message_thread_id: threadId } : {}),
+      }),
+    editMessage: (chatId, messageId, userId, { text, caption } = {}) =>
+      act("POST", `chats/${chatId}/messages/${messageId}/edit`, {
+        user_id: userId,
+        text,
+        caption,
+      }),
+    react: (chatId, messageId, userId, emoji = null) =>
+      act("POST", `chats/${chatId}/messages/${messageId}/reactions`, {
+        user_id: userId,
+        emoji,
+      }),
     pressButton: (chatId, messageId, userId, data) =>
       act("POST", `chats/${chatId}/messages/${messageId}/callback`, {
         user_id: userId,
