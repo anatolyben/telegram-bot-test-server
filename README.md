@@ -1,7 +1,7 @@
 # telegram-bot-test-server
 
-`telegram-bot-test-server` is a local, in-memory fake of the Telegram Bot API for testing bots that
-manage groups.
+`telegram-bot-test-server` is a local test server for the Telegram Bot API, for testing bots that
+manage groups. It keeps everything in memory.
 
 Point your bot's Bot API base URL at it instead of `https://api.telegram.org`. It answers the way
 Telegram does and keeps the state a group bot depends on: members and their status, restrictions and
@@ -277,7 +277,7 @@ The details a moderation bot depends on, each covered by a test:
 
 The server also answers at oauth.telegram.org's paths, so an app logs in against it by changing only
 the origin: `GET /.well-known/openid-configuration`, `GET /.well-known/jwks.json`, `GET /auth` (a
-page with a "Log in as ..." button per fake user, and Cancel) and `POST /token`. It follows
+page with a "Log in as ..." button per test user, and Cancel) and `POST /token`. It follows
 [Telegram's docs](https://core.telegram.org/bots/telegram-login) and its
 [discovery document](https://oauth.telegram.org/.well-known/openid-configuration):
 
@@ -392,6 +392,7 @@ A button press waits up to 10 seconds for the bot to call `answerCallbackQuery` 
 
 ## Changes
 
+- **0.8.1**: describes the package as a local test server.
 - **0.8.0**: Telegram Login (OpenID Connect): discovery, keys, the login page, the token endpoint,
   signed ID tokens, a login client secret per bot, and `approveLogin` / `cancelLogin` for tests
   without a browser.
