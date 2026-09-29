@@ -102,7 +102,10 @@ response happens after that, so wait for the outcome rather than checking it imm
 | `getMember(chatId, userId)`                                                                      | The member as `getChatMember` returns them: status, restrictions, ban.                                                                                                      |
 | `getJoinRequests(chatId)`                                                                        | User ids waiting for approval.                                                                                                                                              |
 | `addBot({ token, username, firstName })`                                                         | Another bot, with its own webhook or update queue; it is in no chat yet.                                                                                                    |
-| `createChat({ ownerId, title, type, ownerName, isForum })`                                       | A new group, forum (`isForum`) or channel (`type: "channel"`) with no bot in it; returns its id.                                                                            |
+| `createChat({ ownerId, title, type, ownerName, isForum })`                                       | A new supergroup, forum (`isForum`), basic group (`type: "group"`) or channel (`type: "channel"`) with no bot in it; returns its id.                                        |
+| `addBotViaLink(chatId, botId, { by, startParameter, rights })`                                   | A person adds the bot through its `startgroup` link: it joins (as an administrator with `rights`), then `/start@<bot> <startParameter>` is posted from the person.          |
+| `migrateToSupergroup(chatId, { by })`                                                            | The creator or an administrator upgrades a basic group; returns the supergroup's id.                                                                                        |
+| `renameChat(chatId, { by, title })`, `changeChatPhoto(chatId, { by, bytes })`                    | A person with `can_change_info` renames the chat or sets its photo.                                                                                                         |
 | `setBotMembership(chatId, botId, { status, rights, by })`                                        | The owner adds, promotes, demotes or removes a bot; the bot gets `my_chat_member`.                                                                                          |
 | `createTopic(chatId, name)`, `renameTopic(chatId, threadId, name)`                               | A forum topic is created or renamed, with Telegram's service message; `createTopic` returns its `message_thread_id`.                                                        |
 | `getChat(chatId)`                                                                                | The chat, its pinned message ids and its members.                                                                                                                           |
@@ -240,6 +243,29 @@ The details a moderation bot depends on, each covered by a test:
   message the owner's private chat (`user_chat_id`). `getMe` reports `can_connect_to_business`.
 - **Redelivery.** A test can have Telegram deliver any update again, byte for byte, as it does when a
   webhook does not confirm one.
+- **Adding the bot through a link** ([links](https://core.telegram.org/api/links#group-channel-bot-links),
+  [deep linking](https://core.telegram.org/bots/features#deep-linking)). With admin rights
+  requested, only the creator or an administrator with `can_promote_members` may add it; without,
+  anyone who can add members (`can_invite_users`). Otherwise the person gets `CHAT_ADMIN_REQUIRED`.
+  The bot gets `my_chat_member` from the person, the chat's other bots `chat_member`, all bots the
+  `new_chat_members` message, and then the person's `/start@<bot> <parameter>` with a
+  `bot_command` entity, as `messages.startBot` posts. An administrator's existing rights are
+  combined with the requested ones, and `/start` is still posted. Unverified: Telegram does not
+  document whether `my_chat_member` or the `/start` message arrives first; this server sends
+  `my_chat_member` first.
+- **Service messages about the bot itself.** A bot gets the `new_chat_members` and
+  `left_chat_member` messages that name it, as the
+  [Message](https://core.telegram.org/bots/api#message) fields say it "may be the bot itself".
+- **Basic groups and the upgrade** ([migration](https://core.telegram.org/api/channel#migration)).
+  A basic group has a negative id without the `-100` prefix. The creator or an administrator can
+  upgrade it: a new supergroup takes its members, administrators and bots, the old chat posts
+  `migrate_to_chat_id` and the new one `migrate_from_chat_id`, and every later Bot API call to the
+  old id fails with `400 Bad Request: group chat was upgraded to a supergroup chat` and
+  `parameters.migrate_to_chat_id` ([ResponseParameters](https://core.telegram.org/bots/api#responseparameters)).
+  Unverified: whether bots also get `my_chat_member` on the upgrade; this server sends none.
+- **People changing the chat.** A person with `can_change_info` renames the chat or sets its photo,
+  with the same `new_chat_title` and `new_chat_photo` service messages as `setChatTitle` and
+  `setChatPhoto`; `getChat` returns the title and a `ChatPhoto`, and `getFile` serves the photo.
 - **Forum topics.** In a forum, a send to a `message_thread_id` that is not a topic fails with
   `message thread not found`. A member's message in a topic that answers nothing replies to the
   topic's creation message, as on Telegram.
@@ -303,6 +329,10 @@ The test actions above, over HTTP, for tests written in other languages. All rou
 | `POST chats`                                           | Create `{ owner_id, title?, type?: "supergroup" \| "channel", owner_name?, is_forum? }`; returns the chat.                                                                                                                                                               |
 | `GET chats/:id`                                        | The chat with its pinned message ids and members.                                                                                                                                                                                                                        |
 | `POST chats/:id/bots`                                  | Add, promote, demote or remove a bot `{ bot_id, status?, rights?, by? }`, as the owner would.                                                                                                                                                                            |
+| `POST chats/:id/bots` with `start_parameter`           | A person `{ by?, bot_id, start_parameter, rights? }` adds the bot through its `startgroup` link.                                                                                                                                                                         |
+| `POST chats/:id/migrate`                               | Upgrade a basic group `{ by? }`; returns the new supergroup.                                                                                                                                                                                                             |
+| `POST chats/:id/title`                                 | A person renames the chat `{ by?, title }`.                                                                                                                                                                                                                              |
+| `POST chats/:id/photo`                                 | A person sets the chat photo `{ by?, base64 }`.                                                                                                                                                                                                                          |
 | `POST chats/:id/topics`                                | Create a forum topic `{ name, by? }`; returns `{ message_thread_id, name }`.                                                                                                                                                                                             |
 | `POST chats/:id/topics/:threadId/edit`                 | Rename a topic `{ name, by? }`.                                                                                                                                                                                                                                          |
 | `GET chats/:id/topics`                                 | The forum's topics.                                                                                                                                                                                                                                                      |
@@ -328,6 +358,10 @@ A button press waits up to 10 seconds for the bot to call `answerCallbackQuery` 
 
 ## Changes
 
+- **0.7.0**: adding the bot through a `startgroup` link, basic groups and their upgrade to a
+  supergroup, people renaming the chat and changing its photo, and a bot's own `new_chat_members`
+  and `left_chat_member` messages. Tests now cover `getChatMemberCount` following joins and
+  leaves, and `leaveChat` sending `my_chat_member`.
 - **0.6.0**: business connections and business chats (`business_connection`,
   `business_message`, `sendMessage` with `business_connection_id`, `getBusinessConnection`),
   `is_bot` and `is_premium` on test users, `can_connect_to_business` on `getMe`, and update

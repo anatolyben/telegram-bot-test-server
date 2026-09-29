@@ -174,9 +174,11 @@ const MEMBER_MEDIA = Object.freeze({
 const MEDIA_KINDS = Object.freeze(["photo", "video", "animation", "document"]);
 
 class TelegramError extends Error {
-  constructor(code, description) {
+  constructor(code, description, parameters = null) {
     super(description);
     this.code = code;
+    // The Bot API's ResponseParameters, when Telegram sends any.
+    this.parameters = parameters;
   }
 }
 
@@ -452,6 +454,8 @@ export async function startTestServer({
   let updateId = startSeconds;
   let nextUserId = 7_000_000_000 + startSeconds;
   let nextChatId = startSeconds;
+  // Basic groups have their own ids: negative, without the -100 prefix.
+  let nextBasicGroupId = 4_000_000_000 + (startSeconds % 100_000_000);
   let nextMediaGroupId = BigInt(startSeconds) * 1_000_000n;
   let nextPollId = BigInt(startSeconds) * 1_000_000n;
 
@@ -632,7 +636,9 @@ export async function startTestServer({
   }
 
   function chatKind(chat) {
-    return chat.type === "channel" ? "channel" : "supergroup";
+    return chat.type === "channel" || chat.type === "group"
+      ? chat.type
+      : "supergroup";
   }
 
   /** Refuse a bot's send the way Telegram does when it may not post there. */
@@ -901,6 +907,7 @@ export async function startTestServer({
   async function setBotMembership(chat, record, { status, rights, actor }) {
     const before = chatMemberObject(chat, record.id);
     const wasIn = isInChat(chat, record.id);
+    const botsBefore = botsIn(chat);
     if (status === "left") chat.members.delete(record.id);
     else chat.members.set(record.id, { status, ...(rights ? { rights } : {}) });
     const after = chatMemberObject(chat, record.id);
@@ -922,9 +929,182 @@ export async function startTestServer({
           ? { new_chat_members: [userObject(record)] }
           : { left_chat_member: userObject(record) },
       );
-      await emit("message", service, { except: record.id });
+      // The bot itself gets it too: new_chat_members and left_chat_member
+      // "may be the bot itself" (https://core.telegram.org/bots/api#message).
+      await emit("message", service, {
+        to: [...new Set([...botsBefore, ...botsIn(chat)])],
+      });
     }
     return after;
+  }
+
+  /**
+   * Whether a person may add members: the creator, an administrator with
+   * can_invite_users, or a member when the chat's permissions allow it.
+   */
+  function canAddMembers(chat, userId) {
+    const member = memberStatus(chat, userId);
+    if (member.status === "creator") return true;
+    if (member.status === "administrator") {
+      return hasRight(chat, userId, "can_invite_users");
+    }
+    return canPost(chat, userId, "can_invite_users");
+  }
+
+  /** Whether a person may add or change administrators. */
+  function canAddAdmins(chat, userId) {
+    const member = memberStatus(chat, userId);
+    return (
+      member.status === "creator" ||
+      (member.status === "administrator" &&
+        hasRight(chat, userId, "can_promote_members"))
+    );
+  }
+
+  /** Whether a person may change the chat's title or photo. */
+  function canChangeInfo(chat, userId) {
+    const member = memberStatus(chat, userId);
+    if (member.status === "creator") return true;
+    if (member.status === "administrator") {
+      return hasRight(chat, userId, "can_change_info");
+    }
+    return canPost(chat, userId, "can_change_info");
+  }
+
+  /**
+   * A person adds the bot through its t.me/<bot>?startgroup=<parameter> link
+   * (https://core.telegram.org/api/links#group-channel-bot-links). With admin
+   * rights requested, only someone who can add admins may; without, someone
+   * who can add members. An existing administrator's rights are combined with
+   * the requested ones. The link then invokes messages.startBot with the
+   * parameter, which posts "/start@<bot> <parameter>" from the person
+   * (https://core.telegram.org/bots/features#deep-linking).
+   */
+  async function addBotViaLink(chat, record, { by, startParameter, rights }) {
+    const actor = requireUser(by ?? creatorOf(chat));
+    const asAdmin = rights != null;
+    if (
+      asAdmin ? !canAddAdmins(chat, actor.id) : !canAddMembers(chat, actor.id)
+    ) {
+      throw new TelegramError(400, "CHAT_ADMIN_REQUIRED");
+    }
+    const current = memberStatus(chat, record.id);
+    if (asAdmin) {
+      const existing =
+        current.status === "administrator"
+          ? chatMemberObject(chat, record.id)
+          : {};
+      const combined = {};
+      for (const [right, value] of Object.entries(rights)) {
+        combined[right] = value === true || existing[right] === true;
+      }
+      for (const [right, value] of Object.entries(existing)) {
+        if (right.startsWith("can_") && value === true) combined[right] = true;
+      }
+      await setBotMembership(chat, record, {
+        status: "administrator",
+        rights: combined,
+        actor,
+      });
+    } else if (!isInChat(chat, record.id)) {
+      await setBotMembership(chat, record, { status: "member", actor });
+    }
+    const text =
+      `/start@${record.username}` +
+      (startParameter ? ` ${String(startParameter)}` : "");
+    const message = addMessage(chat, actor, { text });
+    const entities = messageEntities(text);
+    if (entities.length > 0) message.entities = entities;
+    await emit("message", message);
+    return chatMemberObject(chat, record.id);
+  }
+
+  /**
+   * The creator or an administrator upgrades a basic group to a supergroup
+   * (https://core.telegram.org/api/channel#migration): a new supergroup takes
+   * its members, administrators and bots; the old chat says where it went
+   * (migrate_to_chat_id) and the new one where it came from
+   * (migrate_from_chat_id).
+   */
+  async function migrateToSupergroup(chat, { by }) {
+    if (chat.type !== "group") {
+      throw new TelegramError(400, "only a basic group can be upgraded");
+    }
+    if (chat.migratedTo != null) {
+      throw new TelegramError(400, "the group was already upgraded");
+    }
+    const actor = requireUser(by ?? creatorOf(chat));
+    if (
+      !["creator", "administrator"].includes(
+        memberStatus(chat, actor.id).status,
+      )
+    ) {
+      throw new TelegramError(400, "CHAT_ADMIN_REQUIRED");
+    }
+    nextChatId += 1;
+    const supergroup = {
+      ...chat,
+      id: -(1_000_000_000_000 + nextChatId),
+      type: "supergroup",
+      members: new Map(
+        [...chat.members].map(([id, member]) => [id, structuredClone(member)]),
+      ),
+      messages: new Map(),
+      inviteLinks: new Map(),
+      joinRequests: new Map(),
+      pinned: [],
+      migratedFrom: chat.id,
+    };
+    delete supergroup.migratedTo;
+    chats.set(supergroup.id, supergroup);
+    chat.migratedTo = supergroup.id;
+    await emit(
+      "message",
+      addMessage(chat, actor, { migrate_to_chat_id: supergroup.id }),
+    );
+    await emit(
+      "message",
+      addMessage(supergroup, actor, { migrate_from_chat_id: chat.id }),
+    );
+    return chatObject(supergroup);
+  }
+
+  /** A person renames the chat; bots get the new_chat_title service message. */
+  async function renameByPerson(chat, { by, title }) {
+    const actor = requireUser(by ?? creatorOf(chat));
+    if (!canChangeInfo(chat, actor.id)) {
+      throw new TelegramError(400, "CHAT_ADMIN_REQUIRED");
+    }
+    const name = String(title ?? "").trim();
+    if (!name || name.length > 128) {
+      throw new TelegramError(400, "CHAT_TITLE_EMPTY");
+    }
+    if (name === chat.title) throw new TelegramError(400, "CHAT_NOT_MODIFIED");
+    chat.title = name;
+    const message = addMessage(chat, actor, { new_chat_title: name });
+    await emit("message", message);
+    return { message_id: message.message_id };
+  }
+
+  /** A person sets the chat photo; bots get the new_chat_photo service message. */
+  async function changePhotoByPerson(chat, { by, base64 }) {
+    const actor = requireUser(by ?? creatorOf(chat));
+    if (!canChangeInfo(chat, actor.id)) {
+      throw new TelegramError(400, "CHAT_ADMIN_REQUIRED");
+    }
+    const bytes = Buffer.from(String(base64 ?? ""), "base64");
+    if (bytes.length === 0) throw new TelegramError(400, "PHOTO_INVALID");
+    chat.photo = registerPhoto(bytes);
+    const message = addMessage(chat, actor, {
+      new_chat_photo: photoSizes(chat.photo),
+    });
+    await emit("message", message);
+    return { message_id: message.message_id };
+  }
+
+  /** The bots that are members of a chat. */
+  function botsIn(chat) {
+    return [...bots.values()].filter((record) => isInChat(chat, record.id));
   }
 
   function requireBot(botId) {
@@ -2427,8 +2607,14 @@ export async function startTestServer({
     owner_name,
     is_forum,
   }) {
-    if (type !== undefined && !["supergroup", "channel"].includes(type)) {
-      throw new TelegramError(400, 'type must be "supergroup" or "channel"');
+    if (
+      type !== undefined &&
+      !["supergroup", "channel", "group"].includes(type)
+    ) {
+      throw new TelegramError(
+        400,
+        'type must be "supergroup", "channel" or "group"',
+      );
     }
     const kind = type ?? "supergroup";
     const owner = Number(ownerId);
@@ -2446,7 +2632,10 @@ export async function startTestServer({
     }
     nextChatId += 1;
     const chat = {
-      id: -(1_000_000_000_000 + nextChatId),
+      id:
+        kind === "group"
+          ? -nextBasicGroupId++
+          : -(1_000_000_000_000 + nextChatId),
       title: String(title ?? (kind === "channel" ? "Channel" : "Group")),
       type: kind,
       members: new Map([[owner, { status: "creator" }]]),
@@ -2511,6 +2700,13 @@ export async function startTestServer({
       // The owner (or `by`) adds, promotes, demotes or removes a bot.
       const chat = requireChat(id);
       const record = requireBot(body.bot_id);
+      if (body.start_parameter !== undefined) {
+        return addBotViaLink(chat, record, {
+          by: body.by,
+          startParameter: body.start_parameter,
+          rights: body.rights ?? null,
+        });
+      }
       const status = body.status ?? "administrator";
       if (!["administrator", "member", "left", "kicked"].includes(status)) {
         throw new TelegramError(
@@ -2523,6 +2719,15 @@ export async function startTestServer({
         rights: body.rights ?? null,
         actor: requireUser(body.by ?? creatorOf(chat)),
       });
+    }
+    if (resource === "chats" && id && sub === "migrate" && method === "POST") {
+      return migrateToSupergroup(requireChat(id), body);
+    }
+    if (resource === "chats" && id && sub === "title" && method === "POST") {
+      return renameByPerson(requireChat(id), body);
+    }
+    if (resource === "chats" && id && sub === "photo" && method === "POST") {
+      return changePhotoByPerson(requireChat(id), body);
     }
     if (resource === "failures" && method === "POST") {
       if (typeof body.method !== "string" || body.method === "") {
@@ -3288,6 +3493,27 @@ export async function startTestServer({
         });
         return;
       }
+      // A basic group upgraded to a supergroup answers every call with the new
+      // id in ResponseParameters.migrate_to_chat_id.
+      // https://core.telegram.org/bots/api#responseparameters
+      const addressed = chats.get(Number(params.chat_id));
+      if (addressed?.migratedTo != null) {
+        calls.push({
+          method,
+          bot_id: caller.id,
+          params: summarize(params),
+          at: Date.now(),
+          failed: 400,
+        });
+        send(response, 400, {
+          ok: false,
+          error_code: 400,
+          description:
+            "Bad Request: group chat was upgraded to a supergroup chat",
+          parameters: { migrate_to_chat_id: addressed.migratedTo },
+        });
+        return;
+      }
       const failure = takeFailure(method, caller, params);
       calls.push({
         method,
@@ -3345,6 +3571,7 @@ export async function startTestServer({
           ok: false,
           error_code: error.code,
           description: error.message,
+          ...(error.parameters ? { parameters: error.parameters } : {}),
         });
       }
     } catch (error) {
@@ -3417,6 +3644,23 @@ export async function startTestServer({
         })
       ).id,
     getChat: (chatId) => act("GET", `chats/${chatId}`),
+    addBotViaLink: (chatId, botId, { by, startParameter, rights } = {}) =>
+      act("POST", `chats/${chatId}/bots`, {
+        bot_id: botId,
+        start_parameter: startParameter ?? "",
+        ...(by != null ? { by } : {}),
+        ...(rights ? { rights } : {}),
+      }),
+    migrateToSupergroup: async (chatId, { by } = {}) =>
+      (await act("POST", `chats/${chatId}/migrate`, by != null ? { by } : {}))
+        .id,
+    renameChat: (chatId, { by, title } = {}) =>
+      act("POST", `chats/${chatId}/title`, { by, title }),
+    changeChatPhoto: (chatId, { by, bytes } = {}) =>
+      act("POST", `chats/${chatId}/photo`, {
+        by,
+        base64: Buffer.from(bytes ?? []).toString("base64"),
+      }),
     setBotMembership: (chatId, botId, { status, rights, by } = {}) =>
       act("POST", `chats/${chatId}/bots`, {
         bot_id: botId,

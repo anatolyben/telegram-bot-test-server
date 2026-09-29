@@ -124,8 +124,8 @@ export interface PostedMessage {
 
 export interface NewChat {
   title?: string;
-  /** Default "supergroup". */
-  type?: "supergroup" | "channel";
+  /** Default "supergroup". A "group" is a basic group, without the -100 id prefix. */
+  type?: "supergroup" | "channel" | "group";
   /** The chat's creator. */
   ownerId: number;
   ownerName?: string;
@@ -184,6 +184,36 @@ export interface TelegramBotTestServer {
   }): Promise<{ id: number; is_bot: true; username: string }>;
   /** A group, forum or channel owned by `ownerId`, with no bot in it; returns its id. */
   createChat(chat: NewChat): Promise<number>;
+  /**
+   * A person adds the bot through its t.me/<bot>?startgroup=<parameter> link:
+   * the bot joins (as an administrator when rights are given, combined with
+   * any it has), then the person's "/start@<bot> <parameter>" is posted.
+   * Returns the bot's membership.
+   */
+  addBotViaLink(
+    chatId: number,
+    botId: number,
+    link?: {
+      by?: number;
+      startParameter?: string;
+      rights?: Record<string, boolean>;
+    },
+  ): Promise<ChatMember>;
+  /** The creator or an administrator upgrades a basic group; returns the new supergroup's id. */
+  migrateToSupergroup(
+    chatId: number,
+    options?: { by?: number },
+  ): Promise<number>;
+  /** A person with can_change_info renames the chat. */
+  renameChat(
+    chatId: number,
+    change: { by?: number; title: string },
+  ): Promise<{ message_id: number }>;
+  /** A person with can_change_info sets the chat photo. */
+  changeChatPhoto(
+    chatId: number,
+    change: { by?: number; bytes: Uint8Array },
+  ): Promise<{ message_id: number }>;
   /** The chat, its pinned message ids (newest first) and members. */
   getChat(chatId: number): Promise<{
     id: number;
