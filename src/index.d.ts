@@ -30,6 +30,11 @@ export interface TelegramBotTestServerOptions {
    * answerChatJoinRequestQuery. Default false.
    */
   supportsJoinRequestQueries?: boolean;
+  /**
+   * The first bot's Telegram Login client secret (its client id is the bot
+   * id). Default: a random secret, readable from GET /_fake/bot.
+   */
+  loginClientSecret?: string;
   /** Supergroups the bot administers. */
   chats?: TestChat[];
   /** Channels, groups and bots that getChat("@username") resolves. */
@@ -181,6 +186,8 @@ export interface TelegramBotTestServer {
     firstName?: string;
     /** A guard bot that gets join requests as queries. */
     supportsJoinRequestQueries?: boolean;
+    /** Its Telegram Login client secret; default random. */
+    loginClientSecret?: string;
   }): Promise<{ id: number; is_bot: true; username: string }>;
   /** A group, forum or channel owned by `ownerId`, with no bot in it; returns its id. */
   createChat(chat: NewChat): Promise<number>;
@@ -248,6 +255,14 @@ export interface TelegramBotTestServer {
   clearFailures(): Promise<{ ok: true }>;
   /** Create a user; returns their id. */
   createUser(fields?: UserFields): Promise<number>;
+  /**
+   * The user logs in on the Telegram Login page for this authorization URL
+   * (the /auth URL an app sends the browser to). Returns the redirect_uri URL
+   * with the one-time code and state.
+   */
+  approveLogin(authUrl: string, userId: number): Promise<string>;
+  /** The user cancels: returns the redirect_uri URL with error=access_denied and state. */
+  cancelLogin(authUrl: string): Promise<string>;
   /**
    * The owner connects a bot (default the first) to their business account, or,
    * given the id of an existing connection, changes its rights or enabled

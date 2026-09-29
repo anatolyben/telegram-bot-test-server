@@ -101,7 +101,9 @@ response happens after that, so wait for the outcome rather than checking it imm
 | `getDirectMessages(userId)`                                                                      | The private chat between the user and the bot.                                                                                                                              |
 | `getMember(chatId, userId)`                                                                      | The member as `getChatMember` returns them: status, restrictions, ban.                                                                                                      |
 | `getJoinRequests(chatId)`                                                                        | User ids waiting for approval.                                                                                                                                              |
-| `addBot({ token, username, firstName })`                                                         | Another bot, with its own webhook or update queue; it is in no chat yet.                                                                                                    |
+| `addBot({ token, username, firstName, loginClientSecret })`                                      | Another bot, with its own webhook or update queue; it is in no chat yet.                                                                                                    |
+| `approveLogin(authUrl, userId)`                                                                  | The user logs in on the Telegram Login page for that `/auth` URL; returns the `redirect_uri` URL with `code` and `state`.                                                   |
+| `cancelLogin(authUrl)`                                                                           | The user cancels; returns the `redirect_uri` URL with `error=access_denied` and `state`.                                                                                    |
 | `createChat({ ownerId, title, type, ownerName, isForum })`                                       | A new supergroup, forum (`isForum`), basic group (`type: "group"`) or channel (`type: "channel"`) with no bot in it; returns its id.                                        |
 | `addBotViaLink(chatId, botId, { by, startParameter, rights })`                                   | A person adds the bot through its `startgroup` link: it joins (as an administrator with `rights`), then `/start@<bot> <startParameter>` is posted from the person.          |
 | `migrateToSupergroup(chatId, { by })`                                                            | The creator or an administrator upgrades a basic group; returns the supergroup's id.                                                                                        |
@@ -141,6 +143,7 @@ over HTTP through the control API described below, from Python, Go or anything e
 | `botUsername`                | `fake_test_bot`  | Returned by `getMe`.                                                                         |
 | `botName`                    | `Fake Test Bot`  | Returned by `getMe`.                                                                         |
 | `supportsJoinRequestQueries` | `false`          | A guard bot: join requests reach it with a `query_id` to answer.                             |
+| `loginClientSecret`          | random           | The first bot's Telegram Login client secret.                                                |
 | `chats`                      | `[]`             | Supergroups `{ id, title, ownerId, ownerName? }`. The bot is an administrator.               |
 | `publicChats`                | `[]`             | Channels, groups and bots `{ username, type, title? }` resolvable by `getChat("@username")`. |
 | `unimplemented`              | `"error"`        | What an unsupported method returns: a 404 error naming it, or `"ok"` for `true`.             |
@@ -270,6 +273,30 @@ The details a moderation bot depends on, each covered by a test:
   `message thread not found`. A member's message in a topic that answers nothing replies to the
   topic's creation message, as on Telegram.
 
+### Telegram Login (OpenID Connect)
+
+The server also answers at oauth.telegram.org's paths, so an app logs in against it by changing only
+the origin: `GET /.well-known/openid-configuration`, `GET /.well-known/jwks.json`, `GET /auth` (a
+page with a "Log in as ..." button per fake user, and Cancel) and `POST /token`. It follows
+[Telegram's docs](https://core.telegram.org/bots/telegram-login) and its
+[discovery document](https://oauth.telegram.org/.well-known/openid-configuration):
+
+- The client id is the bot id and each bot has a client secret. `/token` takes it by HTTP Basic, as
+  the docs show, or in the form (`client_secret_post`, which the discovery document lists).
+- `/auth` needs `response_type=code` and the `openid` scope. PKCE is recommended, not required, with
+  `S256` or `plain`, as the discovery document lists. An unknown `client_id`, a bad
+  `response_type`, a missing `openid` or a bad challenge method gets a 400 page, never a redirect.
+- A code works once, only with the same `redirect_uri`, and only with a `code_verifier` that
+  matches its challenge; otherwise `/token` answers `invalid_grant`, and a wrong secret
+  `invalid_client` (401). Codes expire after 60 seconds (unverified: Telegram does not document
+  how long).
+- The ID token is signed RS256 with the published key and names it in `kid`. It has `iss`
+  (`https://oauth.telegram.org`), `aud` (the bot id), `sub`, `iat`, `exp` (an hour later, as
+  `expires_in: 3600` says) and `nonce` when the app sent one. `sub` is an opaque id that stays the
+  same for a user, not their Telegram id, as in Telegram's example. The `profile` scope adds `id`,
+  `name`, `given_name`, `family_name`, `preferred_username` and `picture` (served by this server).
+- `telegram:bot_access` lets the bot message the user afterwards, as documented.
+
 ## Update delivery
 
 - With a webhook set, updates are delivered in order to its URL, with the
@@ -322,10 +349,12 @@ The test actions above, over HTTP, for tests written in other languages. All rou
 | `POST users/:id/dm`                                    | The user sends the bot a direct message `{ text }`.                                                                                                                                                                                                                      |
 | `GET users/:id/dm`                                     | The private chat's messages, newest first.                                                                                                                                                                                                                               |
 | `POST users/:id/dm/:messageId/callback`                | The user presses a button in the private chat `{ data }`.                                                                                                                                                                                                                |
-| `GET bot`                                              | The first bot's user.                                                                                                                                                                                                                                                    |
+| `GET bot`                                              | The first bot's user, with its `login_client_secret`.                                                                                                                                                                                                                    |
 | `GET webhook`                                          | The first bot's registered webhook.                                                                                                                                                                                                                                      |
-| `POST bots`                                            | Add a bot `{ token, username, first_name? }`; it is in no chat yet.                                                                                                                                                                                                      |
-| `GET bots`                                             | Every bot, with its webhook URL.                                                                                                                                                                                                                                         |
+| `POST bots`                                            | Add a bot `{ token, username, first_name?, login_client_secret? }`; it is in no chat yet.                                                                                                                                                                                |
+| `POST login/approve`                                   | The user `{ auth_url, user_id }` logs in; returns `{ redirect_url }` with the code and state.                                                                                                                                                                            |
+| `POST login/cancel`                                    | The user cancels `{ auth_url }`; returns `{ redirect_url }` with `error=access_denied`.                                                                                                                                                                                  |
+| `GET bots`                                             | Every bot, with its webhook URL and `login_client_secret`.                                                                                                                                                                                                               |
 | `POST chats`                                           | Create `{ owner_id, title?, type?: "supergroup" \| "channel", owner_name?, is_forum? }`; returns the chat.                                                                                                                                                               |
 | `GET chats/:id`                                        | The chat with its pinned message ids and members.                                                                                                                                                                                                                        |
 | `POST chats/:id/bots`                                  | Add, promote, demote or remove a bot `{ bot_id, status?, rights?, by? }`, as the owner would.                                                                                                                                                                            |
@@ -352,12 +381,20 @@ A button press waits up to 10 seconds for the bot to call `answerCallbackQuery` 
 - Expiry: restrictions and bans with an `until_date` never lift on their own.
 - Webhook retries: an update the webhook rejects, or does not answer within 10 seconds, is logged and
   dropped rather than retried.
+- In Telegram Login: the `phone` scope's `phone_number` (test users have no phone numbers), the
+  ES256, EdDSA and ES256K signing options (only the default RS256), the redirect URLs registered
+  with BotFather (any `redirect_uri` is accepted), the `telegram-login.js` popup and native SDKs, and
+  the legacy Login Widget's hash check. Telegram has no UserInfo endpoint, and neither does this
+  server.
 - Persistence. All state lives in memory and is lost when the server stops.
 - Anything security-related. It is a test tool: bind it to localhost and never expose it to a
   network you do not control.
 
 ## Changes
 
+- **0.8.0**: Telegram Login (OpenID Connect): discovery, keys, the login page, the token endpoint,
+  signed ID tokens, a login client secret per bot, and `approveLogin` / `cancelLogin` for tests
+  without a browser.
 - **0.7.0**: adding the bot through a `startgroup` link, basic groups and their upgrade to a
   supergroup, people renaming the chat and changing its photo, and a bot's own `new_chat_members`
   and `left_chat_member` messages. Tests now cover `getChatMemberCount` following joins and

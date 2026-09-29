@@ -23,7 +23,13 @@
  * Nothing here talks to Telegram.
  */
 import http from "node:http";
-import { randomBytes } from "node:crypto";
+import {
+  createHash,
+  generateKeyPairSync,
+  randomBytes,
+  sign,
+  timingSafeEqual,
+} from "node:crypto";
 
 // Every field of ChatPermissions, as of Bot API 10.3.
 const PERMISSION_KEYS = Object.freeze([
@@ -359,6 +365,7 @@ export async function startTestServer({
   chats: chatConfigs = [],
   publicChats = [],
   unimplemented: unimplementedMode = "error",
+  loginClientSecret,
   log = () => {},
 }) {
   if (unimplementedMode !== "error" && unimplementedMode !== "ok") {
@@ -368,7 +375,13 @@ export async function startTestServer({
   // Every bot this server answers for, by token. Each keeps its own webhook,
   // update queue and commands, as separate bots do on Telegram.
   const bots = new Map();
-  function addBot({ token, username, firstName, joinRequestQueries = false }) {
+  function addBot({
+    token,
+    username,
+    firstName,
+    joinRequestQueries = false,
+    loginClientSecret: secret,
+  }) {
     const id = Number(String(token).split(":")[0]);
     if (!Number.isSafeInteger(id) || !String(token).includes(":")) {
       throw new TypeError(
@@ -394,6 +407,11 @@ export async function startTestServer({
       commands: [],
       // A guard bot that gets join request queries (Bot API 10.x).
       joinRequestQueries: joinRequestQueries === true,
+      // The Telegram Login client secret BotFather shows for the bot.
+      loginClientSecret:
+        typeof secret === "string" && secret !== ""
+          ? secret
+          : randomBytes(24).toString("base64url"),
     };
     bots.set(token, record);
     users.set(id, record);
@@ -405,6 +423,7 @@ export async function startTestServer({
     username: botUsername,
     firstName: botName,
     joinRequestQueries: supportsJoinRequestQueries,
+    loginClientSecret,
   });
   // Join request queries awaiting answerChatJoinRequestQuery, by query id.
   const joinQueries = new Map();
@@ -2670,6 +2689,7 @@ export async function startTestServer({
             username: body.username,
             firstName: body.first_name,
             joinRequestQueries: body.supports_join_request_queries === true,
+            loginClientSecret: body.login_client_secret,
           }),
         );
       } catch (error) {
@@ -2680,6 +2700,7 @@ export async function startTestServer({
       return [...bots.values()].map((record) => ({
         ...userObject(record),
         webhook: record.webhook ? { url: record.webhook.url } : null,
+        login_client_secret: record.loginClientSecret,
       }));
     }
     if (resource === "chats" && !id && method === "POST") {
@@ -2904,7 +2925,25 @@ export async function startTestServer({
         };
       }
     }
-    if (resource === "bot" && method === "GET") return userObject(bot);
+    if (resource === "bot" && method === "GET") {
+      return { ...userObject(bot), login_client_secret: bot.loginClientSecret };
+    }
+    if (resource === "login" && (id === "approve" || id === "cancel")) {
+      // What the login page's buttons do, without a browser.
+      const request = loginRequest(
+        new URL(String(body.auth_url ?? ""), "http://fake").searchParams,
+      );
+      if (request.error) throw new TelegramError(400, request.error);
+      return {
+        redirect_url:
+          id === "approve"
+            ? approveLogin(request, requireUser(body.user_id))
+            : loginRedirect(request.redirectUri, {
+                error: "access_denied",
+                state: request.state,
+              }),
+      };
+    }
     if (resource === "users" && id && sub === "dm") {
       // Only the user writing to the bot opens their private chat; reading it
       // must not, or the bot could then message a user who never wrote.
@@ -3424,6 +3463,376 @@ export async function startTestServer({
   }
 
   // ── HTTP ───────────────────────────────────────────────────────────────
+  // ── Telegram Login (OpenID Connect) ────────────────────────────────────
+  // The code flow at oauth.telegram.org, as documented at
+  // https://core.telegram.org/bots/telegram-login and in its discovery
+  // document, https://oauth.telegram.org/.well-known/openid-configuration.
+  const LOGIN_ISSUER = "https://oauth.telegram.org";
+  // UNVERIFIED: how long Telegram keeps an unused code; OAuth recommends a
+  // short life (RFC 6749 §4.1.2).
+  const LOGIN_CODE_TTL_MS = 60_000;
+  // The documented token response says "expires_in": 3600.
+  const LOGIN_TOKEN_TTL_S = 3600;
+  const loginKey = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const loginKid = `fake-${randomBytes(6).toString("hex")}`;
+  const loginCodes = new Map();
+  // `sub` is an opaque id, not the Telegram id (the documented example has a
+  // different sub and id); it is stable for a user ("public" subject type).
+  const subjectSalt = randomBytes(16);
+
+  function loginSubject(userId) {
+    const digest = createHash("sha256")
+      .update(subjectSalt)
+      .update(String(userId))
+      .digest();
+    return (digest.readBigUInt64BE(0) % 10n ** 19n).toString();
+  }
+
+  function base64url(value) {
+    return Buffer.from(value).toString("base64url");
+  }
+
+  function signIdToken(claims) {
+    const header = { alg: "RS256", typ: "JWT", kid: loginKid };
+    const input = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(claims))}`;
+    const signature = sign("sha256", Buffer.from(input), loginKey.privateKey);
+    return `${input}.${signature.toString("base64url")}`;
+  }
+
+  function discoveryDocument() {
+    return {
+      issuer: LOGIN_ISSUER,
+      authorization_endpoint: `${origin}/auth`,
+      token_endpoint: `${origin}/token`,
+      jwks_uri: `${origin}/.well-known/jwks.json`,
+      response_types_supported: ["code"],
+      token_endpoint_auth_methods_supported: [
+        "client_secret_basic",
+        "client_secret_post",
+      ],
+      subject_types_supported: ["public"],
+      id_token_signing_alg_values_supported: ["RS256"],
+      scopes_supported: ["openid", "phone", "profile", "telegram:bot_access"],
+      claims_supported: [
+        "aud",
+        "preferred_username",
+        "phone_number",
+        "exp",
+        "iat",
+        "iss",
+        "name",
+        "picture",
+        "sub",
+      ],
+      code_challenge_methods_supported: ["plain", "S256"],
+      grant_types_supported: ["authorization_code"],
+    };
+  }
+
+  function jwks() {
+    return {
+      keys: [
+        {
+          ...loginKey.publicKey.export({ format: "jwk" }),
+          alg: "RS256",
+          use: "sig",
+          kid: loginKid,
+        },
+      ],
+    };
+  }
+
+  function loginRedirect(redirectUri, params) {
+    const url = new URL(redirectUri);
+    for (const [key, value] of Object.entries(params)) {
+      if (value != null) url.searchParams.set(key, value);
+    }
+    return url.toString();
+  }
+
+  /**
+   * A /auth request, checked. The docs make openid required and PKCE
+   * recommended; the discovery document lists "plain" and "S256".
+   */
+  function loginRequest(query) {
+    const clientId = String(query.get("client_id") ?? "");
+    const record = [...bots.values()].find(
+      (entry) => String(entry.id) === clientId,
+    );
+    if (!record) return { error: "unknown client_id" };
+    const redirectUri = query.get("redirect_uri") ?? "";
+    try {
+      new URL(redirectUri);
+    } catch {
+      return { error: "redirect_uri must be an absolute URL" };
+    }
+    if (query.get("response_type") !== "code") {
+      return { error: 'response_type must be "code"' };
+    }
+    const scopes = String(query.get("scope") ?? "")
+      .split(/\s+/)
+      .filter(Boolean);
+    if (!scopes.includes("openid")) {
+      return { error: 'scope must include "openid"' };
+    }
+    const challenge = query.get("code_challenge");
+    const method =
+      query.get("code_challenge_method") ?? (challenge ? "plain" : null);
+    if (challenge && method !== "S256" && method !== "plain") {
+      return { error: 'code_challenge_method must be "S256" or "plain"' };
+    }
+    if (!challenge && query.get("code_challenge_method")) {
+      return { error: "code_challenge_method without code_challenge" };
+    }
+    return {
+      bot: record,
+      redirectUri,
+      scopes,
+      state: query.get("state"),
+      nonce: query.get("nonce"),
+      challenge,
+      method,
+    };
+  }
+
+  /** The user allows the login: a one-time code goes back to redirect_uri. */
+  function approveLogin(request, user) {
+    if (user.is_bot) throw new TelegramError(400, "a bot cannot log in");
+    const code = randomBytes(24).toString("base64url");
+    loginCodes.set(code, {
+      ...request,
+      userId: user.id,
+      expiresAt: Date.now() + LOGIN_CODE_TTL_MS,
+      used: false,
+    });
+    return loginRedirect(request.redirectUri, { code, state: request.state });
+  }
+
+  function escapeHtml(value) {
+    return String(value).replace(
+      /[&<>"']/g,
+      (character) =>
+        ({
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;",
+        })[character],
+    );
+  }
+
+  /** The login page: one button per fake user, and Cancel. */
+  function loginPage(url, request) {
+    const action = escapeHtml(`/auth${url.search}`);
+    const people = [...users.values()].filter((user) => !user.is_bot);
+    const buttons = people
+      .map(
+        (user) =>
+          `<form method="post" action="${action}"><input type="hidden" name="user_id" value="${user.id}"><button>Log in as ${escapeHtml(
+            [user.first_name, user.last_name].filter(Boolean).join(" "),
+          )}</button></form>`,
+      )
+      .join("\n");
+    return `<!doctype html><html><head><meta charset="utf-8"><title>Log in to ${escapeHtml(
+      request.bot.first_name,
+    )}</title></head><body><h1>Log in to ${escapeHtml(request.bot.first_name)}</h1>
+${buttons}
+<form method="post" action="${action}"><input type="hidden" name="cancel" value="1"><button>Cancel</button></form>
+</body></html>`;
+  }
+
+  function sendOAuthError(response, status, error, description, headers = {}) {
+    response.writeHead(status, {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+      ...headers,
+    });
+    response.end(JSON.stringify({ error, error_description: description }));
+  }
+
+  /**
+   * POST /token: the code for an ID token, with the client authenticated by
+   * HTTP Basic as the docs show (client_secret_post is listed too), and the
+   * PKCE verifier checked against the challenge (RFC 7636).
+   */
+  function exchangeCode(request, body, response) {
+    const form = new URLSearchParams(body.toString("utf8"));
+    let clientId = form.get("client_id");
+    let secret = form.get("client_secret");
+    const basic = String(request.headers.authorization ?? "").match(
+      /^Basic\s+(.+)$/i,
+    );
+    if (basic) {
+      const decoded = Buffer.from(basic[1], "base64").toString("utf8");
+      const colon = decoded.indexOf(":");
+      clientId = decodeURIComponent(decoded.slice(0, colon));
+      secret = decodeURIComponent(decoded.slice(colon + 1));
+    }
+    const record = [...bots.values()].find(
+      (entry) => String(entry.id) === String(clientId ?? ""),
+    );
+    const expected = Buffer.from(record?.loginClientSecret ?? "");
+    const given = Buffer.from(String(secret ?? ""));
+    if (
+      !record ||
+      expected.length !== given.length ||
+      !timingSafeEqual(expected, given)
+    ) {
+      sendOAuthError(
+        response,
+        401,
+        "invalid_client",
+        "Client authentication failed",
+        {
+          "WWW-Authenticate": 'Basic realm="oauth.telegram.org"',
+        },
+      );
+      return;
+    }
+    if (form.get("grant_type") !== "authorization_code") {
+      sendOAuthError(
+        response,
+        400,
+        "unsupported_grant_type",
+        'grant_type must be "authorization_code"',
+      );
+      return;
+    }
+    const code = loginCodes.get(String(form.get("code") ?? ""));
+    const invalid = (description) =>
+      sendOAuthError(response, 400, "invalid_grant", description);
+    if (!code || code.bot.id !== record.id) return invalid("Unknown code");
+    if (code.used) return invalid("The code was already used");
+    code.used = true;
+    if (Date.now() > code.expiresAt) return invalid("The code has expired");
+    if (form.get("redirect_uri") !== code.redirectUri) {
+      return invalid("redirect_uri does not match the authorization request");
+    }
+    if (code.challenge) {
+      const verifier = String(form.get("code_verifier") ?? "");
+      const derived =
+        code.method === "S256"
+          ? createHash("sha256").update(verifier).digest("base64url")
+          : verifier;
+      if (!verifier || derived !== code.challenge) {
+        return invalid("code_verifier does not match the code_challenge");
+      }
+    }
+    const user = requireUser(code.userId);
+    const issuedAt = Math.floor(Date.now() / 1000);
+    const claims = {
+      iss: LOGIN_ISSUER,
+      aud: String(record.id),
+      sub: loginSubject(user.id),
+      iat: issuedAt,
+      exp: issuedAt + LOGIN_TOKEN_TTL_S,
+      ...(code.nonce ? { nonce: code.nonce } : {}),
+    };
+    // The profile scope adds the user's id, name, username and photo.
+    if (code.scopes.includes("profile")) {
+      Object.assign(claims, {
+        id: user.id,
+        name: [user.first_name, user.last_name].filter(Boolean).join(" "),
+        given_name: user.first_name,
+        ...(user.last_name ? { family_name: user.last_name } : {}),
+        ...(user.username ? { preferred_username: user.username } : {}),
+        ...(user.photos?.length
+          ? { picture: `${origin}/userpic/${user.id}.jpg` }
+          : {}),
+      });
+    }
+    // telegram:bot_access "allows your bot to send direct messages to the
+    // user after login".
+    if (code.scopes.includes("telegram:bot_access")) {
+      const chat = messageChat(user.id);
+      chat.openTo ??= new Set();
+      chat.openTo.add(record.id);
+    }
+    response.writeHead(200, {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store",
+    });
+    response.end(
+      JSON.stringify({
+        access_token: randomBytes(24).toString("base64url"),
+        token_type: "Bearer",
+        expires_in: LOGIN_TOKEN_TTL_S,
+        id_token: signIdToken(claims),
+      }),
+    );
+  }
+
+  /** The login routes, at oauth.telegram.org's paths; false when not one. */
+  function serveLogin(request, url, body, response) {
+    const path = url.pathname;
+    if (
+      path === "/.well-known/openid-configuration" &&
+      request.method === "GET"
+    ) {
+      send(response, 200, discoveryDocument());
+      return true;
+    }
+    if (path === "/.well-known/jwks.json" && request.method === "GET") {
+      send(response, 200, jwks());
+      return true;
+    }
+    if (path === "/token" && request.method === "POST") {
+      exchangeCode(request, body, response);
+      return true;
+    }
+    const picture = path.match(/^\/userpic\/(\d+)\.jpg$/);
+    if (picture && request.method === "GET") {
+      const file = files.get(
+        users.get(Number(picture[1]))?.photos?.[0]?.file_id,
+      );
+      if (!file) {
+        response.writeHead(404).end();
+        return true;
+      }
+      response.writeHead(200, { "Content-Type": "image/jpeg" });
+      response.end(file.data);
+      return true;
+    }
+    if (path !== "/auth" || !["GET", "POST"].includes(request.method)) {
+      return false;
+    }
+    const loginQuery = loginRequest(url.searchParams);
+    if (loginQuery.error) {
+      // An unverified client or redirect_uri is never redirected to
+      // (RFC 6749 §4.1.2.1); the page reports the problem instead.
+      response.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end(`Login refused: ${loginQuery.error}`);
+      return true;
+    }
+    if (request.method === "GET") {
+      response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      response.end(loginPage(url, loginQuery));
+      return true;
+    }
+    const form = new URLSearchParams(body.toString("utf8"));
+    let location;
+    if (form.get("cancel")) {
+      location = loginRedirect(loginQuery.redirectUri, {
+        error: "access_denied",
+        state: loginQuery.state,
+      });
+    } else {
+      const user = users.get(Number(form.get("user_id")));
+      if (!user || user.is_bot) {
+        response.writeHead(400, {
+          "Content-Type": "text/plain; charset=utf-8",
+        });
+        response.end("Login refused: unknown user");
+        return true;
+      }
+      location = approveLogin(loginQuery, user);
+    }
+    response.writeHead(302, { Location: location });
+    response.end();
+    return true;
+  }
+
   function send(response, status, payload) {
     response.writeHead(status, { "Content-Type": "application/json" });
     response.end(JSON.stringify(payload));
@@ -3447,6 +3856,7 @@ export async function startTestServer({
         }
         return;
       }
+      if (serveLogin(request, url, body, response)) return;
       const file = url.pathname.match(/^\/file\/bot([^/]+)\/(.+)$/);
       if (file) {
         const entry = [...files.values()].find((f) => f.file_path === file[2]);
@@ -3686,6 +4096,15 @@ export async function startTestServer({
       }),
     clearFailures: () => act("DELETE", "failures"),
     createUser: async (fields = {}) => (await act("POST", "users", fields)).id,
+    approveLogin: async (authUrl, userId) =>
+      (
+        await act("POST", "login/approve", {
+          auth_url: authUrl,
+          user_id: userId,
+        })
+      ).redirect_url,
+    cancelLogin: async (authUrl) =>
+      (await act("POST", "login/cancel", { auth_url: authUrl })).redirect_url,
     connectBusiness: ({ ownerId, rights, id, isEnabled, botId } = {}) =>
       act("POST", "business/connections", {
         owner_id: ownerId,
