@@ -255,6 +255,71 @@ export interface TelegramBotTestServer {
   clearFailures(): Promise<{ ok: true }>;
   /** Create a user; returns their id. */
   createUser(fields?: UserFields): Promise<number>;
+  /** An owner account a test can connect an owner client to. */
+  createOwner(owner?: {
+    userId?: number;
+    firstName?: string;
+    lastName?: string;
+    username?: string;
+  }): Promise<{ id: number }>;
+  /** Revoke (false) or restore the owner's authorization. */
+  updateOwner(
+    ownerId: number,
+    change: { authorized?: boolean },
+  ): Promise<unknown>;
+  /** The owner's dialogs and filter order; never another owner's. */
+  getOwner(ownerId: number): Promise<unknown>;
+  /** Someone who can send messages in the owner's groups. */
+  addOwnerUser(
+    ownerId: number,
+    user: {
+      id?: number;
+      firstName?: string;
+      lastName?: string;
+      username?: string;
+      bot?: boolean;
+    },
+  ): Promise<{ id: number }>;
+  /** A conversation on the owner's account; returns its peer id. */
+  addOwnerDialog(
+    ownerId: number,
+    dialog: OwnerDialogFields,
+  ): Promise<{ id: number }>;
+  /** Move between folders, pin, mute or set the unread count. */
+  updateOwnerDialog(
+    ownerId: number,
+    peerId: number,
+    change: Pick<
+      OwnerDialogFields,
+      "folder" | "pinned" | "muted" | "muteUntil" | "unreadCount"
+    >,
+  ): Promise<unknown>;
+  addOwnerMessages(
+    ownerId: number,
+    peerId: number,
+    messages: OwnerMessageFields[],
+  ): Promise<{ ids: number[] }>;
+  editOwnerMessage(
+    ownerId: number,
+    peerId: number,
+    messageId: number,
+    edit: { text: string; editDate?: number },
+  ): Promise<unknown>;
+  deleteOwnerMessage(
+    ownerId: number,
+    peerId: number,
+    messageId: number,
+  ): Promise<unknown>;
+  /** Create or change a custom dialog filter. */
+  setOwnerFilter(ownerId: number, filter: OwnerFilterFields): Promise<unknown>;
+  /** Every filter id once, with 0 for the default ("All chats"). */
+  orderOwnerFilters(ownerId: number, ids: number[]): Promise<unknown>;
+  deleteOwnerFilter(ownerId: number, filterId: number): Promise<unknown>;
+  failOwnerCall(ownerId: number, fault: OwnerFault): Promise<unknown>;
+  clearOwnerFaults(ownerId: number): Promise<unknown>;
+  getOwnerCalls(ownerId: number): Promise<OwnerCall[]>;
+  /** Remove every owner and its state. */
+  resetOwners(): Promise<unknown>;
   /**
    * The user logs in on the Telegram Login page for this authorization URL
    * (the /auth URL an app sends the browser to). Returns the redirect_uri URL
@@ -393,6 +458,181 @@ export interface TelegramBotTestServer {
   }>;
   stop(): Promise<void>;
 }
+
+// ── Owner accounts ─────────────────────────────────────────────────────────
+// A user's own account as a GramJS TelegramClient reads it (see the README,
+// "Owner accounts"). Ids are plain numbers; GramJS uses big-integer objects,
+// which give the same String() and Number().
+
+export type OwnerDialogKind =
+  "private" | "bot" | "group" | "supergroup" | "channel";
+
+export interface OwnerDialogFields {
+  kind: OwnerDialogKind;
+  /** The raw id; the dialog's peer id is derived from it (-id for a group, -100<id> for a supergroup or channel). */
+  id?: number;
+  /** Groups, supergroups and channels. */
+  title?: string;
+  /** Private chats and bots. */
+  firstName?: string;
+  lastName?: string;
+  username?: string;
+  participantsCount?: number;
+  /** 0 main (default), 1 archive. */
+  folder?: 0 | 1;
+  pinned?: boolean;
+  /** Muted forever, or not muted. */
+  muted?: boolean;
+  /** Unix time the mute lasts until; 0 is not muted. */
+  muteUntil?: number;
+  unreadCount?: number;
+  /** The dialog's date while it has no messages. */
+  date?: number;
+}
+
+export interface OwnerMessageFields {
+  id: number;
+  /** Unix seconds. */
+  date: number;
+  /** The owner's id or a user added with addOwnerUser; omit in a private chat or for a channel post. */
+  fromId?: number;
+  out?: boolean;
+  text?: string;
+  /** Makes it a MessageService, e.g. { className: "MessageActionChatAddUser", users: [id] }. */
+  action?: { className: string; [field: string]: unknown };
+  /** The id of the message it answers. */
+  replyTo?: number;
+  media?:
+    | {
+        type: "photo";
+        id: number;
+        width?: number;
+        height?: number;
+        size?: number;
+      }
+    | {
+        type: "document";
+        id: number;
+        fileName?: string;
+        mimeType?: string;
+        size?: number;
+      };
+  editDate?: number;
+}
+
+export interface OwnerFilterFields {
+  /** 2 or more; Telegram's custom filter ids start at 2. */
+  id: number;
+  title?: string;
+  emoticon?: string;
+  color?: number;
+  /** Dialog peer ids. */
+  includePeers?: number[];
+  excludePeers?: number[];
+  pinnedPeers?: number[];
+  contacts?: boolean;
+  nonContacts?: boolean;
+  groups?: boolean;
+  broadcasts?: boolean;
+  bots?: boolean;
+  excludeMuted?: boolean;
+  excludeRead?: boolean;
+  excludeArchived?: boolean;
+}
+
+export type OwnerMethod =
+  | "connect"
+  | "disconnect"
+  | "isUserAuthorized"
+  | "getMe"
+  | "getEntity"
+  | "getInputEntity"
+  | "getDialogs"
+  | "getMessages"
+  | "invoke";
+
+export interface OwnerFault {
+  method: OwnerMethod;
+  /** Only calls about this dialog. */
+  peerId?: number;
+  /** How many calls it applies to; default 1. */
+  times?: number;
+  /** Answer after this long (at most 30 000 ms). */
+  delayMs?: number;
+  preset?:
+    | "flood_wait"
+    | "permission_denied"
+    | "reconnect_required"
+    | "stale_entity"
+    | "malformed_page"
+    | "dropped";
+  /** For flood_wait; default 30. */
+  seconds?: number;
+  /** A custom RPC error instead of a preset, e.g. "CHANNEL_PRIVATE". */
+  errorMessage?: string;
+  code?: number;
+}
+
+export interface OwnerCall {
+  owner_id: number;
+  method: string;
+  /** The call's arguments, with session, token and hash fields redacted. */
+  args: Record<string, unknown>;
+  at: string;
+  outcome: "ok" | "error" | "dropped" | "malformed";
+  error_message?: string;
+  duration_ms?: number;
+}
+
+/** The GramJS TelegramClient subset the owner client answers. */
+export interface OwnerClient {
+  connect(): Promise<void>;
+  disconnect(): Promise<void>;
+  destroy(): Promise<void>;
+  isUserAuthorized(): Promise<boolean>;
+  getMe(): Promise<Record<string, unknown>>;
+  getEntity(peer: unknown): Promise<Record<string, unknown>>;
+  getInputEntity(peer: unknown): Promise<Record<string, unknown>>;
+  getDialogs(options?: {
+    folder?: 0 | 1;
+    archived?: boolean;
+    limit?: number;
+    ignorePinned?: boolean;
+    ignoreMigrated?: boolean;
+    offsetDate?: number;
+    offsetId?: number;
+    offsetPeer?: unknown;
+  }): Promise<Array<Record<string, any>> & { total: number }>;
+  getMessages(
+    entity: unknown,
+    options?: { limit?: number; offsetId?: number; ids?: number | number[] },
+  ): Promise<Array<Record<string, any> | undefined> & { total: number }>;
+  /** Only ownerApi.messages.GetDialogFilters (or GramJS's own request of that name). */
+  invoke(request: { className: string }): Promise<Record<string, any>>;
+  /** Reserved: rejects with code "OWNER_CLIENT_NOT_MODELLED". */
+  markAsRead(...args: unknown[]): Promise<never>;
+  /** Reserved: rejects with code "OWNER_CLIENT_NOT_MODELLED". */
+  sendMessage(...args: unknown[]): Promise<never>;
+}
+
+/**
+ * A client for one owner of a running server. `session` stands in for a
+ * StringSession and is only ever recorded redacted.
+ */
+export declare function createOwnerClient(options: {
+  origin: string;
+  userId: number;
+  session?: string;
+}): OwnerClient;
+
+/** Request classes for OwnerClient.invoke(). */
+export declare const ownerApi: {
+  messages: {
+    GetDialogFilters: new (args?: Record<string, unknown>) => {
+      className: "messages.GetDialogFilters";
+    };
+  };
+};
 
 export declare function startTestServer(
   options: TelegramBotTestServerOptions,

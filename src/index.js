@@ -22,6 +22,7 @@
  *
  * Nothing here talks to Telegram.
  */
+import { createOwnerModel, OwnerError } from "./owner.js";
 import http from "node:http";
 import {
   createHash,
@@ -428,6 +429,8 @@ export async function startTestServer({
   // Join request queries awaiting answerChatJoinRequestQuery, by query id.
   const joinQueries = new Map();
   const files = new Map();
+  // Owner accounts: what a user sees on their own account (owner.js).
+  const ownerModel = createOwnerModel({ log });
   const chats = new Map();
   // Public channels, groups and bots other accounts link to, by lower-case
   // username. A personal profile is never public: getChat on it fails.
@@ -2681,6 +2684,16 @@ export async function startTestServer({
   // ── Test controls (/_fake/*) ───────────────────────────────────────────
   async function control(method, parts, body) {
     const [resource, id, sub, subId] = parts;
+    if (resource === "owners") {
+      try {
+        return ownerModel.control(method, parts.slice(1), body);
+      } catch (error) {
+        if (error instanceof OwnerError) {
+          throw new TelegramError(error.status, error.message);
+        }
+        throw error;
+      }
+    }
     if (resource === "bots" && !id && method === "POST") {
       try {
         return userObject(
@@ -3856,6 +3869,22 @@ ${buttons}
         }
         return;
       }
+      const ownerCall = url.pathname.match(/^\/_owner\/([^/]+)\/([A-Za-z]+)$/);
+      if (ownerCall && request.method === "POST") {
+        const args = body.length ? parseJsonObject(body) : {};
+        const answer = await ownerModel.rpc(
+          decodeURIComponent(ownerCall[1]),
+          ownerCall[2],
+          args,
+        );
+        // A dropped response: the call ran, and the connection closes unanswered.
+        if (answer.drop) {
+          request.socket.destroy();
+          return;
+        }
+        send(response, answer.status, answer.body);
+        return;
+      }
       if (serveLogin(request, url, body, response)) return;
       const file = url.pathname.match(/^\/file\/bot([^/]+)\/(.+)$/);
       if (file) {
@@ -4096,6 +4125,108 @@ ${buttons}
       }),
     clearFailures: () => act("DELETE", "failures"),
     createUser: async (fields = {}) => (await act("POST", "users", fields)).id,
+    createOwner: ({ userId, firstName, lastName, username } = {}) =>
+      act("POST", "owners", {
+        user_id: userId,
+        first_name: firstName,
+        last_name: lastName,
+        username,
+      }),
+    updateOwner: (ownerId, { authorized } = {}) =>
+      act("POST", `owners/${ownerId}`, { authorized }),
+    getOwner: (ownerId) => act("GET", `owners/${ownerId}`),
+    addOwnerUser: (ownerId, { id, firstName, lastName, username, bot } = {}) =>
+      act("POST", `owners/${ownerId}/users`, {
+        id,
+        first_name: firstName,
+        last_name: lastName,
+        username,
+        bot,
+      }),
+    addOwnerDialog: (ownerId, fields = {}) =>
+      act("POST", `owners/${ownerId}/dialogs`, {
+        kind: fields.kind,
+        id: fields.id,
+        title: fields.title,
+        first_name: fields.firstName,
+        last_name: fields.lastName,
+        username: fields.username,
+        participants_count: fields.participantsCount,
+        folder: fields.folder,
+        pinned: fields.pinned,
+        muted: fields.muted,
+        mute_until: fields.muteUntil,
+        unread_count: fields.unreadCount,
+        date: fields.date,
+      }),
+    updateOwnerDialog: (ownerId, peerId, fields = {}) =>
+      act("POST", `owners/${ownerId}/dialogs/${peerId}`, {
+        folder: fields.folder,
+        pinned: fields.pinned,
+        muted: fields.muted,
+        mute_until: fields.muteUntil,
+        unread_count: fields.unreadCount,
+      }),
+    addOwnerMessages: (ownerId, peerId, messages) =>
+      act("POST", `owners/${ownerId}/dialogs/${peerId}/messages`, {
+        messages: messages.map((message) => ({
+          id: message.id,
+          date: message.date,
+          from_id: message.fromId,
+          out: message.out,
+          text: message.text,
+          action: message.action,
+          reply_to: message.replyTo,
+          media: message.media,
+          edit_date: message.editDate,
+        })),
+      }),
+    editOwnerMessage: (ownerId, peerId, messageId, { text, editDate } = {}) =>
+      act("POST", `owners/${ownerId}/dialogs/${peerId}/messages/${messageId}`, {
+        text,
+        edit_date: editDate,
+      }),
+    deleteOwnerMessage: (ownerId, peerId, messageId) =>
+      act(
+        "DELETE",
+        `owners/${ownerId}/dialogs/${peerId}/messages/${messageId}`,
+      ),
+    setOwnerFilter: (ownerId, filter) =>
+      act("POST", `owners/${ownerId}/filters`, {
+        id: filter.id,
+        title: filter.title,
+        emoticon: filter.emoticon,
+        color: filter.color,
+        include_peers: filter.includePeers,
+        exclude_peers: filter.excludePeers,
+        pinned_peers: filter.pinnedPeers,
+        contacts: filter.contacts,
+        non_contacts: filter.nonContacts,
+        groups: filter.groups,
+        broadcasts: filter.broadcasts,
+        bots: filter.bots,
+        exclude_muted: filter.excludeMuted,
+        exclude_read: filter.excludeRead,
+        exclude_archived: filter.excludeArchived,
+      }),
+    orderOwnerFilters: (ownerId, ids) =>
+      act("POST", `owners/${ownerId}/filters/order`, { ids }),
+    deleteOwnerFilter: (ownerId, filterId) =>
+      act("DELETE", `owners/${ownerId}/filters/${filterId}`),
+    failOwnerCall: (ownerId, fault) =>
+      act("POST", `owners/${ownerId}/faults`, {
+        method: fault.method,
+        peer_id: fault.peerId,
+        times: fault.times,
+        delay_ms: fault.delayMs,
+        preset: fault.preset,
+        seconds: fault.seconds,
+        error_message: fault.errorMessage,
+        code: fault.code,
+      }),
+    clearOwnerFaults: (ownerId) => act("DELETE", `owners/${ownerId}/faults`),
+    getOwnerCalls: (ownerId) => act("GET", `owners/${ownerId}/calls`),
+    resetOwners: () => act("DELETE", "owners"),
     approveLogin: async (authUrl, userId) =>
       (
         await act("POST", "login/approve", {
@@ -4254,3 +4385,5 @@ ${buttons}
       }),
   };
 }
+
+export { createOwnerClient, ownerApi } from "./owner-client.js";
