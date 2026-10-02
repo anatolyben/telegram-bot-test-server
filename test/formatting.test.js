@@ -279,7 +279,7 @@ describe("bot sends", () => {
     form.append("parse_mode", "Markdown");
     form.append(
       "document",
-      new Blob(["a,b\n1,2"], { type: "text/csv" }),
+      new Blob(["a,b\n1,2"], { type: "text/csv; charset=utf-8" }),
       "report.csv",
     );
     const response = await fetch(`${server.origin}/bot${TOKEN}/sendDocument`, {

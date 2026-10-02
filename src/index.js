@@ -337,9 +337,10 @@ async function readRequestParams(request, body) {
 async function uploadedFile(file) {
   const bytes = Buffer.from(await file.arrayBuffer());
   if (file.name) bytes.fileName = file.name;
-  if (file.type && file.type !== "application/octet-stream") {
-    bytes.mimeType = file.type;
-  }
+  // A part's type may carry parameters ("text/plain;charset=utf-8"); Telegram
+  // reports the bare media type.
+  const type = file.type.split(";")[0].trim().toLowerCase();
+  if (type && type !== "application/octet-stream") bytes.mimeType = type;
   return bytes;
 }
 
