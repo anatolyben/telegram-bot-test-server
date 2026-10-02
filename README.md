@@ -525,12 +525,22 @@ The test actions above, over HTTP, for tests written in other languages. All rou
 A button press waits up to 10 seconds for the bot to call `answerCallbackQuery` and returns
 `{ answered, text, show_alert }`.
 
+## Formatting, replies and uploads
+
+A bot's `text` and `caption` honour `parse_mode` (`HTML`, `MarkdownV2` and legacy `Markdown`) and
+explicit `entities` / `caption_entities`, so messages come back as Telegram stores them: plain
+text plus entities with UTF-16 offsets, and links, mentions and commands detected where no
+formatting covers them. Markup Telegram rejects (an unescaped `.` in MarkdownV2, an unclosed tag)
+fails with Telegram's `can't parse entities` error. `reply_parameters` and `reply_to_message_id`
+set `reply_to_message` (`allow_sending_without_reply` is honoured), and a message in a forum topic
+replies to the topic's creation message, as on Telegram. An uploaded document keeps its file name
+and content type, also when sent again by `file_id`.
+
 ## What it does not do
 
 - Inline mode, payments, games, sticker sets, reaction counts, votes in polls, or Telegram's rate limits
   (a test makes a call fail with a 429 through `POST failures` instead). Channels have no
   subscribers and forum topics cannot be closed or deleted.
-- `parse_mode` formatting: text is stored exactly as sent, tags and all.
 - Expiry: restrictions and bans with an `until_date` never lift on their own.
 - Webhook retries: an update the webhook rejects, or does not answer within 10 seconds, is logged and
   dropped rather than retried.

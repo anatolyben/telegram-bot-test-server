@@ -23,6 +23,7 @@
  * Nothing here talks to Telegram.
  */
 import { createOwnerModel, OwnerError } from "./owner.js";
+import { formatText, FormattingError } from "./formatting.js";
 import http from "node:http";
 import {
   createHash,
@@ -326,12 +327,43 @@ async function readRequestParams(request, body) {
   for (const [key, value] of form.entries()) {
     entries.push([
       key,
-      typeof value === "string"
-        ? value
-        : Buffer.from(await value.arrayBuffer()),
+      typeof value === "string" ? value : await uploadedFile(value),
     ]);
   }
   return { ...params, ...coerceParams(entries) };
+}
+
+/** An uploaded part's bytes, carrying the file name and type it was sent with. */
+async function uploadedFile(file) {
+  const bytes = Buffer.from(await file.arrayBuffer());
+  if (file.name) bytes.fileName = file.name;
+  if (file.type && file.type !== "application/octet-stream") {
+    bytes.mimeType = file.type;
+  }
+  return bytes;
+}
+
+const MIME_TYPES = {
+  txt: "text/plain",
+  csv: "text/csv",
+  html: "text/html",
+  md: "text/markdown",
+  json: "application/json",
+  pdf: "application/pdf",
+  zip: "application/zip",
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  mp3: "audio/mpeg",
+  ogg: "audio/ogg",
+  mp4: "video/mp4",
+};
+
+function guessMimeType(fileName) {
+  const extension = /\.([a-z0-9]+)$/i.exec(fileName ?? "")?.[1]?.toLowerCase();
+  return extension ? MIME_TYPES[extension] : undefined;
 }
 
 function readBody(request) {
@@ -1155,12 +1187,23 @@ export async function startTestServer({
     const data = bytes;
     const fileId = `AgACAgQAAx0Cfake${randomBytes(9).toString("base64url")}`;
     const uniqueId = fileUniqueId();
+    const fileName = bytes.fileName;
+    const mimeType =
+      bytes.mimeType ?? (fileName ? guessMimeType(fileName) : undefined);
     files.set(fileId, {
       data,
       file_unique_id: uniqueId,
       file_path: `${folder}/${fileId}.${extension}`,
+      ...(fileName ? { file_name: fileName } : {}),
+      ...(mimeType ? { mime_type: mimeType } : {}),
     });
-    return { file_id: fileId, file_unique_id: uniqueId, size: data.length };
+    return {
+      file_id: fileId,
+      file_unique_id: uniqueId,
+      size: data.length,
+      ...(fileName ? { file_name: fileName } : {}),
+      ...(mimeType ? { mime_type: mimeType } : {}),
+    };
   }
 
   function registerPhoto(bytes) {
@@ -1178,6 +1221,8 @@ export async function startTestServer({
         file_id: value,
         file_unique_id: file.file_unique_id,
         size: file.data.length,
+        ...(file.file_name ? { file_name: file.file_name } : {}),
+        ...(file.mime_type ? { mime_type: file.mime_type } : {}),
       };
     }
     return registerFile(
@@ -1478,7 +1523,7 @@ export async function startTestServer({
     sendMessage: (p, caller) =>
       p.business_connection_id
         ? sendBusinessMessage(p, caller)
-        : sendFrom(p, caller, { text: String(p.text ?? "") }),
+        : sendFrom(p, caller, textFields(p)),
     getBusinessConnection: (p, caller) =>
       businessConnectionObject(
         requireBusinessConnection(p.business_connection_id, caller),
@@ -1494,7 +1539,7 @@ export async function startTestServer({
           : sentFile(p.photo, "photos", "jpg");
       return sendFrom(p, caller, {
         photo: photoSizes(photo),
-        ...(p.caption ? { caption: String(p.caption) } : {}),
+        ...captionFields(p),
       });
     },
     sendDocument: (p, caller) => {
@@ -1504,8 +1549,10 @@ export async function startTestServer({
           file_id: file.file_id,
           file_unique_id: file.file_unique_id,
           file_size: file.size,
+          file_name: file.file_name ?? "document",
+          mime_type: file.mime_type ?? "application/octet-stream",
         },
-        ...(p.caption ? { caption: String(p.caption) } : {}),
+        ...captionFields(p),
       });
     },
     sendVideo: (p, caller) => {
@@ -1519,7 +1566,7 @@ export async function startTestServer({
           duration: 1,
           file_size: file.size,
         },
-        ...(p.caption ? { caption: String(p.caption) } : {}),
+        ...captionFields(p),
       });
     },
     sendAnimation: (p, caller) => {
@@ -1533,7 +1580,7 @@ export async function startTestServer({
           duration: 1,
           file_size: file.size,
         },
-        ...(p.caption ? { caption: String(p.caption) } : {}),
+        ...captionFields(p),
       });
     },
     sendSticker: (p, caller) => {
@@ -1551,15 +1598,24 @@ export async function startTestServer({
         },
       });
     },
-    editMessageText: (p, caller) =>
-      editMessage(p, caller, (message) => {
-        message.text = String(p.text ?? "");
-      }),
+    editMessageText: (p, caller) => {
+      const formatted = textFields(p);
+      return editMessage(p, caller, (message) => {
+        message.text = formatted.text;
+        if (formatted.entities) message.entities = formatted.entities;
+        else delete message.entities;
+      });
+    },
     editMessageReplyMarkup: (p, caller) => editMessage(p, caller, () => {}),
-    editMessageCaption: (p, caller) =>
-      editMessage(p, caller, (message) => {
-        message.caption = String(p.caption ?? "");
-      }),
+    editMessageCaption: (p, caller) => {
+      const formatted = captionFields(p);
+      return editMessage(p, caller, (message) => {
+        message.caption = formatted.caption ?? "";
+        if (formatted.caption_entities) {
+          message.caption_entities = formatted.caption_entities;
+        } else delete message.caption_entities;
+      });
+    },
     // The new media is an upload attached as attach://<name>, or the file_id
     // of a file this server holds.
     editMessageMedia: (p, caller) => {
@@ -2291,8 +2347,10 @@ export async function startTestServer({
     const chat = botChat(p.chat_id);
     requireCanSend(chat, caller);
     requireTopic(chat, p.message_thread_id);
+    const replyTo = replyTarget(chat, p);
     const message = addMessage(chat, caller, {
       ...fields,
+      ...(replyTo ? { reply_to_message: replyTo } : {}),
       ...(markup ? { reply_markup: markup } : {}),
       ...(p.message_thread_id && chat.topics
         ? {
@@ -2308,16 +2366,106 @@ export async function startTestServer({
     return message;
   }
 
+  /**
+   * The message a bot send answers: reply_parameters (or the older
+   * reply_to_message_id), else, in a forum topic, the topic's creation message.
+   */
+  function replyTarget(chat, p) {
+    const parameters =
+      p.reply_parameters ??
+      (p.reply_to_message_id != null
+        ? {
+            message_id: p.reply_to_message_id,
+            allow_sending_without_reply: p.allow_sending_without_reply,
+          }
+        : null);
+    if (parameters?.message_id != null) {
+      if (
+        parameters.chat_id != null &&
+        String(parameters.chat_id) !== String(chat.id) &&
+        String(parameters.chat_id) !== String(p.chat_id)
+      ) {
+        throw new TelegramError(
+          400,
+          "Bad Request: replies to other chats are not supported here",
+        );
+      }
+      const entry = chat.messages.get(Number(parameters.message_id));
+      if (entry && !entry.deleted) {
+        const { reply_to_message: _nested, ...original } = entry.message;
+        return original;
+      }
+      if (parameters.allow_sending_without_reply === true) return null;
+      throw new TelegramError(
+        400,
+        "Bad Request: message to be replied not found",
+      );
+    }
+    if (p.message_thread_id && chat.topics) {
+      const topic = chat.messages.get(Number(p.message_thread_id));
+      if (topic) {
+        const { reply_to_message: _nested, ...original } = topic.message;
+        return original;
+      }
+    }
+    return null;
+  }
+
+  /** text and entities of a bot's message, after parse_mode or explicit entities. */
+  function textFields(p) {
+    const formatted = formatOrFail(
+      String(p.text ?? ""),
+      p.parse_mode,
+      p.entities,
+    );
+    if (!formatted.text.trim()) {
+      throw new TelegramError(400, "Bad Request: message text is empty");
+    }
+    return {
+      text: formatted.text,
+      ...(formatted.entities.length > 0
+        ? { entities: formatted.entities }
+        : {}),
+    };
+  }
+
+  /** caption and caption_entities of a bot's media message. */
+  function captionFields(p) {
+    if (p.caption == null || p.caption === "") return {};
+    const formatted = formatOrFail(
+      String(p.caption),
+      p.parse_mode,
+      p.caption_entities,
+    );
+    return {
+      caption: formatted.text,
+      ...(formatted.entities.length > 0
+        ? { caption_entities: formatted.entities }
+        : {}),
+    };
+  }
+
+  function formatOrFail(text, parseMode, entities) {
+    try {
+      return formatText(text, { parseMode, entities, detect: messageEntities });
+    } catch (error) {
+      if (error instanceof FormattingError) {
+        throw new TelegramError(400, error.message);
+      }
+      throw error;
+    }
+  }
+
   /** A bot sends a voice note, audio file or video note. */
   function sendMedia(p, caller, type) {
     const file = sentFile(p[type], `${type}s`, MEMBER_MEDIA[type].ext);
     return sendFrom(p, caller, {
       ...mediaFields(type, file, {
         duration: p.duration == null ? 1 : Number(p.duration),
+        fileName: file.file_name,
+        mimeType: file.mime_type,
       }),
-      ...(p.caption && MEMBER_MEDIA[type].caption
-        ? { caption: String(p.caption) }
-        : {}),
+      ...(MEMBER_MEDIA[type].caption ? captionFields(p) : {}),
     });
   }
 
@@ -2606,7 +2754,9 @@ export async function startTestServer({
     const same = (message) =>
       JSON.stringify([
         message.text,
+        message.entities,
         message.caption,
+        message.caption_entities,
         message.reply_markup,
         ...MEDIA_KINDS.map((kind) => message[kind]),
       ]);
