@@ -1,7 +1,7 @@
 /**
  * parse_mode for bot messages: turns HTML, MarkdownV2 or legacy Markdown into
  * plain text plus MessageEntity objects, with UTF-16 offsets as Telegram
- * reports them. Markup Telegram would reject is rejected with its error text.
+ * reports them. Supported contracts are documented in README.md.
  */
 
 export class FormattingError extends Error {}
@@ -16,8 +16,143 @@ function sortEntities(entities) {
   return entities
     .filter((entity) => entity.length > 0)
     .sort(
-      (left, right) => left.offset - right.offset || right.length - left.length,
+      (left, right) =>
+        left.offset - right.offset ||
+        right.length - left.length ||
+        entityPriority(left.type) - entityPriority(right.type),
     );
+}
+
+// TDLib MessageEntity.cpp: fix_entities, split_entities, merge_new_entities.
+// Styles merge per type and split at continuous/blockquote boundaries; code
+// and pre exclude styles. Overlapping continuous entities and quotes are pruned.
+const STYLES = new Set([
+  "bold",
+  "italic",
+  "underline",
+  "strikethrough",
+  "spoiler",
+]);
+const QUOTES = new Set(["blockquote", "expandable_blockquote"]);
+const CODE = new Set(["code", "pre"]);
+function entityPriority(type) {
+  return (
+    {
+      blockquote: 0,
+      expandable_blockquote: 0,
+      pre: 11,
+      code: 20,
+      text_link: 49,
+      text_mention: 49,
+      bold: 90,
+      italic: 91,
+      underline: 92,
+      strikethrough: 93,
+      spoiler: 94,
+      custom_emoji: 99,
+    }[type] ?? 50
+  );
+}
+const endOf = (entity) => entity.offset + entity.length;
+const intersects = (a, b) => a.offset < endOf(b) && b.offset < endOf(a);
+function nonOverlapping(entities) {
+  let end = 0;
+  return sortEntities(entities).filter((entity) => {
+    if (entity.offset < end) return false;
+    end = endOf(entity);
+    return true;
+  });
+}
+function normalizeEntities(entities) {
+  const quotes = nonOverlapping(
+    entities.filter((entity) => QUOTES.has(entity.type)),
+  );
+  const continuous = nonOverlapping(
+    entities.filter(
+      (entity) => !STYLES.has(entity.type) && !QUOTES.has(entity.type),
+    ),
+  ).filter((entity) =>
+    quotes.every(
+      (quote) =>
+        !intersects(entity, quote) ||
+        (quote.offset <= entity.offset && endOf(entity) <= endOf(quote)),
+    ),
+  );
+  const base = sortEntities([...quotes, ...continuous]);
+  const styles = [];
+  for (const type of STYLES) {
+    const merged = [];
+    for (const entity of sortEntities(
+      entities.filter((entry) => entry.type === type),
+    )) {
+      const previous = merged.at(-1);
+      if (previous && entity.offset <= endOf(previous)) {
+        previous.length =
+          Math.max(endOf(previous), endOf(entity)) - previous.offset;
+      } else merged.push({ ...entity });
+    }
+    for (const entity of merged) {
+      const boundaries = [
+        ...new Set([
+          entity.offset,
+          endOf(entity),
+          ...base.flatMap((other) =>
+            [other.offset, endOf(other)].filter(
+              (offset) => entity.offset < offset && offset < endOf(entity),
+            ),
+          ),
+        ]),
+      ].sort((a, b) => a - b);
+      for (let i = 1; i < boundaries.length; i++) {
+        const piece = {
+          type,
+          offset: boundaries[i - 1],
+          length: boundaries[i] - boundaries[i - 1],
+        };
+        if (
+          !continuous.some(
+            (other) => CODE.has(other.type) && intersects(piece, other),
+          )
+        )
+          styles.push(piece);
+      }
+    }
+  }
+  return sortEntities([...base, ...styles]);
+}
+function validateRanges(text, entities) {
+  const insideSurrogate = (offset) =>
+    offset > 0 &&
+    offset < text.length &&
+    text.charCodeAt(offset - 1) >= 0xd800 &&
+    text.charCodeAt(offset - 1) <= 0xdbff &&
+    text.charCodeAt(offset) >= 0xdc00 &&
+    text.charCodeAt(offset) <= 0xdfff;
+  for (const entity of entities) {
+    if (
+      !Number.isInteger(entity.offset) ||
+      entity.offset < 0 ||
+      entity.offset > 1000000
+    )
+      fail(`Receive an entity with incorrect offset ${entity.offset}`);
+    if (
+      !Number.isInteger(entity.length) ||
+      entity.length < 0 ||
+      entity.length > 1000000
+    )
+      fail(`Receive an entity with incorrect length ${entity.length}`);
+    if (entity.length === 0) continue;
+    if (entity.offset > text.length)
+      fail(
+        `Entity begins after the end of the text at UTF-16 offset ${entity.offset}`,
+      );
+    if (endOf(entity) > text.length)
+      fail(
+        `Entity beginning at UTF-16 offset ${entity.offset} ends after the end of the text at UTF-16 offset ${endOf(entity)}`,
+      );
+    if (insideSurrogate(entity.offset) || insideSurrogate(endOf(entity)))
+      fail("Entity boundary is in the middle of a UTF-16 symbol");
+  }
 }
 
 function linkEntity(url, offset, length) {
@@ -202,7 +337,7 @@ export function parseMarkdownV2(input) {
   const atLineStart = (at) => at === 0 || input[at - 1] === "\n";
 
   const toggle = (type, width, at) => {
-    const top = open.findLastIndex((entry) => entry.type === type);
+    const top = open.at(-1)?.type === type ? open.length - 1 : -1;
     if (top >= 0) {
       const [entry] = open.splice(top, 1);
       entities.push({
@@ -338,7 +473,7 @@ export function parseMarkdownV2(input) {
       const top = open.findLastIndex(
         (entry) => entry.type === "link" || entry.type === "custom_emoji_link",
       );
-      if (top < 0 || input[index + 1] !== "(") {
+      if (top < 0 || top !== open.length - 1 || input[index + 1] !== "(") {
         fail(
           `Character ']' is reserved and must be escaped with the preceding '\\'`,
         );
@@ -475,14 +610,14 @@ export function parseMarkdown(input) {
 /**
  * The text and entities a bot message ends up with. Explicit entities win over
  * parse_mode, as on Telegram; `detect` adds the links, mentions and commands
- * Telegram finds by itself where no formatting entity covers them.
+ * Telegram finds by itself outside code, pre and explicit links.
  */
 export function formatText(text, { parseMode, entities, detect }) {
   let parsed;
   if (Array.isArray(entities)) {
     parsed = {
       text,
-      entities: sortEntities(entities.map((entity) => ({ ...entity }))),
+      entities: entities.map((entity) => ({ ...entity })),
     };
   } else {
     const mode = typeof parseMode === "string" ? parseMode.toLowerCase() : "";
@@ -495,15 +630,23 @@ export function formatText(text, { parseMode, entities, detect }) {
         `Bad Request: unsupported parse_mode "${parseMode}"`,
       );
   }
-  const overlaps = (candidate) =>
-    parsed.entities.some(
+  validateRanges(parsed.text, parsed.entities);
+  parsed.entities = normalizeEntities(parsed.entities);
+  // Automatically found entities can coexist with styles, but not continuous
+  // entities such as code, pre or an explicit text link.
+  const detected = detect(parsed.text).filter((candidate) =>
+    parsed.entities.every(
       (entity) =>
-        candidate.offset < entity.offset + entity.length &&
-        entity.offset < candidate.offset + candidate.length,
-    );
-  const detected = detect(parsed.text).filter((entity) => !overlaps(entity));
+        STYLES.has(entity.type) ||
+        (QUOTES.has(entity.type)
+          ? !intersects(candidate, entity) ||
+            (entity.offset <= candidate.offset &&
+              endOf(candidate) <= endOf(entity))
+          : !intersects(candidate, entity)),
+    ),
+  );
   return {
     text: parsed.text,
-    entities: sortEntities([...parsed.entities, ...detected]),
+    entities: normalizeEntities([...parsed.entities, ...detected]),
   };
 }

@@ -53,7 +53,12 @@ export type Message = { message_id: number; [field: string]: unknown };
 /** A chat member in the Bot API's ChatMember shape. */
 export type ChatMember = {
   status:
-    "creator" | "administrator" | "member" | "restricted" | "left" | "kicked";
+    | "creator"
+    | "administrator"
+    | "member"
+    | "restricted"
+    | "left"
+    | "kicked";
   user: { id: number; [field: string]: unknown };
   [field: string]: unknown;
 };
@@ -155,6 +160,14 @@ export interface FailureRule {
   chatId?: number;
   /** Only calls from this bot. */
   botId?: number;
+  /** Only this target user (user_id or ephemeral receiver). */
+  userId?: number;
+  /** Only this message_id. */
+  messageId?: number;
+  /** Start on this matching attempt after installing the rule; default 1. */
+  attempt?: number;
+  /** Delay the response by 0-30000 ms; without an error/drop, succeeds normally. */
+  delayMs?: number;
   /** How many calls fail; default 1. */
   times?: number;
   /** Default 400. */
@@ -444,12 +457,27 @@ export interface TelegramBotTestServer {
   /** Every Bot API call received, and any unsupported methods called. */
   getCalls(): Promise<{
     calls: Array<{
+      seq: number;
       method: string;
+      /** Handler completed successfully; does not imply a mutation for read/no-op methods. */
+      applied: boolean;
+      outcome:
+        | "pending"
+        | "succeeded"
+        | "delayed"
+        | "response_lost"
+        | "rejected"
+        | "unimplemented_ok";
+      status?: number;
+      completed_at?: number;
+      fault_id?: string;
+      attempt?: number;
+      delay_ms?: number;
       /** The bot that made the call. */
       bot_id: number;
       params: Record<string, unknown>;
       at: number;
-      /** The error a failure rule answered with. */
+      /** Rejected status, including actual permission/validation failures. */
       failed?: number;
       /** The call took effect and its answer was dropped. */
       dropped?: true;
@@ -465,7 +493,11 @@ export interface TelegramBotTestServer {
 // which give the same String() and Number().
 
 export type OwnerDialogKind =
-  "private" | "bot" | "group" | "supergroup" | "channel";
+  | "private"
+  | "bot"
+  | "group"
+  | "supergroup"
+  | "channel";
 
 export interface OwnerDialogFields {
   kind: OwnerDialogKind;

@@ -321,3 +321,204 @@ describe("bot sends", () => {
     });
   });
 });
+
+describe("formatting contract regressions", () => {
+  it.each([
+    ["negative offset", "abc", -1, 1],
+    ["negative length", "abc", 0, -1],
+    ["start after text", "abc", 4, 1],
+    ["end after text", "abc", 0, 4],
+    ["start inside surrogate", "😀x", 1, 1],
+    ["end inside surrogate", "😀x", 0, 1],
+  ])(
+    "rejects %s before storing a message",
+    async (_name, text, offset, length) => {
+      const { server, api } = await setup();
+      const before = await server.getMessages(GROUP);
+      expect(
+        await api("sendMessage", {
+          chat_id: GROUP,
+          text,
+          entities: [{ type: "bold", offset, length }],
+        }),
+      ).toMatchObject({ status: 400, ok: false });
+      expect(await server.getMessages(GROUP)).toEqual(before);
+    },
+  );
+
+  it("normalizes styles around code and overlapping blockquotes like TDLib", async () => {
+    const { api } = await setup();
+    const code = await api("sendMessage", {
+      chat_id: GROUP,
+      text: "<b>a<code>x</code>b</b>",
+      parse_mode: "HTML",
+    });
+    expect(code.result).toMatchObject({
+      text: "axb",
+      entities: [
+        { type: "bold", offset: 0, length: 1 },
+        { type: "code", offset: 1, length: 1 },
+        { type: "bold", offset: 2, length: 1 },
+      ],
+    });
+    const quote = await api("sendMessage", {
+      chat_id: GROUP,
+      text: "<blockquote>a<blockquote>x</blockquote>b</blockquote>",
+      parse_mode: "HTML",
+    });
+    expect(quote.result.entities).toEqual([
+      { type: "blockquote", offset: 0, length: 3 },
+    ]);
+  });
+
+  it("rejects crossed Markdown delimiters without posting", async () => {
+    const { server, api } = await setup();
+    const before = await server.getMessages(GROUP);
+    for (const text of ["*a _b* c_", "[a *b](https://e.com)*"]) {
+      expect(
+        await api("sendMessage", {
+          chat_id: GROUP,
+          text,
+          parse_mode: "MarkdownV2",
+        }),
+      ).toMatchObject({ status: 400, ok: false });
+    }
+    expect(await server.getMessages(GROUP)).toEqual(before);
+  });
+
+  it("detects links inside styles but suppresses detection inside code and explicit links", async () => {
+    const { api } = await setup();
+    const bold = await api("sendMessage", {
+      chat_id: GROUP,
+      text: "<b>https://e.com</b>",
+      parse_mode: "HTML",
+    });
+    expect(bold.result.entities).toEqual([
+      { type: "url", offset: 0, length: 13 },
+      { type: "bold", offset: 0, length: 13 },
+    ]);
+    for (const text of [
+      "<code>https://e.com</code>",
+      '<a href="https://target.com">https://e.com</a>',
+    ]) {
+      const sent = await api("sendMessage", {
+        chat_id: GROUP,
+        text,
+        parse_mode: "HTML",
+      });
+      expect(sent.result.entities).toHaveLength(1);
+      expect(sent.result.entities[0].type).not.toBe("url");
+    }
+  });
+
+  it("formats album captions and replaces stale entities on media edits", async () => {
+    const { server, api } = await setup();
+    const form = new FormData();
+    form.append("chat_id", String(GROUP));
+    form.append("photo", new Blob(["photo"]), "photo.jpg");
+    form.append("caption", "<b>old</b>");
+    form.append("parse_mode", "HTML");
+    const sent = await (
+      await fetch(`${server.origin}/bot${TOKEN}/sendPhoto`, {
+        method: "POST",
+        body: form,
+      })
+    ).json();
+    const file = sent.result.photo[0].file_id;
+    const album = await api("sendMediaGroup", {
+      chat_id: GROUP,
+      media: [
+        {
+          type: "photo",
+          media: file,
+          caption: "<i>first</i>",
+          parse_mode: "HTML",
+        },
+        {
+          type: "photo",
+          media: file,
+          caption: "second",
+          caption_entities: [{ type: "bold", offset: 0, length: 6 }],
+        },
+      ],
+    });
+    expect(album.result[0]).toMatchObject({
+      caption: "first",
+      caption_entities: [{ type: "italic", offset: 0, length: 5 }],
+    });
+    expect(album.result[1].caption_entities).toEqual([
+      { type: "bold", offset: 0, length: 6 },
+    ]);
+    const before = await server.getMessages(GROUP);
+    expect(
+      await api("sendMediaGroup", {
+        chat_id: GROUP,
+        media: [
+          { type: "photo", media: file, caption: "valid" },
+          {
+            type: "photo",
+            media: file,
+            caption: "<b>open",
+            parse_mode: "HTML",
+          },
+        ],
+      }),
+    ).toMatchObject({ status: 400, ok: false });
+    expect(await server.getMessages(GROUP)).toEqual(before);
+    const edited = await api("editMessageMedia", {
+      chat_id: GROUP,
+      message_id: sent.result.message_id,
+      media: {
+        type: "photo",
+        media: file,
+        caption: "<i>new</i>",
+        parse_mode: "HTML",
+      },
+    });
+    expect(edited.result).toMatchObject({
+      caption: "new",
+      caption_entities: [{ type: "italic", offset: 0, length: 3 }],
+    });
+    const plain = await api("editMessageMedia", {
+      chat_id: GROUP,
+      message_id: sent.result.message_id,
+      media: { type: "photo", media: file, caption: "plain" },
+    });
+    expect(plain.result.caption).toBe("plain");
+    expect(plain.result.caption_entities).toBeUndefined();
+  });
+});
+
+it("formats business sends and rejects invalid formatting without storing a reply", async () => {
+  const { server, api } = await setup();
+  const owner = await server.createUser();
+  const person = await server.createUser();
+  const { connection } = await server.connectBusiness({
+    ownerId: owner,
+    rights: { can_reply: true },
+  });
+  await server.sayInBusinessChat(connection.id, person, "person", "hello");
+  const sent = await api("sendMessage", {
+    business_connection_id: connection.id,
+    chat_id: person,
+    text: "<b>https://e.com</b>",
+    parse_mode: "HTML",
+  });
+  expect(sent.result).toMatchObject({
+    text: "https://e.com",
+    entities: [
+      { type: "url", offset: 0, length: 13 },
+      { type: "bold", offset: 0, length: 13 },
+    ],
+  });
+  const before = await server.getBusinessChat(connection.id, person);
+  expect(
+    await api("sendMessage", {
+      business_connection_id: connection.id,
+      chat_id: person,
+      text: "<b>open",
+      parse_mode: "HTML",
+    }),
+  ).toMatchObject({ status: 400, ok: false });
+  expect(await server.getBusinessChat(connection.id, person)).toEqual(before);
+});

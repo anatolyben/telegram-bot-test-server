@@ -833,3 +833,121 @@ describe("failures and topics a test can inspect", () => {
       });
   });
 });
+
+describe("precise fault receipts", () => {
+  it("targets the second matching user/message attempt and preserves unrelated operations", async () => {
+    const { fake, api } = await setup();
+    const ann = await fake.createUser(),
+      bob = await fake.createUser();
+    await fake.join(GROUP, ann);
+    await fake.join(GROUP, bob);
+    await fake.failNext({
+      method: "restrictChatMember",
+      chatId: GROUP,
+      userId: ann,
+      attempt: 2,
+      errorCode: 403,
+    });
+    const params = {
+      chat_id: GROUP,
+      user_id: ann,
+      permissions: { can_send_messages: false },
+    };
+    expect(
+      await api("restrictChatMember", { ...params, user_id: bob }),
+    ).toMatchObject({ ok: true });
+    expect(await api("restrictChatMember", params)).toMatchObject({ ok: true });
+    expect(await api("restrictChatMember", params)).toMatchObject({
+      ok: false,
+      status: 403,
+    });
+    const a = await fake.post(GROUP, OWNER, "a"),
+      b = await fake.post(GROUP, OWNER, "b");
+    await fake.failNext({
+      method: "deleteMessage",
+      chatId: GROUP,
+      messageId: a,
+      userId: OWNER,
+      errorCode: 403,
+    });
+    expect(
+      await api("deleteMessage", { chat_id: GROUP, message_id: b }),
+    ).toMatchObject({ ok: true });
+    expect(
+      await api("deleteMessage", { chat_id: GROUP, message_id: a }),
+    ).toMatchObject({ ok: false });
+    expect(await fake.getMessage(GROUP, a)).toMatchObject({ deleted: false });
+    await fake.failNext({
+      method: "deleteMessages",
+      chatId: GROUP,
+      messageId: a,
+      errorCode: 403,
+    });
+    expect(
+      await api("deleteMessages", { chat_id: GROUP, message_ids: [b] }),
+    ).toMatchObject({ ok: true });
+    expect(
+      await api("deleteMessages", { chat_id: GROUP, message_ids: [a] }),
+    ).toMatchObject({ ok: false });
+    expect(await fake.getMessage(GROUP, a)).toMatchObject({ deleted: false });
+  });
+
+  it("records physical execution separately from transport loss and real permission rejection", async () => {
+    const { fake, api } = await setup();
+    const ann = await fake.createUser();
+    await fake.join(GROUP, ann);
+    await fake.failNext({
+      method: "banChatMember",
+      chatId: GROUP,
+      userId: ann,
+      dropAfterApply: true,
+    });
+    await expect(
+      api("banChatMember", { chat_id: GROUP, user_id: ann }),
+    ).rejects.toThrow();
+    expect((await fake.getMember(GROUP, ann)).status).toBe("kicked");
+    expect((await fake.getCalls()).calls.at(-1)).toMatchObject({
+      outcome: "response_lost",
+      applied: true,
+      dropped: true,
+      status: 200,
+    });
+    await fake.setBotMembership(GROUP, 123456, {
+      status: "administrator",
+      rights: { can_restrict_members: false },
+    });
+    await fake.failNext({
+      method: "unbanChatMember",
+      chatId: GROUP,
+      userId: ann,
+      dropAfterApply: true,
+    });
+    expect(
+      await api("unbanChatMember", { chat_id: GROUP, user_id: ann }),
+    ).toMatchObject({ ok: false });
+    expect((await fake.getCalls()).calls.at(-1)).toMatchObject({
+      outcome: "rejected",
+      applied: false,
+      failed: 400,
+    });
+    expect((await fake.getMember(GROUP, ann)).status).toBe("kicked");
+  });
+
+  it("delays a successful response without rejecting or executing it twice", async () => {
+    const { fake, api } = await setup();
+    await fake.failNext({ method: "sendMessage", chatId: GROUP, delayMs: 50 });
+    const start = Date.now();
+    expect(
+      await api("sendMessage", { chat_id: GROUP, text: "delayed" }),
+    ).toMatchObject({ ok: true });
+    expect(Date.now() - start).toBeGreaterThanOrEqual(45);
+    expect(
+      (await fake.getMessages(GROUP)).filter((m) => m.text === "delayed"),
+    ).toHaveLength(1);
+    expect((await fake.getCalls()).calls.at(-1)).toMatchObject({
+      outcome: "delayed",
+      applied: true,
+      delay_ms: 50,
+    });
+  });
+});
