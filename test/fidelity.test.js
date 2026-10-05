@@ -1,6 +1,6 @@
 // Behaviour a group bot relies on that is easy to get subtly wrong. Each case
 // follows the Bot API documentation or Telegram's observable behaviour.
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { startTestServer } from "../src/index.js";
 
@@ -11,6 +11,7 @@ const OWNER = 5000000001;
 
 const cleanups = [];
 afterEach(async () => {
+  vi.restoreAllMocks();
   while (cleanups.length) await cleanups.pop()();
 });
 
@@ -379,3 +380,260 @@ describe("Bot API details", () => {
     });
   });
 });
+
+describe("moderation physical state", () => {
+  it.each([true, "true", false, undefined])(
+    "revokes only the banned author's messages in a supergroup (revoke=%s)",
+    async (revoke) => {
+      const { server, api, member } = await setup();
+      const ann = await member(),
+        bob = await member();
+      const other = await server.createChat({ ownerId: OWNER, title: "Other" });
+      await server.join(other, ann);
+      const a = await server.post(GROUP, ann, "ann"),
+        b = await server.post(GROUP, bob, "bob");
+      const elsewhere = await server.post(other, ann, "elsewhere");
+      expect(
+        await api("banChatMember", {
+          chat_id: GROUP,
+          user_id: ann,
+          revoke_messages: revoke,
+        }),
+      ).toMatchObject({ ok: true });
+      expect(await server.getMessage(GROUP, a)).toMatchObject({
+        deleted: true,
+      });
+      expect(await server.getMessage(GROUP, b)).toMatchObject({
+        deleted: false,
+      });
+      expect(await server.getMessage(other, elsewhere)).toMatchObject({
+        deleted: false,
+      });
+      expect(
+        (await api("getChatMember", { chat_id: GROUP, user_id: ann })).result
+          .status,
+      ).toBe("kicked");
+    },
+  );
+
+  it.each(["restrictChatMember", "banChatMember", "unbanChatMember"])(
+    "requires can_restrict_members for %s without changing physical state",
+    async (method) => {
+      const { server, api, member } = await setup();
+      const ann = await member();
+      const message = await server.post(GROUP, ann, "kept");
+      if (method === "unbanChatMember")
+        await api("banChatMember", { chat_id: GROUP, user_id: ann });
+      const before = await server.getMember(GROUP, ann),
+        beforeMessage = await server.getMessage(GROUP, message);
+      await server.setBotMembership(GROUP, BOT, {
+        status: "administrator",
+        rights: { can_restrict_members: false },
+      });
+      expect(
+        await api(method, {
+          chat_id: GROUP,
+          user_id: ann,
+          permissions: { can_send_messages: false },
+        }),
+      ).toMatchObject({ ok: false, status: 400 });
+      expect(await server.getMember(GROUP, ann)).toEqual(before);
+      expect(await server.getMessage(GROUP, message)).toEqual(beforeMessage);
+    },
+  );
+
+  it.each(["approveChatJoinRequest", "declineChatJoinRequest"])(
+    "requires invite rights for %s and retains the pending request",
+    async (method) => {
+      const { server, api } = await setup();
+      const link = (
+        await api("createChatInviteLink", {
+          chat_id: GROUP,
+          creates_join_request: true,
+        })
+      ).result.invite_link;
+      const ann = await server.createUser();
+      await server.joinByLink(link, ann);
+      expect((await server.getMember(GROUP, ann)).status).toBe("left");
+      await server.setBotMembership(GROUP, BOT, {
+        status: "administrator",
+        rights: { can_invite_users: false },
+      });
+      expect(await api(method, { chat_id: GROUP, user_id: ann })).toMatchObject(
+        { ok: false, status: 400 },
+      );
+      expect(await server.getJoinRequests(GROUP)).toEqual([ann]);
+      expect((await server.getMember(GROUP, ann)).status).toBe("left");
+    },
+  );
+
+  it("rejects bulk deletion before deleting any message when a target needs missing rights", async () => {
+    const { server, api, member } = await setup();
+    const ann = await member();
+    const mine = (await api("sendMessage", { chat_id: GROUP, text: "mine" }))
+      .result.message_id;
+    const theirs = await server.post(GROUP, ann, "theirs");
+    await server.setBotMembership(GROUP, BOT, {
+      status: "administrator",
+      rights: { can_delete_messages: false },
+    });
+    expect(
+      await api("deleteMessages", {
+        chat_id: GROUP,
+        message_ids: [mine, theirs],
+      }),
+    ).toMatchObject({ ok: false, status: 400 });
+    expect(await server.getMessage(GROUP, mine)).toMatchObject({
+      deleted: false,
+    });
+    expect(await server.getMessage(GROUP, theirs)).toMatchObject({
+      deleted: false,
+    });
+    await server.setBotMembership(GROUP, BOT, { status: "administrator" });
+    expect(
+      await api("deleteMessages", {
+        chat_id: GROUP,
+        message_ids: [mine, theirs, 999],
+      }),
+    ).toMatchObject({ ok: true });
+    expect(await server.getMessage(GROUP, theirs)).toMatchObject({
+      deleted: true,
+    });
+  });
+
+  it.each(["restrictChatMember", "banChatMember"])(
+    "normalizes %s until_date boundaries and expires timed state",
+    async (method) => {
+      const { server, api, member } = await setup();
+      const ann = await member();
+      const clock = vi.spyOn(Date, "now").mockReturnValue(2_000_000_000_000);
+      const now = 2_000_000_000;
+      for (const [delta, expected] of [
+        [29, 0],
+        [30, now + 30],
+        [366 * 86400, now + 366 * 86400],
+        [366 * 86400 + 1, 0],
+      ]) {
+        expect(
+          await api(method, {
+            chat_id: GROUP,
+            user_id: ann,
+            permissions: { can_send_messages: false },
+            until_date: now + delta,
+          }),
+        ).toMatchObject({ ok: true });
+        expect((await server.getMember(GROUP, ann)).until_date).toBe(expected);
+      }
+      await api(method, {
+        chat_id: GROUP,
+        user_id: ann,
+        permissions: { can_send_messages: false },
+        until_date: now + 30,
+      });
+      clock.mockReturnValue((now + 30) * 1000);
+      expect((await server.getMember(GROUP, ann)).status).toBe(
+        method === "banChatMember" ? "left" : "member",
+      );
+    },
+  );
+});
+
+describe("documented moderation boundaries", () => {
+  it("honors form-encoded revocation in a basic group and ignores its ban deadline", async () => {
+    const { server } = await setup();
+    const group = await server.createChat({ type: "group", ownerId: OWNER });
+    await server.setBotMembership(group, BOT, { status: "administrator" });
+    const ann = await server.createUser();
+    await server.join(group, ann);
+    const message = await server.post(group, ann, "remove this");
+    const response = await fetch(`${server.origin}/bot${TOKEN}/banChatMember`, {
+      method: "POST",
+      body: new URLSearchParams({
+        chat_id: String(group),
+        user_id: String(ann),
+        revoke_messages: "true",
+        until_date: String(Math.floor(Date.now() / 1000) + 60),
+      }),
+    });
+    expect(await response.json()).toMatchObject({ ok: true });
+    expect(await server.getMessage(group, message)).toMatchObject({
+      deleted: true,
+    });
+    expect(await server.getMember(group, ann)).toMatchObject({
+      status: "kicked",
+      until_date: 0,
+    });
+  });
+
+  it("rejects deletion at 48 hours while allowing it just before that boundary", async () => {
+    const { server, api, member } = await setup();
+    const ann = await member();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(2_000_000_000_000);
+    const recent = await server.post(GROUP, ann, "recent");
+    const old = await server.post(GROUP, ann, "old");
+    clock.mockReturnValue((2_000_000_000 + 48 * 3600 - 1) * 1000);
+    expect(
+      await api("deleteMessage", { chat_id: GROUP, message_id: recent }),
+    ).toMatchObject({ ok: true });
+    clock.mockReturnValue((2_000_000_000 + 48 * 3600) * 1000);
+    expect(
+      await api("deleteMessages", { chat_id: GROUP, message_ids: [old] }),
+    ).toMatchObject({ ok: false });
+    expect(await server.getMessage(GROUP, old)).toMatchObject({
+      deleted: false,
+    });
+  });
+});
+
+it("deletes private dice only after 24 hours", async () => {
+  const { server, api } = await setup();
+  const ann = await server.createUser();
+  await server.sendDirectMessage(ann, "start");
+  const clock = vi.spyOn(Date, "now").mockReturnValue(2_000_000_000_000);
+  const message = (await api("sendDice", { chat_id: ann })).result.message_id;
+  clock.mockReturnValue((2_000_000_000 + 24 * 3600) * 1000);
+  expect(
+    await api("deleteMessage", { chat_id: ann, message_id: message }),
+  ).toMatchObject({ ok: false });
+
+  clock.mockReturnValue((2_000_000_000 + 24 * 3600 + 1) * 1000);
+  expect(
+    await api("deleteMessage", { chat_id: ann, message_id: message }),
+  ).toMatchObject({ ok: true });
+});
+
+it("refuses to delete the creation service message of a forum topic", async () => {
+  const { server, api } = await setup();
+  const group = await server.createChat({ ownerId: OWNER, isForum: true });
+  await server.setBotMembership(group, BOT, { status: "administrator" });
+  const topic = await server.createTopic(group, "Garden");
+  expect(
+    await api("deleteMessage", {
+      chat_id: group,
+      message_id: topic,
+    }),
+  ).toMatchObject({ ok: false });
+  expect(await server.getMessage(group, topic)).toMatchObject({
+    deleted: false,
+  });
+});
+
+it.each(["group", "channel"])(
+  "rejects restrictChatMember outside a supergroup (%s)",
+  async (type) => {
+    const { server, api } = await setup();
+    const chat = await server.createChat({ type, ownerId: OWNER });
+    await server.setBotMembership(chat, BOT, { status: "administrator" });
+    const ann = await server.createUser();
+    await server.join(chat, ann);
+    const before = await server.getMember(chat, ann);
+    expect(
+      await api("restrictChatMember", {
+        chat_id: chat,
+        user_id: ann,
+        permissions: { can_send_messages: false },
+      }),
+    ).toMatchObject({ ok: false });
+    expect(await server.getMember(chat, ann)).toEqual(before);
+  },
+);

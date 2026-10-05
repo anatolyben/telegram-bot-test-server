@@ -59,7 +59,8 @@ describe("grammY", () => {
       .poll(async () => (await server.getMember(GROUP, ann)).status)
       .toBe("kicked");
     expect((await server.getMessage(GROUP, spam)).deleted).toBe(true);
-    expect((await server.getMessage(GROUP, hello)).deleted).toBe(false);
+    // A supergroup ban revokes all messages by the banned author.
+    expect((await server.getMessage(GROUP, hello)).deleted).toBe(true);
   });
 
   it("runs a webhook bot that asks new members to press a button", async () => {

@@ -76,45 +76,45 @@ Both grammY and Telegraf are tested against the server, with polling and with a 
 has been handed to the bot (sent to its webhook, or queued for `getUpdates`); what the bot does in
 response happens after that, so wait for the outcome rather than checking it immediately.
 
-| Action                                                                                           | What happens                                                                                                                                                                |
-| ------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `createUser({ first_name, last_name, username, language_code, bio, is_bot, is_premium })`        | A new Telegram user; returns their id. All fields optional.                                                                                                                 |
-| `connectBusiness({ ownerId, rights, id, isEnabled, botId })`                                     | The owner connects a bot to their business account, or changes the connection with `id`; the bot gets `business_connection`. Returns `{ connection, update_id }`.           |
-| `getBusinessConnection(connectionId)`                                                            | The `BusinessConnection`.                                                                                                                                                   |
-| `sayInBusinessChat(connectionId, userId, sender, text)`                                          | `"person"` writes to the owner, or `"owner"` answers by hand; the bot gets `business_message`. Returns `{ message_id, date, update_id }`.                                   |
-| `getBusinessChat(connectionId, userId)`                                                          | The business chat, newest first: `[{ direction: "inbound" \| "owner" \| "bot", deleted, message }]`.                                                                        |
-| `redeliverUpdate(updateId)`                                                                      | Telegram delivers that update again, byte for byte, to the same bot's webhook.                                                                                              |
-| `updateProfile(userId, fields)`                                                                  | The user changes their name, username or bio.                                                                                                                               |
-| `addProfilePhoto(userId, bytes)`                                                                 | The user adds a profile photo.                                                                                                                                              |
-| `join(chatId, userId)`                                                                           | The user joins the group.                                                                                                                                                   |
-| `joinByLink(inviteLink, userId)`                                                                 | The user opens an invite link: joins, or files a join request if the link requires approval.                                                                                |
-| `leave(chatId, userId)`                                                                          | The user leaves.                                                                                                                                                            |
-| `post(chatId, userId, text)`                                                                     | The user posts a message; returns its `message_id`. Also takes `{ text, photo, media, caption, replyTo, threadId, forwardFrom }`. Fails if the user is not allowed to post. |
-| `postAlbum(chatId, userId, items)`                                                               | The user posts 2 to 10 photos or videos as one album (`media_group_id`).                                                                                                    |
-| `editMessage(chatId, messageId, userId, { text, caption })`                                      | The author edits their message; bots get `edited_message`.                                                                                                                  |
-| `react(chatId, messageId, userId, emoji)`                                                        | The user reacts to a message, or takes the reaction back with `null`.                                                                                                       |
-| `pressButton(chatId, messageId, userId, data)`                                                   | The user presses an inline button; resolves with the bot's `answerCallbackQuery` answer.                                                                                    |
-| `postGuestBotReply(chatId, userId, botUsername, text)`                                           | The user calls a guest bot (Bot API 10.0 guest mode); its answer appears in the group from that bot, with `guest_bot_caller_user` set.                                      |
-| `sendDirectMessage(userId, text)`                                                                | The user messages the bot privately.                                                                                                                                        |
-| `pressDirectButton(userId, messageId, data)`                                                     | The user presses a button in their private chat with the bot.                                                                                                               |
-| `getMessages(chatId)`, `getMessage(chatId, id)`                                                  | The chat's messages, and whether one was deleted.                                                                                                                           |
-| `getDirectMessages(userId)`                                                                      | The private chat between the user and the bot.                                                                                                                              |
-| `getMember(chatId, userId)`                                                                      | The member as `getChatMember` returns them: status, restrictions, ban.                                                                                                      |
-| `getJoinRequests(chatId)`                                                                        | User ids waiting for approval.                                                                                                                                              |
-| `addBot({ token, username, firstName, loginClientSecret })`                                      | Another bot, with its own webhook or update queue; it is in no chat yet.                                                                                                    |
-| `approveLogin(authUrl, userId)`                                                                  | The user logs in on the Telegram Login page for that `/auth` URL; returns the `redirect_uri` URL with `code` and `state`.                                                   |
-| `cancelLogin(authUrl)`                                                                           | The user cancels; returns the `redirect_uri` URL with `error=access_denied` and `state`.                                                                                    |
-| `createChat({ ownerId, title, type, ownerName, isForum })`                                       | A new supergroup, forum (`isForum`), basic group (`type: "group"`) or channel (`type: "channel"`) with no bot in it; returns its id.                                        |
-| `addBotViaLink(chatId, botId, { by, startParameter, rights })`                                   | A person adds the bot through its `startgroup` link: it joins (as an administrator with `rights`), then `/start@<bot> <startParameter>` is posted from the person.          |
-| `migrateToSupergroup(chatId, { by })`                                                            | The creator or an administrator upgrades a basic group; returns the supergroup's id.                                                                                        |
-| `renameChat(chatId, { by, title })`, `changeChatPhoto(chatId, { by, bytes })`                    | A person with `can_change_info` renames the chat or sets its photo.                                                                                                         |
-| `setBotMembership(chatId, botId, { status, rights, by })`                                        | The owner adds, promotes, demotes or removes a bot; the bot gets `my_chat_member`.                                                                                          |
-| `createTopic(chatId, name)`, `renameTopic(chatId, threadId, name)`                               | A forum topic is created or renamed, with Telegram's service message; `createTopic` returns its `message_thread_id`.                                                        |
-| `getChat(chatId)`                                                                                | The chat, its pinned message ids and its members.                                                                                                                           |
-| `failNext({ method, chatId, botId, times, errorCode, description, retryAfter, dropAfterApply })` | The next matching Bot API calls fail with that error, or (`dropAfterApply`) take effect and never answer.                                                                   |
-| `clearFailures()`                                                                                | Drop failure rules not used up.                                                                                                                                             |
-| `getCalls()`                                                                                     | Every Bot API call received, with the bot that made it, and any unsupported methods called.                                                                                 |
-| `stop()`                                                                                         | Shut the server down.                                                                                                                                                       |
+| Action                                                                                                                                | What happens                                                                                                                                                                |
+| ------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `createUser({ first_name, last_name, username, language_code, bio, is_bot, is_premium })`                                             | A new Telegram user; returns their id. All fields optional.                                                                                                                 |
+| `connectBusiness({ ownerId, rights, id, isEnabled, botId })`                                                                          | The owner connects a bot to their business account, or changes the connection with `id`; the bot gets `business_connection`. Returns `{ connection, update_id }`.           |
+| `getBusinessConnection(connectionId)`                                                                                                 | The `BusinessConnection`.                                                                                                                                                   |
+| `sayInBusinessChat(connectionId, userId, sender, text)`                                                                               | `"person"` writes to the owner, or `"owner"` answers by hand; the bot gets `business_message`. Returns `{ message_id, date, update_id }`.                                   |
+| `getBusinessChat(connectionId, userId)`                                                                                               | The business chat, newest first: `[{ direction: "inbound" \| "owner" \| "bot", deleted, message }]`.                                                                        |
+| `redeliverUpdate(updateId)`                                                                                                           | Telegram delivers that update again, byte for byte, to the same bot's webhook.                                                                                              |
+| `updateProfile(userId, fields)`                                                                                                       | The user changes their name, username or bio.                                                                                                                               |
+| `addProfilePhoto(userId, bytes)`                                                                                                      | The user adds a profile photo.                                                                                                                                              |
+| `join(chatId, userId)`                                                                                                                | The user joins the group.                                                                                                                                                   |
+| `joinByLink(inviteLink, userId)`                                                                                                      | The user opens an invite link: joins, or files a join request if the link requires approval.                                                                                |
+| `leave(chatId, userId)`                                                                                                               | The user leaves.                                                                                                                                                            |
+| `post(chatId, userId, text)`                                                                                                          | The user posts a message; returns its `message_id`. Also takes `{ text, photo, media, caption, replyTo, threadId, forwardFrom }`. Fails if the user is not allowed to post. |
+| `postAlbum(chatId, userId, items)`                                                                                                    | The user posts 2 to 10 photos or videos as one album (`media_group_id`).                                                                                                    |
+| `editMessage(chatId, messageId, userId, { text, caption })`                                                                           | The author edits their message; bots get `edited_message`.                                                                                                                  |
+| `react(chatId, messageId, userId, emoji)`                                                                                             | The user reacts to a message, or takes the reaction back with `null`.                                                                                                       |
+| `pressButton(chatId, messageId, userId, data)`                                                                                        | The user presses an inline button; resolves with the bot's `answerCallbackQuery` answer.                                                                                    |
+| `postGuestBotReply(chatId, userId, botUsername, text)`                                                                                | The user calls a guest bot (Bot API 10.0 guest mode); its answer appears in the group from that bot, with `guest_bot_caller_user` set.                                      |
+| `sendDirectMessage(userId, text)`                                                                                                     | The user messages the bot privately.                                                                                                                                        |
+| `pressDirectButton(userId, messageId, data)`                                                                                          | The user presses a button in their private chat with the bot.                                                                                                               |
+| `getMessages(chatId)`, `getMessage(chatId, id)`                                                                                       | The chat's messages, and whether one was deleted.                                                                                                                           |
+| `getDirectMessages(userId)`                                                                                                           | The private chat between the user and the bot.                                                                                                                              |
+| `getMember(chatId, userId)`                                                                                                           | The member as `getChatMember` returns them: status, restrictions, ban.                                                                                                      |
+| `getJoinRequests(chatId)`                                                                                                             | User ids waiting for approval.                                                                                                                                              |
+| `addBot({ token, username, firstName, loginClientSecret })`                                                                           | Another bot, with its own webhook or update queue; it is in no chat yet.                                                                                                    |
+| `approveLogin(authUrl, userId)`                                                                                                       | The user logs in on the Telegram Login page for that `/auth` URL; returns the `redirect_uri` URL with `code` and `state`.                                                   |
+| `cancelLogin(authUrl)`                                                                                                                | The user cancels; returns the `redirect_uri` URL with `error=access_denied` and `state`.                                                                                    |
+| `createChat({ ownerId, title, type, ownerName, isForum })`                                                                            | A new supergroup, forum (`isForum`), basic group (`type: "group"`) or channel (`type: "channel"`) with no bot in it; returns its id.                                        |
+| `addBotViaLink(chatId, botId, { by, startParameter, rights })`                                                                        | A person adds the bot through its `startgroup` link: it joins (as an administrator with `rights`), then `/start@<bot> <startParameter>` is posted from the person.          |
+| `migrateToSupergroup(chatId, { by })`                                                                                                 | The creator or an administrator upgrades a basic group; returns the supergroup's id.                                                                                        |
+| `renameChat(chatId, { by, title })`, `changeChatPhoto(chatId, { by, bytes })`                                                         | A person with `can_change_info` renames the chat or sets its photo.                                                                                                         |
+| `setBotMembership(chatId, botId, { status, rights, by })`                                                                             | The owner adds, promotes, demotes or removes a bot; the bot gets `my_chat_member`.                                                                                          |
+| `createTopic(chatId, name)`, `renameTopic(chatId, threadId, name)`                                                                    | A forum topic is created or renamed, with Telegram's service message; `createTopic` returns its `message_thread_id`.                                                        |
+| `getChat(chatId)`                                                                                                                     | The chat, its pinned message ids and its members.                                                                                                                           |
+| `failNext({ method, chatId, botId, userId, messageId, attempt, times, errorCode, description, retryAfter, dropAfterApply, delayMs })` | The next matching Bot API calls fail with that error, or (`dropAfterApply`) take effect and never answer.                                                                   |
+| `clearFailures()`                                                                                                                     | Drop failure rules not used up.                                                                                                                                             |
+| `getCalls()`                                                                                                                          | Every Bot API call received, with the bot that made it, and any unsupported methods called.                                                                                 |
+| `stop()`                                                                                                                              | Shut the server down.                                                                                                                                                       |
 
 ## Use from any language
 
@@ -465,8 +465,8 @@ field named like a session, token, hash, key, secret, password or phone is recor
 - Joining, leaving and an approved join request produce both a `chat_member` update and the
   `new_chat_members` / `left_chat_member` service message.
 
-A Bot API call returns before the updates it causes are delivered, as on Telegram, so tests should
-wait for the update rather than expect it immediately.
+The fake delivers resulting updates asynchronously. Tests should wait for the exact update
+rather than depend on response/update ordering; the Bot API does not promise that ordering.
 
 ## Control API
 
@@ -518,7 +518,7 @@ The test actions above, over HTTP, for tests written in other languages. All rou
 | `POST chats/:id/topics`                                | Create a forum topic `{ name, by? }`; returns `{ message_thread_id, name }`.                                                                                                                                                                                             |
 | `POST chats/:id/topics/:threadId/edit`                 | Rename a topic `{ name, by? }`.                                                                                                                                                                                                                                          |
 | `GET chats/:id/topics`                                 | The forum's topics.                                                                                                                                                                                                                                                      |
-| `POST failures`                                        | Fail the next calls `{ method, chat_id?, bot_id?, times?, error_code?, description?, retry_after?, drop_after_apply? }`.                                                                                                                                                 |
+| `POST failures`                                        | Fail the next calls `{ method, chat_id?, bot_id?, user_id?, message_id?, attempt?, times?, error_code?, description?, retry_after?, drop_after_apply?, delay_ms? }`.                                                                                                     |
 | `GET failures`, `DELETE failures`                      | The failure rules still waiting, or clear them.                                                                                                                                                                                                                          |
 | `GET calls`                                            | Every Bot API call received, with the bot that made it, and the unsupported methods called.                                                                                                                                                                              |
 
@@ -531,7 +531,7 @@ A button press waits up to 10 seconds for the bot to call `answerCallbackQuery` 
   (a test makes a call fail with a 429 through `POST failures` instead). Channels have no
   subscribers and forum topics cannot be closed or deleted.
 - `parse_mode` formatting: text is stored exactly as sent, tags and all.
-- Expiry: restrictions and bans with an `until_date` never lift on their own.
+- Expiry is evaluated on state access, without a scheduler or an automatic expiry webhook. Restarting loses all state; restart recovery belongs to the application under test.
 - Webhook retries: an update the webhook rejects, or does not answer within 10 seconds, is logged and
   dropped rather than retried.
 - In Telegram Login: the `phone` scope's `phone_number` (test users have no phone numbers), the
@@ -543,7 +543,54 @@ A button press waits up to 10 seconds for the bot to call `answerCallbackQuery` 
 - Anything security-related. It is a test tool: bind it to localhost and never expose it to a
   network you do not control.
 
+## Moderation fidelity and operation receipts
+
+Bans revoke only the target author's messages in the addressed chat. Revocation is
+mandatory in supergroups/channels; basic groups honor `revoke_messages`, including
+form-encoded `"true"`. `restrictChatMember` accepts supergroups only.
+Restrict/ban/unban require `can_restrict_members` and protect
+administrators; approval/decline require `can_invite_users` before touching pending
+requests. Pending requests are not members. Unban leaves a banned user outside;
+`only_if_banned` keeps an admitted user unchanged. Bulk deletion validates permissions
+before changing any existing target and skips missing message IDs. Deletion enforces
+the 48-hour limit, private dice minimum age, and undeletable creation service messages.
+
+Finite restriction/ban dates from 30 seconds through 366 days are inclusive;
+outside that range they are permanent. Expired restrictions become member/left
+according to physical membership; expired bans become left. These contracts follow
+[ban/unban/restrict](https://core.telegram.org/bots/api#banchatmember),
+[join approval/decline](https://core.telegram.org/bots/api#approvechatjoinrequest), and
+[deletion](https://core.telegram.org/bots/api#deletemessages).
+
+Fault rules count only operations matching their method, chat, bot, user and message
+selectors. `userId` identifies the method target, ephemeral recipient, or
+`deleteMessage` author. `messageId` also matches an ID in a `deleteMessages` batch.
+`attempt: 2` starts at the second matching request after installation;
+`times` controls consecutive matching faulted attempts. Unrelated operations do not
+consume the rule. `delayMs` alone executes normally and delays only the response.
+Adding `errorCode` rejects before execution; `dropAfterApply` executes once then drops
+the connection. Delays are bounded to 30 seconds and cancelled on server stop.
+
+`getCalls()` / `GET /_fake/calls` retain append-only receipts with `seq`, `outcome`,
+`applied`, `status`, `completed_at`, and matching `fault_id` / `attempt` / `delay_ms`.
+`applied` means the handler succeeded, including reads/no-ops, rather than claiming a
+state change. Actual permission rejection records `failed` as well as injected
+rejection. A failed handler never records a successful response loss. Compare these
+receipts with `getMember` / `getMessage` for physical-state proof.
+
+Use `redeliverUpdate(updateId)` to replay the exact saved webhook bytes, including
+callback queries. Do not clear messages, update history or receipts between replay
+steps. Clear unused failure rules at scenario boundaries; use a new server for a
+fully independent suite. This fake does not emulate application persistence or
+Telegram's complete permission, media, rate-limit or delivery model. Bulk permission
+validation before mutation is this fake's failure-isolation policy; Telegram's docs
+do not specify partial execution of invalid mixed batches.
+
 ## Changes
+
+- **0.9.1**: scoped ban message revocation, moderation/join/bulk-delete permission checks,
+  finite restriction expiry, exact user/message/attempt faults, delayed responses and
+  truthful execution/transport receipts. Owner-account behavior is unchanged.
 
 - **0.9.0**: owner accounts: `createOwnerClient`, a test stand-in for the GramJS `TelegramClient`
   subset an app uses on a user's own account (dialogs, folders, history, dialog filters), with owner

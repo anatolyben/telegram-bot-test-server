@@ -269,6 +269,13 @@ describe("basic groups and the upgrade to a supergroup", () => {
       description: "Bad Request: group chat was upgraded to a supergroup chat",
       parameters: { migrate_to_chat_id: supergroup },
     });
+    expect((await fake.getCalls()).calls.at(-1)).toMatchObject({
+      outcome: "rejected",
+      applied: false,
+      status: 400,
+      failed: 400,
+      seq: expect.any(Number),
+    });
     expect(
       (await api("sendMessage", { chat_id: supergroup, text: "hi" })).ok,
     ).toBe(true);

@@ -575,7 +575,22 @@ export async function startTestServer({
   }
 
   function memberStatus(chat, userId) {
-    return chat.members.get(Number(userId)) ?? { status: "left" };
+    const id = Number(userId);
+    let member = chat.members.get(id) ?? { status: "left" };
+    if (
+      ["restricted", "kicked"].includes(member.status) &&
+      member.until_date > 0 &&
+      member.until_date <= Math.floor(Date.now() / 1000)
+    ) {
+      member = {
+        status:
+          member.status === "restricted" && member.is_member !== false
+            ? "member"
+            : "left",
+      };
+      chat.members.set(id, member);
+    }
+    return member;
   }
 
   function chatMemberObject(chat, userId) {
@@ -752,6 +767,48 @@ export async function startTestServer({
     return chat.permissions[permission] === true;
   }
 
+  function requireRight(chat, caller, right) {
+    if (!hasRight(chat, caller.id, right)) {
+      throw new TelegramError(400, "Bad Request: not enough rights");
+    }
+  }
+
+  function restrictionUntil(value) {
+    const until = Number(value ?? 0);
+    const duration = until - Math.floor(Date.now() / 1000);
+    return duration < 30 || duration > 366 * 86400 ? 0 : until;
+  }
+
+  function requireDeleteRights(chat, entry, caller) {
+    const age = Math.floor(Date.now() / 1000) - entry.message.date;
+    if (
+      age >= 48 * 3600 ||
+      entry.message.supergroup_chat_created ||
+      entry.message.channel_chat_created ||
+      entry.message.forum_topic_created ||
+      (chat.type === "private" && entry.message.dice && age <= 24 * 3600)
+    ) {
+      throw new TelegramError(400, "Bad Request: message can't be deleted");
+    }
+    if (chat.type === "private") return;
+    if (!isInChat(chat, caller.id)) {
+      throw new TelegramError(
+        403,
+        `Forbidden: bot is not a member of the ${chatKind(chat)} chat`,
+      );
+    }
+    const own = Number(entry.message.from?.id) === caller.id;
+    const allowed =
+      hasRight(chat, caller.id, "can_delete_messages") ||
+      (chat.type === "group" &&
+        memberStatus(chat, caller.id).status === "administrator") ||
+      (own &&
+        (chat.type !== "channel" ||
+          hasRight(chat, caller.id, "can_post_messages")));
+    if (!allowed)
+      throw new TelegramError(400, "Bad Request: message can't be deleted");
+  }
+
   /**
    * Telegram refuses to restrict or remove the chat owner, an administrator
    * or the bot itself.
@@ -760,6 +817,7 @@ export async function startTestServer({
     if (Number(userId) === caller.id && self) {
       throw new TelegramError(400, `Bad Request: ${self}`);
     }
+    requireRight(chat, caller, "can_restrict_members");
     const status = memberStatus(chat, userId).status;
     if (status === "creator") {
       throw new TelegramError(400, "Bad Request: can't remove chat owner");
@@ -1756,17 +1814,11 @@ export async function startTestServer({
           "Bad Request: message to delete not found",
         );
       }
-      if (
-        chat.type !== "private" &&
-        entry.message.from?.id !== caller.id &&
-        !hasRight(chat, caller.id, "can_delete_messages")
-      ) {
-        throw new TelegramError(400, "Bad Request: message can't be deleted");
-      }
+      requireDeleteRights(chat, entry, caller);
       entry.deleted = true;
       return true;
     },
-    deleteMessages: (p) => {
+    deleteMessages: (p, caller) => {
       const chat = botChat(p.chat_id);
       if (!Array.isArray(p.message_ids)) {
         throw new TelegramError(
@@ -1774,14 +1826,27 @@ export async function startTestServer({
           "Bad Request: message_ids must be a JSON array",
         );
       }
-      for (const id of p.message_ids) {
-        const entry = chat.messages.get(Number(id));
-        if (entry) entry.deleted = true;
+      if (p.message_ids.length < 1 || p.message_ids.length > 100) {
+        throw new TelegramError(
+          400,
+          "Bad Request: message_ids must contain 1-100 identifiers",
+        );
       }
+      const entries = p.message_ids
+        .map((id) => chat.messages.get(Number(id)))
+        .filter((entry) => entry && !entry.deleted);
+      for (const entry of entries) requireDeleteRights(chat, entry, caller);
+      for (const entry of entries) entry.deleted = true;
       return true;
     },
     restrictChatMember: (p, caller) => {
       const chat = requireChat(p.chat_id);
+      if (chat.type !== "supergroup") {
+        throw new TelegramError(
+          400,
+          "Bad Request: restrictChatMember requires a supergroup",
+        );
+      }
       const userId = Number(p.user_id);
       requireUser(userId);
       assertCanModerate(chat, userId, { self: "can't restrict self", caller });
@@ -1801,7 +1866,7 @@ export async function startTestServer({
         chat.members.set(userId, {
           status: "restricted",
           is_member: inChat,
-          until_date: Number(p.until_date ?? 0),
+          until_date: restrictionUntil(p.until_date),
           permissions,
         });
       }
@@ -1816,13 +1881,24 @@ export async function startTestServer({
       const before = chatMemberObject(chat, userId);
       chat.members.set(userId, {
         status: "kicked",
-        until_date: Number(p.until_date ?? 0),
+        until_date: ["supergroup", "channel"].includes(chat.type)
+          ? restrictionUntil(p.until_date)
+          : 0,
       });
+      if (
+        ["supergroup", "channel"].includes(chat.type) ||
+        isTrue(p.revoke_messages)
+      ) {
+        for (const entry of chat.messages.values()) {
+          if (Number(entry.message.from?.id) === userId) entry.deleted = true;
+        }
+      }
       memberChanged(chat, userId, before, caller);
       return true;
     },
     unbanChatMember: (p, caller) => {
       const chat = requireChat(p.chat_id);
+      requireRight(chat, caller, "can_restrict_members");
       const userId = Number(p.user_id);
       requireUser(userId);
       const current = memberStatus(chat, userId);
@@ -1846,6 +1922,7 @@ export async function startTestServer({
     },
     approveChatJoinRequest: (p, caller) => {
       const chat = requireChat(p.chat_id);
+      requireRight(chat, caller, "can_invite_users");
       const userId = Number(p.user_id);
       if (!chat.joinRequests.has(userId)) {
         throw new TelegramError(400, "Bad Request: HIDE_REQUESTER_MISSING");
@@ -1868,8 +1945,9 @@ export async function startTestServer({
       );
       return true;
     },
-    declineChatJoinRequest: (p) => {
+    declineChatJoinRequest: (p, caller) => {
       const chat = requireChat(p.chat_id);
+      requireRight(chat, caller, "can_invite_users");
       const userId = Number(p.user_id);
       if (!chat.joinRequests.delete(userId)) {
         throw new TelegramError(400, "Bad Request: HIDE_REQUESTER_MISSING");
@@ -2770,8 +2848,25 @@ export async function startTestServer({
           "a failure needs the method it applies to",
         );
       }
+      for (const field of ["attempt", "times", "delay_ms"]) {
+        if (
+          body[field] != null &&
+          (!Number.isInteger(Number(body[field])) ||
+            Number(body[field]) < (field === "delay_ms" ? 0 : 1))
+        ) {
+          throw new TelegramError(400, `invalid failure ${field}`);
+        }
+      }
+      if (Number(body.delay_ms) > 30000)
+        throw new TelegramError(400, "failure delay_ms must be at most 30000");
       const rule = {
+        id: randomBytes(9).toString("hex"),
         method: body.method,
+        user_id: body.user_id == null ? null : String(body.user_id),
+        message_id: body.message_id == null ? null : String(body.message_id),
+        attempt: numberParam(body.attempt, 1),
+        matched: 0,
+        delay_ms: numberParam(body.delay_ms, 0),
         chat_id: body.chat_id == null ? null : String(body.chat_id),
         bot_id: body.bot_id == null ? null : Number(body.bot_id),
         remaining: Math.max(1, numberParam(body.times, 1)),
@@ -2780,6 +2875,10 @@ export async function startTestServer({
         retry_after:
           body.retry_after == null ? null : numberParam(body.retry_after, 1),
         drop_after_apply: body.drop_after_apply === true,
+        delay_only:
+          body.delay_ms != null &&
+          body.error_code == null &&
+          body.drop_after_apply !== true,
       };
       failures.push(rule);
       return rule;
@@ -3938,6 +4037,11 @@ ${buttons}
       const addressed = chats.get(Number(params.chat_id));
       if (addressed?.migratedTo != null) {
         calls.push({
+          seq: calls.length + 1,
+          applied: false,
+          outcome: "rejected",
+          status: 400,
+          completed_at: Date.now(),
           method,
           bot_id: caller.id,
           params: summarize(params),
@@ -3954,18 +4058,31 @@ ${buttons}
         return;
       }
       const failure = takeFailure(method, caller, params);
-      calls.push({
+      const receipt = {
+        seq: calls.length + 1,
         method,
         bot_id: caller.id,
         params: summarize(params),
         at: Date.now(),
+        applied: false,
+        outcome: "pending",
         ...(failure
-          ? failure.drop_after_apply
-            ? { dropped: true }
-            : { failed: failure.error_code }
+          ? {
+              fault_id: failure.id,
+              attempt: failure.matched,
+              delay_ms: failure.delay_ms,
+            }
           : {}),
-      });
-      if (failure && !failure.drop_after_apply) {
+      };
+      calls.push(receipt);
+      if (failure && !failure.drop_after_apply && !failure.delay_only) {
+        Object.assign(receipt, {
+          failed: failure.error_code,
+          status: failure.error_code,
+          outcome: "rejected",
+          completed_at: Date.now(),
+        });
+        if (failure.delay_ms) await delayResponse(failure.delay_ms);
         send(response, failure.error_code, {
           ok: false,
           error_code: failure.error_code,
@@ -3979,6 +4096,12 @@ ${buttons}
       // Bot API method names are case-insensitive.
       const handler = methodsByLowerName.get(method.toLowerCase());
       if (!handler) {
+        Object.assign(receipt, {
+          outcome: unimplementedMode === "ok" ? "unimplemented_ok" : "rejected",
+          status: unimplementedMode === "ok" ? 200 : 404,
+          completed_at: Date.now(),
+        });
+        if (unimplementedMode !== "ok") receipt.failed = 404;
         if (!unimplemented.has(method)) {
           unimplemented.add(method);
           log(`unimplemented Bot API method ${method}`);
@@ -3998,13 +4121,32 @@ ${buttons}
       }
       try {
         const result = await handler(params, caller);
+        Object.assign(receipt, {
+          applied: true,
+          status: 200,
+          completed_at: Date.now(),
+          outcome: failure?.drop_after_apply
+            ? "response_lost"
+            : failure?.delay_ms
+              ? "delayed"
+              : "succeeded",
+        });
         // The call took effect, but its answer is lost on the way back.
         if (failure?.drop_after_apply) {
+          receipt.dropped = true;
           request.socket.destroy();
           return;
         }
+        if (failure?.delay_ms) await delayResponse(failure.delay_ms);
         send(response, 200, { ok: true, result });
       } catch (error) {
+        Object.assign(receipt, {
+          applied: false,
+          outcome: "rejected",
+          failed: error instanceof TelegramError ? error.code : 500,
+          status: error instanceof TelegramError ? error.code : 500,
+          completed_at: Date.now(),
+        });
         if (!(error instanceof TelegramError)) throw error;
         send(response, error.code, {
           ok: false,
@@ -4023,15 +4165,48 @@ ${buttons}
     }
   });
 
+  function delayResponse(ms) {
+    const abort = new AbortController();
+    inFlight.add(abort);
+    return new Promise((resolve) => {
+      const finish = () => {
+        clearTimeout(timer);
+        inFlight.delete(abort);
+        resolve();
+      };
+      const timer = setTimeout(finish, ms);
+      abort.signal.addEventListener("abort", finish, { once: true });
+    });
+  }
+
   function takeFailure(method, caller, params) {
     const index = failures.findIndex(
       (rule) =>
         rule.method.toLowerCase() === method.toLowerCase() &&
         (rule.chat_id === null || rule.chat_id === String(params.chat_id)) &&
-        (rule.bot_id === null || rule.bot_id === caller.id),
+        (rule.bot_id === null || rule.bot_id === caller.id) &&
+        (rule.user_id === null ||
+          rule.user_id ===
+            String(
+              params.user_id ??
+                params.receiver_user_id ??
+                params.ephemeral_message_parameters?.receiver_user_id ??
+                (method.toLowerCase() === "deletemessage"
+                  ? (
+                      chats.get(Number(params.chat_id)) ??
+                      privateChats.get(Number(params.chat_id))
+                    )?.messages.get(Number(params.message_id))?.message.from?.id
+                  : undefined),
+            )) &&
+        (rule.message_id === null ||
+          rule.message_id === String(params.message_id) ||
+          (Array.isArray(params.message_ids) &&
+            params.message_ids.some((id) => String(id) === rule.message_id))),
     );
     if (index < 0) return null;
     const rule = failures[index];
+    rule.matched += 1;
+    if (rule.matched < rule.attempt) return null;
     rule.remaining -= 1;
     if (rule.remaining <= 0) failures.splice(index, 1);
     return rule;
@@ -4115,6 +4290,10 @@ ${buttons}
     failNext: (rule) =>
       act("POST", "failures", {
         method: rule.method,
+        user_id: rule.userId,
+        message_id: rule.messageId,
+        attempt: rule.attempt,
+        delay_ms: rule.delayMs,
         chat_id: rule.chatId,
         bot_id: rule.botId,
         times: rule.times,
