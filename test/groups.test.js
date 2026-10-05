@@ -121,10 +121,14 @@ describe("adding the bot through a startgroup link", () => {
     const group = await fake.createChat({ ownerId: OWNER });
     const member = await fake.createUser();
     await fake.join(group, member);
-    await api("setChatPermissions", {
-      chat_id: group,
-      permissions: { can_send_messages: true, can_invite_users: false },
-    }).catch(() => null);
+    await fake.setBotMembership(group, me.id, { status: "administrator" });
+    expect(
+      await api("setChatPermissions", {
+        chat_id: group,
+        permissions: { can_send_messages: true, can_invite_users: false },
+      }),
+    ).toMatchObject({ status: 200, ok: true, result: true });
+    await fake.setBotMembership(group, me.id, { status: "left" });
 
     await expect(
       fake.addBotViaLink(group, me.id, { by: member, startParameter: "a" }),

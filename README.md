@@ -168,8 +168,9 @@ These read or change the server's state:
 `setMyCommands`, `deleteMyCommands`, `getMyCommands`, `getBusinessConnection`, and `sendMessage`
 with `business_connection_id`.
 
-These are accepted and return success without changing anything: `setMyDescription`,
-`setMyShortDescription`, `setChatMenuButton`, `setMyDefaultAdministratorRights`.
+These are not modelled: `setMyDescription`, `setMyShortDescription`,
+`setChatMenuButton`, `setMyDefaultAdministratorRights`. In strict mode they return
+an explicit unsupported-method error.
 
 Any other method returns a 404 error that names it, so a test cannot pass against behaviour the
 server does not have. Methods are added when a real bot needs them; the goal is not full coverage of
@@ -604,13 +605,243 @@ receipts with `getMember` / `getMessage` for physical-state proof.
 
 Use `redeliverUpdate(updateId)` to replay the exact saved webhook bytes, including
 callback queries. Do not clear messages, update history or receipts between replay
-steps. Clear unused failure rules at scenario boundaries; use a new server for a
-fully independent suite. This fake does not emulate application persistence or
+steps. Clear unused failure rules at scenario boundaries; use a fresh server or restore a
+quiescent fixture snapshot for an independent fake fixture. This fake does not emulate application persistence or
 Telegram's complete permission, media, rate-limit or delivery model. Bulk permission
 validation before mutation is this fake's failure-isolation policy; Telegram's docs
 do not specify partial execution of invalid mixed batches.
 
+## Exact waits, reusable fixtures and fake-owned time (0.10.0)
+
+These are test controls, not additional Telegram methods. Existing bot URLs,
+fixture helpers, scoped `failNext`, delayed responses, `dropAfterApply` and exact
+update replay continue to work.
+
+```js
+const fake = await startTestServer({
+  botToken: "123456:TEST",
+  clock: { now: 1_800_000_000_000 }, // optional; omit for real time
+  chats: [{ id: -1001234567890, title: "Test", ownerId: 5000000001 }],
+});
+try {
+  const userId = await fake.createUser();
+  await fake.join(-1001234567890, userId);
+  const saved = await fake.snapshot();
+  try {
+    const banned = fake.waitFor(
+      {
+        kind: "member",
+        chatId: -1001234567890,
+        userId,
+        status: "kicked",
+      },
+      { timeoutMs: 1000 },
+    );
+    await Promise.all([
+      banned,
+      (async () => {
+        // A real HTTP call to this local fake, without a production service.
+        const response = await fetch(
+          `${fake.origin}/bot123456:TEST/banChatMember`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chat_id: -1001234567890, user_id: userId }),
+          },
+        );
+        const answer = await response.json();
+        if (!answer.ok) throw new Error(answer.description);
+      })(),
+    ]);
+    await fake.restore(saved);
+    await fake.waitFor({
+      kind: "member",
+      chatId: -1001234567890,
+      userId,
+      status: "member",
+    });
+  } finally {
+    await fake.releaseSnapshot(saved);
+  }
+} finally {
+  await fake.stop();
+}
+```
+
+For application enforcement, trigger the application instead of directly calling
+the fake Bot API and await the same physical-state condition. The following
+selectors are supported:
+
+| `kind`        | Required identity                                                                   | Expected state / optional narrowing                                                                 |
+| ------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `message`     | `chatId` plus `messageId`, or author (`userId`/`botId`) plus exact `text`/`caption` | `deleted`; author/text/caption can also narrow a message ID                                         |
+| `member`      | `chatId`, `userId`, `status`                                                        | `permissions` compares returned ChatMember permission fields                                        |
+| `joinRequest` | `chatId`, `userId`, `state`                                                         | `pending`, `approved`, `declined`; `botId` identifies the resolving bot                             |
+| `call`        | `botId`, `method`                                                                   | `chatId`, `userId`, `messageId`, exact `params` fields, `afterSeq`, `requestId`, `outcome`, `stage` |
+
+`waitFor(condition, { timeoutMs })` evaluates at registration and on changes; it
+never polls. Deadlines use wall time, default 1000 ms, range 1–30000 ms. Results
+are detached copies. Failure reports include the exact expectation, observed
+state or up to eight matching requests, and outstanding fake work. Diagnostics
+are capped at 8000 characters and redact credentials; raw request journals remain
+original evidence and may contain fixture secrets. Do not dump them indiscriminately.
+`botId` on a message identifies its author. Membership is physical chat/user
+state, shared by the bots in that chat. Join decisions are a test observation
+journal, not a new ChatMember status; decline leaves the requester outside.
+
+Snapshot handles are opaque strings owned by one server. `snapshot()` and
+`restore(handle)` require quiescence: no active HTTP/control/owner request,
+long poll, webhook attempt, response delay or clock advance. Idle finite-expiry
+timers and unused fault rules are allowed. Drain existing deliveries and finish
+requests before taking a snapshot; restore fails explicitly with outstanding
+work instead of silently mixing in-flight execution with restored state.
+
+Restore replaces users, bots, chat/private/business/owner fixtures, media bytes,
+memberships, messages, invite/join state, counters, calls, fault rules and their
+attempt counters, saved update bytes, queues, webhook/subscription settings and
+login codes. Aliases between bot/user/update records are retained. Finite expiry
+work is reconstructed from restored membership. Snapshots are detached and reusable;
+`releaseSnapshot(handle)` frees them. Restore cancels older waits. A monotonically
+increasing restore epoch prevents request identities colliding when fixture IDs
+and journals intentionally rewind. Server origin and per-instance login signing
+identity remain fixed. External webhook consumers, sockets, timers, databases
+and application state are not snapshotted.
+
+With `clock: { now: milliseconds }`, `advanceTime(ms)` serializes advances and
+runs due fake expiry and Bot/owner response-fault delays in deadline order. It
+also controls fake message/login/business timestamps. Real mode remains the
+default; real time is not rewound by restore. Manual time is restored with the
+fixture. Global `Date`, timers and the consuming application's jobs are untouched.
+Webhook network I/O, its safety deadline, long polling and diagnostic waits still
+use wall time. A clock advance is not a network-delivery or enforcement barrier.
+
+`drainDeliveries({ botId?, timeoutMs? })` waits for that server's queued/in-flight
+webhook attempts to settle. It does not consume `getUpdates` queues, assert HTTP
+success, or wait for the bot's moderation work after acknowledging a webhook.
+Inspect `getDeliveries()` for update ID, bot ID, replay attempt, epoch, enqueue/start/
+completion times, status and outcome. Saved updates and delivery evidence survive
+until an explicit restore. `stop()` cancels waits/delays, aborts current deliveries,
+prevents queued deliveries starting, clears scheduled work and closes connections.
+Read-only in-process controls remain available after stopping for diagnostics.
+
+The HTTP equivalents use camel-case control fields:
+
+| Request                           | Body/result                                          |
+| --------------------------------- | ---------------------------------------------------- |
+| `POST /_fake/wait`                | `{ condition, timeoutMs? }` → matching observation   |
+| `POST /_fake/snapshots`           | `{}` → JSON string handle                            |
+| `POST /_fake/restore`             | `{ snapshot: handle }` → `{ restored: true, epoch }` |
+| `DELETE /_fake/snapshots/:handle` | release handle                                       |
+| `GET /_fake/clock`                | `{ mode, now, scheduled }`                           |
+| `POST /_fake/clock`               | `{ ms }` → advanced clock; manual mode required      |
+| `GET /_fake/deliveries`           | delivery journal                                     |
+| `POST /_fake/deliveries`          | `{ botId?, timeoutMs? }` → drain fake deliveries     |
+
+### Request timelines and compatibility
+
+Each Bot API receipt has an instance/epoch/sequence `request_id` and a bounded
+`timeline`: `received`, `validated`, `state_applied`, `handler_completed`, and
+`response_sent` or `response_lost`. `received` timestamps HTTP arrival. Shared
+message creation/edit/deletion and membership mutation paths checkpoint known
+physical application before any awaited webhook finishes. Other handlers, and
+successful reads/no-ops, retain a completion checkpoint. `handler_completed`
+separately records successful handler return; it can occur later than application.
+`validated` records successful validation at that checkpoint, not an instrumented
+pretransaction barrier. Not every intermediate mutation is instrumented. Use exact
+message/member waits for physical proof. Request context is scoped through
+AsyncLocalStorage, so concurrent calls cannot borrow one another's checkpoints.
+`applied` remains true if an instrumented mutation is followed by a handler
+failure; `failed_after_apply` distinguishes that from a rejection before execution.
+`response_sent` means Node finished writing locally, not that the remote
+application processed the answer. Completion time includes injected response delays.
+Lost responses preserve known application separately from transport loss;
+permission/injected rejections do not record successful application.
+`target_user_id` captures the target argument, ephemeral recipient, or
+`deleteMessage` author before execution without altering original `params`.
+Matching attempts before fault injection starts now retain
+`fault_id`, `attempt`, and `fault_injected: false`; injected attempts set it true.
+
+`getCalls()` is now detached: mutating its result cannot rewrite evidence.
+Existing `calls` retains its authenticated, parsed-request scope. New
+`rejected_requests` records unauthorized/malformed attempts separately, preserving
+0.9.x call counts. Call waits use `calls` by default; set
+`includeRejectedRequests: true` to observe the early-rejection journal too. Its
+`bot_id` is the attempted numeric token prefix, not authenticated identity.
+`afterSeq` is local to each journal; `requestId` is unique across both. A call
+wait without an outcome/stage can resolve at receipt, before execution.
+Unauthorized URL tokens are not journaled; malformed bodies
+are retained as `raw_body` and suppressed in diagnostics. Migrated-chat failures
+receive the same identity/timeline as other parsed calls. Owner RPCs retain their
+existing owner ledger and duration fields. Owner receipts now use fake time,
+start as `pending`, and become `cancelled` if shutdown interrupts a delay before
+execution. `getOwnerCalls()` is detached too. These are diagnostic outcomes of
+the fake, not invented Telegram RPC errors. Successful owner response shapes are
+unchanged. Call observers use derived per-bot/method indexes and journal sequence
+bounds; restore rebuilds the indexes without removing replay evidence. Large
+restored journals are copied without exceeding JavaScript function argument limits.
+
+Four former no-op setters (`setMyDescription`, `setMyShortDescription`,
+`setChatMenuButton`, `setMyDefaultAdministratorRights`) now report unsupported in
+strict mode instead of claiming to store state. This is an intentional compatibility
+change. The explicitly selected legacy `unimplemented: "ok"` mode remains for
+existing consumers and is not an accuracy mode; strict `"error"` is the default.
+`setChatPermissions` now requires a group/supergroup and the caller’s
+`can_restrict_members` right; an unauthorized call cannot change default
+permissions. Consumers whose fixtures depended on unauthorized success must
+correct their administrator setup. Dependency versions remain unchanged.
+
+RSA login keys are generated only on first signing/JWKS use, separately per
+instance. Bot-only tests avoid the key-generation cost. Login tests still pay
+that cost at first use; this is deferred work, not cheaper cryptography.
+
+### Verification and upgrading
+
+The retained suites cover stored plain text versus original HTML/`parse_mode`,
+UTF-16 entities, literal user markup, emoji/nested/link/mention formatting,
+permissions and membership, join decisions, edit/delete, callbacks, mandatory
+supergroup ban revocation, mute history preservation, response-loss faults,
+replay and bot/chat isolation. Contracts:
+[MessageEntity](https://core.telegram.org/bots/api#messageentity),
+[formatting](https://core.telegram.org/bots/api#formatting-options),
+[ban](https://core.telegram.org/bots/api#banchatmember),
+[restrict](https://core.telegram.org/bots/api#restrictchatmember),
+[default permissions](https://core.telegram.org/bots/api#setchatpermissions),
+[join decisions](https://core.telegram.org/bots/api#approvechatjoinrequest), and
+[callback queries](https://core.telegram.org/bots/api#callbackquery).
+These do not imply complete Telegram compatibility or verified Telegram callback
+expiry/retry timing; the fake's callback wait deadline remains its own test policy.
+
+See the [measurements and regression record](https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/performance.md)
+for reproducible commands, raw samples, observed costs and remaining gaps.
+In a source checkout, run `npm test`, `npm run bench`, `node bench/reuse.mjs`,
+and `node --expose-gc bench/scaling.mjs`. The scaling benchmark accepts
+`BENCH_HISTORY`, `BENCH_MESSAGES`, `BENCH_OBSERVERS` and `BENCH_ROUNDS` for
+explicit capacity runs; do not interpret a small sample as a throughput guarantee.
+Version **0.10.0** adds these test controls and fidelity fixes. Pin it explicitly:
+
+```sh
+pnpm add -D --save-exact telegram-bot-test-server@0.10.0
+# or: npm install --save-dev --save-exact telegram-bot-test-server@0.10.0
+```
+
+Existing consumers can keep using real time and their current helpers. Adopt
+exact waits first, then snapshots only with fake and application state reset
+under each component's ownership. Do not apply 0.9.x source patches blindly to
+0.10.0; rebase and verify only still-needed patches against this source. No
+consumer repository or downstream test runner is changed by this package work.
+
 ## Changes
+
+- **0.10.0**: exact event-driven waits, fixture snapshots/restoration,
+  instance-owned manual time, delivery drains/journals, request timelines, detached
+  request evidence, callback ownership protection and lazy login key generation.
+  Former unmodelled metadata setters now fail explicitly in strict mode.
+  Default chat permissions enforce administrator restriction rights; shared physical
+  checkpoints precede webhook completion. Owner receipts preserve pending/cancelled
+  outcomes and fake time. Exact call observers avoid unrelated history scans; large
+  journals restore without argument-limit failures.
+- **0.9.2**: plain stored text and validated UTF-16 entities, HTML/Markdown formatting,
+  preserved original requests, and file/reply metadata.
 
 - **0.9.1**: scoped ban message revocation, moderation/join/bulk-delete permission checks,
   finite restriction expiry, exact user/message/attempt faults, delayed responses and

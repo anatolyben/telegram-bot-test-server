@@ -134,6 +134,55 @@ describe("moderation", () => {
     );
   });
 
+  it.each([
+    { status: "member" },
+    { status: "administrator", rights: { can_restrict_members: false } },
+  ])(
+    "refuses default-permission changes without restriction rights: %j",
+    async (membership) => {
+      const { server, api, member } = await setup();
+      const ann = await member();
+      const before = (await api("getChat", { chat_id: GROUP })).result
+        .permissions;
+      await server.setBotMembership(GROUP, BOT, membership);
+      const denied = await api("setChatPermissions", {
+        chat_id: GROUP,
+        permissions: { can_send_messages: false },
+      });
+      expect(denied).toMatchObject({ status: 400, ok: false });
+      expect(
+        (await api("getChat", { chat_id: GROUP })).result.permissions,
+      ).toEqual(before);
+      expect((await server.getMember(GROUP, ann)).status).toBe("member");
+      await expect(
+        server.post(GROUP, ann, "still allowed"),
+      ).resolves.toBeTypeOf("number");
+      expect(
+        (await server.getCalls()).calls.find(
+          (call) => call.method === "setChatPermissions",
+        ),
+      ).toMatchObject({ applied: false, outcome: "rejected" });
+    },
+  );
+
+  it("refuses group default permissions on a channel without changing channel state", async () => {
+    const { server, api } = await setup();
+    const channel = await server.createChat({
+      ownerId: OWNER,
+      type: "channel",
+      title: "Channel",
+    });
+    await server.setBotMembership(channel, BOT, { status: "administrator" });
+    const before = (await api("getChat", { chat_id: channel })).result;
+    expect(
+      await api("setChatPermissions", {
+        chat_id: channel,
+        permissions: { can_send_messages: false },
+      }),
+    ).toMatchObject({ status: 400, ok: false });
+    expect((await api("getChat", { chat_id: channel })).result).toEqual(before);
+  });
+
   it("lets broader permissions imply narrower ones unless they are independent", async () => {
     const { server, api, member } = await setup();
     const ann = await member();

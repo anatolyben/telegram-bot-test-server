@@ -19,6 +19,8 @@ export interface TelegramBotTestServerOptions {
   botToken: string;
   /** Default 0 (any free port). */
   port?: number;
+  /** Instance-owned manual time, in Unix milliseconds. Omit for real time. */
+  clock?: { now: number };
   /** Default "127.0.0.1". */
   host?: string;
   /** Default "fake_test_bot". */
@@ -180,6 +182,124 @@ export interface FailureRule {
   dropAfterApply?: boolean;
 }
 
+export interface RecordedCall {
+  seq: number;
+  method: string;
+  /** A physical checkpoint or successful handler completion; reads/no-ops need not mutate. */
+  applied: boolean;
+  outcome:
+    | "pending"
+    | "succeeded"
+    | "delayed"
+    | "response_lost"
+    | "failed_after_apply"
+    | "rejected"
+    | "unimplemented_ok";
+  status?: number;
+  completed_at?: number;
+  fault_id?: string;
+  /** Also present on matching attempts before the fault starts injecting. */
+  fault_injected?: boolean;
+  attempt?: number;
+  delay_ms?: number;
+  /** The bot that made the call. */
+  bot_id: number;
+  params: Record<string, unknown>;
+  at: number;
+  /** Rejected status, including actual permission/validation failures. */
+  failed?: number;
+  /** The call took effect and its answer was dropped. */
+  dropped?: true;
+  /** Target argument, ephemeral recipient, or deleteMessage author captured before execution. */
+  target_user_id?: number;
+  request_id: string;
+  timeline: Array<{
+    stage:
+      | "received"
+      | "validated"
+      | "state_applied"
+      | "handler_completed"
+      | "response_sent"
+      | "response_lost";
+    at: number;
+  }>;
+}
+
+export type FakeWaitCondition =
+  | {
+      kind: "message";
+      chatId: number;
+      messageId?: number;
+      userId?: number;
+      botId?: number;
+      text?: string;
+      caption?: string;
+      deleted?: boolean;
+    }
+  | {
+      kind: "member";
+      chatId: number;
+      userId: number;
+      status: ChatMember["status"];
+      permissions?: Record<string, boolean>;
+    }
+  | {
+      kind: "joinRequest";
+      chatId: number;
+      userId: number;
+      botId?: number;
+      state: "pending" | "approved" | "declined";
+    }
+  | {
+      kind: "call";
+      botId: number;
+      method: string;
+      chatId?: number;
+      userId?: number;
+      messageId?: number;
+      params?: Record<string, unknown>;
+      includeRejectedRequests?: boolean;
+      afterSeq?: number;
+      requestId?: string;
+      outcome?: RecordedCall["outcome"];
+      stage?: RecordedCall["timeline"][number]["stage"];
+    };
+export interface FakeWaitOptions {
+  /** Wall-clock deadline, 1-30000ms; default 1000. */ timeoutMs?: number;
+}
+export interface FakeMessageObservation {
+  exists: true;
+  deleted: boolean;
+  message: Message;
+}
+export interface FakeJoinObservation {
+  state: "pending" | "approved" | "declined";
+  member: ChatMember;
+  botId?: number;
+}
+export interface FakeClockState {
+  mode: "real" | "manual";
+  now: number;
+  scheduled: number;
+}
+export interface FakeDelivery {
+  update_id: number;
+  bot_id: number;
+  attempt: number;
+  epoch: number;
+  received_at: number;
+  started_at?: number;
+  completed_at?: number;
+  status?: number;
+  outcome:
+    | "queued"
+    | "poll_queue"
+    | "delivered"
+    | "rejected"
+    | "failed"
+    | "cancelled";
+}
+
 /**
  * The running server. Besides the Bot API at `origin`, it exposes the actions
  * a test takes on Telegram's side. Each resolves after the resulting update has
@@ -187,6 +307,39 @@ export interface FailureRule {
  * are available over HTTP under `${origin}/_fake/` for tests in other languages.
  */
 export interface TelegramBotTestServer {
+  waitFor(
+    condition: Extract<FakeWaitCondition, { kind: "message" }>,
+    options?: FakeWaitOptions,
+  ): Promise<FakeMessageObservation>;
+  waitFor(
+    condition: Extract<FakeWaitCondition, { kind: "member" }>,
+    options?: FakeWaitOptions,
+  ): Promise<ChatMember>;
+  waitFor(
+    condition: Extract<FakeWaitCondition, { kind: "joinRequest" }>,
+    options?: FakeWaitOptions,
+  ): Promise<FakeJoinObservation>;
+  waitFor(
+    condition: Extract<FakeWaitCondition, { kind: "call" }>,
+    options?: FakeWaitOptions,
+  ): Promise<RecordedCall>;
+  waitFor(
+    condition: FakeWaitCondition,
+    options?: FakeWaitOptions,
+  ): Promise<
+    FakeMessageObservation | ChatMember | FakeJoinObservation | RecordedCall
+  >;
+  /** Opaque, instance-owned handle; requires quiescence. Release when no longer used. */
+  snapshot(): Promise<string>;
+  restore(snapshot: string): Promise<{ restored: true; epoch: number }>;
+  releaseSnapshot(snapshot: string): Promise<{ ok: true }>;
+  getClock(): Promise<FakeClockState>;
+  advanceTime(ms: number): Promise<FakeClockState>;
+  /** Wait for queued/in-flight webhook attempts, not downstream enforcement or queued getUpdates consumption. */
+  drainDeliveries(
+    options?: FakeWaitOptions & { botId?: number },
+  ): Promise<{ drained: true }>;
+  getDeliveries(): Promise<FakeDelivery[]>;
   /** Base URL to use as the bot's Bot API root, e.g. "http://127.0.0.1:53211". */
   origin: string;
   /**
@@ -456,32 +609,9 @@ export interface TelegramBotTestServer {
   getJoinRequests(chatId: number): Promise<number[]>;
   /** Every Bot API call received, and any unsupported methods called. */
   getCalls(): Promise<{
-    calls: Array<{
-      seq: number;
-      method: string;
-      /** Handler completed successfully; does not imply a mutation for read/no-op methods. */
-      applied: boolean;
-      outcome:
-        | "pending"
-        | "succeeded"
-        | "delayed"
-        | "response_lost"
-        | "rejected"
-        | "unimplemented_ok";
-      status?: number;
-      completed_at?: number;
-      fault_id?: string;
-      attempt?: number;
-      delay_ms?: number;
-      /** The bot that made the call. */
-      bot_id: number;
-      params: Record<string, unknown>;
-      at: number;
-      /** Rejected status, including actual permission/validation failures. */
-      failed?: number;
-      /** The call took effect and its answer was dropped. */
-      dropped?: true;
-    }>;
+    calls: RecordedCall[];
+    /** Attempts rejected before parameter validation; kept separate for 0.9.x compatibility. */
+    rejected_requests: RecordedCall[];
     unimplemented: string[];
   }>;
   stop(): Promise<void>;
@@ -611,7 +741,7 @@ export interface OwnerCall {
   /** The call's arguments, with session, token and hash fields redacted. */
   args: Record<string, unknown>;
   at: string;
-  outcome: "ok" | "error" | "dropped" | "malformed";
+  outcome: "pending" | "ok" | "error" | "dropped" | "malformed" | "cancelled";
   error_message?: string;
   duration_ms?: number;
 }

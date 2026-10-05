@@ -1,0 +1,121 @@
+{
+  "node": "v24.19.0",
+  "platform": "darwin arm64",
+  "cpu": "Apple M5 Pro",
+  "gc": true,
+  "rounds": 10,
+  "warmup": 1,
+  "history": 3000,
+  "messages": 1000,
+  "observers": 100,
+  "requests": 20,
+  "workload": "local fake-only HTTP; identical source-independent fixture; snapshot/restore with saved journal; 100 exact ban-call observers during 20 unrelated getMe calls; verified receipts and physical ban; heap sample is process heapUsed after optional forced GC outside timing phases, not a leak test or total process memory",
+  "phases": {
+    "snapshot_ms": {
+      "median": 7.348667000000205,
+      "p95": 7.584541000000172
+    },
+    "restore_ms": {
+      "median": 7.701709000000847,
+      "p95": 7.81958399999894
+    },
+    "register_ms": {
+      "median": 5.835291999999754,
+      "p95": 7.582083000000239
+    },
+    "unrelated_api_ms": {
+      "median": 537.0575840000001,
+      "p95": 543.4292080000014
+    },
+    "resolve_ms": {
+      "median": 33.060749999998734,
+      "p95": 34.218041000000085
+    },
+    "heap_bytes": {
+      "median": 23463976,
+      "p95": 23752992
+    }
+  },
+  "samples": [
+    {
+      "snapshot_ms": 7.236625000000004,
+      "restore_ms": 7.569041999999854,
+      "register_ms": 6.174958000000061,
+      "unrelated_api_ms": 535.2864590000001,
+      "resolve_ms": 32.602583000000095,
+      "heap_bytes": 22919656
+    },
+    {
+      "snapshot_ms": 7.246959000000061,
+      "restore_ms": 7.604874999999993,
+      "register_ms": 7.582083000000239,
+      "unrelated_api_ms": 531.8138749999998,
+      "resolve_ms": 32.72829200000024,
+      "heap_bytes": 22779000
+    },
+    {
+      "snapshot_ms": 7.400166999999783,
+      "restore_ms": 7.61520900000005,
+      "register_ms": 5.800083000000086,
+      "unrelated_api_ms": 537.0575840000001,
+      "resolve_ms": 34.218041000000085,
+      "heap_bytes": 23323800
+    },
+    {
+      "snapshot_ms": 7.348667000000205,
+      "restore_ms": 7.592333999999937,
+      "register_ms": 5.6284999999998035,
+      "unrelated_api_ms": 530.9010829999997,
+      "resolve_ms": 32.37166700000034,
+      "heap_bytes": 23146368
+    },
+    {
+      "snapshot_ms": 7.289542000000438,
+      "restore_ms": 7.707666999999674,
+      "register_ms": 5.640457999999853,
+      "unrelated_api_ms": 536.6383329999999,
+      "resolve_ms": 32.3159999999998,
+      "heap_bytes": 23137880
+    },
+    {
+      "snapshot_ms": 7.350917000000663,
+      "restore_ms": 7.701709000000847,
+      "register_ms": 5.835291999999754,
+      "unrelated_api_ms": 525.5424590000002,
+      "resolve_ms": 33.67316699999992,
+      "heap_bytes": 23521088
+    },
+    {
+      "snapshot_ms": 7.244541999999456,
+      "restore_ms": 7.577500000000327,
+      "register_ms": 5.673749999999927,
+      "unrelated_api_ms": 539.3298749999994,
+      "resolve_ms": 32.81450000000041,
+      "heap_bytes": 23463976
+    },
+    {
+      "snapshot_ms": 7.368875000000116,
+      "restore_ms": 7.711500000000342,
+      "register_ms": 5.656750000000102,
+      "unrelated_api_ms": 538.9317919999994,
+      "resolve_ms": 33.060749999998734,
+      "heap_bytes": 23589136
+    },
+    {
+      "snapshot_ms": 7.344999999999345,
+      "restore_ms": 7.761540999999852,
+      "register_ms": 5.974917000001369,
+      "unrelated_api_ms": 538.3861249999991,
+      "resolve_ms": 33.38875000000007,
+      "heap_bytes": 23596784
+    },
+    {
+      "snapshot_ms": 7.584541000000172,
+      "restore_ms": 7.81958399999894,
+      "register_ms": 5.87525000000096,
+      "unrelated_api_ms": 543.4292080000014,
+      "resolve_ms": 33.13733300000058,
+      "heap_bytes": 23752992
+    }
+  ]
+}

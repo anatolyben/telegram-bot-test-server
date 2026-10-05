@@ -25,6 +25,8 @@
 import { createOwnerModel, OwnerError } from "./owner.js";
 import { formatText, FormattingError } from "./formatting.js";
 import http from "node:http";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createClock, createWaits, diagnostic } from "./test-controls.js";
 import {
   createHash,
   generateKeyPairSync,
@@ -400,11 +402,30 @@ export async function startTestServer({
   publicChats = [],
   unimplemented: unimplementedMode = "error",
   loginClientSecret,
+  clock: clockOptions,
   log = () => {},
 }) {
   if (unimplementedMode !== "error" && unimplementedMode !== "ok") {
     throw new TypeError('unimplemented must be "error" or "ok"');
   }
+  const clock = createClock(clockOptions);
+  const waits = createWaits();
+  const execution = new AsyncLocalStorage();
+  const now = () => Math.floor(clock.now() / 1000);
+  const instanceId = randomBytes(12).toString("hex");
+  let epoch = 0;
+  let stopped = false;
+  let stopPromise;
+  const responseClosures = new Set();
+  let activeControls = 0;
+  let activeOwners = 0;
+  let activeHttp = 0;
+  let deliveryCount = 0;
+  const deliveryJournal = [];
+  const deliveryAttempts = new Map();
+  const snapshots = new Map();
+  const joinDecisions = new Map();
+  const expiryTasks = new Map();
   const users = new Map();
   // Every bot this server answers for, by token. Each keeps its own webhook,
   // update queue and commands, as separate bots do on Telegram.
@@ -452,7 +473,7 @@ export async function startTestServer({
     return record;
   }
   // The bot the server starts with: the one in every configured chat.
-  const bot = addBot({
+  let bot = addBot({
     token: botToken,
     username: botUsername,
     firstName: botName,
@@ -463,7 +484,12 @@ export async function startTestServer({
   const joinQueries = new Map();
   const files = new Map();
   // Owner accounts: what a user sees on their own account (owner.js).
-  const ownerModel = createOwnerModel({ log });
+  const ownerModel = createOwnerModel({
+    log,
+    now: clock.now,
+    isStopped: () => stopped,
+    sleep: delayResponse,
+  });
   const chats = new Map();
   // Public channels, groups and bots other accounts link to, by lower-case
   // username. A personal profile is never public: getChat on it fails.
@@ -493,8 +519,12 @@ export async function startTestServer({
   const sentUpdates = new Map();
   const callbackAnswers = new Map();
   // Callback queries awaiting an answer; any other id is refused.
-  const openQueries = new Set();
+  const openQueries = new Map();
   const calls = [];
+  const rejectedRequests = [];
+  const callIndex = new Map();
+  const rejectedRequestIndex = new Map();
+  let requestSequence = 0;
   const unimplemented = new Set();
   // Calls a test asked to fail: the next `times` calls of a method (to one
   // chat, from one bot, when named) answer the error, or take effect and never
@@ -505,7 +535,7 @@ export async function startTestServer({
   // Telegram never reuses an update, member or message id, and bots commonly
   // treat a repeated one as already handled; counters start from the clock so
   // a restarted fake does not repeat the previous run's ids.
-  const startSeconds = Math.floor(Date.now() / 1000);
+  const startSeconds = Math.floor(clock.now() / 1000);
   let updateId = startSeconds;
   let nextUserId = 7_000_000_000 + startSeconds;
   let nextChatId = startSeconds;
@@ -532,7 +562,7 @@ export async function startTestServer({
         [bot.id, { status: "administrator" }],
       ]),
       messages: new Map(),
-      nextMessageId: startSeconds - 1_700_000_000,
+      nextMessageId: Math.max(1, startSeconds - 1_700_000_000),
       inviteLinks: new Map(),
       joinRequests: new Map(),
       permissions: { ...ALL_PERMISSIONS },
@@ -613,7 +643,7 @@ export async function startTestServer({
     if (
       ["restricted", "kicked"].includes(member.status) &&
       member.until_date > 0 &&
-      member.until_date <= Math.floor(Date.now() / 1000)
+      member.until_date <= Math.floor(clock.now() / 1000)
     ) {
       member = {
         status:
@@ -808,12 +838,12 @@ export async function startTestServer({
 
   function restrictionUntil(value) {
     const until = Number(value ?? 0);
-    const duration = until - Math.floor(Date.now() / 1000);
+    const duration = until - Math.floor(clock.now() / 1000);
     return duration < 30 || duration > 366 * 86400 ? 0 : until;
   }
 
   function requireDeleteRights(chat, entry, caller) {
-    const age = Math.floor(Date.now() / 1000) - entry.message.date;
+    const age = Math.floor(clock.now() / 1000) - entry.message.date;
     if (
       age >= 48 * 3600 ||
       entry.message.supergroup_chat_created ||
@@ -882,6 +912,9 @@ export async function startTestServer({
     const after = chatMemberObject(chat, userId);
     if (JSON.stringify(before) === JSON.stringify(after))
       return Promise.resolve();
+    scheduleExpiry(chat, userId);
+    appliedCheckpoint();
+    waits.notify();
     return emitMemberChange(chat, userId, before, actor, extra);
   }
 
@@ -907,6 +940,7 @@ export async function startTestServer({
    * channel it happened in, the bot a private chat is with, or the bots named.
    */
   function emit(type, payload, { to = null, except = null } = {}) {
+    waits.notify();
     const chatId = payload?.chat?.id ?? payload?.message?.chat?.id;
     const chat = chatId == null ? null : chats.get(Number(chatId));
     const recipients =
@@ -957,42 +991,71 @@ export async function startTestServer({
   function deliver(record, update, sentBody = null) {
     const type = Object.keys(update).find((key) => key !== "update_id");
     // Serialised now, so later state changes cannot rewrite a sent update.
+    if (stopped) return Promise.resolve();
     const body = sentBody ?? JSON.stringify(update);
-    record.delivery = record.delivery.then(async () => {
-      // The webhook may have been removed while this update waited its turn;
-      // it then belongs to getUpdates, as on Telegram.
-      const target = record.webhook;
-      if (!target?.url) {
-        record.queue.push(JSON.parse(body));
-        wakePollers(record);
-        return;
-      }
-      const abort = new AbortController();
-      const timer = setTimeout(() => abort.abort(), WEBHOOK_TIMEOUT_MS);
-      inFlight.add(abort);
-      try {
-        const response = await fetch(target.url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            ...(target.secret_token
-              ? { "X-Telegram-Bot-Api-Secret-Token": target.secret_token }
-              : {}),
-          },
-          body,
-          signal: abort.signal,
-        });
-        await response.body?.cancel();
-        if (!response.ok) {
-          log(`webhook answered ${response.status} for ${type}`);
+    const attemptKey = `${record.id}:${update.update_id}`;
+    const attempt = (deliveryAttempts.get(attemptKey) ?? 0) + 1;
+    deliveryAttempts.set(attemptKey, attempt);
+    const receipt = {
+      update_id: update.update_id,
+      bot_id: record.id,
+      attempt,
+      epoch,
+      received_at: clock.now(),
+      outcome: "queued",
+    };
+    deliveryJournal.push(receipt);
+    deliveryCount += 1;
+    record.delivery = record.delivery
+      .then(async () => {
+        // The webhook may have been removed while this update waited its turn;
+        // it then belongs to getUpdates, as on Telegram.
+        if (stopped) {
+          receipt.outcome = "cancelled";
+          return;
         }
-      } catch (error) {
-        log(`webhook delivery failed for ${type}: ${error.message}`);
-      } finally {
-        clearTimeout(timer);
-        inFlight.delete(abort);
-      }
-    });
+        receipt.started_at = clock.now();
+        const target = record.webhook;
+        if (!target?.url) {
+          record.queue.push(JSON.parse(body));
+          wakePollers(record);
+          receipt.outcome = "poll_queue";
+          return;
+        }
+        const abort = new AbortController();
+        const timer = setTimeout(() => abort.abort(), WEBHOOK_TIMEOUT_MS);
+        inFlight.add(abort);
+        try {
+          const response = await fetch(target.url, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              ...(target.secret_token
+                ? { "X-Telegram-Bot-Api-Secret-Token": target.secret_token }
+                : {}),
+            },
+            body,
+            signal: abort.signal,
+          });
+          receipt.status = response.status;
+          receipt.outcome = response.ok ? "delivered" : "rejected";
+          await response.body?.cancel();
+          if (!response.ok) {
+            log(`webhook answered ${response.status} for ${type}`);
+          }
+        } catch (error) {
+          receipt.outcome = stopped ? "cancelled" : "failed";
+          log(`webhook delivery failed for ${type}: ${error.message}`);
+        } finally {
+          clearTimeout(timer);
+          inFlight.delete(abort);
+        }
+      })
+      .finally(() => {
+        deliveryCount -= 1;
+        receipt.completed_at = clock.now();
+        waits.notify();
+      });
     return record.delivery;
   }
 
@@ -1024,6 +1087,8 @@ export async function startTestServer({
     if (status === "left") chat.members.delete(record.id);
     else chat.members.set(record.id, { status, ...(rights ? { rights } : {}) });
     const after = chatMemberObject(chat, record.id);
+    appliedCheckpoint();
+    waits.notify();
     const change = {
       chat: chatObject(chat),
       from: userObject(actor),
@@ -1237,6 +1302,8 @@ export async function startTestServer({
       ...fields,
     };
     chat.messages.set(message.message_id, { message, deleted: false });
+    appliedCheckpoint();
+    waits.notify();
     return message;
   }
 
@@ -1451,21 +1518,19 @@ export async function startTestServer({
       return true;
     },
     getMyCommands: (_p, caller) => caller.commands,
-    setMyDescription: () => true,
-    setMyShortDescription: () => true,
-    setChatMenuButton: () => true,
-    setMyDefaultAdministratorRights: () => true,
-    answerCallbackQuery: (p) => {
-      if (!openQueries.delete(String(p.callback_query_id))) {
+    answerCallbackQuery: (p, caller) => {
+      if (openQueries.get(String(p.callback_query_id)) !== caller.id) {
         throw new TelegramError(
           400,
           "Bad Request: query is too old and response timeout expired or query ID is invalid",
         );
       }
+      openQueries.delete(String(p.callback_query_id));
       callbackAnswers.set(String(p.callback_query_id), {
         text: p.text ?? "",
         show_alert: String(p.show_alert) === "true",
       });
+      waits.notify();
       return true;
     },
     getChat: (p) => {
@@ -1845,8 +1910,15 @@ export async function startTestServer({
       chat.pinned = [];
       return true;
     },
-    setChatPermissions: (p) => {
+    setChatPermissions: (p, caller) => {
       const chat = requireChat(p.chat_id);
+      if (!["group", "supergroup"].includes(chat.type)) {
+        throw new TelegramError(
+          400,
+          "Bad Request: setChatPermissions requires a group or supergroup",
+        );
+      }
+      requireRight(chat, caller, "can_restrict_members");
       chat.permissions = normalizePermissions(
         p.permissions,
         p.use_independent_chat_permissions,
@@ -1872,6 +1944,8 @@ export async function startTestServer({
       }
       requireDeleteRights(chat, entry, caller);
       entry.deleted = true;
+      appliedCheckpoint();
+      waits.notify();
       return true;
     },
     deleteMessages: (p, caller) => {
@@ -1893,6 +1967,8 @@ export async function startTestServer({
         .filter((entry) => entry && !entry.deleted);
       for (const entry of entries) requireDeleteRights(chat, entry, caller);
       for (const entry of entries) entry.deleted = true;
+      appliedCheckpoint();
+      waits.notify();
       return true;
     },
     restrictChatMember: (p, caller) => {
@@ -1985,6 +2061,10 @@ export async function startTestServer({
       }
       const request = chat.joinRequests.get(userId);
       chat.joinRequests.delete(userId);
+      joinDecisions.set(`${chat.id}:${userId}`, {
+        state: "approved",
+        botId: caller.id,
+      });
       const before = chatMemberObject(chat, userId);
       admit(chat, userId);
       // via_join_request is only for requests made without an invite link;
@@ -2008,6 +2088,11 @@ export async function startTestServer({
       if (!chat.joinRequests.delete(userId)) {
         throw new TelegramError(400, "Bad Request: HIDE_REQUESTER_MISSING");
       }
+      joinDecisions.set(`${chat.id}:${userId}`, {
+        state: "declined",
+        botId: caller.id,
+      });
+      waits.notify();
       return true;
     },
     createChatInviteLink: (p, caller) => {
@@ -2683,7 +2768,7 @@ export async function startTestServer({
     const chat = businessChat(connection, userId);
     if (
       chat.lastInboundAt == null ||
-      Date.now() - chat.lastInboundAt > 24 * 60 * 60 * 1000
+      clock.now() - chat.lastInboundAt > 24 * 60 * 60 * 1000
     ) {
       throw new TelegramError(400, "Bad Request: BUSINESS_PEER_USAGE_MISSING");
     }
@@ -2776,7 +2861,7 @@ export async function startTestServer({
       { text: String(text ?? "") },
     );
     if (sender === "person")
-      businessChat(connection, userId).lastInboundAt = Date.now();
+      businessChat(connection, userId).lastInboundAt = clock.now();
     let updateId = null;
     if (connection.isEnabled) {
       const sent = emitOne(
@@ -2860,6 +2945,8 @@ export async function startTestServer({
     }
     edited.edit_date = now();
     entry.message = edited;
+    appliedCheckpoint();
+    waits.notify();
     return edited;
   }
 
@@ -2904,7 +2991,7 @@ export async function startTestServer({
       type: kind,
       members: new Map([[owner, { status: "creator" }]]),
       messages: new Map(),
-      nextMessageId: startSeconds - 1_700_000_000,
+      nextMessageId: Math.max(1, startSeconds - 1_700_000_000),
       inviteLinks: new Map(),
       joinRequests: new Map(),
       permissions: { ...ALL_PERMISSIONS },
@@ -2924,8 +3011,453 @@ export async function startTestServer({
   }
 
   // ── Test controls (/_fake/*) ───────────────────────────────────────────
+  function scheduleExpiry(chat, userId) {
+    const key = `${chat.id}:${userId}`;
+    expiryTasks.get(key)?.();
+    expiryTasks.delete(key);
+    const member = chat.members.get(Number(userId));
+    if (
+      !["restricted", "kicked"].includes(member?.status) ||
+      !member.until_date
+    )
+      return;
+    const cancel = clock.schedule(
+      () => {
+        expiryTasks.delete(key);
+        memberStatus(chat, userId);
+        waits.notify();
+      },
+      Math.max(0, member.until_date * 1000 - clock.now()),
+      { passive: true },
+    );
+    expiryTasks.set(key, cancel);
+  }
+
+  function matchesCall(call, condition) {
+    return (
+      call.bot_id === condition.botId &&
+      call.method.toLowerCase() === condition.method.toLowerCase() &&
+      (condition.chatId == null ||
+        String(call.params.chat_id) === String(condition.chatId)) &&
+      (condition.userId == null ||
+        String(call.target_user_id) === String(condition.userId)) &&
+      (condition.messageId == null ||
+        Number(call.params.message_id) === condition.messageId ||
+        call.params.message_ids?.map(Number).includes(condition.messageId)) &&
+      (condition.requestId == null ||
+        call.request_id === condition.requestId) &&
+      Object.entries(condition.params ?? {}).every(
+        ([key, value]) =>
+          JSON.stringify(call.params[key]) === JSON.stringify(value),
+      )
+    );
+  }
+
+  function observe(condition, describe = false) {
+    if (condition.kind === "call") {
+      const key = `${condition.botId}:${condition.method.toLowerCase()}`;
+      let result = null;
+      const matching = [];
+      for (const index of condition.includeRejectedRequests
+        ? [callIndex, rejectedRequestIndex]
+        : [callIndex]) {
+        const candidates = index.get(key) ?? [];
+        // Each journal's sequence is ordered; skip the already observed prefix.
+        let low = 0;
+        let high = candidates.length;
+        if (!describe) {
+          while (low < high) {
+            const middle = (low + high) >>> 1;
+            if (candidates[middle].seq <= (condition.afterSeq ?? 0))
+              low = middle + 1;
+            else high = middle;
+          }
+        }
+        for (let i = low; i < candidates.length; i++) {
+          const call = candidates[i];
+          if (!matchesCall(call, condition)) continue;
+          if (describe) {
+            matching.push(call);
+            if (matching.length > 8) matching.shift();
+          }
+          if (
+            result == null &&
+            call.seq > (condition.afterSeq ?? 0) &&
+            (condition.outcome == null || call.outcome === condition.outcome) &&
+            (condition.stage == null ||
+              call.timeline?.some((e) => e.stage === condition.stage))
+          ) {
+            result = call;
+            if (!describe) return { result };
+          }
+        }
+      }
+      return { result, observed: { matching } };
+    }
+    const chat =
+      chats.get(condition.chatId) ?? privateChats.get(condition.chatId);
+    if (!chat)
+      return {
+        result: null,
+        observed: { chatId: condition.chatId, exists: false },
+      };
+    if (condition.kind === "message") {
+      const entries =
+        condition.messageId == null
+          ? [...chat.messages.values()]
+          : [chat.messages.get(condition.messageId)].filter(Boolean);
+      const matching = entries.filter(
+        (entry) =>
+          (condition.userId == null ||
+            entry.message.from?.id === condition.userId) &&
+          (condition.botId == null ||
+            entry.message.from?.id === condition.botId) &&
+          (condition.text == null || entry.message.text === condition.text) &&
+          (condition.caption == null ||
+            entry.message.caption === condition.caption),
+      );
+      const entry = matching.find(
+        (entry) =>
+          condition.deleted == null || entry.deleted === condition.deleted,
+      );
+      return {
+        result: entry ? { exists: true, ...entry } : null,
+        observed: matching
+          .slice(-4)
+          .map((entry) => ({ exists: true, ...entry })),
+      };
+    }
+    const member = chatMemberObject(chat, condition.userId);
+    if (condition.kind === "member") {
+      const matched =
+        member.status === condition.status &&
+        Object.entries(condition.permissions ?? {}).every(
+          ([key, value]) => member[key] === value,
+        );
+      return { result: matched ? member : null, observed: member };
+    }
+    const decision = joinDecisions.get(`${chat.id}:${condition.userId}`);
+    const state = chat.joinRequests.has(condition.userId)
+      ? "pending"
+      : (decision?.state ?? "absent");
+    const view = {
+      state,
+      member,
+      ...(decision && state !== "pending" ? { botId: decision.botId } : {}),
+    };
+    return {
+      result:
+        state === condition.state &&
+        (condition.botId == null ||
+          state === "pending" ||
+          decision?.botId === condition.botId)
+          ? view
+          : null,
+      observed: view,
+    };
+  }
+
+  async function waitFor(condition, { timeoutMs = 1000 } = {}) {
+    if (
+      !condition ||
+      !["message", "member", "joinRequest", "call"].includes(condition.kind)
+    )
+      throw new TypeError("Unknown fake wait kind");
+    if (condition.kind === "call") {
+      if (
+        !Number.isSafeInteger(condition.botId) ||
+        typeof condition.method !== "string" ||
+        !/^[A-Za-z]+$/.test(condition.method)
+      )
+        throw new TypeError("Call waits require exact botId and method");
+    } else {
+      if (!Number.isSafeInteger(condition.chatId))
+        throw new TypeError("State waits require exact chatId");
+      if (
+        condition.kind !== "message" &&
+        !Number.isSafeInteger(condition.userId)
+      )
+        throw new TypeError("Membership/join waits require exact userId");
+      if (
+        condition.kind === "message" &&
+        condition.messageId == null &&
+        !(
+          (condition.userId != null || condition.botId != null) &&
+          (condition.text != null || condition.caption != null)
+        )
+      )
+        throw new TypeError(
+          "Message waits require messageId or author plus exact text/caption",
+        );
+      if (
+        condition.kind === "member" &&
+        ![
+          "creator",
+          "administrator",
+          "member",
+          "restricted",
+          "left",
+          "kicked",
+        ].includes(condition.status)
+      )
+        throw new TypeError("Member waits require a supported status");
+      if (
+        condition.kind === "joinRequest" &&
+        !["pending", "approved", "declined"].includes(condition.state)
+      )
+        throw new TypeError("Join waits require pending/approved/declined");
+    }
+    condition = structuredClone(condition);
+    const secrets = () =>
+      [...bots.values()].flatMap((record) => [
+        record.token,
+        record.loginClientSecret,
+        record.webhook?.secret_token,
+      ]);
+    return waits.wait(
+      () => observe(condition).result,
+      timeoutMs,
+      () =>
+        diagnostic(
+          {
+            expected: condition,
+            observed: observe(condition, true).observed,
+            outstanding: outstanding(),
+          },
+          secrets(),
+        ),
+    );
+  }
+
+  function outstanding() {
+    return {
+      controls: activeControls,
+      http: activeHttp,
+      owners: activeOwners,
+      deliveries: deliveryCount,
+      polls: [...bots.values()].reduce(
+        (n, record) => n + record.pollWaiters.size,
+        0,
+      ),
+      delayedOrNetworkRequests: inFlight.size,
+      waits: waits.size,
+    };
+  }
+
+  function requireQuiescent() {
+    const work = outstanding();
+    if (
+      activeControls ||
+      activeHttp ||
+      activeOwners ||
+      deliveryCount ||
+      work.polls ||
+      inFlight.size ||
+      clock.busy()
+    ) {
+      throw new TelegramError(
+        409,
+        `Fake fixture is busy; outstanding ${JSON.stringify(work)}`,
+      );
+    }
+  }
+
+  function snapshot() {
+    requireQuiescent();
+    const records = new Map(
+      [...bots].map(([token, record]) => {
+        const { delivery, pollWaiters, ...fixture } = record;
+        return [token, fixture];
+      }),
+    );
+    const fixtureUsers = new Map(
+      [...users].map(([id, user]) => [
+        id,
+        user.is_bot && bots.has(user.token) ? records.get(user.token) : user,
+      ]),
+    );
+    const fixtureUpdates = new Map(
+      [...sentUpdates].map(([id, sent]) => [
+        id,
+        { body: sent.body, record: records.get(sent.record.token) },
+      ]),
+    );
+    const state = structuredClone({
+      users: fixtureUsers,
+      bots: records,
+      sentUpdates: fixtureUpdates,
+      chats,
+      privateChats,
+      businessConnections,
+      joinQueries,
+      files,
+      callbackAnswers,
+      openQueries,
+      calls,
+      rejectedRequests,
+      requestSequence,
+      failures,
+      unimplemented,
+      publicByUsername,
+      joinDecisions,
+      deliveryJournal,
+      deliveryAttempts,
+      loginCodes,
+      counters: {
+        nextPublicId,
+        updateId,
+        nextUserId,
+        nextChatId,
+        nextBasicGroupId,
+        nextMediaGroupId,
+        nextPollId,
+      },
+      owner: ownerModel.snapshot(),
+      time: clock.now(),
+    });
+    const id = `${instanceId}-${randomBytes(12).toString("hex")}`;
+    snapshots.set(id, state);
+    return id;
+  }
+
+  function restore(id) {
+    if (!snapshots.has(id))
+      throw new TelegramError(404, "Unknown snapshot for this server");
+    requireQuiescent();
+    const state = structuredClone(snapshots.get(id));
+    waits.cancel("Fake fixture restored");
+    clock.clear();
+    expiryTasks.clear();
+    clock.restore(state.time);
+    for (const [target, source] of [
+      [users, state.users],
+      [bots, state.bots],
+      [sentUpdates, state.sentUpdates],
+      [chats, state.chats],
+      [privateChats, state.privateChats],
+      [businessConnections, state.businessConnections],
+      [joinQueries, state.joinQueries],
+      [files, state.files],
+      [callbackAnswers, state.callbackAnswers],
+      [openQueries, state.openQueries],
+      [publicByUsername, state.publicByUsername],
+      [joinDecisions, state.joinDecisions],
+      [loginCodes, state.loginCodes],
+      [deliveryAttempts, state.deliveryAttempts],
+    ]) {
+      target.clear();
+      for (const [key, value] of source) target.set(key, value);
+    }
+    for (const record of bots.values()) {
+      record.delivery = Promise.resolve();
+      record.pollWaiters = new Set();
+    }
+    for (const file of files.values()) file.data = Buffer.from(file.data);
+    bot = bots.get(botToken);
+    // Do not spread a fixture journal into function arguments: large replay
+    // histories exceed the engine's argument limit and leave a partial restore.
+    for (const [target, entries] of [
+      [calls, state.calls],
+      [rejectedRequests, state.rejectedRequests],
+      [failures, state.failures],
+      [deliveryJournal, state.deliveryJournal],
+    ]) {
+      target.length = 0;
+      for (const entry of entries) target.push(entry);
+    }
+    callIndex.clear();
+    rejectedRequestIndex.clear();
+    for (const receipt of calls) indexCall(receipt, callIndex);
+    for (const receipt of rejectedRequests)
+      indexCall(receipt, rejectedRequestIndex);
+    requestSequence = state.requestSequence;
+    unimplemented.clear();
+    for (const method of state.unimplemented) unimplemented.add(method);
+    ({
+      nextPublicId,
+      updateId,
+      nextUserId,
+      nextChatId,
+      nextBasicGroupId,
+      nextMediaGroupId,
+      nextPollId,
+    } = state.counters);
+    ownerModel.restore(state.owner);
+    epoch += 1;
+    for (const chat of chats.values())
+      for (const userId of chat.members.keys()) scheduleExpiry(chat, userId);
+    waits.notify();
+    return { restored: true, epoch };
+  }
+
+  async function drainDeliveries({ botId, timeoutMs = 1000 } = {}) {
+    if (
+      botId != null &&
+      ![...bots.values()].some((record) => record.id === botId)
+    )
+      throw new TypeError("Unknown botId");
+    return waits.wait(
+      () => {
+        const outstanding = deliveryJournal.filter(
+          (e) =>
+            e.completed_at == null && (botId == null || e.bot_id === botId),
+        );
+        return outstanding.length ? null : { drained: true };
+      },
+      timeoutMs,
+      () =>
+        diagnostic({
+          outstanding: deliveryJournal
+            .filter(
+              (e) =>
+                e.completed_at == null && (botId == null || e.bot_id === botId),
+            )
+            .slice(-8),
+        }),
+    );
+  }
+
   async function control(method, parts, body) {
+    const managed = [
+      "wait",
+      "snapshots",
+      "restore",
+      "clock",
+      "deliveries",
+    ].includes(parts[0]);
+    if (stopped && method !== "GET")
+      throw new TelegramError(409, "Fake server stopped");
+    if (!managed) activeControls += 1;
+    try {
+      return await controlInner(method, parts, body);
+    } finally {
+      if (!managed) activeControls -= 1;
+      waits.notify();
+    }
+  }
+
+  async function controlInner(method, parts, body) {
     const [resource, id, sub, subId] = parts;
+    if (resource === "wait" && method === "POST")
+      return waitFor(body.condition, { timeoutMs: body.timeoutMs });
+    if (resource === "snapshots" && method === "POST") return snapshot();
+    if (resource === "snapshots" && id && method === "DELETE") {
+      if (!snapshots.delete(id))
+        throw new TelegramError(404, "Unknown snapshot for this server");
+      return { ok: true };
+    }
+    if (resource === "restore" && method === "POST")
+      return restore(body.snapshot);
+    if (resource === "clock" && method === "GET") return clock.state();
+    if (resource === "clock" && method === "POST") {
+      const state = await clock.advance(body.ms);
+      waits.notify();
+      return state;
+    }
+    if (resource === "deliveries" && method === "GET")
+      return structuredClone(deliveryJournal);
+    if (resource === "deliveries" && method === "POST")
+      return drainDeliveries(body);
     if (resource === "owners") {
       try {
         return ownerModel.control(method, parts.slice(1), body);
@@ -3321,7 +3853,11 @@ export async function startTestServer({
       return { message_id: message.message_id };
     }
     if (resource === "calls" && method === "GET") {
-      return { calls, unimplemented: [...unimplemented] };
+      return structuredClone({
+        calls,
+        rejected_requests: rejectedRequests,
+        unimplemented: [...unimplemented],
+      });
     }
     if (resource === "webhook" && method === "GET") return bot.webhook;
     throw new TelegramError(
@@ -3393,11 +3929,11 @@ export async function startTestServer({
       );
     }
     const queryId = randomBytes(8).readBigUInt64BE().toString();
-    openQueries.add(queryId);
     // Only the bot that sent the message hears its buttons pressed.
     const sender = [...bots.values()].find(
       (record) => record.id === entry.message.from?.id,
     );
+    openQueries.set(queryId, (sender ?? bot).id);
     await emit(
       "callback_query",
       {
@@ -3409,17 +3945,19 @@ export async function startTestServer({
       },
       { to: sender ? [sender] : [bot] },
     );
-    const deadline = Date.now() + 10_000;
-    while (Date.now() < deadline) {
-      if (callbackAnswers.has(queryId)) {
-        const answer = callbackAnswers.get(queryId);
-        callbackAnswers.delete(queryId);
-        return { answered: true, ...answer };
-      }
-      await new Promise((resolve) => setTimeout(resolve, 100));
+    try {
+      const answer = await waits.wait(
+        () => callbackAnswers.get(queryId) ?? null,
+        10_000,
+      );
+      callbackAnswers.delete(queryId);
+      return { answered: true, ...answer };
+    } catch (error) {
+      if (stopped) throw error;
+      return { answered: false };
+    } finally {
+      openQueries.delete(queryId);
     }
-    openQueries.delete(queryId);
-    return { answered: false };
   }
 
   async function join(chat, { user_id: userId, invite_link: link }) {
@@ -3436,6 +3974,7 @@ export async function startTestServer({
       throw new TelegramError(400, "INVITE_HASH_EXPIRED");
     }
     if (invite?.creates_join_request) {
+      joinDecisions.delete(`${chat.id}:${user.id}`);
       chat.joinRequests.set(user.id, {
         invite_link: { ...invite },
         date: now(),
@@ -3749,7 +4288,10 @@ export async function startTestServer({
   const LOGIN_CODE_TTL_MS = 60_000;
   // The documented token response says "expires_in": 3600.
   const LOGIN_TOKEN_TTL_S = 3600;
-  const loginKey = generateKeyPairSync("rsa", { modulusLength: 2048 });
+  let loginKey;
+  function requireLoginKey() {
+    return (loginKey ??= generateKeyPairSync("rsa", { modulusLength: 2048 }));
+  }
   const loginKid = `fake-${randomBytes(6).toString("hex")}`;
   const loginCodes = new Map();
   // `sub` is an opaque id, not the Telegram id (the documented example has a
@@ -3771,7 +4313,11 @@ export async function startTestServer({
   function signIdToken(claims) {
     const header = { alg: "RS256", typ: "JWT", kid: loginKid };
     const input = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(claims))}`;
-    const signature = sign("sha256", Buffer.from(input), loginKey.privateKey);
+    const signature = sign(
+      "sha256",
+      Buffer.from(input),
+      requireLoginKey().privateKey,
+    );
     return `${input}.${signature.toString("base64url")}`;
   }
 
@@ -3809,7 +4355,7 @@ export async function startTestServer({
     return {
       keys: [
         {
-          ...loginKey.publicKey.export({ format: "jwk" }),
+          ...requireLoginKey().publicKey.export({ format: "jwk" }),
           alg: "RS256",
           use: "sig",
           kid: loginKid,
@@ -3878,7 +4424,7 @@ export async function startTestServer({
     loginCodes.set(code, {
       ...request,
       userId: user.id,
-      expiresAt: Date.now() + LOGIN_CODE_TTL_MS,
+      expiresAt: clock.now() + LOGIN_CODE_TTL_MS,
       used: false,
     });
     return loginRedirect(request.redirectUri, { code, state: request.state });
@@ -3981,7 +4527,7 @@ ${buttons}
     if (!code || code.bot.id !== record.id) return invalid("Unknown code");
     if (code.used) return invalid("The code was already used");
     code.used = true;
-    if (Date.now() > code.expiresAt) return invalid("The code has expired");
+    if (clock.now() > code.expiresAt) return invalid("The code has expired");
     if (form.get("redirect_uri") !== code.redirectUri) {
       return invalid("redirect_uri does not match the authorization request");
     }
@@ -3996,7 +4542,7 @@ ${buttons}
       }
     }
     const user = requireUser(code.userId);
-    const issuedAt = Math.floor(Date.now() / 1000);
+    const issuedAt = Math.floor(clock.now() / 1000);
     const claims = {
       iss: LOGIN_ISSUER,
       aud: String(record.id),
@@ -4115,6 +4661,27 @@ ${buttons}
   }
 
   const server = http.createServer(async (request, response) => {
+    let closed;
+    const closure = new Promise((resolve) => {
+      closed = resolve;
+    });
+    responseClosures.add(closure);
+    response.once("close", () => {
+      responseClosures.delete(closure);
+      closed();
+    });
+    const receivedAt = clock.now();
+    const management =
+      /^\/_fake\/(wait|snapshots|restore|clock|deliveries)(\/|$)/.test(
+        request.url,
+      );
+    if (!management) {
+      activeHttp += 1;
+      response.once("close", () => {
+        activeHttp -= 1;
+        waits.notify();
+      });
+    }
     try {
       const url = new URL(request.url, "http://localhost");
       const body = await readBody(request);
@@ -4135,11 +4702,18 @@ ${buttons}
       const ownerCall = url.pathname.match(/^\/_owner\/([^/]+)\/([A-Za-z]+)$/);
       if (ownerCall && request.method === "POST") {
         const args = body.length ? parseJsonObject(body) : {};
-        const answer = await ownerModel.rpc(
-          decodeURIComponent(ownerCall[1]),
-          ownerCall[2],
-          args,
-        );
+        let answer;
+        activeOwners += 1;
+        try {
+          answer = await ownerModel.rpc(
+            decodeURIComponent(ownerCall[1]),
+            ownerCall[2],
+            args,
+          );
+        } finally {
+          activeOwners -= 1;
+          waits.notify();
+        }
         // A dropped response: the call ran, and the connection closes unanswered.
         if (answer.drop) {
           request.socket.destroy();
@@ -4175,6 +4749,20 @@ ${buttons}
       }
       const caller = bots.get(call[1]);
       if (!caller) {
+        recordCall(
+          {
+            method: call[2],
+            bot_id: Number(call[1].split(":")[0]) || 0,
+            params: {},
+            at: receivedAt,
+            applied: false,
+            outcome: "rejected",
+            status: 401,
+            failed: 401,
+          },
+          response,
+          rejectedRequests,
+        );
         send(response, 401, {
           ok: false,
           error_code: 401,
@@ -4188,6 +4776,20 @@ ${buttons}
         params = await readRequestParams(request, body);
       } catch (error) {
         if (!(error instanceof TelegramError)) throw error;
+        recordCall(
+          {
+            method,
+            bot_id: caller.id,
+            params: { raw_body: body.toString("utf8") },
+            at: receivedAt,
+            applied: false,
+            outcome: "rejected",
+            status: error.code,
+            failed: error.code,
+          },
+          response,
+          rejectedRequests,
+        );
         send(response, error.code, {
           ok: false,
           error_code: error.code,
@@ -4200,18 +4802,20 @@ ${buttons}
       // https://core.telegram.org/bots/api#responseparameters
       const addressed = chats.get(Number(params.chat_id));
       if (addressed?.migratedTo != null) {
-        calls.push({
-          seq: calls.length + 1,
-          applied: false,
-          outcome: "rejected",
-          status: 400,
-          completed_at: Date.now(),
-          method,
-          bot_id: caller.id,
-          params: summarize(params),
-          at: Date.now(),
-          failed: 400,
-        });
+        recordCall(
+          {
+            applied: false,
+            outcome: "rejected",
+            status: 400,
+            completed_at: clock.now(),
+            method,
+            bot_id: caller.id,
+            params: summarize(params),
+            at: receivedAt,
+            failed: 400,
+          },
+          response,
+        );
         send(response, 400, {
           ok: false,
           error_code: 400,
@@ -4221,15 +4825,17 @@ ${buttons}
         });
         return;
       }
-      const failure = takeFailure(method, caller, params);
+      const faultTrace = {};
+      const failure = takeFailure(method, caller, params, faultTrace);
       const receipt = {
         seq: calls.length + 1,
         method,
         bot_id: caller.id,
         params: summarize(params),
-        at: Date.now(),
+        at: receivedAt,
         applied: false,
         outcome: "pending",
+        ...faultTrace,
         ...(failure
           ? {
               fault_id: failure.id,
@@ -4238,14 +4844,15 @@ ${buttons}
             }
           : {}),
       };
-      calls.push(receipt);
+      recordCall(receipt, response);
       if (failure && !failure.drop_after_apply && !failure.delay_only) {
         Object.assign(receipt, {
           failed: failure.error_code,
           status: failure.error_code,
           outcome: "rejected",
-          completed_at: Date.now(),
+          completed_at: clock.now(),
         });
+        waits.notify();
         if (failure.delay_ms) await delayResponse(failure.delay_ms);
         send(response, failure.error_code, {
           ok: false,
@@ -4263,7 +4870,7 @@ ${buttons}
         Object.assign(receipt, {
           outcome: unimplementedMode === "ok" ? "unimplemented_ok" : "rejected",
           status: unimplementedMode === "ok" ? 200 : 404,
-          completed_at: Date.now(),
+          completed_at: clock.now(),
         });
         if (unimplementedMode !== "ok") receipt.failed = 404;
         if (!unimplemented.has(method)) {
@@ -4284,20 +4891,30 @@ ${buttons}
         return;
       }
       try {
-        const result = await handler(params, caller);
+        const result = await execution.run(receipt, () =>
+          handler(params, caller),
+        );
+        // Uninstrumented handlers and successful reads/no-ops retain their
+        // completion checkpoint; message/membership helpers checkpoint earlier.
         Object.assign(receipt, {
           applied: true,
           status: 200,
-          completed_at: Date.now(),
-          outcome: failure?.drop_after_apply
-            ? "response_lost"
-            : failure?.delay_ms
-              ? "delayed"
-              : "succeeded",
+          completed_at: clock.now(),
+          outcome:
+            failure?.drop_after_apply ||
+            receipt.timeline.some((e) => e.stage === "response_lost")
+              ? "response_lost"
+              : failure?.delay_ms
+                ? "delayed"
+                : "succeeded",
         });
+        if (receipt.outcome === "response_lost") receipt.dropped = true;
+        appliedCheckpoint(receipt);
+        stage(receipt, "handler_completed");
         // The call took effect, but its answer is lost on the way back.
         if (failure?.drop_after_apply) {
           receipt.dropped = true;
+          stage(receipt, "response_lost");
           request.socket.destroy();
           return;
         }
@@ -4305,11 +4922,11 @@ ${buttons}
         send(response, 200, { ok: true, result });
       } catch (error) {
         Object.assign(receipt, {
-          applied: false,
-          outcome: "rejected",
+          applied: receipt.applied,
+          outcome: receipt.applied ? "failed_after_apply" : "rejected",
           failed: error instanceof TelegramError ? error.code : 500,
           status: error instanceof TelegramError ? error.code : 500,
-          completed_at: Date.now(),
+          completed_at: clock.now(),
         });
         if (!(error instanceof TelegramError)) throw error;
         send(response, error.code, {
@@ -4334,34 +4951,98 @@ ${buttons}
     inFlight.add(abort);
     return new Promise((resolve) => {
       const finish = () => {
-        clearTimeout(timer);
+        cancel();
         inFlight.delete(abort);
+        abort.signal.removeEventListener("abort", finish);
         resolve();
+        waits.notify();
       };
-      const timer = setTimeout(finish, ms);
+      const cancel = clock.schedule(finish, ms);
       abort.signal.addEventListener("abort", finish, { once: true });
     });
   }
 
-  function takeFailure(method, caller, params) {
+  function recordCall(receipt, response, journal = calls) {
+    const target = Number(targetUser(receipt.method, receipt.params));
+    if (Number.isSafeInteger(target)) receipt.target_user_id = target;
+    receipt.seq = journal.length + 1;
+    receipt.request_id = `${instanceId}:${epoch}:${++requestSequence}`;
+    receipt.timeline = [{ stage: "received", at: receipt.at }];
+    const socket = response.socket;
+    function lost() {
+      if (receipt.applied) {
+        receipt.outcome = "response_lost";
+        receipt.dropped = true;
+      }
+      receipt.completed_at = clock.now();
+      if (!receipt.timeline.some((e) => e.stage === "response_lost"))
+        stage(receipt, "response_lost");
+    }
+    response.once("finish", () => {
+      if (socket.destroyed) lost();
+      else {
+        receipt.completed_at = clock.now();
+        stage(receipt, "response_sent");
+      }
+    });
+    response.once("close", () => {
+      if (
+        !response.writableFinished ||
+        (socket.destroyed &&
+          !receipt.timeline.some((e) => e.stage === "response_sent"))
+      )
+        lost();
+    });
+    journal.push(receipt);
+    indexCall(receipt, journal === calls ? callIndex : rejectedRequestIndex);
+    waits.notify();
+  }
+
+  function appliedCheckpoint(receipt = execution.getStore()) {
+    if (
+      !receipt ||
+      receipt.timeline.some((event) => event.stage === "state_applied")
+    )
+      return;
+    receipt.applied = true;
+    stage(receipt, "validated");
+    stage(receipt, "state_applied");
+  }
+
+  function indexCall(receipt, index) {
+    const key = `${receipt.bot_id}:${receipt.method.toLowerCase()}`;
+    let bucket = index.get(key);
+    if (!bucket) index.set(key, (bucket = []));
+    bucket.push(receipt);
+  }
+
+  function stage(receipt, name) {
+    receipt.timeline.push({ stage: name, at: clock.now() });
+    waits.notify();
+  }
+
+  function targetUser(method, params) {
+    return (
+      params.user_id ??
+      params.receiver_user_id ??
+      params.ephemeral_message_parameters?.receiver_user_id ??
+      (method.toLowerCase() === "deletemessage"
+        ? (
+            chats.get(Number(params.chat_id)) ??
+            privateChats.get(Number(params.chat_id))
+          )?.messages.get(Number(params.message_id))?.message.from?.id
+        : undefined)
+    );
+  }
+
+  function takeFailure(method, caller, params, trace) {
     const index = failures.findIndex(
       (rule) =>
         rule.method.toLowerCase() === method.toLowerCase() &&
         (rule.chat_id === null || rule.chat_id === String(params.chat_id)) &&
         (rule.bot_id === null || rule.bot_id === caller.id) &&
         (rule.user_id === null ||
-          rule.user_id ===
-            String(
-              params.user_id ??
-                params.receiver_user_id ??
-                params.ephemeral_message_parameters?.receiver_user_id ??
-                (method.toLowerCase() === "deletemessage"
-                  ? (
-                      chats.get(Number(params.chat_id)) ??
-                      privateChats.get(Number(params.chat_id))
-                    )?.messages.get(Number(params.message_id))?.message.from?.id
-                  : undefined),
-            )) &&
+          rule.user_id === String(targetUser(method, params))) &&
         (rule.message_id === null ||
           rule.message_id === String(params.message_id) ||
           (Array.isArray(params.message_ids) &&
@@ -4370,6 +5051,11 @@ ${buttons}
     if (index < 0) return null;
     const rule = failures[index];
     rule.matched += 1;
+    Object.assign(trace, {
+      fault_id: rule.id,
+      attempt: rule.matched,
+      fault_injected: rule.matched >= rule.attempt,
+    });
     if (rule.matched < rule.attempt) return null;
     rule.remaining -= 1;
     if (rule.remaining <= 0) failures.splice(index, 1);
@@ -4379,7 +5065,9 @@ ${buttons}
   function summarize(params) {
     const out = {};
     for (const [key, value] of Object.entries(params)) {
-      out[key] = Buffer.isBuffer(value) ? `<${value.length} bytes>` : value;
+      out[key] = Buffer.isBuffer(value)
+        ? `<${value.length} bytes>`
+        : structuredClone(value);
     }
     return out;
   }
@@ -4404,6 +5092,14 @@ ${buttons}
 
   return {
     origin,
+    waitFor,
+    snapshot: () => act("POST", "snapshots"),
+    restore: (snapshot) => act("POST", "restore", { snapshot }),
+    releaseSnapshot: (snapshot) => act("DELETE", `snapshots/${snapshot}`),
+    getClock: () => act("GET", "clock"),
+    advanceTime: (ms) => act("POST", "clock", { ms }),
+    drainDeliveries,
+    getDeliveries: () => act("GET", "deliveries"),
     addBot: ({ token, username, firstName, supportsJoinRequestQueries } = {}) =>
       act("POST", "bots", {
         token,
@@ -4720,12 +5416,22 @@ ${buttons}
     getJoinRequests: (chatId) => act("GET", `chats/${chatId}/join-requests`),
     getCalls: () => act("GET", "calls"),
     stop: () =>
-      new Promise((resolve) => {
+      (stopPromise ??= (async () => {
+        stopped = true;
+        waits.cancel("Fake server stopped", true);
         for (const record of bots.values()) wakePollers(record);
-        for (const abort of inFlight) abort.abort();
-        server.close(() => resolve());
-        server.closeAllConnections();
-      }),
+        for (const abort of [...inFlight]) abort.abort();
+        clock.clear();
+        expiryTasks.clear();
+        snapshots.clear();
+        const closing = [...responseClosures];
+        await new Promise((resolve) => {
+          server.close(resolve);
+          server.closeAllConnections();
+        });
+        await Promise.all(closing);
+        await Promise.all([...bots.values()].map((record) => record.delivery));
+      })()),
   };
 }
 

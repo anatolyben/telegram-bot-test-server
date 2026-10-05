@@ -1,0 +1,49 @@
+{
+  "node": "v24.19.0",
+  "platform": "darwin arm64",
+  "cpu": "Apple M5 Pro",
+  "gc": true,
+  "rounds": 1,
+  "warmup": 1,
+  "history": 150000,
+  "messages": 0,
+  "observers": 1,
+  "requests": 20,
+  "workload": "local fake-only HTTP; identical source-independent fixture; snapshot/restore with saved journal; 1 exact ban-call observers during 20 unrelated getMe calls; verified receipts and physical ban; heap sample is process heapUsed after optional forced GC outside timing phases, not a leak test or total process memory",
+  "phases": {
+    "snapshot_ms": {
+      "median": 351.6124590000036,
+      "p95": 351.6124590000036
+    },
+    "restore_ms": {
+      "median": 374.4642079999976,
+      "p95": 374.4642079999976
+    },
+    "register_ms": {
+      "median": 0.15470799999457086,
+      "p95": 0.15470799999457086
+    },
+    "unrelated_api_ms": {
+      "median": 26.999666999996407,
+      "p95": 26.999666999996407
+    },
+    "resolve_ms": {
+      "median": 1.5609579999945709,
+      "p95": 1.5609579999945709
+    },
+    "heap_bytes": {
+      "median": 443676352,
+      "p95": 443676352
+    }
+  },
+  "samples": [
+    {
+      "snapshot_ms": 351.6124590000036,
+      "restore_ms": 374.4642079999976,
+      "register_ms": 0.15470799999457086,
+      "unrelated_api_ms": 26.999666999996407,
+      "resolve_ms": 1.5609579999945709,
+      "heap_bytes": 443676352
+    }
+  ]
+}

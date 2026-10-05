@@ -1,0 +1,61 @@
+{
+  "node": "v24.19.0",
+  "platform": "darwin arm64",
+  "cpu": "Apple M5 Pro",
+  "rounds": 10,
+  "warmup": 1,
+  "cases": 20,
+  "workload": "same 0.10.0 source; 20 users/joins/inbound messages and 20 formatted HTTP sends per fixture, then verified ban/revocation per case; includes initial fixture/snapshot/cleanup; no consuming application",
+  "phases": {
+    "restart": {
+      "median_ms": 648.0266670000001,
+      "p95_ms": 658.7731250000002
+    },
+    "restore": {
+      "median_ms": 75.14233299999978,
+      "p95_ms": 77.28999999999996
+    }
+  },
+  "samples": [
+    {
+      "restart": 651.0606660000001,
+      "restore": 77.18462499999987
+    },
+    {
+      "restore": 77.28999999999996,
+      "restart": 595.191167
+    },
+    {
+      "restart": 653.0580419999997,
+      "restore": 76.95862499999976
+    },
+    {
+      "restore": 71.82920800000011,
+      "restart": 658.7731250000002
+    },
+    {
+      "restart": 648.0266670000001,
+      "restore": 75.14233299999978
+    },
+    {
+      "restore": 69.2895840000001,
+      "restart": 649.0873750000001
+    },
+    {
+      "restart": 618.4541669999999,
+      "restore": 73.04179199999999
+    },
+    {
+      "restore": 70.74970799999937,
+      "restart": 615.7810840000002
+    },
+    {
+      "restart": 631.5954579999998,
+      "restore": 76.03837500000009
+    },
+    {
+      "restore": 71.10820800000056,
+      "restart": 612.5411669999994
+    }
+  ]
+}

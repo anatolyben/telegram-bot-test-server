@@ -134,9 +134,14 @@ function accessHash(rawId) {
   return (rawId * 2_654_435_761) % 2_147_483_647;
 }
 
-export function createOwnerModel({ log = () => {} } = {}) {
+export function createOwnerModel({
+  log = () => {},
+  now = Date.now,
+  isStopped = () => false,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+} = {}) {
   const owners = new Map();
-  const startSeconds = Math.floor(Date.now() / 1000);
+  const startSeconds = Math.floor(now() / 1000);
   let nextOwnerId = 6_000_000_000 + (startSeconds % 1_000_000);
   let pinSequence = 0;
 
@@ -670,17 +675,13 @@ export function createOwnerModel({ log = () => {} } = {}) {
       owner_id: owner.id,
       method,
       args: redact(args),
-      at: new Date().toISOString(),
-      outcome: "ok",
+      at: new Date(now()).toISOString(),
+      outcome: "pending",
     };
     owner.calls.push(call);
-    const started = Date.now();
+    const started = now();
     const finish = (outcome, extra = {}) => {
-      Object.assign(
-        call,
-        { outcome, duration_ms: Date.now() - started },
-        extra,
-      );
+      Object.assign(call, { outcome, duration_ms: now() - started }, extra);
     };
     if (!Object.hasOwn(handlers, method)) {
       const failure = notModelled(`owner client method ${method}`);
@@ -689,7 +690,11 @@ export function createOwnerModel({ log = () => {} } = {}) {
     }
     const fault = takeFault(owner, method, args);
     if (fault?.delayMs) {
-      await new Promise((resolve) => setTimeout(resolve, fault.delayMs));
+      await sleep(fault.delayMs);
+    }
+    if (isStopped()) {
+      finish("cancelled");
+      return { drop: true };
     }
     const injected = fault ? faultError(fault, method, args) : null;
     if (injected) {
@@ -828,9 +833,7 @@ export function createOwnerModel({ log = () => {} } = {}) {
       muteUntil: 0,
       unreadCount: 0,
       createdDate:
-        body.date == null
-          ? Math.floor(Date.now() / 1000)
-          : whole(body.date, "date"),
+        body.date == null ? Math.floor(now() / 1000) : whole(body.date, "date"),
       messages: new Map(),
     };
     applyDialogState(peer, body);
@@ -1011,7 +1014,7 @@ export function createOwnerModel({ log = () => {} } = {}) {
           message.text = body.text;
           message.editDate =
             body.edit_date == null
-              ? Math.floor(Date.now() / 1000)
+              ? Math.floor(now() / 1000)
               : whole(body.edit_date, "edit_date");
           return messageView(owner, peer, message);
         }
@@ -1090,7 +1093,8 @@ export function createOwnerModel({ log = () => {} } = {}) {
         return { faults: owner.faults.length };
       }
     }
-    if (section === "calls" && method === "GET") return owner.calls;
+    if (section === "calls" && method === "GET")
+      return structuredClone(owner.calls);
     log(`unknown owner control ${method} /${parts.join("/")}`);
     throw new OwnerError(
       404,
@@ -1098,7 +1102,17 @@ export function createOwnerModel({ log = () => {} } = {}) {
     );
   }
 
-  return { rpc, control };
+  return {
+    rpc,
+    control,
+    snapshot: () => ({ owners, nextOwnerId, pinSequence }),
+    restore(state) {
+      owners.clear();
+      for (const [id, owner] of state.owners) owners.set(id, owner);
+      nextOwnerId = state.nextOwnerId;
+      pinSequence = state.pinSequence;
+    },
+  };
 }
 
 function snake(name) {
