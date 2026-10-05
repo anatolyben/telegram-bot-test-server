@@ -525,12 +525,36 @@ The test actions above, over HTTP, for tests written in other languages. All rou
 A button press waits up to 10 seconds for the bot to call `answerCallbackQuery` and returns
 `{ answered, text, show_alert }`.
 
+## Formatting, replies and uploads
+
+Bot text and media captions support `parse_mode` (`HTML`, `MarkdownV2` and legacy
+`Markdown`) and explicit `entities` / `caption_entities`. The stored response has plain
+text and UTF-16 entity offsets. Formatting also applies to album captions, media edits
+and business text sends. Links, mentions and commands can be detected inside styles;
+code, pre and explicit links suppress overlapping automatic detection.
+
+The contract cases cover malformed markup, crossed Markdown delimiters, invalid entity
+ranges (including surrogate-pair boundaries), style splitting around code, and overlapping
+blockquote normalization. These rules follow [Bot API formatting options](https://core.telegram.org/bots/api#formatting-options)
+and Telegram's [TDLib entity implementation](https://github.com/tdlib/td/blob/master/td/telegram/MessageEntity.cpp).
+Album captions are all parsed before any album message is stored, following the
+[Bot API server's request parsing](https://github.com/tdlib/telegram-bot-api/blob/master/telegram-bot-api/Client.cpp).
+This is a tested subset, not a claim that every Telegram parser edge case is implemented
+or every error description is byte-for-byte identical.
+
+Same-chat `reply_parameters` and the older `reply_to_message_id` populate
+`reply_to_message`, without nested reply chains. The basic same-chat
+`allow_sending_without_reply` option is supported. Forum-topic sends without an explicit
+reply attach the topic's creation message. Cross-chat replies, quoted substrings and
+business reply metadata are not implemented; see [ReplyParameters](https://core.telegram.org/bots/api#replyparameters)
+for Telegram's broader contract. Uploaded documents preserve their original filename
+and MIME type when reused by `file_id` ([Document](https://core.telegram.org/bots/api#document)).
+
 ## What it does not do
 
 - Inline mode, payments, games, sticker sets, reaction counts, votes in polls, or Telegram's rate limits
   (a test makes a call fail with a 429 through `POST failures` instead). Channels have no
   subscribers and forum topics cannot be closed or deleted.
-- `parse_mode` formatting: text is stored exactly as sent, tags and all.
 - Expiry is evaluated on state access, without a scheduler or an automatic expiry webhook. Restarting loses all state; restart recovery belongs to the application under test.
 - Webhook retries: an update the webhook rejects, or does not answer within 10 seconds, is logged and
   dropped rather than retried.
