@@ -758,6 +758,21 @@ describe("bot membership", () => {
       ]);
   });
 
+  it("lists other administrator bots only when return_bots is set", async () => {
+    const { fake, api, second } = await setup();
+    const me = (await api("getMe")).result;
+    await fake.setBotMembership(GROUP, second.id, { status: "administrator" });
+    const admins = async (params) =>
+      (await api("getChatAdministrators", { chat_id: GROUP, ...params })).result
+        .map((admin) => admin.user.id)
+        .sort();
+
+    expect(await admins({})).toEqual([OWNER, me.id].sort());
+    expect(await admins({ return_bots: true })).toEqual(
+      [OWNER, me.id, second.id].sort(),
+    );
+  });
+
   it("says can_be_edited only to the bot that promoted the administrator", async () => {
     const { fake, api, second } = await setup();
     const me = (await api("getMe")).result;

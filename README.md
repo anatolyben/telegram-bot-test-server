@@ -212,7 +212,8 @@ The details a moderation bot depends on, each covered by a test:
   `can_edit_messages`), and deletes others' messages only with `can_delete_messages`. A bot hears
   of its own status changing as `my_chat_member`, whether the owner or another bot changed it; the
   chat's administrator bots hear of it as `chat_member`. `can_be_edited` is true only for the bot
-  that promoted that administrator. Only the bot that sent a message hears its buttons pressed.
+  that promoted that administrator, and `getChatAdministrators` leaves out other bots unless
+  `return_bots` is set. Only the bot that sent a message hears its buttons pressed.
   Users write privately only to the first bot, so no other bot can message them (403).
 - **Polls.** `sendPoll` needs a question and 2 to 12 options and keeps `is_anonymous`,
   `allows_multiple_answers`, `description` and an attached photo; `stopPoll` closes a poll once.

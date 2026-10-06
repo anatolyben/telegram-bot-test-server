@@ -1653,10 +1653,15 @@ export async function startTestServer({
     },
     getChatMember: (p, caller) =>
       chatMemberObject(requireChat(p.chat_id), p.user_id, caller),
+    // Other bots are left out unless return_bots is set.
     getChatAdministrators: (p, caller) => {
       const chat = requireChat(p.chat_id);
       return [...chat.members.entries()]
         .filter(([, m]) => ["creator", "administrator"].includes(m.status))
+        .filter(
+          ([id]) =>
+            isTrue(p.return_bots) || id === caller.id || !users.get(id)?.is_bot,
+        )
         .map(([id]) => chatMemberObject(chat, id, caller));
     },
     getChatMemberCount: (p) => {
