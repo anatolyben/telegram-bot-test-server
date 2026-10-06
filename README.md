@@ -170,17 +170,18 @@ These read or change the server's state:
 `setChatDescription`, `setChatPhoto`, `deleteChatPhoto`, `approveChatJoinRequest`,
 `declineChatJoinRequest`, `answerChatJoinRequestQuery`, `createChatInviteLink`,
 `exportChatInviteLink`, `editChatInviteLink`, `revokeChatInviteLink`, `answerCallbackQuery`,
-`setMyCommands`, `deleteMyCommands`, `getMyCommands`, `getBusinessConnection`, and `sendMessage`
-with `business_connection_id`.
+`setMyCommands`, `deleteMyCommands`, `getMyCommands`, `getBusinessConnection`, and `sendMessage`,
+`editMessageText` and `editMessageReplyMarkup` with `business_connection_id`.
 
 These are not modelled: `setMyDescription`, `setMyShortDescription`,
 `setChatMenuButton`, `setMyDefaultAdministratorRights`. In strict mode they return
 an explicit unsupported-method error.
 
 Any other method returns a 404 error that names it, so a test cannot pass against behaviour the
-server does not have. Methods are added when a real bot needs them; the goal is not full coverage of
-the Bot API. Method names are case-insensitive, and parameters are accepted as a query string, JSON
-or multipart form data, as with Telegram.
+server does not have; so do `editMessageCaption` and `editMessageMedia` with
+`business_connection_id`. Methods are added when a real bot needs them; the goal is not full
+coverage of the Bot API. Method names are case-insensitive, and parameters are accepted as a query
+string, JSON or multipart form data, as with Telegram.
 
 ## Behaves like Telegram
 
@@ -197,7 +198,15 @@ The details a moderation bot depends on, each covered by a test:
   guarantee.
 - **Editing.** Only the bot's own messages can be edited, except in a channel (below); an edit that
   changes nothing fails with `message is not modified`; an edit without `reply_markup` removes the
-  inline keyboard, after which its buttons can no longer be pressed.
+  inline keyboard, after which its buttons can no longer be pressed. As in TDLib's
+  [`can_edit_message`](https://github.com/tdlib/td/blob/master/td/telegram/MessagesManager.cpp),
+  a forward, and a message sent with a reply keyboard, `remove_keyboard` or `force_reply`, can't be
+  edited (`message can't be edited`; `message media can't be edited` from `editMessageMedia`).
+  `editMessageText` needs a text message (`there is no text in the message to edit`), and
+  `editMessageCaption` a photo, video, animation, audio, document or voice message
+  (`there is no caption in the message to edit`); `editMessageMedia` replaces a photo, video,
+  animation, audio, document or text. A sticker, video note, location, contact or dice only has its
+  inline keyboard changed. An empty caption is left out of the message.
 - **Channels** ([Update](https://core.telegram.org/bots/api#update),
   [ChatAdministratorRights](https://core.telegram.org/bots/api#chatadministratorrights)). Every
   message in a channel comes from the channel: `sender_chat` is the channel and there is no `from`,
@@ -267,8 +276,13 @@ The details a moderation bot depends on, each covered by a test:
   attached photo, and gives each option a `persistent_id`. A quiz needs `correct_option_ids` (or
   the older `correct_option_id`), and the bot that sent it sees them in the poll. `stopPoll` closes
   a poll once, and the bot then gets the closed poll as a `poll` update. Members do not vote.
-- **Forwards and copies.** A forward carries `forward_origin`; a copy does not. A bot cannot forward
-  from a chat it is not in.
+- **Forwards and copies.** A forward carries `forward_origin`; a copy does not. A forward of a
+  forward keeps the first origin and its date. A bot cannot forward from a chat it is not in.
+  Service messages can't be forwarded or copied (`the message can't be forwarded` / `copied`). A
+  send with `protect_content` has `has_protected_content`; it can't be forwarded, but the bot can
+  still copy it. One item of an album is forwarded or copied without its `media_group_id`. A copy's
+  `caption` replaces the original on media that takes one, formatted with `parse_mode` or
+  `caption_entities`, and an empty one removes it; a text message gets no caption.
 - **Pins** ([unpinChatMessage](https://core.telegram.org/bots/api#unpinchatmessage)). Pinned
   messages are kept newest first by sending date. `getChat` returns the most recent one as
   `pinned_message`, in groups, channels and private chats, and `unpinChatMessage` without
@@ -305,8 +319,14 @@ The details a moderation bot depends on, each covered by a test:
   and a message from the person in the last 24 hours (`BUSINESS_PEER_USAGE_MISSING` otherwise, as
   [documented](https://core.telegram.org/method/messages.sendMessage)). An unknown connection is
   `BUSINESS_CONNECTION_INVALID`. Unverified: the error for a disabled connection (treated as
-  invalid) and for a missing `can_reply` (`403 BOT_ACCESS_FORBIDDEN`). The connected bot may also
-  message the owner's private chat (`user_chat_id`). `getMe` reports `can_connect_to_business`.
+  invalid) and for a missing `can_reply` (`403 BOT_ACCESS_FORBIDDEN`). `editMessageText` and
+  `editMessageReplyMarkup` with `business_connection_id` edit the bot's and the owner's messages in
+  a business chat, under the same rules as sending; the owner's own messages without an inline
+  keyboard only within 48 hours, as documented. Unverified: the errors, taken from
+  [messages.editMessage](https://core.telegram.org/method/messages.editMessage), for the person's
+  message (`MESSAGE_AUTHOR_REQUIRED`), an unknown one (`MESSAGE_ID_INVALID`) and the 48 hours
+  (`MESSAGE_EDIT_TIME_EXPIRED`). The connected bot may also message the owner's private chat
+  (`user_chat_id`). `getMe` reports `can_connect_to_business`.
 - **Redelivery.** A test can have Telegram deliver any update again, byte for byte, as it does when a
   webhook does not confirm one.
 - **Adding the bot through a link** ([links](https://core.telegram.org/api/links#group-channel-bot-links),
@@ -632,9 +652,9 @@ not count.
 
 Bot text and media captions support `parse_mode` (`HTML`, `MarkdownV2` and legacy
 `Markdown`) and explicit `entities` / `caption_entities`. The stored response has plain
-text and UTF-16 entity offsets. Formatting also applies to album captions, media edits
-and business text sends. Links, mentions and commands can be detected inside styles;
-code, pre and explicit links suppress overlapping automatic detection.
+text and UTF-16 entity offsets. Formatting also applies to album captions, media edits,
+copy captions, reply quotes and business text sends. Links, mentions and commands can be
+detected inside styles; code, pre and explicit links suppress overlapping automatic detection.
 
 The contract cases cover malformed markup, crossed Markdown delimiters, invalid entity
 ranges (including surrogate-pair boundaries), style splitting around code, and overlapping
@@ -645,13 +665,28 @@ Album captions are all parsed before any album message is stored, following the
 This is a tested subset, not a claim that every Telegram parser edge case is implemented
 or every error description is byte-for-byte identical.
 
-Same-chat `reply_parameters` and the older `reply_to_message_id` populate
-`reply_to_message`, without nested reply chains. The basic same-chat
-`allow_sending_without_reply` option is supported. Forum-topic sends without an explicit
-reply attach the topic's creation message. Cross-chat replies, quoted substrings and
-business reply metadata are not implemented; see [ReplyParameters](https://core.telegram.org/bots/api#replyparameters)
-for Telegram's broader contract. Uploaded documents preserve their original filename
-and MIME type when reused by `file_id` ([Document](https://core.telegram.org/bots/api#document)).
+`reply_parameters` and the older `reply_to_message_id` populate `reply_to_message`, without
+nested reply chains, in every send method including `sendMediaGroup`, and
+`allow_sending_without_reply` is supported. With `reply_parameters.chat_id` the bot replies to a
+message in another chat it can read: the message gets `external_reply` (the original's origin, its
+chat and id for a supergroup or channel, and its media without the caption) instead of
+`reply_to_message`, plus an automatic `quote` of the original's text or caption. A reply to a
+supergroup or channel the bot is not in fails with `message to be replied not found`, and to an
+unknown chat with `chat not found`. A `quote` (with `quote_parse_mode` or `quote_entities`) must be
+an exact substring of the original, including its bold, italic, underline, strikethrough, spoiler,
+custom emoji and date entities, or the send fails with `QUOTE_TEXT_INVALID`
+([messages.sendMessage](https://core.telegram.org/method/messages.sendMessage)); the message then
+carries `quote` with `is_manual` and the `quote_position` given. Forum-topic sends without an
+explicit reply attach the topic's creation message. Not implemented: replies to another forum
+topic as `external_reply`, reply metadata in business sends, and `checklist_task_id` and
+`poll_option_id`; see [ReplyParameters](https://core.telegram.org/bots/api#replyparameters).
+
+A text message carries `link_preview_options` when the options sent or edited with it differ from
+the defaults, kept as Telegram keeps them: `is_disabled` only when the text has a link, and
+`prefer_small_media` or `prefer_large_media` only with a `url`. No link previews are generated.
+
+Uploaded documents preserve their original filename and MIME type when reused by `file_id`
+([Document](https://core.telegram.org/bots/api#document)).
 
 ## What it does not do
 

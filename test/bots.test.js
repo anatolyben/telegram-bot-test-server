@@ -695,6 +695,135 @@ describe("polls, forwards and media", () => {
     });
   });
 
+  it("protects a message's content from forwarding, but lets the bot copy it", async () => {
+    const { fake, api } = await setup();
+    const sent = await api("sendMessage", {
+      chat_id: GROUP,
+      text: "members only",
+      protect_content: true,
+    });
+    expect(sent.result.has_protected_content).toBe(true);
+    const source = {
+      chat_id: GROUP,
+      from_chat_id: GROUP,
+      message_id: sent.result.message_id,
+    };
+
+    expect(await api("forwardMessage", source)).toMatchObject({
+      status: 400,
+      description: "Bad Request: the message can't be forwarded",
+    });
+    const copy = await api("copyMessage", source);
+    expect(copy.ok).toBe(true);
+    const copied = await fake.getMessage(GROUP, copy.result.message_id);
+    expect(copied.message.text).toBe("members only");
+    expect(copied.message).not.toHaveProperty("has_protected_content");
+  });
+
+  it("keeps the first origin when it forwards a forwarded message", async () => {
+    const { fake, api } = await setup();
+    const ann = await fake.createUser({ first_name: "Ann" });
+    const bob = await fake.createUser({ first_name: "Bob" });
+    await fake.join(GROUP, ann);
+    const relayed = await fake.post(GROUP, ann, {
+      text: "bob said hi",
+      forwardFrom: { userId: bob },
+    });
+    const { message } = await fake.getMessage(GROUP, relayed);
+
+    const forward = await api("forwardMessage", {
+      chat_id: GROUP,
+      from_chat_id: GROUP,
+      message_id: relayed,
+    });
+
+    expect(forward.result.forward_origin).toEqual(message.forward_origin);
+    expect(forward.result.forward_origin.sender_user.id).toBe(bob);
+  });
+
+  it("refuses to forward or copy a service message", async () => {
+    const { fake, api } = await setup();
+    await fake.join(GROUP, await fake.createUser());
+    const service = (await fake.getMessages(GROUP)).find(
+      (message) => message.new_chat_members,
+    );
+    const source = {
+      chat_id: GROUP,
+      from_chat_id: GROUP,
+      message_id: service.message_id,
+    };
+
+    expect(await api("forwardMessage", source)).toMatchObject({
+      status: 400,
+      description: "Bad Request: the message can't be forwarded",
+    });
+    expect(await api("copyMessage", source)).toMatchObject({
+      status: 400,
+      description: "Bad Request: the message can't be copied",
+    });
+  });
+
+  it("puts a copy's new caption only on media, formatted, and leaves out an empty one", async () => {
+    const { fake, api } = await setup();
+    const copy = async (messageId, fields) => {
+      const copied = await api("copyMessage", {
+        chat_id: GROUP,
+        from_chat_id: GROUP,
+        message_id: messageId,
+        ...fields,
+      });
+      return (await fake.getMessage(GROUP, copied.result.message_id)).message;
+    };
+    const text = await api("sendMessage", { chat_id: GROUP, text: "plain" });
+    const photo = await api("sendPhoto", {
+      chat_id: GROUP,
+      photo: "x",
+      caption: "orig",
+    });
+
+    const textCopy = await copy(text.result.message_id, {
+      caption: "<b>cap</b>",
+      parse_mode: "HTML",
+    });
+    expect(textCopy.text).toBe("plain");
+    expect(textCopy).not.toHaveProperty("caption");
+    expect(
+      await copy(photo.result.message_id, {
+        caption: "<b>bold</b>",
+        parse_mode: "HTML",
+      }),
+    ).toMatchObject({
+      caption: "bold",
+      caption_entities: [{ type: "bold", offset: 0, length: 4 }],
+    });
+    expect(
+      await copy(photo.result.message_id, { caption: "" }),
+    ).not.toHaveProperty("caption");
+  });
+
+  it("forwards and copies one item of an album without its media_group_id", async () => {
+    const { fake, api } = await setup();
+    const ann = await fake.createUser();
+    await fake.join(GROUP, ann);
+    const album = await fake.postAlbum(GROUP, ann, [
+      { type: "photo", bytes: PHOTO },
+      { type: "photo", bytes: PHOTO },
+    ]);
+    const source = {
+      chat_id: GROUP,
+      from_chat_id: GROUP,
+      message_id: album.message_ids[0],
+    };
+
+    const forward = await api("forwardMessage", source);
+    const copy = await api("copyMessage", source);
+
+    expect(forward.result.photo).toBeDefined();
+    expect(forward.result).not.toHaveProperty("media_group_id");
+    const copied = await fake.getMessage(GROUP, copy.result.message_id);
+    expect(copied.message).not.toHaveProperty("media_group_id");
+  });
+
   it("replaces a message's photo, and refuses a replacement that changes nothing", async () => {
     const { fake, api } = await setup();
     const form = (fields) => {

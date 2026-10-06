@@ -377,6 +377,126 @@ describe("messages and buttons", () => {
     ).toMatchObject(badData);
   });
 
+  it("edits text only in a text message and a caption only in a media message", async () => {
+    const { api } = await setup();
+    const text = (await api("sendMessage", { chat_id: GROUP, text: "plain" }))
+      .result;
+    const photo = (
+      await api("sendPhoto", { chat_id: GROUP, photo: "x", caption: "old" })
+    ).result;
+    const sticker = (await api("sendSticker", { chat_id: GROUP, sticker: "x" }))
+      .result;
+
+    expect(
+      await api("editMessageText", {
+        chat_id: GROUP,
+        message_id: photo.message_id,
+        text: "now text",
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: there is no text in the message to edit",
+    });
+    expect(
+      await api("editMessageCaption", {
+        chat_id: GROUP,
+        message_id: text.message_id,
+        caption: "a caption",
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: there is no caption in the message to edit",
+    });
+    for (const method of ["editMessageText", "editMessageCaption"]) {
+      expect(
+        await api(method, {
+          chat_id: GROUP,
+          message_id: sticker.message_id,
+          text: "x",
+          caption: "x",
+        }),
+      ).toMatchObject({
+        status: 400,
+        description: "Bad Request: message can't be edited",
+      });
+    }
+  });
+
+  it("refuses to edit a forwarded message or one sent with a reply keyboard", async () => {
+    const { server, api, member } = await setup();
+    const said = await server.post(GROUP, await member(), "original words");
+    const forward = (
+      await api("forwardMessage", {
+        chat_id: GROUP,
+        from_chat_id: GROUP,
+        message_id: said,
+      })
+    ).result;
+    const photo = (await api("sendPhoto", { chat_id: GROUP, photo: "x" }))
+      .result;
+    const keyboard = (
+      await api("sendMessage", {
+        chat_id: GROUP,
+        text: "Pick one",
+        reply_markup: { keyboard: [[{ text: "A" }]] },
+      })
+    ).result;
+    const cantEdit = {
+      status: 400,
+      description: "Bad Request: message can't be edited",
+    };
+
+    expect(
+      await api("editMessageText", {
+        chat_id: GROUP,
+        message_id: forward.message_id,
+        text: "rewritten forward",
+      }),
+    ).toMatchObject(cantEdit);
+    expect(
+      await api("editMessageMedia", {
+        chat_id: GROUP,
+        message_id: forward.message_id,
+        media: { type: "photo", media: photo.photo[0].file_id },
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: message media can't be edited",
+    });
+    expect(
+      await api("editMessageText", {
+        chat_id: GROUP,
+        message_id: keyboard.message_id,
+        text: "Picked",
+      }),
+    ).toMatchObject(cantEdit);
+    expect(
+      await api("editMessageReplyMarkup", {
+        chat_id: GROUP,
+        message_id: keyboard.message_id,
+        reply_markup: {
+          inline_keyboard: [[{ text: "B", callback_data: "b" }]],
+        },
+      }),
+    ).toMatchObject(cantEdit);
+  });
+
+  it("leaves out a caption an edit empties", async () => {
+    const { api } = await setup();
+    const photo = (
+      await api("sendPhoto", { chat_id: GROUP, photo: "x", caption: "old" })
+    ).result;
+
+    const edited = await api("editMessageCaption", {
+      chat_id: GROUP,
+      message_id: photo.message_id,
+      caption: "",
+    });
+
+    expect(edited.ok).toBe(true);
+    expect(edited.result).not.toHaveProperty("caption");
+  });
+
   it("refuses to answer a callback query that was never sent", async () => {
     const { api } = await setup();
     expect(

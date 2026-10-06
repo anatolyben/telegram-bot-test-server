@@ -251,6 +251,157 @@ describe("bot sends", () => {
     expect(stored.message.reply_to_message.message_id).toBe(question);
   });
 
+  it("quotes part of the replied message, and refuses a quote it does not contain", async () => {
+    const { server, api } = await setup();
+    const userId = await server.createUser();
+    await server.join(GROUP, userId);
+    const question = await server.post(GROUP, userId, "the quick brown fox");
+    const styled = await api("sendMessage", {
+      chat_id: GROUP,
+      text: "<b>quick</b> brown fox",
+      parse_mode: "HTML",
+    });
+    const reply = (messageId, fields) =>
+      api("sendMessage", {
+        chat_id: GROUP,
+        text: "yes",
+        reply_parameters: { message_id: messageId, ...fields },
+      });
+
+    const quoted = await reply(question, {
+      quote: "quick brown",
+      quote_position: 4,
+    });
+    expect(quoted.result.reply_to_message.message_id).toBe(question);
+    expect(quoted.result.quote).toEqual({
+      text: "quick brown",
+      position: 4,
+      is_manual: true,
+    });
+    const bold = await reply(styled.result.message_id, {
+      quote: "<b>quick</b> brown",
+      quote_parse_mode: "HTML",
+    });
+    expect(bold.result.quote).toEqual({
+      text: "quick brown",
+      entities: [{ type: "bold", offset: 0, length: 5 }],
+      position: 0,
+      is_manual: true,
+    });
+
+    const invalid = {
+      status: 400,
+      description: "Bad Request: QUOTE_TEXT_INVALID",
+    };
+    expect(await reply(question, { quote: "slow fox" })).toMatchObject(invalid);
+    expect(
+      await reply(styled.result.message_id, { quote: "quick brown" }),
+    ).toMatchObject(invalid);
+  });
+
+  it("replies to a message in another chat with external_reply and an automatic quote", async () => {
+    const { server, api } = await setup();
+    const other = await server.createChat({ title: "Other", ownerId: OWNER });
+    await server.setBotMembership(other, 123456);
+    const ann = await server.createUser({ first_name: "Ann" });
+    await server.join(other, ann);
+    const photo = await server.post(other, ann, {
+      photo: Buffer.from("jpeg-bytes"),
+      caption: "look at this",
+    });
+
+    const reply = await api("sendMessage", {
+      chat_id: GROUP,
+      text: "seen it",
+      reply_parameters: { chat_id: other, message_id: photo },
+    });
+
+    expect(reply.result).not.toHaveProperty("reply_to_message");
+    expect(reply.result.external_reply).toMatchObject({
+      origin: { type: "user", sender_user: { id: ann } },
+      chat: { id: other, type: "supergroup" },
+      message_id: photo,
+      photo: expect.any(Array),
+    });
+    expect(reply.result.external_reply).not.toHaveProperty("caption");
+    expect(reply.result.quote).toEqual({ text: "look at this", position: 0 });
+    const said = await server.post(other, ann, "plain words");
+    const toText = await api("sendMessage", {
+      chat_id: GROUP,
+      text: "agreed",
+      reply_parameters: { chat_id: other, message_id: said },
+    });
+    expect(Object.keys(toText.result.external_reply).sort()).toEqual([
+      "chat",
+      "message_id",
+      "origin",
+    ]);
+    expect(toText.result.quote).toEqual({ text: "plain words", position: 0 });
+
+    const closed = await server.createChat({ title: "Closed", ownerId: OWNER });
+    await server.join(closed, ann);
+    const unseen = await server.post(closed, ann, "between us");
+    expect(
+      await api("sendMessage", {
+        chat_id: GROUP,
+        text: "x",
+        reply_parameters: { chat_id: closed, message_id: unseen },
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: message to be replied not found",
+    });
+    expect(
+      await api("sendMessage", {
+        chat_id: GROUP,
+        text: "x",
+        reply_parameters: { chat_id: -1009999999999, message_id: 1 },
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: chat not found",
+    });
+  });
+
+  it("shows link preview options that differ from the defaults", async () => {
+    const { api } = await setup();
+    const send = (text, options) =>
+      api("sendMessage", {
+        chat_id: GROUP,
+        text,
+        link_preview_options: options,
+      });
+
+    const disabled = await send("see https://example.com/a", {
+      is_disabled: true,
+    });
+    expect(disabled.result.link_preview_options).toEqual({ is_disabled: true });
+    const chosen = await send("read this", {
+      url: "https://example.com/b",
+      prefer_large_media: true,
+      show_above_text: true,
+    });
+    expect(chosen.result.link_preview_options).toEqual({
+      url: "https://example.com/b",
+      prefer_large_media: true,
+      show_above_text: true,
+    });
+    for (const unchanged of [
+      await send("no link here", { is_disabled: true }),
+      await send("see https://example.com/c", { prefer_small_media: true }),
+    ]) {
+      expect(unchanged.result).not.toHaveProperty("link_preview_options");
+    }
+
+    const edited = await api("editMessageText", {
+      chat_id: GROUP,
+      message_id: chosen.result.message_id,
+      text: "read https://example.com/d",
+      link_preview_options: { is_disabled: true },
+    });
+    expect(edited.result.link_preview_options).toEqual({ is_disabled: true });
+  });
+
   it("replies to a forum topic's creation message by default", async () => {
     const { server, api } = await setup();
     const forum = await server.createChat({ ownerId: OWNER, isForum: true });
