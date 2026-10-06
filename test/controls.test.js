@@ -447,6 +447,9 @@ it("answers failed HTTP waits, drains, clock advances and bad media as control e
     400,
     "Unknown fake wait kind",
   ]);
+  expect(
+    await control("wait", { condition: { ...kicked, userId: 42 } }),
+  ).toEqual([400, "Bad Request: user not found"]);
   expect(await control("wait", { condition: kicked, timeoutMs: 20 })).toEqual([
     408,
     expect.stringContaining("Fake wait deadline 20ms exceeded"),

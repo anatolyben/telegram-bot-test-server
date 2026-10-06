@@ -3830,6 +3830,7 @@ export async function startTestServer({
    * that was cancelled or is not allowed (409).
    */
   function controlFailure(error) {
+    if (error instanceof TelegramError) throw error;
     throw new TelegramError(
       error instanceof TypeError ? 400 : error.timedOut ? 408 : 409,
       error.message,
