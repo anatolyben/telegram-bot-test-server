@@ -319,6 +319,157 @@ describe("more send methods", () => {
     ).toMatchObject({ status: 400 });
   });
 
+  it("sends an animation that is also a document", async () => {
+    const { upload } = await setup();
+    const { animation, document } = (
+      await upload("sendAnimation", {
+        chat_id: String(GROUP),
+        animation: BYTES,
+      })
+    ).result;
+
+    expect(document).toEqual({
+      file_id: animation.file_id,
+      file_unique_id: animation.file_unique_id,
+      file_size: animation.file_size,
+      file_name: animation.file_name,
+      mime_type: animation.mime_type,
+    });
+  });
+
+  it("keeps what the sender says about its media, a contact and a live location", async () => {
+    const { api, upload } = await setup();
+    const send = async (method, fields) =>
+      (await upload(method, { chat_id: String(GROUP), ...fields })).result;
+
+    const { video } = await send("sendVideo", {
+      video: BYTES,
+      width: "100",
+      height: "20000",
+      duration: "7",
+    });
+    expect(video).toMatchObject({ width: 100, height: 10000, duration: 7 });
+    expect(
+      (await send("sendVideo", { video: video.file_id, width: "1" })).video,
+    ).toMatchObject({ width: 100, height: 10000, duration: 7 });
+    expect(
+      (
+        await send("sendAnimation", {
+          animation: BYTES,
+          width: "100",
+          height: "50",
+          duration: "9",
+        })
+      ).animation,
+    ).toMatchObject({ width: 100, height: 50, duration: 9 });
+    expect(
+      (
+        await send("sendVideoNote", {
+          video_note: BYTES,
+          length: "360",
+          duration: "5",
+        })
+      ).video_note,
+    ).toMatchObject({ length: 360, duration: 5 });
+    expect(
+      (
+        await send("sendAudio", {
+          audio: BYTES,
+          performer: "Band",
+          title: "Song",
+          duration: "120",
+        })
+      ).audio,
+    ).toMatchObject({ performer: "Band", title: "Song", duration: 120 });
+    expect(
+      (await send("sendSticker", { sticker: BYTES, emoji: "😀" })).sticker,
+    ).toMatchObject({ emoji: "😀" });
+    const vcard = "BEGIN:VCARD\nVERSION:3.0\nEND:VCARD";
+    expect(
+      (
+        await api("sendContact", {
+          chat_id: GROUP,
+          phone_number: "+15550100",
+          first_name: "Ann",
+          vcard,
+        })
+      ).result.contact,
+    ).toEqual({ phone_number: "+15550100", first_name: "Ann", vcard });
+    expect(
+      (
+        await api("sendLocation", {
+          chat_id: GROUP,
+          latitude: 40.7,
+          longitude: -74,
+          live_period: 600,
+          heading: 90,
+          proximity_alert_radius: 100,
+        })
+      ).result.location,
+    ).toEqual({
+      latitude: 40.7,
+      longitude: -74,
+      live_period: 600,
+      heading: 90,
+      proximity_alert_radius: 100,
+    });
+  });
+
+  it("refuses a live location's period, heading or alert radius out of range", async () => {
+    const { api } = await setup();
+    const live = (fields) =>
+      api("sendLocation", {
+        chat_id: GROUP,
+        latitude: 40.7,
+        longitude: -74,
+        live_period: 600,
+        ...fields,
+      });
+
+    expect(await live({ live_period: 30 })).toMatchObject({
+      status: 400,
+      description: "Bad Request: wrong live location period specified",
+    });
+    expect(await live({ heading: 361 })).toMatchObject({
+      status: 400,
+      description: "Bad Request: wrong live location heading specified",
+    });
+    expect(await live({ proximity_alert_radius: 100001 })).toMatchObject({
+      status: 400,
+      description:
+        "Bad Request: wrong live location proximity alert radius specified",
+    });
+  });
+
+  it("gives a photo its image's size, at most Telegram's 2560x2560", async () => {
+    const { fake, upload, member } = await setup();
+    const png = Buffer.from(
+      "89504e470d0a1a0a0000000d4948445200000002000000030806000000",
+      "hex",
+    );
+    const jpeg = Buffer.from(
+      "ffd8ffe000104a46494600010100000100010000ffc00011080bb80fa003012200021101031101ffd9",
+      "hex",
+    );
+    const gif = Buffer.from("4749463839610a0014000000", "hex");
+    const sizeOf = (photo) => ({
+      width: photo.at(-1).width,
+      height: photo.at(-1).height,
+    });
+    const posted = async (photo) =>
+      (await fake.getMessage(GROUP, await fake.post(GROUP, member, { photo })))
+        .message.photo;
+
+    expect(
+      sizeOf(
+        (await upload("sendPhoto", { chat_id: String(GROUP), photo: png }))
+          .result.photo,
+      ),
+    ).toEqual({ width: 2, height: 3 });
+    expect(sizeOf(await posted(jpeg))).toEqual({ width: 2560, height: 1920 });
+    expect(sizeOf(await posted(gif))).toEqual({ width: 10, height: 20 });
+  });
+
   it("accepts known chat actions only", async () => {
     const { api } = await setup();
     expect(

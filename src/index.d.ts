@@ -114,7 +114,7 @@ export interface BusinessChatEntry {
 
 export interface PostedMessage {
   text?: string;
-  /** Image bytes, sent as a photo. */
+  /** Image bytes, sent as a photo; a PNG, GIF or JPEG header gives its size. */
   photo?: Uint8Array;
   caption?: string;
   /** message_id this message replies to. */
@@ -640,7 +640,8 @@ export interface TelegramBotTestServer {
   ): Promise<ButtonAnswer>;
   /**
    * Messages not deleted, newest first, with ephemeral messages (message_id 0,
-   * receiver_user set) in the order they were sent.
+   * receiver_user set) in the order they were sent. Their file_ids are the
+   * first bot's; every other bot gets its own for the same file.
    */
   getMessages(chatId: number): Promise<Message[]>;
   getMessage(

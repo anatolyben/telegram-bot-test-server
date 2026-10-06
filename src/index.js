@@ -222,8 +222,33 @@ const MEMBER_MEDIA = Object.freeze({
   document: { permission: "can_send_documents", ext: "bin", caption: true },
 });
 
-// The media a message can carry, one at a time, and editMessageMedia replaces.
-const MEDIA_KINDS = Object.freeze(["photo", "video", "animation", "document"]);
+// The media editMessageMedia edits and replaces. A live photo also carries
+// photo, and an animation document.
+const MEDIA_KINDS = Object.freeze([
+  "photo",
+  "live_photo",
+  "video",
+  "animation",
+  "audio",
+  "document",
+]);
+
+// TDLib's name for each kind of file, as its errors print it (FileType.cpp).
+// A photo cannot stand in for any other kind, nor any other kind for a photo.
+const FILE_TYPE_NAMES = Object.freeze({
+  photo: "Photo",
+  live_photo: "LivePhotoVideo",
+  video: "Video",
+  animation: "Animation",
+  document: "Document",
+  sticker: "Sticker",
+  voice: "VoiceNote",
+  audio: "Audio",
+  video_note: "VideoNote",
+});
+
+// The fields of a Bot API payload that hold a file_id, which differs per bot.
+const FILE_ID_FIELDS = new Set(["file_id", "small_file_id", "big_file_id"]);
 
 // The fields that give an inline keyboard button its action, in the order the
 // Bot API server reads them (Client.cpp get_inline_keyboard_button_type): the
@@ -756,6 +781,69 @@ function guessMimeType(fileName) {
   return extension ? MIME_TYPES[extension] : undefined;
 }
 
+/**
+ * A photo's width and height from its PNG, GIF or JPEG header, scaled down to
+ * Telegram's largest photo size, "bounded by 2560x2560 pixels"
+ * (https://core.telegram.org/api/files); none when the header is unreadable.
+ */
+function photoDimensions(bytes) {
+  let size = null;
+  if (bytes.length >= 24 && bytes.toString("latin1", 1, 4) === "PNG") {
+    size = [bytes.readUInt32BE(16), bytes.readUInt32BE(20)];
+  } else if (bytes.length >= 10 && bytes.toString("latin1", 0, 4) === "GIF8") {
+    size = [bytes.readUInt16LE(6), bytes.readUInt16LE(8)];
+  } else if (bytes[0] === 0xff && bytes[1] === 0xd8) {
+    // A JPEG's frame header (SOF0 to SOF15, but not DHT, JPG or DAC) holds it.
+    for (let at = 2; at + 9 <= bytes.length && bytes[at] === 0xff; ) {
+      const marker = bytes[at + 1];
+      if (
+        marker >= 0xc0 &&
+        marker <= 0xcf &&
+        ![0xc4, 0xc8, 0xcc].includes(marker)
+      ) {
+        size = [bytes.readUInt16BE(at + 7), bytes.readUInt16BE(at + 5)];
+        break;
+      }
+      at += 2 + bytes.readUInt16BE(at + 2);
+    }
+  }
+  if (!size?.[0] || !size[1]) return {};
+  const scale = Math.min(1, 2560 / Math.max(...size));
+  return {
+    width: Math.round(size[0] * scale),
+    height: Math.round(size[1] * scale),
+  };
+}
+
+/**
+ * Why Telegram cannot read a string as a file_id, in TDLib's words
+ * (FileManager::from_persistent_id and tdutils' base64url_decode).
+ */
+function unreadableFileId(id) {
+  const wrong = "wrong remote file identifier specified: ";
+  const body = id.replace(/=+$/, "");
+  const padding = id.length - body.length;
+  if (padding >= 3) return `${wrong}Wrong string padding`;
+  if (padding > 0 && id.length % 4 !== 0) return `${wrong}Wrong padding length`;
+  if (body.length % 4 === 1) return `${wrong}Wrong string length`;
+  if (/[^\w-]/.test(body)) return `${wrong}Wrong character in the string`;
+  const bytes = Buffer.from(body, "base64url");
+  if (bytes.toString("base64url") !== body) {
+    return `${wrong}Wrong padding in the string`;
+  }
+  // The last byte names the id's format: 2, 3 or 4 (FileManager.h). Format 4
+  // puts a serialization version before it, below Version::Next, 62
+  // (Version.h).
+  const format = bytes.at(-1);
+  if (format === 4 && (bytes.length < 2 || bytes.at(-2) >= 62)) {
+    return "invalid remote file identifier";
+  }
+  if (![2, 3, 4].includes(format)) {
+    return `${wrong}can't unserialize it. Wrong last symbol`;
+  }
+  return `${wrong}can't unserialize it`;
+}
+
 function readBody(request) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -872,6 +960,10 @@ export async function startTestServer({
   });
   // Join request queries awaiting answerChatJoinRequestQuery, by query id.
   const joinQueries = new Map();
+  // Stored files by file_id, each as { file, botId }. "file_id is unique for
+  // each individual bot and can't be transferred from one bot to another"
+  // (https://core.telegram.org/bots/api#sending-files): every bot that sees a
+  // file gets its own file_id for it, and all share its file_unique_id.
   const files = new Map();
   // Owner accounts: what a user sees on their own account (owner.js).
   const ownerModel = createOwnerModel({
@@ -1564,7 +1656,7 @@ export async function startTestServer({
     }
     const update = {
       update_id: nextUpdateId(),
-      [type]: inviteLinkSeenBy(record, payload),
+      [type]: seenBy(record, inviteLinkSeenBy(record, payload)),
     };
     sentUpdates.set(update.update_id, {
       record,
@@ -1963,64 +2055,164 @@ export async function startTestServer({
     return message;
   }
 
-  // Image bytes only. Accepting a file path here would let anyone who can reach
-  // the control API read any file on the host through the file download URL.
-  function registerFile(bytes, folder, extension) {
-    const data = bytes;
-    const fileId = `AgACAgQAAx0C${randomBytes(12).toString("base64url")}`;
-    const uniqueId = fileUniqueId();
-    const fileName = bytes.fileName;
+  /**
+   * Store a file of one kind of media with what its sender says about it
+   * (file_name, mime_type, width, height, duration, length, title, performer,
+   * emoji). Image bytes only: accepting a file path here would let anyone who
+   * can reach the control API read any file on the host through the file
+   * download URL.
+   */
+  function registerFile(bytes, kind, meta = {}) {
+    // A photo's size is its image's; its sender says nothing about it.
+    const said = kind === "photo" ? photoDimensions(bytes) : meta;
+    const fileName = said.file_name ?? bytes.fileName;
     const mimeType =
-      bytes.mimeType ?? (fileName ? guessMimeType(fileName) : undefined);
-    files.set(fileId, {
-      data,
-      file_unique_id: uniqueId,
-      file_path: `${folder}/${fileId}.${extension}`,
+      said.mime_type ??
+      bytes.mimeType ??
+      (fileName ? guessMimeType(fileName) : undefined);
+    const file = {
+      ...Object.fromEntries(
+        Object.entries(said).filter(([, value]) => value != null),
+      ),
       ...(fileName ? { file_name: fileName } : {}),
       ...(mimeType ? { mime_type: mimeType } : {}),
-    });
-    return {
-      file_id: fileId,
-      file_unique_id: uniqueId,
-      size: data.length,
-      ...(fileName ? { file_name: fileName } : {}),
-      ...(mimeType ? { mime_type: mimeType } : {}),
+      kind,
+      data: bytes,
+      file_unique_id: fileUniqueId(),
+      ids: {},
     };
+    return fileView(file);
   }
 
   function registerPhoto(bytes) {
-    return registerFile(bytes, "photos", "jpg");
+    return registerFile(bytes, "photo");
+  }
+
+  /** The file_id one bot knows a stored file by, made when it first sees it. */
+  function fileIdFor(file, botId) {
+    if (!file.ids[botId]) {
+      file.ids[botId] = randomBytes(24).toString("base64url");
+      files.set(file.ids[botId], { file, botId });
+    }
+    return file.ids[botId];
   }
 
   /**
-   * The file a send* call refers to: an uploaded file, or the file_id of one
-   * this server already holds. Anything else becomes a one-byte placeholder.
+   * A stored file as messages hold it: by the first bot's file_id, which
+   * seenBy turns into each other bot's own.
    */
-  function sentFile(value, folder, extension) {
-    if (typeof value === "string" && files.has(value)) {
-      const file = files.get(value);
-      return {
-        file_id: value,
-        file_unique_id: file.file_unique_id,
-        size: file.data.length,
-        ...(file.file_name ? { file_name: file.file_name } : {}),
-        ...(file.mime_type ? { mime_type: file.mime_type } : {}),
-      };
-    }
-    return registerFile(
-      Buffer.isBuffer(value) ? value : Buffer.alloc(1),
-      folder,
-      extension,
+  function fileView(file) {
+    const { data, ids: _ids, ...described } = file;
+    return {
+      file_id: fileIdFor(file, bot.id),
+      size: data.length,
+      ...described,
+    };
+  }
+
+  /** Where a bot downloads a file, under its own file_id. */
+  function filePath(file, fileId) {
+    const extension =
+      file.kind === "photo" ? "jpg" : (MEMBER_MEDIA[file.kind]?.ext ?? "mp4");
+    return `${file.kind}s/${fileId}.${extension}`;
+  }
+
+  /**
+   * A Bot API payload as one bot sees it: every file_id in it that bot's own.
+   * Stored messages carry the first bot's, as the control API shows them.
+   */
+  function seenBy(record, payload) {
+    if (record.id === bot.id || payload === undefined) return payload;
+    return JSON.parse(JSON.stringify(payload), (key, value) =>
+      FILE_ID_FIELDS.has(key) && files.has(value)
+        ? fileIdFor(files.get(value).file, record.id)
+        : value,
     );
   }
 
+  /**
+   * The file a send names, of the kind the method sends: an upload, also as
+   * attach://<name>; the file_id of a file the calling bot was given; or an
+   * HTTP URL, which TDLib takes any string with a dot for and this server
+   * stands in for with a one-byte file instead of fetching it. Null when it
+   * names nothing. A file keeps its kind when sent again, and a photo and any
+   * other kind cannot stand in for each other (FileManager::check_input_file_id).
+   */
+  function sentFile(
+    p,
+    value,
+    kind,
+    caller,
+    meta,
+    typeName = FILE_TYPE_NAMES[kind],
+  ) {
+    const named = namedFile(p, value);
+    if (named === null) return null;
+    if (Buffer.isBuffer(named)) return registerFile(named, kind, meta);
+    const held = files.get(named);
+    if (held) {
+      if ((held.file.kind === "photo") !== (kind === "photo")) {
+        throw new TelegramError(
+          400,
+          `Bad Request: can't use file of type ${FILE_TYPE_NAMES[held.file.kind]} as ${typeName}`,
+        );
+      }
+      // Another bot's file_id reads as one, but Telegram refuses the send.
+      if (held.botId !== caller.id) {
+        throw new TelegramError(
+          400,
+          "Bad Request: wrong file identifier/HTTP URL specified",
+        );
+      }
+      return fileView(held.file);
+    }
+    if (named.includes(".")) return registerFile(Buffer.alloc(1), kind, meta);
+    throw new TelegramError(400, `Bad Request: ${unreadableFileId(named)}`);
+  }
+
+  /**
+   * What a send's file field names: uploaded bytes, given directly or as
+   * attach://<name>, or a string; null for nothing (Client.cpp get_input_file).
+   */
+  function namedFile(p, value) {
+    if (typeof value === "string" && value.startsWith("attach://")) {
+      const upload = p[value.slice("attach://".length)];
+      return Buffer.isBuffer(upload) ? upload : null;
+    }
+    return Buffer.isBuffer(value) || (typeof value === "string" && value !== "")
+      ? value
+      : null;
+  }
+
+  /**
+   * What a sender says about the media it uploads, as the Bot API reads it:
+   * sizes up to 10000 and durations up to a day, 0 meaning unsaid
+   * (Client.cpp get_integer_arg, get_input_video, MAX_LENGTH, MAX_DURATION).
+   */
+  function senderMeta(p) {
+    const number = (name, max) => {
+      const value = Math.min(max, Math.trunc(numberParam(p[name], 0)));
+      return value > 0 ? { [name]: value } : {};
+    };
+    return {
+      ...number("width", 10000),
+      ...number("height", 10000),
+      ...number("length", 10000),
+      ...number("duration", 86400),
+      ...(p.title ? { title: String(p.title) } : {}),
+      ...(p.performer ? { performer: String(p.performer) } : {}),
+      ...(p.emoji ? { emoji: String(p.emoji) } : {}),
+    };
+  }
+
   /** The Message field for a stored file of a media type, as the Bot API has it. */
-  function mediaField(type, file, { fileName, mimeType, duration = 1 } = {}) {
+  function mediaField(type, file) {
     const base = {
       file_id: file.file_id,
       file_unique_id: file.file_unique_id,
       file_size: file.size,
     };
+    const duration = file.duration ?? 1;
     switch (type) {
       case "photo":
         return photoSizes(file);
@@ -2028,11 +2220,19 @@ export async function startTestServer({
       case "animation":
         return {
           ...base,
-          width: 1280,
-          height: 720,
+          width: file.width ?? 1280,
+          height: file.height ?? 720,
           duration,
-          mime_type: mimeType ?? "video/mp4",
-          ...(fileName ? { file_name: fileName } : {}),
+          mime_type: file.mime_type ?? "video/mp4",
+          ...(file.file_name ? { file_name: file.file_name } : {}),
+        };
+      case "live_photo":
+        return {
+          ...base,
+          width: file.width ?? 1280,
+          height: file.height ?? 720,
+          duration,
+          mime_type: file.mime_type ?? "video/mp4",
         };
       case "sticker":
         return {
@@ -2040,48 +2240,72 @@ export async function startTestServer({
           type: "regular",
           width: 512,
           height: 512,
+          ...(file.emoji ? { emoji: file.emoji } : {}),
           is_animated: false,
           is_video: false,
         };
       case "voice":
-        return { ...base, duration, mime_type: mimeType ?? "audio/ogg" };
+        return {
+          ...base,
+          duration,
+          mime_type: file.mime_type ?? "audio/ogg",
+        };
       case "audio":
         return {
           ...base,
           duration,
-          mime_type: mimeType ?? "audio/mpeg",
-          ...(fileName ? { file_name: fileName } : {}),
+          mime_type: file.mime_type ?? "audio/mpeg",
+          ...(file.file_name ? { file_name: file.file_name } : {}),
+          ...(file.title ? { title: file.title } : {}),
+          ...(file.performer ? { performer: file.performer } : {}),
         };
       case "video_note":
-        return { ...base, length: 240, duration };
+        return { ...base, length: file.length ?? 240, duration };
       default:
         return {
           ...base,
-          file_name: fileName ?? "file",
-          mime_type: mimeType ?? "application/octet-stream",
+          file_name: file.file_name ?? "file",
+          mime_type: file.mime_type ?? "application/octet-stream",
         };
     }
   }
 
-  /** Message fields for one piece of media; an animation is also a document. */
-  function mediaFields(type, file, options) {
-    const fields = { [type]: mediaField(type, file, options) };
+  /**
+   * Message fields for one piece of media. An animation is also a document
+   * with its file name and type, and a live photo also the photo it moves
+   * (Client.cpp JsonMessage).
+   */
+  function mediaFields(type, file, photo) {
+    const fields = { [type]: mediaField(type, file) };
     if (type === "animation") {
-      fields.document = mediaField("document", file, {
-        fileName: options?.fileName ?? "animation.mp4",
-        mimeType: "video/mp4",
-      });
+      const { file_id, file_unique_id, file_size, file_name, mime_type } =
+        fields.animation;
+      fields.document = {
+        file_id,
+        file_unique_id,
+        file_size,
+        ...(file_name ? { file_name } : {}),
+        mime_type,
+      };
+    }
+    if (type === "live_photo") {
+      fields.photo = photoSizes(photo);
+      fields.live_photo = { photo: fields.photo, ...fields.live_photo };
     }
     return fields;
   }
 
+  /**
+   * A photo's sizes. Telegram lists several, each bounded by a box from
+   * 100x100 up; here there is one, the largest.
+   */
   function photoSizes(photo) {
     return [
       {
         file_id: photo.file_id,
         file_unique_id: photo.file_unique_id,
-        width: 800,
-        height: 800,
+        width: photo.width ?? 800,
+        height: photo.height ?? 800,
         file_size: photo.size,
       },
     ];
@@ -2324,14 +2548,22 @@ export async function startTestServer({
         photos: photos.map(photoSizes),
       };
     },
-    getFile: (p) => {
-      const file = files.get(String(p.file_id));
-      if (!file) throw new TelegramError(400, "Bad Request: invalid file_id");
+    getFile: (p, caller) => {
+      const held = files.get(String(p.file_id));
+      if (!held) throw new TelegramError(400, "Bad Request: invalid file_id");
+      // Another bot's file_id reads as one, but its download fails
+      // (Client.cpp on_update_file).
+      if (held.botId !== caller.id) {
+        throw new TelegramError(
+          400,
+          "Bad Request: wrong file_id or the file is temporarily unavailable",
+        );
+      }
       return {
         file_id: p.file_id,
-        file_unique_id: file.file_unique_id,
-        file_size: file.data.length,
-        file_path: file.file_path,
+        file_unique_id: held.file.file_unique_id,
+        file_size: held.file.data.length,
+        file_path: filePath(held.file, p.file_id),
       };
     },
     sendMessage: (p, caller) =>
@@ -2342,83 +2574,18 @@ export async function startTestServer({
       businessConnectionObject(
         requireBusinessConnection(p.business_connection_id, caller),
       ),
-    sendPhoto: async (p, caller) => {
-      const photo =
-        typeof p.photo === "string" && files.has(p.photo)
-          ? {
-              file_id: p.photo,
-              ...files.get(p.photo),
-              size: files.get(p.photo).data.length,
-            }
-          : sentFile(p.photo, "photos", "jpg");
-      return sendFrom(p, caller, {
-        photo: photoSizes(photo),
-        ...captionFields(p),
-      });
-    },
-    sendDocument: (p, caller) => {
-      const file = sentFile(p.document, "documents", "bin");
-      return sendFrom(p, caller, {
-        document: {
-          file_id: file.file_id,
-          file_unique_id: file.file_unique_id,
-          file_size: file.size,
-          file_name: file.file_name ?? "document",
-          mime_type: file.mime_type ?? "application/octet-stream",
-        },
-        ...captionFields(p),
-      });
-    },
-    sendVideo: (p, caller) => {
-      const file = sentFile(p.video, "videos", "mp4");
-      return sendFrom(p, caller, {
-        video: {
-          file_id: file.file_id,
-          file_unique_id: file.file_unique_id,
-          width: 640,
-          height: 360,
-          duration: 1,
-          file_size: file.size,
-        },
-        ...captionFields(p),
-      });
-    },
-    sendAnimation: (p, caller) => {
-      const file = sentFile(p.animation, "animations", "mp4");
-      return sendFrom(p, caller, {
-        animation: {
-          file_id: file.file_id,
-          file_unique_id: file.file_unique_id,
-          width: 320,
-          height: 240,
-          duration: 1,
-          file_size: file.size,
-        },
-        ...captionFields(p),
-      });
-    },
-    sendSticker: (p, caller) => {
-      const file = sentFile(p.sticker, "stickers", "webp");
-      return sendFrom(p, caller, {
-        sticker: {
-          file_id: file.file_id,
-          file_unique_id: file.file_unique_id,
-          type: "regular",
-          width: 512,
-          height: 512,
-          is_animated: false,
-          is_video: false,
-          file_size: file.size,
-        },
-      });
-    },
+    sendPhoto: (p, caller) => sendMedia(p, caller, "photo"),
+    sendDocument: (p, caller) => sendMedia(p, caller, "document"),
+    sendVideo: (p, caller) => sendMedia(p, caller, "video"),
+    sendAnimation: (p, caller) => sendMedia(p, caller, "animation"),
+    sendSticker: (p, caller) => sendMedia(p, caller, "sticker"),
     editMessageText: (p, caller) => editMessage(p, caller, "text", textEdit(p)),
     editMessageReplyMarkup: (p, caller) =>
       editMessage(p, caller, "reply_markup", () => {}),
     editMessageCaption: (p, caller) =>
       editMessage(p, caller, "caption", captionEdit(p)),
     editMessageMedia: (p, caller) =>
-      editMessage(p, caller, "media", mediaEdit(p)),
+      editMessage(p, caller, "media", mediaEdit(p, caller)),
     // Ephemeral messages are edited and deleted by the bot that sent them,
     // through their own methods, which return True.
     editEphemeralMessageText: (p, caller) =>
@@ -2428,7 +2595,7 @@ export async function startTestServer({
     editEphemeralMessageCaption: (p, caller) =>
       editEphemeralMessage(p, caller, captionEdit(p)),
     editEphemeralMessageMedia: (p, caller) =>
-      editEphemeralMessage(p, caller, mediaEdit(p)),
+      editEphemeralMessage(p, caller, mediaEdit(p, caller)),
     deleteEphemeralMessage: (p, caller) => {
       ownEphemeralMessage(p, caller).deleted = true;
       appliedCheckpoint();
@@ -2873,10 +3040,15 @@ export async function startTestServer({
     sendVoice: (p, caller) => sendMedia(p, caller, "voice"),
     sendAudio: (p, caller) => sendMedia(p, caller, "audio"),
     sendVideoNote: (p, caller) => sendMedia(p, caller, "video_note"),
-    sendLocation: (p, caller) =>
-      sendFrom(p, caller, {
-        location: coordinates(p, "Bad Request: invalid location specified"),
-      }),
+    sendLocation: (p, caller) => {
+      const location = coordinates(
+        p,
+        "Bad Request: invalid location specified",
+      );
+      return sendFrom(p, caller, () => ({
+        location: { ...location, ...liveLocation(p) },
+      }));
+    },
     sendVenue: (p, caller) => {
       const location = coordinates(
         p,
@@ -2909,6 +3081,7 @@ export async function startTestServer({
           phone_number: String(p.phone_number),
           first_name: String(p.first_name),
           ...(p.last_name ? { last_name: String(p.last_name) } : {}),
+          ...(p.vcard ? { vcard: String(p.vcard) } : {}),
         },
       });
     },
@@ -2963,24 +3136,31 @@ export async function startTestServer({
         );
       }
       requireCanSend(chat, caller);
-      // Telegram parses every InputMedia caption before issuing an album send.
-      const prepared = items.map((item) => {
-        const formatted = captionFields(item);
-        const reference =
-          typeof item.media === "string" && item.media.startsWith("attach://")
-            ? p[item.media.slice("attach://".length)]
-            : item.media;
-        if (
-          !Buffer.isBuffer(reference) &&
-          !(typeof reference === "string" && files.has(reference))
-        ) {
+      // Telegram parses every InputMedia caption, then reads every file,
+      // before it sends any of the album.
+      const formatted = items.map((item) => {
+        const caption = captionFields(item);
+        if (namedFile(p, item.media) === null) {
           throw new TelegramError(
             400,
             "Bad Request: wrong file identifier/HTTP URL specified",
           );
         }
-        return { item, formatted, reference };
+        return caption;
       });
+      // Then it reads every file, as send_message_group does before it counts
+      // the album.
+      const media = items.map((item) =>
+        // An album's documents go as plain files (Client.cpp get_input_media).
+        sentFile(
+          p,
+          item.media,
+          item.type,
+          caller,
+          senderMeta(item),
+          item.type === "document" ? "DocumentAsFile" : undefined,
+        ),
+      );
       if (items.length > 10) {
         throw new TelegramError(
           400,
@@ -2997,23 +3177,9 @@ export async function startTestServer({
       }
       const mediaGroupId =
         items.length > 1 ? String(nextMediaGroupId++) : undefined;
-      return prepared.map(({ item, formatted, reference }, index) => {
-        const file =
-          typeof reference === "string" && files.has(reference)
-            ? sentFile(reference)
-            : Buffer.isBuffer(reference)
-              ? item.type === "photo"
-                ? registerPhoto(reference)
-                : registerFile(reference, `${item.type}s`, "bin")
-              : null;
-        if (!file) {
-          throw new TelegramError(
-            400,
-            "Bad Request: wrong file identifier/HTTP URL specified",
-          );
-        }
-        // Every item answers the same message, as one album send does.
-        return sendFrom(
+      // Every item answers the same message, as one album send does.
+      return media.map((file, index) =>
+        sendFrom(
           {
             chat_id: p.chat_id,
             message_thread_id: p.message_thread_id,
@@ -3024,14 +3190,14 @@ export async function startTestServer({
           },
           caller,
           {
-            ...mediaFields(item.type, file, {}),
-            ...formatted,
+            ...mediaFields(file.kind, file),
+            ...formatted[index],
             ...(mediaGroupId ? { media_group_id: mediaGroupId } : {}),
           },
           // Flood control counts the album as one send.
           { counts: index === 0 },
-        );
-      });
+        ),
+      );
     },
     promoteChatMember: async (p, caller) => {
       const userId = userIdParam(p.user_id);
@@ -3500,10 +3666,13 @@ export async function startTestServer({
         ? ephemeralReceiver(chat, caller, ephemeral)
         : null;
     const reply = replyFields(chat, p, caller, parameters);
+    // Content given as a function is read only now, after the chat and reply
+    // checks, as TDLib reads a file or live location only when it sends.
+    const body = typeof fields === "function" ? fields() : fields;
     requireButtonData(markup);
     if (counts) countSend(chat, caller);
     const content = {
-      ...fields,
+      ...body,
       ...reply,
       ...(markup ? { reply_markup: markup } : {}),
       ...(p.message_thread_id && chat.topics
@@ -3970,17 +4139,65 @@ export async function startTestServer({
     return user ? userObject(user) : { id, is_bot: false, first_name: "" };
   }
 
-  /** A bot sends a voice note, audio file or video note. */
+  /**
+   * A bot sends a photo, document, video, animation, sticker, voice note, audio
+   * file or video note. A file sent again by file_id keeps its kind and what
+   * its first sender said about it. A send that names no file stores a
+   * one-byte file.
+   */
   function sendMedia(p, caller, type) {
-    const file = sentFile(p[type], `${type}s`, MEMBER_MEDIA[type].ext);
-    return sendFrom(p, caller, {
-      ...mediaFields(type, file, {
-        duration: p.duration == null ? 1 : Number(p.duration),
-        fileName: file.file_name,
-        mimeType: file.mime_type,
-      }),
-      ...(MEMBER_MEDIA[type].caption ? captionFields(p) : {}),
+    const caption =
+      type === "photo" || MEMBER_MEDIA[type].caption ? captionFields(p) : {};
+    // sendDocument's disable_content_type_detection sends a plain file
+    // (MessageContent.cpp get_input_message_content).
+    const typeName =
+      type === "document" && isTrue(p.disable_content_type_detection)
+        ? "DocumentAsFile"
+        : undefined;
+    return sendFrom(p, caller, () => {
+      const meta = senderMeta(p);
+      const file =
+        sentFile(p, p[type], type, caller, meta, typeName) ??
+        registerFile(Buffer.alloc(1), type, meta);
+      return { ...mediaFields(file.kind, file), ...caption };
     });
+  }
+
+  /**
+   * A live location's period, heading and proximity alert radius, checked as
+   * TDLib checks them (Location.cpp process_live_location); none without a
+   * live_period (Client.cpp process_send_location_query).
+   */
+  function liveLocation(p) {
+    const [period, heading, radius] = [
+      p.live_period,
+      p.heading,
+      p.proximity_alert_radius,
+    ].map((value) => Math.trunc(numberParam(value, 0)));
+    if (period === 0) return {};
+    if (period !== 0x7fffffff && (period < 60 || period > 86400)) {
+      throw new TelegramError(
+        400,
+        "Bad Request: wrong live location period specified",
+      );
+    }
+    if (heading !== 0 && (heading < 1 || heading > 360)) {
+      throw new TelegramError(
+        400,
+        "Bad Request: wrong live location heading specified",
+      );
+    }
+    if (radius < 0 || radius > 100000) {
+      throw new TelegramError(
+        400,
+        "Bad Request: wrong live location proximity alert radius specified",
+      );
+    }
+    return {
+      live_period: period,
+      ...(heading > 0 ? { heading } : {}),
+      ...(radius > 0 ? { proximity_alert_radius: radius } : {}),
+    };
   }
 
   /**
@@ -4543,50 +4760,72 @@ export async function startTestServer({
 
   /**
    * The media edit of editMessageMedia and editEphemeralMessageMedia. The new
-   * media is an upload attached as attach://<name>, or the file_id of a file
-   * this server holds.
+   * media is an upload attached as attach://<name>, a file_id the bot was
+   * given or an HTTP URL; a live photo names its still photo too. In an album
+   * it may change only to a kind the album allows
+   * (MessagesManager::edit_message_media).
    */
-  function mediaEdit(p) {
+  function mediaEdit(p, caller) {
     const input = p.media ?? {};
     const type = input.type ?? "photo";
-    if (!MEDIA_KINDS.includes(type)) {
-      throw new TelegramError(400, "Bad Request: unsupported media type");
-    }
-    const reference =
-      typeof input.media === "string" && input.media.startsWith("attach://")
-        ? p[input.media.slice("attach://".length)]
-        : input.media;
-    if (
-      !Buffer.isBuffer(reference) &&
-      !(typeof reference === "string" && files.has(reference))
-    ) {
+    // The Bot API reads the InputMedia before the message (Client.cpp
+    // get_input_media).
+    const unreadable = !MEDIA_KINDS.includes(type)
+      ? `type "${type}" is unsupported`
+      : namedFile(p, input.media) === null
+        ? "media not found"
+        : type === "live_photo" && namedFile(p, input.photo) === null
+          ? "Photo not found"
+          : null;
+    if (unreadable) {
       throw new TelegramError(
         400,
-        "Bad Request: wrong file identifier/HTTP URL specified",
+        `Bad Request: can't parse InputMedia: ${unreadable}`,
       );
     }
-    const file = sentFile(
-      reference,
-      `${type}s`,
-      type === "photo" ? "jpg" : "bin",
-    );
     const formatted = captionFields(input);
     return (message) => {
+      const current = MEDIA_KINDS.find((kind) => message[kind]);
+      // InputMediaLivePhoto gives no size or duration for its video.
+      const file = sentFile(
+        p,
+        input.media,
+        type,
+        caller,
+        type === "live_photo" ? {} : senderMeta(input),
+      );
+      const photo =
+        type === "live_photo"
+          ? sentFile(p, input.photo, "photo", caller, {})
+          : null;
+      const albumKind = (kind) => (kind === "live_photo" ? "photo" : kind);
+      if (message.media_group_id && albumKind(current) !== albumKind(type)) {
+        if (type === "animation") {
+          throw new TelegramError(
+            400,
+            "Bad Request: message content type can't be used in an album",
+          );
+        }
+        if (
+          [current, type].some((kind) => ["audio", "document"].includes(kind))
+        ) {
+          throw new TelegramError(
+            400,
+            "Bad Request: can't change media type in the album",
+          );
+        }
+      }
       delete message.text;
       delete message.entities;
       delete message.link_preview_options;
       for (const kind of MEDIA_KINDS) delete message[kind];
-      message[type] =
-        type === "photo"
-          ? photoSizes(file)
-          : {
-              file_id: file.file_id,
-              file_unique_id: file.file_unique_id,
-              file_size: file.size,
-            };
       delete message.caption;
       delete message.caption_entities;
-      Object.assign(message, formatted);
+      Object.assign(
+        message,
+        mediaFields(type === "live_photo" ? type : file.kind, file, photo),
+        formatted,
+      );
     };
   }
 
@@ -4994,7 +5233,9 @@ export async function startTestServer({
       record.delivery = Promise.resolve();
       record.pollWaiters = new Set();
     }
-    for (const file of files.values()) file.data = Buffer.from(file.data);
+    for (const { file } of files.values()) {
+      if (!Buffer.isBuffer(file.data)) file.data = Buffer.from(file.data);
+    }
     bot = bots.get(botToken);
     // Do not spread a fixture journal into function arguments: large replay
     // histories exceed the engine's argument limit and leave a partial restore.
@@ -5955,18 +6196,12 @@ export async function startTestServer({
         );
       }
       const bytes = Buffer.from(base64, "base64");
-      const file =
-        type === "photo"
-          ? registerPhoto(bytes)
-          : registerFile(bytes, `${type}s`, MEMBER_MEDIA[type].ext);
-      Object.assign(
-        fields,
-        mediaFields(type, file, {
-          fileName: media?.file_name,
-          mimeType: media?.mime_type,
-          duration: media?.duration,
-        }),
-      );
+      const file = registerFile(bytes, type, {
+        file_name: media?.file_name,
+        mime_type: media?.mime_type,
+        duration: media?.duration,
+      });
+      Object.assign(fields, mediaFields(type, file));
       const formatted =
         caption && (type === "photo" || MEMBER_MEDIA[type].caption)
           ? formatText(String(caption))
@@ -6330,15 +6565,15 @@ ${buttons}
     }
     const picture = path.match(/^\/userpic\/(\d+)\.jpg$/);
     if (picture && request.method === "GET") {
-      const file = files.get(
+      const held = files.get(
         users.get(Number(picture[1]))?.photos?.[0]?.file_id,
       );
-      if (!file) {
+      if (!held) {
         response.writeHead(404).end();
         return true;
       }
       response.writeHead(200, { "Content-Type": "image/jpeg" });
-      response.end(file.data);
+      response.end(held.file.data);
       return true;
     }
     if (path !== "/auth" || !["GET", "POST"].includes(request.method)) {
@@ -6451,19 +6686,27 @@ ${buttons}
         return;
       }
       if (serveLogin(request, url, body, response)) return;
-      const file = url.pathname.match(/^\/file\/bot([^/]+)\/(.+)$/);
-      if (file) {
-        const entry = [...files.values()].find((f) => f.file_path === file[2]);
-        if (!entry || !bots.has(file[1])) {
+      // A file_path names the bot's own file_id, so it works with that bot's
+      // token alone.
+      const download = url.pathname.match(/^\/file\/bot([^/]+)\/(.+)$/);
+      if (download) {
+        const fileId = download[2].replace(/^[^/]*\/|\.[^.]*$/g, "");
+        const held = files.get(fileId);
+        if (
+          !held ||
+          held.botId !== bots.get(download[1])?.id ||
+          filePath(held.file, fileId) !== download[2]
+        ) {
           response.writeHead(404).end();
           return;
         }
         response.writeHead(200, {
-          "Content-Type": entry.file_path.startsWith("photos/")
-            ? "image/jpeg"
-            : "application/octet-stream",
+          "Content-Type":
+            held.file.kind === "photo"
+              ? "image/jpeg"
+              : "application/octet-stream",
         });
-        response.end(entry.data);
+        response.end(held.file.data);
         return;
       }
       const call = url.pathname.match(/^\/bot([^/]+)\/([A-Za-z]+)$/);
@@ -6665,7 +6908,7 @@ ${buttons}
           return;
         }
         if (failure?.delay_ms) await delayResponse(failure.delay_ms);
-        send(response, 200, { ok: true, result });
+        send(response, 200, { ok: true, result: seenBy(caller, result) });
       } catch (error) {
         Object.assign(receipt, {
           applied: receipt.applied,

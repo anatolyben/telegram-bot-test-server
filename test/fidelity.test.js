@@ -1130,8 +1130,12 @@ describe("Bot API details", () => {
 
   it("returns media with the fields the Bot API requires, and files getFile can resolve", async () => {
     const { api } = await setup();
-    const video = (await api("sendVideo", { chat_id: GROUP, video: "x" }))
-      .result.video;
+    const video = (
+      await api("sendVideo", {
+        chat_id: GROUP,
+        video: "https://example.com/clip.mp4",
+      })
+    ).result.video;
 
     expect(video).toMatchObject({
       file_id: expect.any(String),
@@ -1167,6 +1171,56 @@ describe("Bot API details", () => {
     for (const identifier of identifiers) {
       expect(identifier).not.toContain("fake");
     }
+  });
+
+  it("refuses a file_id string it cannot read, with TDLib's reason", async () => {
+    const { api } = await setup();
+    const reasons = {
+      "not-a-real-file-id":
+        "wrong remote file identifier specified: Wrong padding in the string",
+      abc$: "wrong remote file identifier specified: Wrong character in the string",
+      x: "wrong remote file identifier specified: Wrong string length",
+      AAAA: "wrong remote file identifier specified: can't unserialize it. Wrong last symbol",
+      AAAE: "wrong remote file identifier specified: can't unserialize it",
+      AP8E: "invalid remote file identifier",
+    };
+
+    for (const [photo, reason] of Object.entries(reasons)) {
+      expect(await api("sendPhoto", { chat_id: GROUP, photo })).toMatchObject({
+        status: 400,
+        description: `Bad Request: ${reason}`,
+      });
+    }
+  });
+
+  it("keeps a file's type when it is sent again by file_id", async () => {
+    const { api } = await setup();
+    const send = (method, field, media) =>
+      api(method, { chat_id: GROUP, [field]: media });
+    const photo = (
+      await send("sendPhoto", "photo", "https://example.com/a.jpg")
+    ).result.photo[0];
+    const document = (
+      await send("sendDocument", "document", "https://example.com/a.pdf")
+    ).result.document;
+    const animation = (
+      await send("sendAnimation", "animation", "https://example.com/a.mp4")
+    ).result.animation;
+
+    expect(await send("sendDocument", "document", photo.file_id)).toMatchObject(
+      {
+        status: 400,
+        description: "Bad Request: can't use file of type Photo as Document",
+      },
+    );
+    expect(await send("sendPhoto", "photo", document.file_id)).toMatchObject({
+      status: 400,
+      description: "Bad Request: can't use file of type Document as Photo",
+    });
+    const resent = await send("sendDocument", "document", animation.file_id);
+    expect(resent.result.animation).toMatchObject({
+      file_unique_id: animation.file_unique_id,
+    });
   });
 });
 

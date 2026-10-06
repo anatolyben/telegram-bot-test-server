@@ -98,7 +98,7 @@ response happens after that, so wait for the outcome rather than checking it imm
 | `postGuestBotReply(chatId, userId, botUsername, text)`                                                                                | The user calls a guest bot (Bot API 10.0 guest mode); its answer appears in the group from that bot, with `guest_bot_caller_user` set.                                      |
 | `sendDirectMessage(userId, text)`                                                                                                     | The user messages the bot privately; empty text fails with `MESSAGE_EMPTY`.                                                                                                 |
 | `pressDirectButton(userId, messageId, data)`                                                                                          | The user presses a button in their private chat with the bot.                                                                                                               |
-| `getMessages(chatId)`, `getMessage(chatId, id)`                                                                                       | The chat's messages, ephemeral ones included, and whether one was deleted.                                                                                                  |
+| `getMessages(chatId)`, `getMessage(chatId, id)`                                                                                       | The chat's messages, ephemeral ones included, and whether one was deleted. Their file_ids are the first bot's.                                                              |
 | `getEphemeralMessage(chatId, ephemeralMessageId)`                                                                                     | An ephemeral message by its `ephemeral_message_id`, and whether it was deleted.                                                                                             |
 | `getDirectMessages(userId)`                                                                                                           | The private chat between the user and the bot.                                                                                                                              |
 | `getMember(chatId, userId)`                                                                                                           | The member as `getChatMember` returns them to the first bot: status, restrictions, ban.                                                                                     |
@@ -282,10 +282,32 @@ The details a moderation bot depends on, each covered by a test:
   `_`, `/`, `<` or `>`), `hashtag`, `cashtag`, `url` and `email`, with UTF-16 offsets, in groups
   and in private chats. A link without a protocol needs a common top-level domain, so `example.com` is a
   link and `package.json` is not. Phone numbers are not marked.
-- **Media.** Sent photos, documents, videos, animations and stickers carry the fields the Bot API
-  requires and resolve through `getFile`. `editMessageMedia` replaces a message's media with an
-  upload (`attach://`) or a held `file_id`. `sendMediaGroup` sends up to 10 items as one album; a
-  single item is sent as an ordinary message, as TDLib does.
+- **Media.** Sent photos, documents, videos, animations, stickers, voice notes, audio and video
+  notes carry the fields the Bot API requires and resolve through `getFile`. They keep what the
+  sender says: a video's or animation's `width`, `height` and `duration`, a video note's `length`,
+  an audio's `title` and `performer`, an uploaded sticker's `emoji`, capped as the Bot API caps
+  them (sizes at 10000, durations at a day). What the sender leaves out gets a stand-in (1280x720,
+  one second). An animation also carries `document`. A photo has one size: its image's, read from
+  a PNG, GIF or JPEG header and scaled down to fit 2560x2560, Telegram's largest, or 800x800 when
+  the header cannot be read. Telegram also lists smaller sizes. A contact keeps its `vcard`. A
+  location with `live_period` is a live location with its `heading` and `proximity_alert_radius`,
+  refused out of Telegram's ranges. `sendMediaGroup` sends up to 10 items as one album; a single
+  item is sent as an ordinary message, as TDLib does.
+- **Files** ([sending files](https://core.telegram.org/bots/api#sending-files)). Each bot gets its
+  own opaque `file_id` for a file, and `file_unique_id` is the same for every bot. A bot can send
+  again, `getFile` and download (with its own token) only the file_ids it was given. `getFile` on
+  another bot's fails with `wrong file_id or the file is temporarily unavailable`, and sending it
+  with `wrong file identifier/HTTP URL specified`. A string that is not a file_id fails with TDLib's
+  reason, such as `wrong remote file identifier specified: can't unserialize it`. As in TDLib, any
+  string with a dot is an HTTP URL; this server does not fetch it and stores a one-byte file
+  instead. A file sent again keeps its kind: a photo cannot stand in for any other kind, nor any
+  other kind for a photo (`can't use file of type Photo as Document`), and a document, video or the
+  like sent by another method stays what it was. The control API shows messages with the first bot's
+  file_ids.
+- **Editing media.** `editMessageMedia` turns a text, or a photo, live photo, video, animation,
+  audio or document message, into any of these, from an upload (`attach://`), a `file_id` or a
+  URL. In an album, a photo or video becomes only a photo, live photo or video, and an audio or
+  document keeps its kind. Other messages' media cannot be edited.
 - **More than one bot.** Each bot has its own webhook or update queue and its own membership and
   rights in each chat. A bot posts only where it is a member (a channel needs `can_post_messages`),
   edits and stops only its own messages and polls (in a channel, others' too with
@@ -783,6 +805,8 @@ Uploaded documents preserve their original filename and MIME type when reused by
   with BotFather (any `redirect_uri` is accepted), the `telegram-login.js` popup and native SDKs, and
   the legacy Login Widget's hash check. Telegram has no UserInfo endpoint, and neither does this
   server.
+- Fetching media from HTTP URLs (a URL stands in as a one-byte file), several sizes per photo,
+  `sendLivePhoto` and `editMessageLiveLocation`.
 - Persistence. All state lives in memory and is lost when the server stops.
 - Anything security-related. It is a test tool: bind it to localhost and never expose it to a
   network you do not control.
