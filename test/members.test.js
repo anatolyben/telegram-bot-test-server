@@ -463,6 +463,54 @@ describe("administrators and chat settings", () => {
     ).toMatchObject({
       description: "Bad Request: not enough rights to change chat title",
     });
+    expect(
+      await api("setChatDescription", { chat_id: GROUP, description: "x" }),
+    ).toMatchObject({
+      description: "Bad Request: not enough rights to set chat description",
+    });
+  });
+
+  it("answers setChatAdministratorCustomTitle with Telegram's errors", async () => {
+    const { fake, api, member, me } = await setup();
+    await fake.setBotMembership(GROUP, me.id, {
+      status: "administrator",
+      rights: { can_promote_members: true },
+    });
+    const title = (userId, custom_title, chat_id = GROUP) =>
+      api("setChatAdministratorCustomTitle", {
+        chat_id,
+        user_id: userId,
+        custom_title,
+      });
+
+    expect(await title(OWNER, "Boss")).toMatchObject({
+      status: 400,
+      description: "Bad Request: only the owner can edit their custom title",
+    });
+    expect(await title(member, "Helper")).toMatchObject({
+      status: 400,
+      description: "Bad Request: user is not an administrator",
+    });
+    await api("promoteChatMember", {
+      chat_id: GROUP,
+      user_id: member,
+      can_delete_messages: true,
+    });
+    expect(await title(member, "⭐ Star")).toMatchObject({
+      status: 400,
+      description: "Bad Request: CUSTOM_TITLE_EMOJI_NOT_ALLOWED",
+    });
+    expect(await title(member, "x".repeat(17))).toMatchObject({
+      status: 400,
+      description: "Bad Request: CUSTOM_TITLE_INVALID",
+    });
+    const channel = await fake.createChat({ type: "channel", ownerId: OWNER });
+    await fake.setBotMembership(channel, me.id, { status: "administrator" });
+    expect(await title(member, "Helper", channel)).toMatchObject({
+      status: 400,
+      description:
+        "Bad Request: method is available only in groups and supergroups",
+    });
   });
 
   it("edits the bot's own invite links", async () => {
@@ -578,6 +626,40 @@ describe("reactions and join request queries", () => {
         )
       ).result,
     ).toBe(true);
+    expect((await fake.getMember(GROUP, applicant)).status).toBe("member");
+  });
+
+  it("reads a join request query's result trimmed and in any case, and checks it first", async () => {
+    const { fake, api } = await setup();
+    const guard = await fake.addBot({
+      token: GUARD_TOKEN,
+      username: "guard_bot",
+      supportsJoinRequestQueries: true,
+    });
+    await fake.setBotMembership(GROUP, guard.id, { status: "administrator" });
+    const answer = (id, result) =>
+      api(
+        "answerChatJoinRequestQuery",
+        { chat_join_request_query_id: id, result },
+        GUARD_TOKEN,
+      );
+    expect(await answer("1", "maybe")).toMatchObject({
+      status: 400,
+      description: "Bad Request: invalid query result specified",
+    });
+    const link = (
+      await api("createChatInviteLink", {
+        chat_id: GROUP,
+        creates_join_request: true,
+      })
+    ).result.invite_link;
+    const applicant = await fake.createUser();
+    await fake.joinByLink(link, applicant);
+    const updates = (await api("getUpdates", {}, GUARD_TOKEN)).result;
+    const queryId = updates.find((update) => update.chat_join_request)
+      .chat_join_request.query_id;
+
+    expect((await answer(queryId, " Approve ")).result).toBe(true);
     expect((await fake.getMember(GROUP, applicant)).status).toBe("member");
   });
 });

@@ -854,9 +854,20 @@ export async function startTestServer({
     return chat.permissions[permission] === true;
   }
 
-  function requireRight(chat, caller, right) {
+  /** promoteChatMember and unbanChatMember work only there. */
+  function requireSupergroupOrChannel(chat) {
+    if (chat.type === "group") {
+      throw new TelegramError(
+        400,
+        "Bad Request: method is available only in supergroup and channel chats",
+      );
+    }
+  }
+
+  /** Refuse a bot without the right, with the text TDLib gives for the call. */
+  function requireRight(chat, caller, right, description) {
     if (!hasRight(chat, caller.id, right)) {
-      throw new TelegramError(400, "Bad Request: not enough rights");
+      throw new TelegramError(400, `Bad Request: ${description}`);
     }
   }
 
@@ -898,7 +909,16 @@ export async function startTestServer({
     if (Number(userId) === caller.id && self) {
       throw new TelegramError(400, `Bad Request: ${self}`);
     }
-    requireRight(chat, caller, "can_restrict_members");
+    // A basic group removes members through messages.deleteChatUser, which
+    // answers a non-administrator with CHAT_ADMIN_REQUIRED.
+    requireRight(
+      chat,
+      caller,
+      "can_restrict_members",
+      chat.type === "group"
+        ? "CHAT_ADMIN_REQUIRED"
+        : "not enough rights to restrict/unrestrict chat member",
+    );
     const status = memberStatus(chat, userId).status;
     if (status === "creator") {
       throw new TelegramError(400, "Bad Request: can't remove chat owner");
@@ -1966,13 +1986,18 @@ export async function startTestServer({
     },
     setChatPermissions: (p, caller) => {
       const chat = requireChat(p.chat_id);
-      if (!["group", "supergroup"].includes(chat.type)) {
+      if (chat.type === "channel") {
         throw new TelegramError(
           400,
-          "Bad Request: setChatPermissions requires a group or supergroup",
+          "Bad Request: can't change channel chat permissions",
         );
       }
-      requireRight(chat, caller, "can_restrict_members");
+      requireRight(
+        chat,
+        caller,
+        "can_restrict_members",
+        "not enough rights to change chat permissions",
+      );
       chat.permissions = normalizePermissions(
         p.permissions,
         p.use_independent_chat_permissions,
@@ -2034,7 +2059,7 @@ export async function startTestServer({
       if (chat.type !== "supergroup") {
         throw new TelegramError(
           400,
-          "Bad Request: restrictChatMember requires a supergroup",
+          "Bad Request: method is available only in supergroups",
         );
       }
       const userId = Number(p.user_id);
@@ -2081,7 +2106,13 @@ export async function startTestServer({
     },
     unbanChatMember: (p, caller) => {
       const chat = requireChat(p.chat_id);
-      requireRight(chat, caller, "can_restrict_members");
+      requireSupergroupOrChannel(chat);
+      requireRight(
+        chat,
+        caller,
+        "can_restrict_members",
+        "not enough rights to restrict/unrestrict chat member",
+      );
       const userId = Number(p.user_id);
       requireUser(userId);
       const before = memberStatus(chat, userId);
@@ -2104,7 +2135,12 @@ export async function startTestServer({
     },
     approveChatJoinRequest: (p, caller) => {
       const chat = requireChat(p.chat_id);
-      requireRight(chat, caller, "can_invite_users");
+      requireRight(
+        chat,
+        caller,
+        "can_invite_users",
+        "not enough rights to manage chat join requests",
+      );
       const userId = Number(p.user_id);
       if (!chat.joinRequests.has(userId)) {
         throw new TelegramError(400, "Bad Request: HIDE_REQUESTER_MISSING");
@@ -2133,7 +2169,12 @@ export async function startTestServer({
     },
     declineChatJoinRequest: (p, caller) => {
       const chat = requireChat(p.chat_id);
-      requireRight(chat, caller, "can_invite_users");
+      requireRight(
+        chat,
+        caller,
+        "can_invite_users",
+        "not enough rights to manage chat join requests",
+      );
       const userId = Number(p.user_id);
       if (!chat.joinRequests.delete(userId)) {
         throw new TelegramError(400, "Bad Request: HIDE_REQUESTER_MISSING");
@@ -2299,6 +2340,7 @@ export async function startTestServer({
     },
     promoteChatMember: async (p, caller) => {
       const chat = requireChat(p.chat_id);
+      requireSupergroupOrChannel(chat);
       const userId = Number(p.user_id);
       requireUser(userId);
       if (!hasRight(chat, caller.id, "can_promote_members")) {
@@ -2345,26 +2387,42 @@ export async function startTestServer({
     },
     setChatAdministratorCustomTitle: async (p, caller) => {
       const chat = requireChat(p.chat_id);
+      if (chat.type === "channel") {
+        throw new TelegramError(
+          400,
+          "Bad Request: method is available only in groups and supergroups",
+        );
+      }
       const userId = Number(p.user_id);
       const member = memberStatus(chat, userId);
-      if (
-        member.status !== "administrator" ||
-        member.promotedBy !== caller.id
-      ) {
+      if (member.status === "creator") {
+        throw new TelegramError(
+          400,
+          "Bad Request: only the owner can edit their custom title",
+        );
+      }
+      if (member.status !== "administrator") {
+        throw new TelegramError(
+          400,
+          "Bad Request: user is not an administrator",
+        );
+      }
+      if (member.promotedBy !== caller.id) {
         throw new TelegramError(
           400,
           "Bad Request: not enough rights to change custom title of the user",
         );
       }
+      // Telegram's server renames the RANK_* errors for this method.
       const title = String(p.custom_title ?? "");
       if (/\p{Extended_Pictographic}/u.test(title)) {
         throw new TelegramError(
           400,
-          "Bad Request: ADMIN_RANK_EMOJI_NOT_ALLOWED",
+          "Bad Request: CUSTOM_TITLE_EMOJI_NOT_ALLOWED",
         );
       }
       if ([...title].length > 16) {
-        throw new TelegramError(400, "Bad Request: ADMIN_RANK_INVALID");
+        throw new TelegramError(400, "Bad Request: CUSTOM_TITLE_INVALID");
       }
       chat.members.set(userId, { ...member, customTitle: title || undefined });
       await memberChanged(chat, userId, member, caller);
@@ -2372,7 +2430,7 @@ export async function startTestServer({
     },
     setChatTitle: async (p, caller) => {
       const chat = requireChat(p.chat_id);
-      requireInfoRight(chat, caller, "title");
+      requireInfoRight(chat, caller, "change chat title");
       const title = String(p.title ?? "").trim();
       if (!title || title.length > 128) {
         throw new TelegramError(400, "Bad Request: chat title can't be empty");
@@ -2390,7 +2448,7 @@ export async function startTestServer({
     },
     setChatDescription: (p, caller) => {
       const chat = requireChat(p.chat_id);
-      requireInfoRight(chat, caller, "description");
+      requireInfoRight(chat, caller, "set chat description");
       const description = String(p.description ?? "");
       if (description.length > 255) {
         throw new TelegramError(
@@ -2409,7 +2467,7 @@ export async function startTestServer({
     },
     setChatPhoto: async (p, caller) => {
       const chat = requireChat(p.chat_id);
-      requireInfoRight(chat, caller, "photo");
+      requireInfoRight(chat, caller, "change chat photo");
       if (!Buffer.isBuffer(p.photo)) {
         throw new TelegramError(
           400,
@@ -2426,7 +2484,7 @@ export async function startTestServer({
     },
     deleteChatPhoto: async (p, caller) => {
       const chat = requireChat(p.chat_id);
-      requireInfoRight(chat, caller, "photo");
+      requireInfoRight(chat, caller, "change chat photo");
       if (!chat.photo) {
         throw new TelegramError(400, "Bad Request: CHAT_NOT_MODIFIED");
       }
@@ -2509,6 +2567,16 @@ export async function startTestServer({
     // A guard bot answers a join request query: approve, decline, or leave it
     // to the other administrators.
     answerChatJoinRequestQuery: (p, caller) => {
+      // The result is read trimmed and lower-cased, before the query id.
+      const result = String(p.result ?? "")
+        .trim()
+        .toLowerCase();
+      if (!["approve", "decline", "queue"].includes(result)) {
+        throw new TelegramError(
+          400,
+          "Bad Request: invalid query result specified",
+        );
+      }
       const id = String(p.chat_join_request_query_id ?? "");
       const query = joinQueries.get(id);
       if (!query || query.botId !== caller.id) {
@@ -2517,18 +2585,10 @@ export async function startTestServer({
           "Bad Request: query is too old and response timeout expired or query ID is invalid",
         );
       }
-      if (!["approve", "decline", "queue"].includes(p.result)) {
-        throw new TelegramError(
-          400,
-          'Bad Request: result must be "approve", "decline" or "queue"',
-        );
-      }
       joinQueries.delete(id);
       const target = { chat_id: query.chatId, user_id: query.userId };
-      if (p.result === "approve")
-        methods.approveChatJoinRequest(target, caller);
-      if (p.result === "decline")
-        methods.declineChatJoinRequest(target, caller);
+      if (result === "approve") methods.approveChatJoinRequest(target, caller);
+      if (result === "decline") methods.declineChatJoinRequest(target, caller);
       return true;
     },
     revokeChatInviteLink: (p) => {
@@ -2717,13 +2777,14 @@ export async function startTestServer({
   }
 
   /** Changing a chat's title, description or photo needs can_change_info. */
-  function requireInfoRight(chat, caller, what) {
-    if (!hasRight(chat, caller.id, "can_change_info")) {
-      throw new TelegramError(
-        400,
-        `Bad Request: not enough rights to change chat ${what}`,
-      );
-    }
+  /** `change` names the call in TDLib's text, e.g. "change chat title". */
+  function requireInfoRight(chat, caller, change) {
+    requireRight(
+      chat,
+      caller,
+      "can_change_info",
+      `not enough rights to ${change}`,
+    );
   }
 
   // ── Business connections ────────────────────────────────────────────────

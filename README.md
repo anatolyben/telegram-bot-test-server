@@ -242,7 +242,7 @@ The details a moderation bot depends on, each covered by a test:
   refuse a change that changes nothing, and post Telegram's service messages.
 - **Join request queries (Bot API 10.x).** A guard bot (`supportsJoinRequestQueries`) gets each join
   request with a `query_id`, which it answers with `answerChatJoinRequestQuery`
-  (`chat_join_request_query_id`, `result`: `approve`, `decline` or `queue`).
+  (`chat_join_request_query_id`, `result`: `approve`, `decline` or `queue`, in any case).
 - **Business connections** ([Bot API](https://core.telegram.org/bots/api#businessconnection),
   [connected business bots](https://core.telegram.org/api/bots/connected-business-bots)). An owner
   connects the bot to their account; the bot gets `business_connection` on every change, and
@@ -591,10 +591,13 @@ and MIME type when reused by `file_id` ([Document](https://core.telegram.org/bot
 A ban deletes no messages, as on Telegram: `revoke_messages` only decides what the
 removed user can still see, which this server does not model. A bot that wants a
 banned user's messages gone deletes them with `deleteMessage` or `deleteMessages`.
-`restrictChatMember` accepts supergroups only.
+`restrictChatMember` works only in supergroups, and `promoteChatMember` and
+`unbanChatMember` only in supergroups and channels.
 Restrict/ban/unban require `can_restrict_members` and protect
 administrators; approval/decline require `can_invite_users` before touching pending
-requests. Pending requests are not members. Unban leaves a banned user outside;
+requests. Refusals carry Telegram's own texts, such as `not enough rights to
+restrict/unrestrict chat member`, `method is available only in supergroups` or, for a
+basic group that only an administrator may remove members from, `CHAT_ADMIN_REQUIRED`. Pending requests are not members. Unban leaves a banned user outside;
 `only_if_banned` keeps an admitted user unchanged. Bulk deletion validates permissions
 before changing any existing target and skips missing message IDs. Deletion enforces
 the 48-hour limit, private dice minimum age, and undeletable creation service messages.
