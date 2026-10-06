@@ -1,12 +1,17 @@
 /**
- * parse_mode for bot messages: turns HTML, MarkdownV2 or legacy Markdown into
- * plain text plus MessageEntity objects, with UTF-16 offsets as Telegram
- * reports them. Supported contracts are documented in README.md.
+ * Message text as Telegram stores it: parse_mode (HTML, MarkdownV2 or legacy
+ * Markdown) turned into plain text plus MessageEntity objects, the text
+ * cleaned and trimmed, and the entities Telegram finds by itself, all with
+ * UTF-16 offsets as Telegram reports them. Supported contracts are documented
+ * in README.md.
  */
 
 export class FormattingError extends Error {}
 
 const utf8Length = (text) => Buffer.byteLength(text, "utf8");
+// TDLib's to_lower changes ASCII letters only.
+const asciiLower = (text) =>
+  text.replace(/[A-Z]/g, (char) => char.toLowerCase());
 
 function fail(reason) {
   throw new FormattingError(`Bad Request: can't parse entities: ${reason}`);
@@ -24,8 +29,9 @@ function sortEntities(entities) {
 }
 
 // TDLib MessageEntity.cpp: fix_entities, split_entities, merge_new_entities.
-// Styles merge per type and split at continuous/blockquote boundaries; code
-// and pre exclude styles. Overlapping continuous entities and quotes are pruned.
+// Styles merge per type and split at continuous/blockquote boundaries; code,
+// pre and date_time (TDLib's pre entities) exclude styles. Overlapping
+// continuous entities and quotes are pruned.
 const STYLES = new Set([
   "bold",
   "italic",
@@ -34,7 +40,7 @@ const STYLES = new Set([
   "spoiler",
 ]);
 const QUOTES = new Set(["blockquote", "expandable_blockquote"]);
-const CODE = new Set(["code", "pre"]);
+const CODE = new Set(["code", "pre", "date_time"]);
 function entityPriority(type) {
   return (
     {
@@ -42,6 +48,7 @@ function entityPriority(type) {
       expandable_blockquote: 0,
       pre: 11,
       code: 20,
+      date_time: 30,
       text_link: 49,
       text_mention: 49,
       bold: 90,
@@ -168,6 +175,91 @@ function linkEntity(url, offset, length) {
   return { type: "text_link", offset, length, url };
 }
 
+/**
+ * A date_time format as the Bot API writes it back (Client.cpp
+ * get_date_time_format): "r", or w, then d or D, then t or T. TDLib
+ * FormattedDate::get_date_flags accepts "r" or "R" alone, or any of tTdDwW,
+ * and a short precision wins over a long one; null for anything else.
+ */
+function dateTimeFormat(format) {
+  if (format === "r" || format === "R") return "r";
+  if (!/^[tTdDwW]*$/.test(format)) return null;
+  const pick = (short, long) =>
+    format.includes(short) ? short : format.includes(long) ? long : "";
+  return (/[wW]/.test(format) ? "w" : "") + pick("d", "D") + pick("t", "T");
+}
+
+/** td::to_integer<int32>: the leading digits, wrapped to 32 bits. */
+function int32Prefix(value) {
+  const [, sign, digits] = /^(-?)(\d*)/.exec(value);
+  return Number(BigInt.asIntN(32, BigInt(`${sign}${digits || "0"}`)));
+}
+
+/** td::to_integer_safe: only the integer's own decimal form, in range. */
+function exactInteger(value, bits) {
+  if (!/^-?\d+$/.test(value)) return null;
+  const number = BigInt(value);
+  return number.toString() === value && BigInt.asIntN(bits, number) === number
+    ? number
+    : null;
+}
+
+/**
+ * The parameters of a tg://<host>?... link, or null for another link (TDLib
+ * LinkManager::check_tg_url_host).
+ */
+function tgLinkParameters(url, host) {
+  if (!/^tg:/i.test(url)) return null;
+  let rest = url.slice(3);
+  if (rest.startsWith("//")) rest = rest.slice(2);
+  if (
+    asciiLower(rest.slice(0, host.length)) !== host ||
+    (rest.length > host.length && !"/?#".includes(rest[host.length]))
+  )
+    return null;
+  rest = rest.slice(host.length);
+  if (rest.startsWith("/")) rest = rest.slice(1);
+  if (!rest.startsWith("?")) return null;
+  return rest
+    .slice(1)
+    .split("#")[0]
+    .split("&")
+    .map((parameter) => {
+      const equals = parameter.indexOf("=");
+      return equals < 0
+        ? [parameter, ""]
+        : [parameter.slice(0, equals), parameter.slice(equals + 1)];
+    });
+}
+
+/**
+ * The entity a MarkdownV2 ![text](url) makes: a custom emoji for
+ * tg://emoji?id=, else a date_time for tg://time?unix=&format= (TDLib
+ * LinkManager get_link_custom_emoji_id, get_link_formatted_date); null when
+ * the URL is neither.
+ */
+function emojiOrTimeEntity(url) {
+  const id = tgLinkParameters(url, "emoji")?.find(([key]) => key === "id")?.[1];
+  const emoji = id === undefined ? null : exactInteger(id, 64);
+  if (emoji != null && emoji !== 0n) {
+    return { type: "custom_emoji", custom_emoji_id: id };
+  }
+  const parameters = tgLinkParameters(url, "time");
+  if (!parameters) return null;
+  let unix = 0;
+  let format = "";
+  for (const [key, value] of parameters) {
+    if (key === "unix") {
+      unix = Number(exactInteger(value, 32) ?? 0);
+      if (unix <= 0) return null;
+    }
+    if (key === "format") format = value;
+  }
+  const canonical = dateTimeFormat(format);
+  if (unix === 0 || canonical == null) return null;
+  return { type: "date_time", unix_time: unix, date_time_format: canonical };
+}
+
 // ── HTML ────────────────────────────────────────────────────────────────────
 
 const HTML_ENTITIES = { lt: "<", gt: ">", amp: "&", quot: '"' };
@@ -188,6 +280,7 @@ const HTML_TAGS = {
   a: "text_link",
   blockquote: "blockquote",
   "tg-emoji": "custom_emoji",
+  "tg-time": "date_time",
   span: "spoiler",
 };
 
@@ -266,8 +359,25 @@ export function parseHtml(input) {
         );
       }
       const length = text.length - open.offset;
-      if (open.entity)
+      if (open.entity?.type === "date_time") {
+        // TDLib checks the format only around some text, and makes the
+        // entity only for a positive time.
+        if (length > 0) {
+          const format = dateTimeFormat(open.entity.format);
+          if (format == null) fail("Invalid date format used");
+          if (open.entity.unix > 0) {
+            entities.push({
+              type: "date_time",
+              offset: open.offset,
+              length,
+              unix_time: open.entity.unix,
+              date_time_format: format,
+            });
+          }
+        }
+      } else if (open.entity) {
         entities.push({ ...open.entity, offset: open.offset, length });
+      }
       continue;
     }
     const nameMatch = /^([a-z][a-z0-9-]*)/i.exec(tag);
@@ -295,6 +405,12 @@ export function parseHtml(input) {
       entity = {
         type: "custom_emoji",
         custom_emoji_id: attributes["emoji-id"],
+      };
+    } else if (name === "tg-time") {
+      entity = {
+        type: "date_time",
+        unix: int32Prefix(attributes.unix ?? ""),
+        format: attributes.format ?? "",
       };
     } else if (name === "blockquote" && "expandable" in attributes) {
       entity = { type: "expandable_blockquote" };
@@ -473,6 +589,13 @@ export function parseMarkdownV2(input) {
       const top = open.findLastIndex(
         (entry) => entry.type === "link" || entry.type === "custom_emoji_link",
       );
+      if (
+        top >= 0 &&
+        top === open.length - 1 &&
+        open[top].type === "custom_emoji_link" &&
+        input[index + 1] !== "("
+      )
+        fail("The entity must contain a tg://emoji or tg://time URL");
       if (top < 0 || top !== open.length - 1 || input[index + 1] !== "(") {
         fail(
           `Character ']' is reserved and must be escaped with the preceding '\\'`,
@@ -490,14 +613,9 @@ export function parseMarkdownV2(input) {
         fail(`Can't find end of a URL at byte offset ${byteOffset(index + 2)}`);
       const length = text.length - entry.offset;
       if (entry.type === "custom_emoji_link") {
-        const id = /^tg:\/\/emoji\?id=(\d+)$/.exec(url)?.[1];
-        if (!id) fail(`Custom emoji entity must contain a tg://emoji URL`);
-        entities.push({
-          type: "custom_emoji",
-          offset: entry.offset,
-          length,
-          custom_emoji_id: id,
-        });
+        const entity = emojiOrTimeEntity(url);
+        if (!entity) fail("Invalid tg://emoji or tg://time URL specified");
+        entities.push({ ...entity, offset: entry.offset, length });
       } else {
         entities.push(linkEntity(url, entry.offset, length));
       }
@@ -608,34 +726,35 @@ export function parseMarkdown(input) {
 }
 
 /**
- * The text and entities a bot message ends up with. Explicit entities win over
- * parse_mode, as on Telegram; `detect` adds the links, mentions and commands
- * Telegram finds by itself outside code, pre and explicit links.
+ * The text and entities a message ends up with, as the Bot API server and
+ * TDLib make them. A parse_mode other than "none" wins over explicit entities
+ * (Client.cpp get_formatted_text); then the text is cleaned and trimmed, and
+ * the links, mentions, commands, hashtags and cashtags Telegram finds by
+ * itself are added outside code, pre and explicit links. `user` gives the
+ * User a text_mention shows for a user id.
  */
-export function formatText(text, { parseMode, entities, detect }) {
+export function formatText(text, { parseMode, entities, user } = {}) {
+  const mode = typeof parseMode === "string" ? parseMode.toLowerCase() : "";
   let parsed;
-  if (Array.isArray(entities)) {
-    parsed = {
-      text,
-      entities: entities.map((entity) => ({ ...entity })),
-    };
-  } else {
-    const mode = typeof parseMode === "string" ? parseMode.toLowerCase() : "";
+  if (text && mode && mode !== "none") {
     if (mode === "html") parsed = parseHtml(text);
     else if (mode === "markdownv2") parsed = parseMarkdownV2(text);
     else if (mode === "markdown") parsed = parseMarkdown(text);
-    else if (!mode) parsed = { text, entities: [] };
-    else
-      throw new FormattingError(
-        `Bad Request: unsupported parse_mode "${parseMode}"`,
-      );
+    else throw new FormattingError("Bad Request: unsupported parse_mode");
+  } else {
+    parsed = {
+      text,
+      entities: Array.isArray(entities)
+        ? entities.map((entity) => ({ ...entity }))
+        : [],
+    };
   }
   validateRanges(parsed.text, parsed.entities);
-  parsed.entities = normalizeEntities(parsed.entities);
+  const trimmed = cleanAndTrim(parsed.text, normalizeEntities(parsed.entities));
   // Automatically found entities can coexist with styles, but not continuous
   // entities such as code, pre or an explicit text link.
-  const detected = detect(parsed.text).filter((candidate) =>
-    parsed.entities.every(
+  const detected = findEntities(trimmed.text).filter((candidate) =>
+    trimmed.entities.every(
       (entity) =>
         STYLES.has(entity.type) ||
         (QUOTES.has(entity.type)
@@ -646,7 +765,616 @@ export function formatText(text, { parseMode, entities, detect }) {
     ),
   );
   return {
-    text: parsed.text,
-    entities: normalizeEntities([...parsed.entities, ...detected]),
+    text: trimmed.text,
+    entities: normalizeEntities([...trimmed.entities, ...detected]).map(
+      (entity) =>
+        entity.type === "text_mention" && user && entity.user?.id != null
+          ? { ...entity, user: user(Number(entity.user.id)) }
+          : entity,
+    ),
   };
 }
+
+/**
+ * TDLib fix_formatted_text for a message being sent. clean_input_string turns
+ * control characters other than \n into spaces and drops \r, U+2028 to U+202E
+ * and the combining marks U+030A, U+0333 and U+033F; in a run of
+ * left-to-right and right-to-left marks all but the last become zero-width
+ * non-joiners. Then spaces and newlines are cut from the end, and from the
+ * start up to the first entity. Entities move with the text; empty text comes
+ * back empty.
+ */
+function cleanAndTrim(text, entities) {
+  let clean = "";
+  // removed[i]: characters dropped before UTF-16 offset i.
+  const removed = [0];
+  for (let index = 0; index < text.length; index++) {
+    const code = text.charCodeAt(index);
+    const drop =
+      code === 0x0d ||
+      (code >= 0x2028 && code <= 0x202e) ||
+      code === 0x30a ||
+      code === 0x333 ||
+      code === 0x33f;
+    removed.push(removed[index] + (drop ? 1 : 0));
+    if (!drop) clean += code < 0x20 && code !== 0x0a ? " " : text[index];
+  }
+  clean = clean.replace(/[\u200e\u200f](?=[\u200e\u200f])/g, "\u200c");
+  let moved = normalizeEntities(
+    entities.map((entity) => {
+      const offset = entity.offset - removed[entity.offset];
+      return {
+        ...entity,
+        offset,
+        length: endOf(entity) - removed[endOf(entity)] - offset,
+      };
+    }),
+  );
+  let end = clean.length;
+  while (end > 0 && (clean[end - 1] === " " || clean[end - 1] === "\n")) end--;
+  if (end === 0) return { text: "", entities: [] };
+  moved = moved
+    .filter((entity) => entity.offset < end)
+    .map((entity) =>
+      endOf(entity) > end ? { ...entity, length: end - entity.offset } : entity,
+    );
+  const first = Math.min(end, ...moved.map((entity) => entity.offset));
+  let start = 0;
+  while (start < first && (clean[start] === " " || clean[start] === "\n"))
+    start++;
+  return {
+    text: clean.slice(start, end),
+    entities: sortEntities(
+      moved.map((entity) => ({ ...entity, offset: entity.offset - start })),
+    ),
+  };
+}
+
+// ── Entities Telegram finds by itself ───────────────────────────────────────
+// TDLib MessageEntity.cpp find_entities: mentions, bot commands, hashtags,
+// cashtags, tg:// links, URLs and emails; a match overlapping an earlier one
+// is dropped. Phone numbers are a TODO there, so none are found. Bank card
+// numbers and media timestamps are not looked for: the Bot API never shows
+// them. Unicode classes stand in for TDLib's get_unicode_simple_category.
+
+const isWordCharacter = (char) => /^[\p{L}\p{N}_]$/u.test(char);
+const isAlphaDigitOrUnderscore = (char) => /^[A-Za-z0-9_]$/.test(char ?? "");
+const isDigit = (char) => /^[0-9]$/.test(char ?? "");
+/** The character (code point) at a UTF-16 offset, or "" at the end. */
+const charAt = (text, index) =>
+  index < text.length ? String.fromCodePoint(text.codePointAt(index)) : "";
+/** The character (code point) ending at a UTF-16 offset, or "" at the start. */
+const charBefore = (text, index) =>
+  [...text.slice(Math.max(0, index - 2), index)].at(-1) ?? "";
+
+function isHashtagLetter(char) {
+  const code = char.codePointAt(0);
+  return (
+    char === "_" ||
+    code === 0x200c ||
+    code === 0xb7 ||
+    (code >= 0xd80 && code <= 0xdff) ||
+    /^[\p{L}\p{Nd}]$/u.test(char)
+  );
+}
+
+function isUrlUnicodeSymbol(char) {
+  const code = char.codePointAt(0);
+  if (code >= 0x2000 && code <= 0x206f) {
+    // Zero-width non-joiner and joiner, and dashes.
+    return (
+      code === 0x200c || code === 0x200d || (code >= 0x2010 && code <= 0x2015)
+    );
+  }
+  return !/^\p{Z}$/u.test(char);
+}
+
+const isUrlPathSymbol = (char) =>
+  !'\n<>"«»'.includes(char) && isUrlUnicodeSymbol(char);
+const isUserDataSymbol = (char) =>
+  !"\n/[]{}()'`<>\"@«»".includes(char) && isUrlUnicodeSymbol(char);
+const isDomainSymbol = (char) =>
+  char.codePointAt(0) < 0xc0
+    ? /^[.A-Za-z0-9_~-]$/.test(char)
+    : isUrlUnicodeSymbol(char);
+// Dots in a protocol are not allowed; other letters are taken so that the
+// protocol is then refused.
+const isProtocolSymbol = (char) =>
+  char.codePointAt(0) < 0x80
+    ? /^[A-Za-z0-9+-]$/.test(char)
+    : !/^\p{Z}$/u.test(char);
+const BAD_PATH_END = ".:;,('?!`";
+
+/** The end of a path that starts at `from` (a /, ? or #), or `from`. */
+function pathEnd(text, from) {
+  let end = from + 1;
+  while (end < text.length && isUrlPathSymbol(charAt(text, end)))
+    end += charAt(text, end).length;
+  while (end > from + 1 && BAD_PATH_END.includes(text[end - 1])) end--;
+  return text[from] === "/" || end > from + 1 ? end : from;
+}
+
+function matchMentions(text) {
+  const found = [];
+  let index = 0;
+  while ((index = text.indexOf("@", index)) >= 0) {
+    if (index > 0 && isWordCharacter(charBefore(text, index))) {
+      index++;
+      continue;
+    }
+    const begin = ++index;
+    while (isAlphaDigitOrUnderscore(text[index])) index++;
+    const size = index - begin;
+    if (size < 2 || size > 32 || isWordCharacter(charAt(text, index))) continue;
+    found.push([begin - 1, index]);
+  }
+  return found;
+}
+
+function matchBotCommands(text) {
+  const found = [];
+  const blocks = (char) => isWordCharacter(char) || "/<>".includes(char || "x");
+  let index = 0;
+  while ((index = text.indexOf("/", index)) >= 0) {
+    if (index > 0 && blocks(charBefore(text, index))) {
+      index++;
+      continue;
+    }
+    const begin = ++index;
+    while (isAlphaDigitOrUnderscore(text[index])) index++;
+    let end = index;
+    if (end - begin < 1 || end - begin > 64) continue;
+    if (text[index] === "@") {
+      const username = ++index;
+      while (isAlphaDigitOrUnderscore(text[index])) index++;
+      if (index - username < 3 || index - username > 32) continue;
+      end = index;
+    }
+    if (blocks(charAt(text, index))) continue;
+    found.push([begin - 1, end]);
+  }
+  return found;
+}
+
+function matchHashtags(text) {
+  const found = [];
+  let index = 0;
+  while ((index = text.indexOf("#", index)) >= 0) {
+    if (index > 0 && isHashtagLetter(charBefore(text, index))) {
+      index++;
+      continue;
+    }
+    const begin = ++index;
+    let size = 0;
+    let end = -1;
+    let hasLetter = false;
+    while (index < text.length) {
+      const char = charAt(text, index);
+      if (!isHashtagLetter(char)) break;
+      index += char.length;
+      // At most 256 characters are part of the hashtag.
+      if (size === 255) end = index;
+      if (size !== 256) {
+        hasLetter ||= /^\p{L}$/u.test(char);
+        size++;
+      }
+    }
+    if (end < 0) end = index;
+    if (size < 1) continue;
+    if (end === index && text[index] === "@") {
+      let username = index + 1;
+      while (username - index < 33 && isAlphaDigitOrUnderscore(text[username]))
+        username++;
+      if (username - index - 1 >= 3) {
+        index = username;
+        end = username;
+      }
+    }
+    if (text[index] === "#" || !hasLetter) continue;
+    found.push([begin - 1, end]);
+  }
+  return found;
+}
+
+function matchCashtags(text) {
+  const found = [];
+  const blocks = (char) =>
+    char === "$" || (char !== "" && isHashtagLetter(char));
+  let index = 0;
+  while ((index = text.indexOf("$", index)) >= 0) {
+    if (index > 0 && blocks(charBefore(text, index))) {
+      index++;
+      continue;
+    }
+    const begin = ++index;
+    if (text.startsWith("1INCH", index)) index += 5;
+    else while (/^[A-Z]$/.test(text[index] ?? "")) index++;
+    let end = index;
+    if (end - begin < 1 || end - begin > 8) continue;
+    if (text[index] === "@") {
+      let username = index + 1;
+      while (isAlphaDigitOrUnderscore(text[username])) username++;
+      if (username - index - 1 >= 3 && username - index - 1 <= 32) {
+        end = username;
+        index = username;
+      }
+    }
+    if (blocks(charAt(text, index))) continue;
+    found.push([begin - 1, end]);
+  }
+  return found;
+}
+
+/** tg://, ton:// and tonsite:// links (TDLib match_tg_urls). */
+function matchTgUrls(text) {
+  const found = [];
+  let index = 0;
+  while (text.length - index > 5) {
+    index = text.indexOf(":", index);
+    if (index < 0) break;
+    let begin = -1;
+    if (text.startsWith("//", index + 1)) {
+      const scheme = asciiLower(text.slice(Math.max(0, index - 7), index));
+      if (scheme.endsWith("tg")) begin = index - 2;
+      else if (scheme.endsWith("ton")) begin = index - 3;
+      // TDLib starts a tonsite:// link three characters back as well.
+      else if (scheme === "tonsite") begin = index - 3;
+    }
+    if (begin < 0) {
+      index++;
+      continue;
+    }
+    index += 3;
+    const domain = index;
+    while (index - domain !== 253 && /^[A-Za-z0-9_-]$/.test(text[index] ?? ""))
+      index++;
+    if (index === domain) continue;
+    if ("/?#".includes(text[index] || "x")) index = pathEnd(text, index);
+    found.push([begin, index]);
+  }
+  return found;
+}
+
+/** Candidate links and emails around each dot (TDLib match_urls). */
+function matchUrls(text) {
+  const found = [];
+  let start = 0;
+  while (true) {
+    const dot = text.indexOf(".", start);
+    if (dot < 0 || dot + 1 === text.length) break;
+    if (text[dot + 1] === " ") {
+      start = dot + 2;
+      continue;
+    }
+    const back = (from, accepts) => {
+      let at = from;
+      while (at > start && accepts(charBefore(text, at)))
+        at -= charBefore(text, at).length;
+      return at;
+    };
+    let domainBegin = back(dot, isDomainSymbol);
+    let lastAt = -1;
+    let domainEnd = dot;
+    while (domainEnd < text.length) {
+      const char = charAt(text, domainEnd);
+      if (char === "@") lastAt = domainEnd;
+      else if (!isDomainSymbol(char)) break;
+      domainEnd += char.length;
+    }
+    if (lastAt >= 0) domainBegin = back(domainBegin, isUserDataSymbol);
+
+    let urlEnd = domainEnd;
+    if (text[urlEnd] === ":") {
+      let portEnd = urlEnd + 1;
+      while (isDigit(text[portEnd])) portEnd++;
+      let portBegin = urlEnd + 1;
+      while (portBegin !== portEnd && text[portBegin] === "0") portBegin++;
+      if (
+        portBegin !== portEnd &&
+        portEnd - portBegin <= 5 &&
+        Number(text.slice(portBegin, portEnd)) <= 65535
+      )
+        urlEnd = portEnd;
+    }
+    if ("/?#".includes(text[urlEnd] || "x")) urlEnd = pathEnd(text, urlEnd);
+    while (urlEnd > dot + 1 && text[urlEnd - 1] === ".") urlEnd--;
+
+    let bad = false;
+    let urlBegin = domainBegin;
+    if (urlBegin !== start && text[urlBegin - 1] === "@") {
+      if (lastAt >= 0) bad = true;
+      const userData = back(urlBegin - 1, isUserDataSymbol);
+      if (userData === urlBegin - 1) bad = true;
+      urlBegin = userData;
+    }
+    if (urlBegin !== start) {
+      if (
+        text.endsWith("://", urlBegin) &&
+        (urlBegin - start >= 6 || utf8Length(text.slice(start, urlBegin)) >= 6)
+      ) {
+        const protocol = asciiLower(
+          text.slice(back(urlBegin - 3, isProtocolSymbol), urlBegin - 3),
+        );
+        if (protocol.endsWith("http") && protocol !== "shttp") urlBegin -= 7;
+        else if (protocol.endsWith("https")) urlBegin -= 8;
+        else if (
+          protocol.endsWith("ftp") &&
+          protocol !== "tftp" &&
+          protocol !== "sftp"
+        )
+          urlBegin -= 6;
+        else if (protocol.endsWith("tonsite")) urlBegin -= 10;
+        else bad = true;
+      } else {
+        const before = charBefore(text, urlBegin);
+        if (isWordCharacter(before) || "/#@".includes(before)) bad = true;
+      }
+    }
+
+    if (!bad) {
+      if (urlEnd > dot + 1) found.push([urlBegin, urlEnd]);
+      while (text[urlEnd] === ".") urlEnd++;
+    } else {
+      while (text[urlEnd - 1] !== ".") urlEnd--;
+    }
+    start = Math.max(urlEnd, dot + 1);
+  }
+  return found;
+}
+
+/** TDLib is_email_address. */
+function isEmailAddress(text) {
+  const at = text.indexOf("@");
+  if (at < 0 || at === text.length - 1) return false;
+  const userParts = text.slice(0, at).split(/[.+]/);
+  if (
+    userParts.length >= 12 ||
+    userParts.slice(0, -1).some((part) => part.length >= 27) ||
+    userParts.at(-1).length === 0 ||
+    userParts.at(-1).length >= 36 ||
+    !userParts.every((part) => /^[A-Za-z0-9_-]*$/.test(part))
+  )
+    return false;
+  const domainParts = text.slice(at + 1).split(".");
+  const tld = domainParts.pop();
+  return (
+    domainParts.length >= 1 &&
+    domainParts.length <= 6 &&
+    /^[A-Za-z]{2,8}$/.test(tld) &&
+    domainParts.every(
+      (part) =>
+        part.length < 31 &&
+        /^[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?$/.test(part),
+    )
+  );
+}
+
+/**
+ * How much of a candidate is a link, or 0 when it is none (TDLib fix_url):
+ * unbalanced brackets and trailing punctuation end it, and a link without a
+ * protocol needs a top-level domain from TDLib's list of common ones.
+ */
+function urlLength(url) {
+  let rest = url;
+  const hasProtocol = /^(?:https?|ftp|tonsite):\/\//.test(
+    asciiLower(url.slice(0, 10)),
+  );
+  if (hasProtocol) rest = rest.slice(rest.indexOf(":") + 3);
+  const domainEnd = rest.search(/[/?#]|$/);
+  let domain = rest.slice(0, domainEnd);
+  const path = rest.slice(domainEnd);
+  domain = domain.slice(domain.indexOf("@") + 1);
+  if (domain.includes(":")) domain = domain.slice(0, domain.lastIndexOf(":"));
+  if (asciiLower(domain) === "teiegram.org") return 0;
+
+  const balance = { "(": 0, "[": 0, "{": 0 };
+  const closes = { ")": "(", "]": "[", "}": "{" };
+  let pathLength = 0;
+  for (; pathLength < path.length; pathLength++) {
+    const char = path[pathLength];
+    if (char in balance) balance[char]++;
+    if (char in closes && --balance[closes[char]] < 0) break;
+  }
+  while (pathLength > 0 && BAD_PATH_END.includes(path[pathLength - 1]))
+    pathLength--;
+  const length = url.length - (path.length - pathLength);
+
+  const parts = domain.split(".");
+  if (
+    parts.some(
+      (part) => part === "" || utf8Length(part) >= 64 || part.endsWith("-"),
+    ) ||
+    parts.length === 1
+  )
+    return 0;
+  const isOctet = (part) =>
+    /^(?:0|[1-9][0-9]{0,2})$/.test(part) && Number(part) <= 255;
+  if (parts.length === 4 && parts.every(isOctet)) return length;
+  if (/^[0-9.]*$/.test(domain)) return 0;
+  const tld = parts.at(-1);
+  if ([...tld].length <= 1) return 0;
+  if (tld.startsWith("xn--")) {
+    if (tld.length <= 5 || !/^[A-Za-z0-9]+$/.test(tld.slice(4))) return 0;
+  } else if (/[_-]/.test(tld) || (!hasProtocol && !isCommonTld(tld))) {
+    return 0;
+  }
+  return parts.at(-2).includes("_") ? 0 : length;
+}
+
+function isCommonTld(tld) {
+  if (/^[a-z]*$/.test(tld)) return COMMON_TLDS.has(tld);
+  const lower = tld.toLowerCase();
+  // Only the first letter capitalized does not count.
+  if (
+    lower !== tld &&
+    [...lower].slice(1).join("") === [...tld].slice(1).join("")
+  )
+    return false;
+  return COMMON_TLDS.has(lower);
+}
+
+/**
+ * The entities Telegram finds in text by itself, with UTF-16 offsets:
+ * mentions, bot commands, hashtags, cashtags, links and emails.
+ */
+export function findEntities(text) {
+  const found = [];
+  const add = (type, begin, end) =>
+    found.push({ type, offset: begin, length: end - begin });
+  for (const [begin, end] of matchMentions(text)) {
+    const username = text.slice(begin + 1, end);
+    if (username.length >= 4 || SHORT_USERNAMES.has(username.toLowerCase()))
+      add("mention", begin, end);
+  }
+  for (const [begin, end] of matchBotCommands(text))
+    add("bot_command", begin, end);
+  for (const [begin, end] of matchHashtags(text)) add("hashtag", begin, end);
+  for (const [begin, end] of matchCashtags(text)) add("cashtag", begin, end);
+  for (const [begin, end] of matchTgUrls(text)) add("url", begin, end);
+  for (const [begin, end] of matchUrls(text)) {
+    const url = text.slice(begin, end);
+    if (isEmailAddress(url)) add("email", begin, end);
+    else if (url.startsWith("mailto:") && isEmailAddress(url.slice(7)))
+      add("email", begin + 7, end);
+    else {
+      const length = urlLength(url);
+      if (length > 0) add("url", begin, begin + length);
+    }
+  }
+  // TDLib fix_entity_offsets: by position, longer first; overlaps are dropped.
+  let reached = 0;
+  return found
+    .sort(
+      (left, right) => left.offset - right.offset || right.length - left.length,
+    )
+    .filter((entity) => {
+      if (entity.offset < reached) return false;
+      reached = endOf(entity);
+      return true;
+    });
+}
+
+// TDLib find_mentions: a username shorter than 4 characters is a mention
+// only when it is one of these.
+const SHORT_USERNAMES = new Set(["gif", "nft", "pic", "ufc", "vid"]);
+
+// TDLib is_common_tld: the top-level domains a link without a protocol may have.
+const COMMON_TLDS = new Set(
+  `
+  aaa aarp abb abbott abbvie abc able abogado abudhabi ac academy accenture
+  accountant accountants aco actor ad ads adult ae aeg aero aetna af afl
+  africa ag agakhan agency ai aig airbus airforce airtel akdn al alibaba
+  alipay allfinanz allstate ally alsace alstom am amazon americanexpress
+  americanfamily amex amfam amica amsterdam analytics android anquan anz ao
+  aol apartments app apple aq aquarelle ar arab aramco archi army arpa art
+  arte as asda asia associates at athleta attorney au auction audi audible
+  audio auspost author auto autos aw aws ax axa az azure ba baby baidu banamex
+  band bank bar barcelona barclaycard barclays barefoot bargains baseball
+  basketball bauhaus bayern bb bbc bbt bbva bcg bcn bd be beats beauty beer
+  bentley berlin best bestbuy bet bf bg bh bharti bi bible bid bike bing bingo
+  bio biz bj black blackfriday blockbuster blog bloomberg blue bm bms bmw bn
+  bnpparibas bo boats boehringer bofa bom bond boo book booking bosch bostik
+  boston bot boutique box br bradesco bridgestone broadway broker brother
+  brussels bs bt build builders business buy buzz bv bw by bz bzh ca cab cafe
+  cal call calvinklein cam camera camp canon capetown capital capitalone car
+  caravan cards care career careers cars casa case cash casino cat catering
+  catholic cba cbn cbre cc cd center ceo cern cf cfa cfd cg ch chanel channel
+  charity chase chat cheap chintai christmas chrome church ci cipriani circle
+  cisco citadel citi citic city ck cl claims cleaning click clinic clinique
+  clothing cloud club clubmed cm cn co coach codes coffee college cologne com
+  commbank community company compare computer comsec condos construction
+  consulting contact contractors cooking cool coop corsica country coupon
+  coupons courses cpa cr credit creditcard creditunion cricket crown crs
+  cruise cruises cu cuisinella cv cw cx cy cymru cyou cz dabur dad dance data
+  date dating datsun day dclk dds de deal dealer deals degree delivery dell
+  deloitte delta democrat dental dentist desi design dev dhl diamonds diet
+  digital direct directory discount discover dish diy dj dk dm dnp do docs
+  doctor dog domains dot download drive dtv dubai dunlop dupont durban dvag
+  dvr dz earth eat ec eco edeka edu education ee eg email emerck energy
+  engineer engineering enterprises epson equipment er ericsson erni es esq
+  estate et eu eurovision eus events exchange expert exposed express
+  extraspace fage fail fairwinds faith family fan fans farm farmers fashion
+  fast fedex feedback ferrari ferrero fi fidelity fido film final finance
+  financial fire firestone firmdale fish fishing fit fitness fj fk flickr
+  flights flir florist flowers fly fm fo foo food football ford forex forsale
+  forum foundation fox fr free fresenius frl frogans frontier ftr fujitsu fun
+  fund furniture futbol fyi ga gal gallery gallo gallup game games gap garden
+  gay gb gbiz gd gdn ge gea gent genting george gf gg ggee gh gi gift gifts
+  gives giving gl glass gle global globo gm gmail gmbh gmo gmx gn godaddy gold
+  goldpoint golf goo goodyear goog google gop got gov gp gq gr grainger
+  graphics gratis green gripe grocery group gs gt gu gucci guge guide guitars
+  guru gw gy hair hamburg hangout haus hbo hdfc hdfcbank health healthcare
+  help helsinki here hermes hiphop hisamitsu hitachi hiv hk hkt hm hn hockey
+  holdings holiday homedepot homegoods homes homesense honda horse hospital
+  host hosting hot hotels hotmail house how hr hsbc ht hu hughes hyatt hyundai
+  ibm icbc ice icu id ie ieee ifm ikano il im imamat imdb immo immobilien in
+  inc industries infiniti info ing ink institute insurance insure int
+  international intuit investments io ipiranga iq ir irish is ismaili ist
+  istanbul it itau itv jaguar java jcb je jeep jetzt jewelry jio jll jm jmp
+  jnj jo jobs joburg jot joy jp jpmorgan jprs juegos juniper kaufen kddi ke
+  kerryhotels kerrylogistics kerryproperties kfh kg kh ki kia kids kim kindle
+  kitchen kiwi km kn koeln komatsu kosher kp kpmg kpn kr krd kred kuokgroup kw
+  ky kyoto kz la lacaixa lamborghini lamer lancaster land landrover lanxess
+  lasalle lat latino latrobe law lawyer lb lc lds lease leclerc lefrak legal
+  lego lexus lgbt li lidl life lifeinsurance lifestyle lighting like lilly
+  limited limo lincoln link lipsy live living lk llc llp loan loans locker
+  locus lol london lotte lotto love lpl lplfinancial lr ls lt ltd ltda lu
+  lundbeck luxe luxury lv ly ma madrid maif maison makeup man management mango
+  map market marketing markets marriott marshalls mattel mba mc mckinsey md me
+  med media meet melbourne meme memorial men menu merckmsd mg mh miami
+  microsoft mil mini mint mit mitsubishi mk ml mlb mls mm mma mn mo mobi
+  mobile moda moe moi mom monash money monster mormon mortgage moscow moto
+  motorcycles mov movie mp mq mr ms msd mt mtn mtr mu museum music mv mw mx my
+  mz na nab nagoya name navy nba nc ne nec net netbank netflix network neustar
+  new news next nextdirect nexus nf nfl ng ngo nhk ni nico nike nikon ninja
+  nissan nissay nl no nokia norton now nowruz nowtv np nr nra nrw ntt nu nyc
+  nz obi observer office okinawa olayan olayangroup ollo om omega one ong
+  onion onl online ooo open oracle orange org organic origins osaka otsuka ott
+  ovh pa page panasonic paris pars partners parts party pay pccw pe pet pf
+  pfizer pg ph pharmacy phd philips phone photo photography photos physio pics
+  pictet pictures pid pin ping pink pioneer pizza pk pl place play playstation
+  plumbing plus pm pn pnc pohl poker politie porn post pr pramerica praxi
+  press prime pro prod productions prof progressive promo properties property
+  protection pru prudential ps pt pub pw pwc py qa qpon quebec quest racing
+  radio re read realestate realtor realty recipes red redstone redumbrella
+  rehab reise reisen reit reliance ren rent rentals repair report republican
+  rest restaurant review reviews rexroth rich richardli ricoh ril rio rip ro
+  rocks rodeo rogers room rs rsvp ru rugby ruhr run rw rwe ryukyu sa saarland
+  safe safety sakura sale salon samsclub samsung sandvik sandvikcoromant
+  sanofi sap sarl sas save saxo sb sbi sbs sc scb schaeffler schmidt
+  scholarships school schule schwarz science scot sd se search seat secure
+  security seek select sener services seven sew sex sexy sfr sg sh shangrila
+  sharp shell shia shiksha shoes shop shopping shouji show si silk sina
+  singles site sj sk ski skin sky skype sl sling sm smart smile sn sncf so
+  soccer social softbank software sohu solar solutions song sony soy spa space
+  sport spot sr srl ss st stada staples star statebank statefarm stc stcgroup
+  stockholm storage store stream studio study style su sucks supplies supply
+  support surf surgery suzuki sv swatch swiss sx sy sydney systems sz tab
+  taipei talk taobao target tatamotors tatar tattoo tax taxi tc tci td tdk
+  team tech technology tel temasek tennis teva tf tg th thd theater theatre
+  tiaa tickets tienda tips tires tirol tj tjmaxx tjx tk tkmaxx tl tm tmall tn
+  to today tokyo ton tools top toray toshiba total tours town toyota toys tr
+  trade trading training travel travelers travelersinsurance trust trv tt tube
+  tui tunes tushu tv tvs tw tz ua ubank ubs ug uk unicom university uno uol
+  ups us uy uz va vacations vana vanguard vc ve vegas ventures verisign
+  vermögensberater vermögensberatung versicherung vet vg vi viajes video vig
+  viking villas vin vip virgin visa vision viva vivo vlaanderen vn vodka volvo
+  vote voting voto voyage vu wales walmart walter wang wanggou watch watches
+  weather weatherchannel webcam weber website wed wedding weibo weir wf
+  whoswho wien wiki williamhill win windows wine winners wme wolterskluwer
+  woodside work works world wow ws wtc wtf xbox xerox xihuan xin ελ ευ бг бел
+  дети ею католик ком мкд мон москва онлайн орг рус рф сайт срб укр қаз հայ
+  ישראל קום ابوظبي ارامكو الاردن البحرين الجزائر السعودية العليان المغرب
+  امارات ایران بارت بازار بيتك بھارت تونس سودان سورية شبكة عراق عرب عمان
+  فلسطين قطر كاثوليك كوم مصر مليسيا موريتانيا موقع همراه پاکستان ڀارت कॉम नेट
+  भारत भारतम् भारोत संगठन বাংলা ভারত ভাৰত ਭਾਰਤ ભારત ଭାରତ இந்தியா இலங்கை
+  சிங்கப்பூர் భారత్ ಭಾರತ ഭാരതം ලංකා คอม ไทย ລາວ გე みんな アマゾン クラウド グーグル コム ストア
+  セール ファッション ポイント 世界 中信 中国 中國 中文网 亚马逊 企业 佛山 信息 健康 八卦 公司 公益 台湾 台灣 商城 商店 商标 嘉里
+  嘉里大酒店 在线 大拿 天主教 娱乐 家電 广东 微博 慈善 我爱你 手机 招聘 政务 政府 新加坡 新闻 时尚 書籍 机构 淡马锡 游戏 澳門 点看
+  移动 组织机构 网址 网店 网站 网络 联通 谷歌 购物 通販 集团 電訊盈科 飞利浦 食品 餐厅 香格里拉 香港 닷넷 닷컴 삼성 한국 xxx
+  xyz yachts yahoo yamaxun yandex ye yodobashi yoga yokohama you youtube yt
+  yun za zappos zara zero zip zm zone zuerich zw
+`
+    .trim()
+    .split(/\s+/),
+);

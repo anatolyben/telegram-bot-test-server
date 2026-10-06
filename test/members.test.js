@@ -116,6 +116,25 @@ describe("what members post", () => {
     ).rejects.toThrow(/CHAT_WRITE_FORBIDDEN/);
   });
 
+  it("trims a member's text and refuses text that is empty", async () => {
+    const { fake, member } = await setup();
+    const id = await fake.post(GROUP, member, "  hi /help \n");
+    expect((await fake.getMessage(GROUP, id)).message).toMatchObject({
+      text: "hi /help",
+      entities: [{ type: "bot_command", offset: 3, length: 5 }],
+    });
+    const before = await fake.getMessages(GROUP);
+    for (const text of ["", " \n "]) {
+      await expect(fake.post(GROUP, member, text)).rejects.toThrow(
+        /MESSAGE_EMPTY/,
+      );
+    }
+    expect(await fake.getMessages(GROUP)).toEqual(before);
+    await expect(fake.sendDirectMessage(member, "  ")).rejects.toThrow(
+      /MESSAGE_EMPTY/,
+    );
+  });
+
   it("marks forwarded messages with where they came from", async () => {
     const { fake, api, member, me } = await setup();
     const source = await fake.createUser({ first_name: "Source" });
@@ -181,13 +200,13 @@ describe("what members post", () => {
     const id = await fake.post(GROUP, member, "hello");
 
     await fake.editMessage(GROUP, id, member, {
-      text: "buy followers at spam.example",
+      text: "buy followers at spam.example.com",
     });
 
     await expect.poll(() => hook.ofType("edited_message").length).toBe(1);
     expect(hook.ofType("edited_message")[0]).toMatchObject({
       message_id: id,
-      text: "buy followers at spam.example",
+      text: "buy followers at spam.example.com",
       edit_date: expect.any(Number),
       entities: [{ type: "url" }],
     });
@@ -196,7 +215,7 @@ describe("what members post", () => {
     ).rejects.toThrow(/MESSAGE_AUTHOR_REQUIRED/);
     await expect(
       fake.editMessage(GROUP, id, member, {
-        text: "buy followers at spam.example",
+        text: "buy followers at spam.example.com",
       }),
     ).rejects.toThrow(/MESSAGE_NOT_MODIFIED/);
   });

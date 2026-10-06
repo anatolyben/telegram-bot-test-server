@@ -550,9 +550,11 @@ export interface TelegramBotTestServer {
   ): Promise<{ chat_id: number; status: "member" | "requested" }>;
   leave(chatId: number, userId: number): Promise<{ status: string }>;
   /**
-   * The user posts in a chat; returns the message_id. Fails if they may not
-   * post: in a channel, only the creator and administrators with
-   * can_post_messages may, and bots get the post as channel_post.
+   * The user posts in a chat; returns the message_id. Text and captions are
+   * trimmed as Telegram's apps send them. Fails if they may not post: in a
+   * channel, only the creator and administrators with can_post_messages may,
+   * and bots get the post as channel_post. Fails with MESSAGE_EMPTY when the
+   * text is empty once trimmed.
    */
   post(
     chatId: number,
@@ -618,7 +620,10 @@ export interface TelegramBotTestServer {
     botUsername: string,
     text: string,
   ): Promise<number>;
-  /** The user sends the bot a direct message; returns the message_id. */
+  /**
+   * The user sends the bot a direct message; returns the message_id. Empty
+   * text, once trimmed, fails with MESSAGE_EMPTY.
+   */
   sendDirectMessage(userId: number, text: string): Promise<number>;
   /** The user presses an inline button in their private chat with the bot. */
   pressDirectButton(
