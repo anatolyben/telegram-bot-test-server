@@ -116,6 +116,7 @@ const OBJECT_PARAMS = new Set([
   "scope",
   "ephemeral_message_parameters",
   "options",
+  "correct_option_ids",
   "entities",
   "caption_entities",
   "reaction",
@@ -363,6 +364,59 @@ function reactionType(reaction) {
   }
   if (type === "custom_emoji") return reaction;
   throw new Error("invalid reaction type specified");
+}
+
+/** An InputPollOption's text: the option itself, or its text field. */
+function pollOptionText(option) {
+  if (typeof option === "string") return option;
+  if (option === null || typeof option !== "object" || Array.isArray(option)) {
+    throw new Error("Expected InputPollOption to be an Object");
+  }
+  return requiredString(option, "text");
+}
+
+/**
+ * A quiz's correct_option_ids, or else the older correct_option_id, read as
+ * the Bot API server reads them.
+ */
+function correctOptionIds(p) {
+  if (p.correct_option_ids === undefined) {
+    return p.correct_option_id === undefined
+      ? []
+      : [Number.parseInt(String(p.correct_option_id), 10) || 0];
+  }
+  let ids = p.correct_option_ids;
+  if (typeof ids === "string") {
+    try {
+      ids = JSON.parse(ids);
+    } catch {
+      throw new TelegramError(
+        400,
+        "Bad Request: can't parse correct option identifiers JSON object",
+      );
+    }
+  }
+  if (!Array.isArray(ids)) {
+    throw new TelegramError(
+      400,
+      "Bad Request: expected an Array of correct option identifiers",
+    );
+  }
+  return ids.map((id) => {
+    if (typeof id !== "number") {
+      throw new TelegramError(
+        400,
+        "Bad Request: correct option identifier must be of type Number",
+      );
+    }
+    if (!Number.isInteger(id) || id < -(2 ** 31) || id >= 2 ** 31) {
+      throw new TelegramError(
+        400,
+        "Bad Request: invalid correct option identifier specified",
+      );
+    }
+    return id;
+  });
 }
 
 async function readRequestParams(request, body) {
@@ -1856,29 +1910,64 @@ export async function startTestServer({
     },
     // A poll may carry a photo, uploaded with it as attach://<name>.
     sendPoll: (p, caller) => {
-      const options = (Array.isArray(p.options) ? p.options : []).map(
-        (option) => ({
-          text:
-            typeof option === "string" ? option : String(option?.text ?? ""),
-          voter_count: 0,
-        }),
+      const texts = jsonList(
+        p.options === undefined ? "" : p.options,
+        "options",
+        "InputPollOption",
+        pollOptionText,
       );
-      if (!p.question) {
+      const quiz = p.type === "quiz";
+      const correct = quiz ? correctOptionIds(p) : [];
+      const chat = botChat(p.chat_id);
+      if (!String(p.question ?? "").trim()) {
+        throw new TelegramError(400, "Bad Request: text must be non-empty");
+      }
+      if (texts.length === 0) {
         throw new TelegramError(
           400,
-          "Bad Request: poll question must be non-empty",
+          "Bad Request: poll must have at least one answer option",
         );
       }
-      if (options.length < 2) {
-        throw new TelegramError(
-          400,
-          "Bad Request: poll must have at least 2 option",
-        );
-      }
-      if (options.length > 12) {
+      if (texts.length > 12) {
         throw new TelegramError(
           400,
           "Bad Request: poll can't have more than 12 options",
+        );
+      }
+      for (const text of texts) {
+        if (!text.trim()) {
+          throw new TelegramError(400, "Bad Request: text must be non-empty");
+        }
+        if ([...text.trim()].length > 100) {
+          throw new TelegramError(
+            400,
+            "Bad Request: poll options length must not exceed 100",
+          );
+        }
+      }
+      if (quiz && correct.length === 0) {
+        throw new TelegramError(
+          400,
+          "Bad Request: correct quiz option list must be non-empty",
+        );
+      }
+      if (correct.some((id, index) => index > 0 && id <= correct[index - 1])) {
+        throw new TelegramError(
+          400,
+          "Bad Request: correct quiz option list must be increasing",
+        );
+      }
+      if (correct.some((id) => id < 0 || id >= texts.length)) {
+        throw new TelegramError(
+          400,
+          "Bad Request: wrong quiz correct_option_id",
+        );
+      }
+      const membersOnly = isTrue(p.members_only);
+      if (membersOnly && chat.type !== "channel") {
+        throw new TelegramError(
+          400,
+          "Bad Request: poll voters can be restricted only in channel chats",
         );
       }
       const attached =
@@ -1892,18 +1981,34 @@ export async function startTestServer({
         poll: {
           id: String(nextPollId),
           question: String(p.question),
-          options,
+          // persistent_id is the option's data. Telegram does not document
+          // its form; TDLib, when it chose it for a new poll, counted from "0".
+          options: texts.map((text, index) => ({
+            persistent_id: String.fromCharCode(48 + index),
+            text,
+            voter_count: 0,
+          })),
           total_voter_count: 0,
-          is_closed: false,
+          is_closed: isTrue(p.is_closed),
           is_anonymous: String(p.is_anonymous ?? "true") !== "false",
-          type: p.type === "quiz" ? "quiz" : "regular",
           allows_multiple_answers: isTrue(p.allows_multiple_answers),
+          allows_revoting:
+            p.allows_revoting === undefined
+              ? !quiz
+              : isTrue(p.allows_revoting),
+          members_only: membersOnly,
+          type: quiz ? "quiz" : "regular",
+          // The Bot API server still adds the single correct option as the
+          // older correct_option_id.
+          ...(correct.length === 1 ? { correct_option_id: correct[0] } : {}),
+          ...(quiz ? { correct_option_ids: correct } : {}),
           ...(p.description ? { description: String(p.description) } : {}),
           ...(photo ? { media: { photo: photoSizes(photo) } } : {}),
         },
       });
     },
-    stopPoll: (p, caller) => {
+    // The bot that stops its poll gets the closed poll as a poll update.
+    stopPoll: async (p, caller) => {
       const chat = botChat(p.chat_id);
       const entry = chat.messages.get(Number(p.message_id));
       if (!entry || entry.deleted || !entry.message.poll) {
@@ -1922,6 +2027,13 @@ export async function startTestServer({
         );
       }
       entry.message.poll.is_closed = true;
+      // Only a message's poll carries its description and media.
+      const {
+        description: _description,
+        media: _media,
+        ...state
+      } = entry.message.poll;
+      await emit("poll", structuredClone(state), { to: [caller] });
       return entry.message.poll;
     },
     forwardMessage: (p, caller) => {

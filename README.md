@@ -213,8 +213,12 @@ The details a moderation bot depends on, each covered by a test:
   promoted or removed reaches that bot as `my_chat_member` and the chat's other bots as
   `chat_member`; only the bot that sent a message hears its buttons pressed. Users write privately
   only to the first bot, so no other bot can message them (403).
-- **Polls.** `sendPoll` needs a question and 2 to 12 options and keeps `is_anonymous`,
-  `allows_multiple_answers`, `description` and an attached photo; `stopPoll` closes a poll once.
+- **Polls.** `sendPoll` needs a question and 1 to 12 options of up to 100 characters each. It
+  keeps `is_anonymous`, `allows_multiple_answers`, `allows_revoting` (on by default for regular
+  polls, off for quizzes), `members_only` (channels only), `is_closed`, `description` and an
+  attached photo, and gives each option a `persistent_id`. A quiz needs `correct_option_ids` (or
+  the older `correct_option_id`), and the bot that sent it sees them in the poll. `stopPoll` closes
+  a poll once, and the bot then gets the closed poll as a `poll` update. Members do not vote.
 - **Forwards and copies.** A forward carries `forward_origin`; a copy does not. A bot cannot forward
   from a chat it is not in.
 - **Pins.** Pinned messages are kept, newest first, and `getChat` returns the latest as
