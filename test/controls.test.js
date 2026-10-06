@@ -319,6 +319,15 @@ it("restores the flood control history with the fixture's time", async () => {
   });
   await fake.releaseSnapshot(saved);
 });
+it("restores queued updates that still expire a day after they happened", async () => {
+  const { fake, api, user } = await setup({ clock: { now: 1800000000000 } });
+  await fake.post(CHAT, user, "before snapshot");
+  const saved = await fake.snapshot();
+  await fake.restore(saved);
+  await fake.advanceTime(86_401_000);
+  expect((await api("getUpdates")).result).toEqual([]);
+  await fake.releaseSnapshot(saved);
+});
 it("restores media bytes, owner-account state and webhook replay bytes without cross-instance delivery", async () => {
   const { fake, api, user } = await setup();
   const updates = [];

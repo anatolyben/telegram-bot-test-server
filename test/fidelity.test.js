@@ -1478,6 +1478,43 @@ describe("flood control", () => {
     await server.advanceTime(1000);
     expect(await api("sendMessage", last)).toMatchObject({ ok: true });
   });
+
+  it("answers 429 to a setWebhook with a URL within a second of the previous one", async () => {
+    const { server, api } = await setup(limited);
+    const url = "http://127.0.0.1:1/hook";
+    const tooSoon = {
+      status: 429,
+      description: "Too Many Requests: retry after 1",
+      parameters: { retry_after: 1 },
+    };
+    expect(await api("setWebhook", { url })).toMatchObject({
+      description: "Webhook was set",
+    });
+    // Refused before the URL is compared with the current one or checked.
+    expect(await api("setWebhook", { url })).toMatchObject(tooSoon);
+    expect(await api("setWebhook", { url: "not a url" })).toMatchObject(
+      tooSoon,
+    );
+    // Removing the webhook is not limited.
+    expect(await api("deleteWebhook")).toMatchObject({
+      description: "Webhook was deleted",
+    });
+    expect(await api("setWebhook", { url: "" })).toMatchObject({
+      description: "Webhook is already deleted",
+    });
+    await server.advanceTime(999);
+    expect(await api("setWebhook", { url })).toMatchObject(tooSoon);
+    await server.advanceTime(1);
+    // A refused URL counts too.
+    expect(await api("setWebhook", { url: "not a url" })).toMatchObject({
+      status: 400,
+    });
+    expect(await api("setWebhook", { url })).toMatchObject(tooSoon);
+    await server.advanceTime(1000);
+    expect(await api("setWebhook", { url })).toMatchObject({
+      description: "Webhook was set",
+    });
+  });
 });
 
 describe("moderation physical state", () => {

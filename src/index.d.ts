@@ -51,7 +51,9 @@ export interface TelegramBotTestServerOptions {
   /**
    * Answer a bot's sends with Telegram's 429 "Too Many Requests: retry after N"
    * once they exceed the limits Telegram publishes: one message a second in a
-   * chat, 20 a minute in a group, 30 a second across all chats. Default false.
+   * chat, 20 a minute in a group, 30 a second across all chats. Also answer
+   * a setWebhook with a URL within a second of the previous one with "retry
+   * after 1", as Telegram's Bot API server does. Default false.
    */
   floodControl?: boolean;
   log?: (line: string) => void;

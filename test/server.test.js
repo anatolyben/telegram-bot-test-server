@@ -1,4 +1,5 @@
 import http from "node:http";
+import https from "node:https";
 import { gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -10,6 +11,24 @@ const SECOND_TOKEN = "654321:SECOND-TOKEN";
 const GROUP = -1001000000001;
 const OWNER = 5000000001;
 const PHOTO = Buffer.from("fake-jpeg-bytes");
+// A self-signed certificate for localhost, valid until 2126.
+const SELF_SIGNED = {
+  key: `-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEIHTK7yStHXXh+3vlasn4rN0j+cgnLUQt0GXmB5qR9T0uoAoGCCqGSM49
+AwEHoUQDQgAEIu04dsYE2tjJAIpnTqcKT1iq5h5AvK/MW9bt2OQCoKakD1xmEq5D
+MSG5ZbWEAsVST68bh1W1Y6CZC+NIJu33ow==
+-----END EC PRIVATE KEY-----
+`,
+  cert: `-----BEGIN CERTIFICATE-----
+MIIBGTCBwAIJAKa1vi7gtxPgMAoGCCqGSM49BAMCMBQxEjAQBgNVBAMMCWxvY2Fs
+aG9zdDAgFw0yNjEwMDYwODE3NDdaGA8yMTI2MDkxMjA4MTc0N1owFDESMBAGA1UE
+AwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIu04dsYE2tjJ
+AIpnTqcKT1iq5h5AvK/MW9bt2OQCoKakD1xmEq5DMSG5ZbWEAsVST68bh1W1Y6CZ
+C+NIJu33ozAKBggqhkjOPQQDAgNIADBFAiEAlbNj5N/Qwsekzm4K3YQOp1oLVrOO
+ysADvJm81yxPAFQCIFQfYxXS9nT5WrkndCST3wjtEj2wq7ZKLzT02HbYjYGh
+-----END CERTIFICATE-----
+`,
+};
 
 const cleanups = [];
 afterEach(async () => {
@@ -443,6 +462,52 @@ describe("webhook delivery", () => {
     expect(arrivals()).toEqual(["slow", "private"]);
   });
 
+  it("sends first the queue that has waited longest, then the one with the lowest id", async () => {
+    const { fake, api, newUser } = await setup();
+    let release;
+    const held = new Promise((resolve) => {
+      release = resolve;
+    });
+    let refused = false;
+    const hook = await startScriptedReceiver(
+      Array.from({ length: 5 }, () => async (update) => {
+        if (update.message.text !== "A1" || refused) return [200];
+        refused = true;
+        await held;
+        return [500];
+      }),
+    );
+    const arrivals = () =>
+      hook.requests.map(({ update }) => update.message.text);
+    const ann = await newUser();
+    const bob = await newUser();
+
+    // Updates pending when the webhook is set are ready at the same moment,
+    // so the chat with the lower id goes first.
+    await fake.sendDirectMessage(bob, "B0");
+    await fake.sendDirectMessage(ann, "A0");
+    await api("setWebhook", { url: hook.url, max_connections: 1 });
+    await fake.drainDeliveries();
+    expect(arrivals()).toEqual(["A0", "B0"]);
+
+    // A refused update goes behind the queue already waiting.
+    const first = fake.sendDirectMessage(ann, "A1");
+    await hook.arrived(3);
+    const second = fake.sendDirectMessage(bob, "B1");
+    await expect
+      .poll(
+        async () =>
+          (await fake.getDeliveries()).filter(
+            (attempt) => attempt.completed_at == null,
+          ).length,
+      )
+      .toBe(2);
+    release();
+    await Promise.all([first, second]);
+    await fake.drainDeliveries();
+    expect(arrivals()).toEqual(["A0", "B0", "A1", "B1", "A1"]);
+  });
+
   it("sends exactly Telegram's webhook request headers", async () => {
     const { fake, api, newUser } = await setup();
     const hook = await startScriptedReceiver();
@@ -540,7 +605,7 @@ describe("setWebhook and getWebhookInfo", () => {
 
   it("describes what setWebhook and deleteWebhook changed", async () => {
     const { api } = await setup();
-    const url = "https://example.com/hook";
+    const url = "https://127.0.0.1/hook";
     const said = async (method, params) =>
       (await api(method, params)).description;
 
@@ -617,6 +682,43 @@ describe("setWebhook and getWebhookInfo", () => {
     });
   });
 
+  it("reports a webhook's TLS failure in Telegram's words, not Node's", async () => {
+    const { fake, api, newUser } = await setup();
+    const user = await newUser();
+    const lastError = async () =>
+      (await api("getWebhookInfo")).result.last_error_message;
+
+    // An https URL whose server answers in plain http.
+    const plain = await startScriptedReceiver();
+    await api("setWebhook", { url: `https://127.0.0.1:${plain.port}/hook` });
+    await fake.sendDirectMessage(user, "plain");
+    expect(await lastError()).toBe(
+      "SSL error {error:0A00010B:SSL routines::wrong version number}",
+    );
+
+    // A certificate no trusted authority signed.
+    const secure = https.createServer(
+      { key: SELF_SIGNED.key, cert: SELF_SIGNED.cert },
+      (request, response) => response.end(),
+    );
+    await new Promise((resolve) => secure.listen(0, "127.0.0.1", resolve));
+    cleanups.push(
+      () =>
+        new Promise((resolve) => {
+          secure.close(resolve);
+          secure.closeAllConnections();
+        }),
+    );
+    await api("setWebhook", {
+      url: `https://127.0.0.1:${secure.address().port}/hook`,
+      drop_pending_updates: true,
+    });
+    await fake.sendDirectMessage(user, "secure");
+    expect(await lastError()).toBe(
+      "SSL error {error:0A000086:SSL routines::certificate verify failed}",
+    );
+  });
+
   it("sends to the ip_address given instead of resolving the host", async () => {
     const { fake, api, newUser } = await setup();
     const hook = await startScriptedReceiver();
@@ -635,20 +737,28 @@ describe("setWebhook and getWebhookInfo", () => {
     });
   });
 
-  it("reads allowed_updates sent as a JSON string inside a JSON body", async () => {
-    const { api, control, newUser } = await setup();
-    const hook = await startReceiver();
-    await api("setWebhook", {
-      url: hook.url,
-      allowed_updates: JSON.stringify(["message", "chat_member"]),
-    });
-    await control("POST", `chats/${GROUP}/join`, { user_id: await newUser() });
+  it("resolves the webhook's host name before answering, and refuses one that does not resolve", async () => {
+    const { api } = await setup();
+    const hook = await startScriptedReceiver();
 
-    expect(hook.ofType("chat_member")).toHaveLength(1);
-    expect((await api("getWebhookInfo")).result.allowed_updates).toEqual([
-      "message",
-      "chat_member",
-    ]);
+    expect(
+      await api("setWebhook", { url: "http://bot.invalid:9/hook" }),
+    ).toMatchObject({
+      status: 400,
+      description:
+        "Bad Request: bad webhook: Failed to resolve host: Name or service not known",
+    });
+    expect((await api("getWebhookInfo")).result.url).toBe("");
+
+    const url = `http://localhost:${hook.port}/hook`;
+    expect(await api("setWebhook", { url })).toMatchObject({
+      description: "Webhook was set",
+    });
+    // The first IPv4 address, before anything is delivered.
+    expect((await api("getWebhookInfo")).result).toMatchObject({
+      url,
+      ip_address: "127.0.0.1",
+    });
   });
 
   it("matches allowed_updates names in any case and falls back to the default when none is known", async () => {

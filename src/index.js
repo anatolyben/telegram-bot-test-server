@@ -26,10 +26,12 @@
  */
 import { createOwnerModel, OwnerError } from "./owner.js";
 import { findEntities, formatText, FormattingError } from "./formatting.js";
+import { lookup } from "node:dns/promises";
 import http from "node:http";
 import https from "node:https";
 import net from "node:net";
 import { domainToASCII } from "node:url";
+import { getSystemErrorName } from "node:util";
 import { unzipSync } from "node:zlib";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createClock, createWaits, diagnostic } from "./test-controls.js";
@@ -164,6 +166,16 @@ const CONNECTION_ERRORS = Object.freeze({
   EHOSTUNREACH: "No route to host",
   ENETUNREACH: "Network is unreachable",
   EPIPE: "Broken pipe",
+});
+// Why a webhook's host name did not resolve, as glibc's gai_strerror says it
+// (td IPAddress::init_host_port: "Failed to resolve host: " + gai_strerror).
+// Any other code is EAI_SYSTEM, which libuv reports as the system error.
+const RESOLVE_ERRORS = Object.freeze({
+  EAI_NONAME: "Name or service not known",
+  EAI_NODATA: "No address associated with hostname",
+  EAI_AGAIN: "Temporary failure in name resolution",
+  EAI_FAIL: "Non-recoverable failure in name resolution",
+  EAI_MEMORY: "Memory allocation failure",
 });
 // How long after a callback query a bot that is not an administrator may send
 // the user an ephemeral message.
@@ -530,6 +542,54 @@ function parseWebhookUrl(url) {
       (c) => `%${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`,
     ),
   };
+}
+
+/**
+ * The address Telegram's Bot API server sends a webhook's updates to: the
+ * first IPv4 address its host name resolves to, else the first IPv6 one (td
+ * IPAddress::init_host_port, which WebhookActor runs with prefer_ipv6 false).
+ * Resolves with { address } or with { error }, the text Telegram gives.
+ */
+async function resolveWebhookHost(hostname) {
+  try {
+    const addresses = await lookup(hostname, { all: true });
+    return {
+      address: (addresses.find(({ family }) => family === 4) ?? addresses[0])
+        .address,
+    };
+  } catch (error) {
+    const code =
+      Number.isInteger(error.errno) && error.errno < 0
+        ? getSystemErrorName(error.errno)
+        : error.code;
+    return {
+      error: `Failed to resolve host: ${RESOLVE_ERRORS[code] ?? "System error"}`,
+    };
+  }
+}
+
+/**
+ * What Telegram records as a webhook's last error when a connection fails, or
+ * null when it records none: a connection closed without an answer is only
+ * retried (WebhookActor::handle, "Webhook connection closed").
+ */
+function connectionErrorText(error, socket) {
+  // td SslStream: "SSL error " and each OpenSSL error in braces, as
+  // ERR_error_string_n writes it. With peer verification on, a certificate
+  // that does not verify fails OpenSSL's handshake.
+  if (socket?.authorizationError) {
+    return "SSL error {error:0A000086:SSL routines::certificate verify failed}";
+  }
+  const ssl = [
+    ...String(error.message).matchAll(
+      /error:([0-9A-F]{8}):([^:\n]*):[^:\n]*:([^:\n]*)/g,
+    ),
+  ];
+  if (ssl.length) {
+    return `SSL error ${ssl.map(([, code, library, reason]) => `{error:${code}:${library}::${reason}}`).join("")}`;
+  }
+  // A failed system call, in strerror's words.
+  return (error.syscall && CONNECTION_ERRORS[error.code]) || null;
 }
 
 /**
@@ -1151,6 +1211,8 @@ export async function startTestServer({
       sending: new Map(),
       // When Telegram next answers a getUpdates conflict at once.
       nextConflictAt: 0,
+      // When floodControl next lets setWebhook set a URL.
+      nextSetWebhookAt: 0,
       // Command lists by scope and language (see commandsKey).
       commands: new Map(),
       // A guard bot that gets join request queries (Bot API 10.x).
@@ -1217,6 +1279,9 @@ export async function startTestServer({
   // Every update sent, by update_id, with the bot it went to and its exact
   // bytes, so a test can have Telegram deliver it again.
   const sentUpdates = new Map();
+  // Counts the moments updates become ready for a webhook, so updates ready
+  // at the same server time still go in the order that happened.
+  let readyOrder = 0;
   const callbackAnswers = new Map();
   // Callback queries awaiting an answer; any other id is refused.
   const openQueries = new Map();
@@ -1974,6 +2039,8 @@ export async function startTestServer({
         receipt: newAttempt(record, update.update_id),
         delay: 1,
         fails: 0,
+        readyAt: clock.now(),
+        order: ++readyOrder,
         handed,
       });
     });
@@ -1986,37 +2053,40 @@ export async function startTestServer({
   }
 
   /**
-   * The queue an update waits in for the webhook, keyed as Telegram's Bot API
-   * server keys it (telegram-bot-api Client.cpp, the webhook_queue_id of each
-   * add_update): messages by chat, member changes, join requests and button
-   * presses by user. One queue's updates arrive in order, one at a time;
-   * different queues are delivered at once.
+   * The queue an update waits in for the webhook, numbered as Telegram's Bot
+   * API server numbers it (telegram-bot-api Client.cpp, the webhook_queue_id
+   * of each add_update: an id plus a kind shifted left by 33 bits): messages
+   * by chat, member changes, join requests and button presses by user. One
+   * queue's updates arrive in order, one at a time; different queues are
+   * delivered at once. Any other update has a queue of its own, numbered
+   * after all of these (WebhookActor's unique_queue_id_).
    */
   function webhookQueue(type, payload, updateId) {
+    const queue = (id, kind = 0) => BigInt(id) + (BigInt(kind) << 33n);
     switch (type) {
       case "message":
       case "edited_message":
       case "channel_post":
       case "edited_channel_post":
-        return `${payload.chat.id}`;
+        return queue(payload.chat.id);
       case "callback_query":
-        return `3:${payload.from.id}`;
+        return queue(payload.from.id, 3);
       case "my_chat_member":
-        return `5:${payload.chat.id}`;
+        return queue(payload.chat.id, 5);
       case "chat_member":
-        return `6:${payload.new_chat_member.user.id}`;
+        return queue(payload.new_chat_member.user.id, 6);
       case "chat_join_request":
-        return `6:${payload.from.id}`;
+        return queue(payload.from.id, 6);
       case "message_reaction":
-        return `8:${payload.chat.id}`;
+        return queue(payload.chat.id, 8);
       case "business_connection":
-        return `10:${payload.user.id}`;
+        return queue(payload.user.id, 10);
       case "business_message":
       case "edited_business_message":
       case "deleted_business_messages":
-        return `11:${payload.chat.id}`;
+        return queue(payload.chat.id, 11);
       default:
-        return `update:${updateId}`;
+        return (1n << 60n) + BigInt(updateId);
     }
   }
 
@@ -2058,23 +2128,34 @@ export async function startTestServer({
   /**
    * Send what the webhook may take now: the first unconfirmed update of each
    * queue that is not waiting to be retried, up to max_connections requests
-   * at a time (telegram-bot-api WebhookActor::send_updates).
+   * at a time (telegram-bot-api WebhookActor::send_updates). The queue ready
+   * longest goes first, then the lowest queue id, as WebhookActor's queues_
+   * orders them: an update is ready from when it was loaded, a refused one
+   * from when it may be tried again.
    */
   function pump(record) {
     const webhook = record.webhook;
-    if (stopped || !webhook) return;
+    // Nothing goes out before the host's address is known
+    // (WebhookActor::create_new_connections).
+    if (stopped || !webhook?.ip_address) return;
     let busy = 0;
     for (const state of record.sending.values()) if (state.request) busy += 1;
     const started = new Set();
     const waiting = new Set();
+    const ready = [];
+    // Updates pending when the webhook starts are loaded at the same moment.
+    let loaded;
     for (const update of record.queue) {
       const { queue } = sentUpdates.get(updateKey(record.id, update.update_id));
       let state = record.sending.get(update.update_id);
       if (!state) {
+        loaded ??= ++readyOrder;
         state = {
           receipt: newAttempt(record, update.update_id),
           delay: 1,
           fails: 0,
+          readyAt: clock.now(),
+          order: loaded,
         };
         record.sending.set(update.update_id, state);
       }
@@ -2085,9 +2166,19 @@ export async function startTestServer({
         continue;
       }
       started.add(queue);
-      if (state.request || busy >= webhook.max_connections) continue;
+      if (!state.request)
+        ready.push({ queue, updateId: update.update_id, state });
+    }
+    ready.sort(
+      (a, b) =>
+        a.state.readyAt - b.state.readyAt ||
+        a.state.order - b.state.order ||
+        (a.queue < b.queue ? -1 : 1),
+    );
+    for (const { updateId, state } of ready) {
+      if (busy >= webhook.max_connections) break;
       busy += 1;
-      const sending = attempt(record, webhook, update.update_id, state).catch(
+      const sending = attempt(record, webhook, updateId, state).catch(
         (error) => {
           deliveryError ??= error;
         },
@@ -2136,6 +2227,9 @@ export async function startTestServer({
       state.delay = delay;
       state.fails += 1;
       state.receipt = newAttempt(record, updateId);
+      // Behind the queues already waiting.
+      state.readyAt = clock.now() + wait * 1000;
+      state.order = ++readyOrder;
       if (wait > 0) {
         state.retry = clock.schedule(() => {
           state.retry = null;
@@ -2219,7 +2313,7 @@ export async function startTestServer({
       try {
         request = (target.https ? https : http).request(
           {
-            host: webhook.fixed_ip ? webhook.ip_address : target.hostname,
+            host: webhook.ip_address,
             port: target.port,
             // The path's UTF-8 bytes, as Telegram writes them.
             path: Buffer.from(target.path).toString("latin1"),
@@ -2264,28 +2358,22 @@ export async function startTestServer({
         resolve({ error });
         return;
       }
-      request.on("socket", (socket) =>
-        socket.once("connect", () => {
-          if (!webhook.fixed_ip) webhook.ip_address = socket.remoteAddress;
-        }),
+      // Telegram closes a webhook connection that stays silent for a minute
+      // (HttpConnectionBase::timeout_expired).
+      request.setTimeout(WEBHOOK_TIMEOUT_MS, () => {
+        const text = "Read timeout expired";
+        resolve({ error: new Error(text), text });
+        request.destroy();
+      });
+      request.on("error", (error) =>
+        resolve({ error, text: connectionErrorText(error, request.socket) }),
       );
-      // Telegram closes a webhook connection that stays silent for a minute.
-      request.setTimeout(WEBHOOK_TIMEOUT_MS, () =>
-        request.destroy(new Error("Read timeout expired")),
-      );
-      request.on("error", (error) => resolve({ error }));
       request.end(body);
     });
     inFlight.delete(abort);
     if (abort.signal.aborted) return answer;
     if (answer.error) {
-      // A connection the webhook closed without an error is retried quietly.
-      if (answer.error.message !== "socket hang up") {
-        recordWebhookError(
-          webhook,
-          CONNECTION_ERRORS[answer.error.code] ?? answer.error.message,
-        );
-      }
+      if (answer.text) recordWebhookError(webhook, answer.text);
     } else if (answer.status < 200 || answer.status > 299) {
       const value = String(answer.headers["retry-after"] ?? "");
       answer.retryAfter = /^-?\d{1,9}$/.test(value)
@@ -2352,9 +2440,19 @@ export async function startTestServer({
    * setWebhook and deleteWebhook, as telegram-bot-api's
    * process_set_webhook_query and do_set_webhook handle them. Like a Bot API
    * server run with --local, this one takes http URLs, any port and local
-   * addresses.
+   * addresses. A host name is resolved once, when the webhook is set.
    */
-  function changeWebhook(record, p, url) {
+  async function changeWebhook(record, p, url) {
+    // With floodControl, a URL at most once a second, before anything else is
+    // checked (process_set_webhook_query's next_allowed_set_webhook_time_).
+    if (url && floodControl === true) {
+      if (clock.now() < record.nextSetWebhookAt) {
+        throw new TelegramError(429, "Too Many Requests: retry after 1", {
+          retry_after: 1,
+        });
+      }
+      record.nextSetWebhookAt = clock.now() + 1000;
+    }
     const current = record.webhook;
     const attached =
       typeof p.certificate === "string" && p.certificate.startsWith("attach://")
@@ -2425,7 +2523,7 @@ export async function startTestServer({
         "Bad Request: bad webhook: Invalid IP address specified",
       );
     }
-    record.webhook = {
+    const webhook = {
       url,
       secret_token: secret,
       max_connections: maxConnections,
@@ -2437,6 +2535,29 @@ export async function startTestServer({
       last_error_date: 0,
       last_error_message: "",
     };
+    record.webhook = webhook;
+    if (!webhook.ip_address) {
+      // Telegram answers once it has the host's address, and a host that does
+      // not resolve closes the webhook again (WebhookActor::resolve_ip_address,
+      // Client::webhook_verified and on_webhook_closed).
+      const resolved = await resolveWebhookHost(target.hostname);
+      if (record.webhook !== webhook) {
+        await conflictPause(record);
+        throw new TelegramError(
+          409,
+          "Conflict: terminated by other setWebhook",
+        );
+      }
+      if (resolved.error) {
+        closeAttempts(record, "poll_queue");
+        record.webhook = null;
+        throw new TelegramError(
+          400,
+          `Bad Request: bad webhook: ${resolved.error}`,
+        );
+      }
+      webhook.ip_address = resolved.address;
+    }
     pump(record);
     return new Described(true, "Webhook was set");
   }
@@ -6108,7 +6229,7 @@ export async function startTestServer({
     const fixtureUpdates = new Map(
       [...sentUpdates].map(([id, sent]) => [
         id,
-        { body: sent.body, record: records.get(sent.record.token) },
+        { ...sent, record: records.get(sent.record.token) },
       ]),
     );
     const state = structuredClone({
@@ -6503,7 +6624,7 @@ export async function startTestServer({
         );
       }
       const [sent] = matches;
-      if (!sent.record.webhook) {
+      if (!sent.record.webhook?.ip_address) {
         throw new TelegramError(409, `The bot for update ${id} has no webhook`);
       }
       await redeliver(sent);

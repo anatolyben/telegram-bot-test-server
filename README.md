@@ -515,6 +515,11 @@ gets the answer Telegram's Bot API server gives: HTTP 429, a `Retry-After` heade
 its own limits. The limits run on the server clock, so with `clock` a test moves past them with
 `advanceTime`, and a snapshot keeps and restores the recent sends.
 
+`floodControl` also applies a limit of the Bot API server itself: a `setWebhook` with a URL less
+than a second after the previous one gets 429 `Too Many Requests: retry after 1` before anything
+else is checked, even when the earlier call was refused. `deleteWebhook` and `setWebhook` with an
+empty URL are not limited.
+
 ### Telegram Login (OpenID Connect)
 
 The server also answers at oauth.telegram.org's paths, so an app logs in against it by changing only
@@ -708,8 +713,11 @@ after 150 seconds.
 - **Order.** Updates wait in queues keyed as Telegram keys them: messages and `my_chat_member` by
   chat, `chat_member`, join requests and button presses by user, reactions by chat. A queue's updates
   arrive one at a time, in order; different queues are delivered at once, up to `max_connections`
-  requests (1 to 100, default 40). Telegram also opens its connections gradually; this server does
-  not.
+  requests (1 to 100, default 40). When more queues are ready than connections are free, the queue
+  ready longest goes first, then the one with the lowest queue id, as on Telegram. Updates pending
+  when the webhook is set are ready together; an update the webhook refused is ready again only
+  when its retry is due, behind the queues already waiting. Telegram also opens its connections
+  gradually and loads at most twice `max_connections` updates at a time; this server does neither.
 - **Retries.** An update the webhook does not answer with 2XX (another status, a refused or reset
   connection, or a minute without an answer) is sent again: at once after the first failure, then
   after 2, 4, 8 ... seconds up to a random 60 to 120, or after the answer's `Retry-After` (at most an
@@ -720,17 +728,30 @@ after 150 seconds.
   `getCalls()`; its result goes nowhere. `setWebhook`, `deleteWebhook`, `close`, `logOut` and any
   `get` method are not run.
 - **`getWebhookInfo`** reports `pending_update_count`, `last_error_date` and `last_error_message`
-  (`Wrong response from the webhook: 500 Internal Server Error`, `Connection refused`,
-  `Read timeout expired`; other connection errors give Node's message), `max_connections`,
-  `ip_address` (the `ip_address` given, or the address last connected to; `<unknown>` before the first
-  delivery to a host name), `has_custom_certificate`, and `allowed_updates` unless it is the default.
+  in Telegram's words: `Wrong response from the webhook: 500 Internal Server Error`, a connection
+  error as Linux words it (`Connection refused`, `Connection reset by peer`, `Connection timed out`,
+  `No route to host`, `Network is unreachable`, `Broken pipe`), `Read timeout expired`, or a TLS
+  failure as OpenSSL 3 words it, such as
+  `SSL error {error:0A000086:SSL routines::certificate verify failed}`. A connection closed without
+  an answer records no error, and neither does any other connection error. It also reports
+  `max_connections`, `ip_address` (the `ip_address` given, or the address the host name resolved
+  to; `<unknown>` only while `setWebhook` is still resolving it), `has_custom_certificate`, and
+  `allowed_updates` unless it is the default.
 - **`setWebhook`** answers `Webhook was set` or `Webhook is already set`, and `deleteWebhook`
   `Webhook was deleted` or `Webhook is already deleted`. It refuses a URL Telegram cannot read
   (`invalid webhook URL specified`; a URL without a scheme is taken as https) and a `secret_token`
-  longer than 256 characters or with characters other than `A-Z`, `a-z`, `0-9`, `_` and `-`. A new
-  webhook replaces the old one first, so a refused URL leaves none. `drop_pending_updates` empties the
-  queue, even with an empty URL. Like a Bot API server run with `--local`, this one takes `http` URLs,
-  any port and local addresses, and it does not check that a host name resolves.
+  longer than 256 characters or with characters other than `A-Z`, `a-z`, `0-9`, `_` and `-`. Unless
+  `ip_address` is given, it resolves the URL's host name before it answers and sends to the first
+  IPv4 address (an IPv6 one only when there is none). A name that does not resolve is refused with
+  `Bad Request: bad webhook: Failed to resolve host: Name or service not known` (the lookup error in
+  glibc's words). Telegram looks the name up again about every half hour; this server keeps the
+  first address. A new webhook replaces the old one first, so a refused URL leaves none, and a
+  `setWebhook` still resolving when another one arrives gets 409
+  `Conflict: terminated by other setWebhook`. `drop_pending_updates` empties the queue, even with an
+  empty URL. With `floodControl`, a URL less than a second after the previous one gets 429
+  ([Flood control](#flood-control)). An uploaded `certificate` only sets `has_custom_certificate`:
+  deliveries over https trust what Node trusts, not that certificate as Telegram does. Like a Bot
+  API server run with `--local`, this one takes `http` URLs, any port and local addresses.
 - **Removing or replacing the webhook** ends its requests in progress. Every update it has not
   confirmed stays pending, the one in flight included, for `getUpdates` or the new webhook.
 - **`getUpdates`** supports `offset`, `limit`, `allowed_updates` and long polling with `timeout`.
