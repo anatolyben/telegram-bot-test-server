@@ -91,7 +91,7 @@ response happens after that, so wait for the outcome rather than checking it imm
 | `leave(chatId, userId)`                                                                                                               | The user leaves.                                                                                                                                                            |
 | `post(chatId, userId, text)`                                                                                                          | The user posts a message; returns its `message_id`. Also takes `{ text, photo, media, caption, replyTo, threadId, forwardFrom }`. Fails if the user is not allowed to post. |
 | `postAlbum(chatId, userId, items)`                                                                                                    | The user posts 2 to 10 photos or videos as one album (`media_group_id`).                                                                                                    |
-| `editMessage(chatId, messageId, userId, { text, caption })`                                                                           | The author edits their message; bots get `edited_message`.                                                                                                                  |
+| `editMessage(chatId, messageId, userId, { text, caption })`                                                                           | The author edits their message; bots get `edited_message` (`edited_channel_post` in a channel).                                                                             |
 | `react(chatId, messageId, userId, emoji)`                                                                                             | The user reacts to a message, or takes the reaction back with `null`.                                                                                                       |
 | `pressButton(chatId, messageId, userId, data)`                                                                                        | The user presses an inline button; resolves with the bot's `answerCallbackQuery` answer.                                                                                    |
 | `postGuestBotReply(chatId, userId, botUsername, text)`                                                                                | The user calls a guest bot (Bot API 10.0 guest mode); its answer appears in the group from that bot, with `guest_bot_caller_user` set.                                      |
@@ -105,7 +105,7 @@ response happens after that, so wait for the outcome rather than checking it imm
 | `approveLogin(authUrl, userId)`                                                                                                       | The user logs in on the Telegram Login page for that `/auth` URL; returns the `redirect_uri` URL with `code` and `state`.                                                   |
 | `cancelLogin(authUrl)`                                                                                                                | The user cancels; returns the `redirect_uri` URL with `error=access_denied` and `state`.                                                                                    |
 | `createChat({ ownerId, title, type, ownerName, isForum })`                                                                            | A new supergroup, forum (`isForum`), basic group (`type: "group"`) or channel (`type: "channel"`) with no bot in it; returns its id.                                        |
-| `addBotViaLink(chatId, botId, { by, startParameter, rights })`                                                                        | A person adds the bot through its `startgroup` link: it joins (as an administrator with `rights`), then `/start@<bot> <startParameter>` is posted from the person.          |
+| `addBotViaLink(chatId, botId, { by, startParameter, rights })`                                                                        | A person adds the bot through its `startgroup` link (as an administrator with `rights`), then `/start@<bot> <startParameter>` is posted; or its `startchannel` link.        |
 | `migrateToSupergroup(chatId, { by })`                                                                                                 | The creator or an administrator upgrades a basic group; returns the supergroup's id.                                                                                        |
 | `renameChat(chatId, { by, title })`, `changeChatPhoto(chatId, { by, bytes })`                                                         | A person with `can_change_info` renames the chat or sets its photo.                                                                                                         |
 | `setBotMembership(chatId, botId, { status, rights, by })`                                                                             | The owner adds, promotes, demotes or removes a bot; the bot gets `my_chat_member`.                                                                                          |
@@ -190,9 +190,18 @@ The details a moderation bot depends on, each covered by a test:
   fails with Telegram's error.
 - **Unbanning.** `unbanChatMember` without `only_if_banned` removes a current member, as the docs
   guarantee.
-- **Editing.** Only the bot's own messages can be edited; an edit that changes nothing fails with
-  `message is not modified`; an edit without `reply_markup` removes the inline keyboard, after which
-  its buttons can no longer be pressed.
+- **Editing.** Only the bot's own messages can be edited, except in a channel (below); an edit that
+  changes nothing fails with `message is not modified`; an edit without `reply_markup` removes the
+  inline keyboard, after which its buttons can no longer be pressed.
+- **Channels** ([Update](https://core.telegram.org/bots/api#update),
+  [ChatAdministratorRights](https://core.telegram.org/bots/api#chatadministratorrights)). Every
+  message in a channel comes from the channel: `sender_chat` is the channel and there is no `from`,
+  both for what bots send and for what people post (channel signatures are not modelled). Bots get
+  the channel's messages, service messages such as `new_chat_title` included, as `channel_post` and
+  their edits as `edited_channel_post`, never as `message`. Only the creator and administrators with
+  `can_post_messages` post; `post()` refuses anyone else with `CHAT_WRITE_FORBIDDEN`. A bot with
+  `can_edit_messages` edits any post and stops any poll; without it, only its own, and only while it
+  has `can_post_messages`.
 - **Private chats.** The bot cannot message a user who has not written to it first (403).
 - **Ephemeral messages.** A send with `ephemeral_message_parameters` (Bot API 10.2) returns a message
   with `receiver_user` and `ephemeral_message_id`. Unlike Telegram, which gives it `message_id` 0, it
@@ -208,8 +217,9 @@ The details a moderation bot depends on, each covered by a test:
   upload (`attach://`) or a held `file_id`.
 - **More than one bot.** Each bot has its own webhook or update queue and its own membership and
   rights in each chat. A bot posts only where it is a member (a channel needs `can_post_messages`),
-  edits and stops only its own messages and polls, pins only with `can_pin_messages` (a channel's
-  `can_edit_messages`), and deletes others' messages only with `can_delete_messages`. Being added,
+  edits and stops only its own messages and polls (in a channel, others' too with
+  `can_edit_messages`), pins only with `can_pin_messages` (a channel's `can_edit_messages`), and
+  deletes others' messages only with `can_delete_messages`. Being added,
   promoted or removed reaches that bot as `my_chat_member` and the chat's other bots as
   `chat_member`; only the bot that sent a message hears its buttons pressed. Users write privately
   only to the first bot, so no other bot can message them (403).
@@ -223,7 +233,8 @@ The details a moderation bot depends on, each covered by a test:
   `document` too), stickers, voice notes, audio, video notes and documents, each needing its own
   permission (`can_send_videos`, `can_send_voice_notes`, ...), plus albums sharing a
   `media_group_id` and forwards with `forward_origin` (a user, a hidden user or a channel post).
-  An edit by the author reaches bots as `edited_message` with `edit_date`.
+  An edit by the author reaches bots as `edited_message` (in a channel, `edited_channel_post`) with
+  `edit_date`.
 - **Reactions.** A member's reaction reaches the chat's administrator bots as `message_reaction`,
   only when they list it in `allowed_updates`, as on Telegram. A bot sets at most one reaction, and
   removes a member's with `deleteMessageReaction` and `can_delete_messages`.
@@ -256,7 +267,9 @@ The details a moderation bot depends on, each covered by a test:
   `bot_command` entity, as `messages.startBot` posts. An administrator's existing rights are
   combined with the requested ones, and `/start` is still posted. Unverified: Telegram does not
   document whether `my_chat_member` or the `/start` message arrives first; this server sends
-  `my_chat_member` first.
+  `my_chat_member` first. A channel's `startchannel` link always asks for admin rights and has no
+  parameter, so the bot only gets `my_chat_member` and nothing is posted; `addBotViaLink` on a
+  channel fails without `rights` or with a `startParameter`.
 - **Service messages about the bot itself.** A bot gets the `new_chat_members` and
   `left_chat_member` messages that name it, as the
   [Message](https://core.telegram.org/bots/api#message) fields say it "may be the bot itself".
@@ -512,7 +525,7 @@ The test actions above, over HTTP, for tests written in other languages. All rou
 | `POST chats`                                           | Create `{ owner_id, title?, type?: "supergroup" \| "channel", owner_name?, is_forum? }`; returns the chat.                                                                                                                                                               |
 | `GET chats/:id`                                        | The chat with its pinned message ids and members.                                                                                                                                                                                                                        |
 | `POST chats/:id/bots`                                  | Add, promote, demote or remove a bot `{ bot_id, status?, rights?, by? }`, as the owner would.                                                                                                                                                                            |
-| `POST chats/:id/bots` with `start_parameter`           | A person `{ by?, bot_id, start_parameter, rights? }` adds the bot through its `startgroup` link.                                                                                                                                                                         |
+| `POST chats/:id/bots` with `start_parameter`           | A person `{ by?, bot_id, start_parameter, rights? }` adds the bot through its `startgroup` link, or, with `rights` and an empty `start_parameter`, a channel's `startchannel` link.                                                                                      |
 | `POST chats/:id/migrate`                               | Upgrade a basic group `{ by? }`; returns the new supergroup.                                                                                                                                                                                                             |
 | `POST chats/:id/title`                                 | A person renames the chat `{ by?, title }`.                                                                                                                                                                                                                              |
 | `POST chats/:id/photo`                                 | A person sets the chat photo `{ by?, base64 }`.                                                                                                                                                                                                                          |
@@ -685,7 +698,8 @@ are detached copies. Failure reports include the exact expectation, observed
 state or up to eight matching requests, and outstanding fake work. Diagnostics
 are capped at 8000 characters and redact credentials; raw request journals remain
 original evidence and may contain fixture secrets. Do not dump them indiscriminately.
-`botId` on a message identifies its author. Membership is physical chat/user
+`userId` or `botId` on a message identifies its author, also in a channel, where
+the message itself names only the channel. Membership is physical chat/user
 state, shared by the bots in that chat. Join decisions are a test observation
 journal, not a new ChatMember status; decline leaves the requester outside.
 
