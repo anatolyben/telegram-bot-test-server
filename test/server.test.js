@@ -1,4 +1,5 @@
 import http from "node:http";
+import { gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { startTestServer } from "../src/index.js";
@@ -39,6 +40,56 @@ async function startReceiver() {
     url: `http://127.0.0.1:${server.address().port}/hook`,
     updates,
     ofType: (type) => updates.map(({ update }) => update[type]).filter(Boolean),
+  };
+}
+
+/**
+ * A webhook endpoint that answers each update with the next scripted
+ * [status, headers, body], or 200, and records what arrived.
+ */
+async function startScriptedReceiver(answers = []) {
+  const requests = [];
+  const waiting = new Set();
+  const server = http.createServer((request, response) => {
+    const chunks = [];
+    request.on("data", (chunk) => chunks.push(chunk));
+    request.on("end", async () => {
+      const update = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      requests.push({
+        url: request.url,
+        rawHeaders: request.rawHeaders,
+        update,
+      });
+      for (const check of [...waiting]) check();
+      const answer = answers.shift() ?? [200];
+      const [status, headers = {}, body = ""] =
+        typeof answer === "function" ? await answer(update) : answer;
+      response.writeHead(status, headers).end(body);
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  cleanups.push(
+    () =>
+      new Promise((resolve) => {
+        server.close(resolve);
+        server.closeAllConnections();
+      }),
+  );
+  return {
+    port: server.address().port,
+    url: `http://127.0.0.1:${server.address().port}/hook`,
+    requests,
+    /** Resolves once `count` requests have arrived. */
+    arrived: (count) =>
+      new Promise((resolve) => {
+        const check = () => {
+          if (requests.length < count) return;
+          waiting.delete(check);
+          resolve();
+        };
+        waiting.add(check);
+        check();
+      }),
   };
 }
 
@@ -167,6 +218,444 @@ describe("webhook delivery", () => {
       status: "member",
       user: { id: second },
     });
+  });
+
+  it("runs the Bot API call a webhook answers with, but never a get method, setWebhook, deleteWebhook, close or logOut", async () => {
+    const { fake, api, newUser } = await setup();
+    const user = await newUser();
+    const hook = await startScriptedReceiver([
+      [
+        200,
+        { "Content-Type": "application/json" },
+        JSON.stringify({ method: "sendMessage", chat_id: user, text: "json" }),
+      ],
+      [
+        200,
+        { "Content-Type": "application/x-www-form-urlencoded" },
+        `method=SendMessage&chat_id=${user}&text=form`,
+      ],
+      // Telegram asks for gzip and deflate, and reads either.
+      [
+        200,
+        { "Content-Type": "application/json", "Content-Encoding": "gzip" },
+        gzipSync(
+          JSON.stringify({
+            method: "sendMessage",
+            chat_id: user,
+            text: "gzip",
+          }),
+        ),
+      ],
+      ...["GETME", "SetWebhook", "deleteWebhook", "close", "logOut"].map(
+        (method) => [
+          200,
+          { "Content-Type": "application/json" },
+          JSON.stringify({ method, url: "http://127.0.0.1:1/" }),
+        ],
+      ),
+    ]);
+    await api("setWebhook", { url: hook.url });
+
+    for (let i = 0; i < 8; i++) await fake.sendDirectMessage(user, `m${i}`);
+
+    const replies = (await fake.getDirectMessages(user))
+      .filter((message) => message.from.is_bot)
+      .map((message) => message.text);
+    expect(replies.sort()).toEqual(["form", "gzip", "json"]);
+    expect((await fake.getCalls()).calls.map((call) => call.method)).toEqual([
+      "setWebhook",
+      "sendMessage",
+      "SendMessage",
+      "sendMessage",
+    ]);
+    expect((await api("getWebhookInfo")).result.url).toBe(hook.url);
+  });
+
+  it("keeps an update the webhook refuses and retries it on Telegram's backoff, honouring Retry-After", async () => {
+    const start = 1_800_000_000_000;
+    const { fake, api, newUser } = await setup({ clock: { now: start } });
+    const hook = await startScriptedReceiver([
+      [500],
+      [503],
+      [429, { "Retry-After": "30" }],
+      [200],
+    ]);
+    await api("setWebhook", { url: hook.url });
+    const user = await newUser();
+    const outcomes = async () =>
+      (await fake.getDeliveries()).map((attempt) => attempt.outcome);
+
+    await fake.sendDirectMessage(user, "hello");
+    await hook.arrived(2);
+    // The first failure is retried at once, the next after 2 seconds.
+    await expect.poll(outcomes).toEqual(["rejected", "rejected", "queued"]);
+    expect((await api("getWebhookInfo")).result).toMatchObject({
+      pending_update_count: 1,
+      last_error_date: start / 1000,
+      last_error_message:
+        "Wrong response from the webhook: 503 Service Unavailable",
+    });
+    await fake.advanceTime(1999);
+    expect((await fake.getDeliveries()).at(-1).started_at).toBeUndefined();
+    await fake.advanceTime(1);
+    await hook.arrived(3);
+    await expect
+      .poll(outcomes)
+      .toEqual(["rejected", "rejected", "rejected", "queued"]);
+    // Retry-After replaces the backoff.
+    await fake.advanceTime(29_999);
+    expect((await fake.getDeliveries()).at(-1).started_at).toBeUndefined();
+    await fake.advanceTime(1);
+    await hook.arrived(4);
+    await fake.drainDeliveries();
+    expect(
+      new Set(hook.requests.map(({ update }) => update.update_id)).size,
+    ).toBe(1);
+    expect((await api("getWebhookInfo")).result).toMatchObject({
+      pending_update_count: 0,
+      last_error_date: start / 1000 + 2,
+      last_error_message:
+        "Wrong response from the webhook: 429 Too Many Requests",
+    });
+  });
+
+  it("gives up on an update when its next retry would come after it expires", async () => {
+    const { fake, api, newUser } = await setup({
+      clock: { now: 1_800_000_000_000 },
+    });
+    const hook = await startScriptedReceiver(
+      Array.from({ length: 10 }, () => [429, { "Retry-After": "200" }]),
+    );
+    await api("setWebhook", { url: hook.url });
+    const user = await newUser();
+    await fake.sendDirectMessage(user, "hello");
+    const sent = await api("sendMessage", {
+      chat_id: user,
+      text: "Press",
+      reply_markup: {
+        inline_keyboard: [[{ text: "ok", callback_data: "ok" }]],
+      },
+    });
+    const pressing = fake
+      .pressDirectButton(user, sent.result.message_id, "ok")
+      .catch(() => null);
+
+    // A message lives for a day; a button press only 150 seconds.
+    await hook.arrived(2);
+    await expect
+      .poll(
+        async () => (await api("getWebhookInfo")).result.pending_update_count,
+      )
+      .toBe(1);
+    await fake.advanceTime(200_000);
+    await hook.arrived(3);
+    expect(hook.requests.map(({ update }) => Object.keys(update)[1])).toEqual([
+      "message",
+      "callback_query",
+      "message",
+    ]);
+    await fake.stop();
+    await pressing;
+  });
+
+  it("delivers different chats at once, each chat in order, up to max_connections at a time", async () => {
+    const { fake, api, control, newUser } = await setup();
+    let release;
+    let held;
+    const hold = () => {
+      held = new Promise((resolve) => {
+        release = resolve;
+      });
+    };
+    const hook = await startScriptedReceiver(
+      Array.from({ length: 12 }, () => async (update) => {
+        if (update.message?.text === "slow") await held;
+        return [200];
+      }),
+    );
+    await api("setWebhook", {
+      url: hook.url,
+      allowed_updates: ["message", "chat_member"],
+    });
+    const arrivals = () =>
+      hook.requests.map(
+        ({ update }) =>
+          update.message?.text ??
+          (update.message?.new_chat_members ? "joined" : null) ??
+          (update.chat_member ? "chat_member" : null),
+      );
+    const ann = await newUser();
+    await control("POST", `chats/${GROUP}/join`, { user_id: ann });
+    hook.requests.length = 0;
+
+    hold();
+    const slow = fake.post(GROUP, ann, "slow");
+    await hook.arrived(1);
+    await fake.sendDirectMessage(ann, "private");
+    const second = fake.post(GROUP, ann, "second");
+    // A member change queues by user, so it does not wait for the chat.
+    const bob = await newUser();
+    const joining = fake.join(GROUP, bob);
+    await hook.arrived(3);
+    expect(arrivals()).toEqual(["slow", "private", "chat_member"]);
+    release();
+    await Promise.all([slow, second, joining]);
+    expect(arrivals()).toEqual([
+      "slow",
+      "private",
+      "chat_member",
+      "second",
+      "joined",
+    ]);
+
+    // With one connection, the private chat waits for the group.
+    hook.requests.length = 0;
+    await api("setWebhook", { url: hook.url, max_connections: 1 });
+    hold();
+    const slowAgain = fake.post(GROUP, ann, "slow");
+    await hook.arrived(1);
+    const privateAgain = fake.sendDirectMessage(ann, "private");
+    await expect
+      .poll(
+        async () =>
+          (await fake.getDeliveries()).filter(
+            (attempt) => attempt.completed_at == null,
+          ).length,
+      )
+      .toBe(2);
+    expect(arrivals()).toEqual(["slow"]);
+    release();
+    await Promise.all([slowAgain, privateAgain]);
+    expect(arrivals()).toEqual(["slow", "private"]);
+  });
+
+  it("sends exactly Telegram's webhook request headers", async () => {
+    const { fake, api, newUser } = await setup();
+    const hook = await startScriptedReceiver();
+    await api("setWebhook", {
+      url: `http://user:pa%20ss@127.0.0.1:${hook.port}/hook?x=1`,
+      secret_token: "s3cret",
+    });
+    await fake.sendDirectMessage(await newUser(), "hello");
+
+    const [{ url, rawHeaders, update }] = hook.requests;
+    expect(url).toBe("/hook?x=1");
+    expect(rawHeaders).toEqual([
+      "Host",
+      `127.0.0.1:${hook.port}`,
+      "Authorization",
+      `Basic ${Buffer.from("user:pa%20ss").toString("base64")}`,
+      "X-Telegram-Bot-Api-Secret-Token",
+      "s3cret",
+      "Content-Type",
+      "application/json",
+      "Content-Length",
+      String(Buffer.byteLength(JSON.stringify(update))),
+      "Connection",
+      "keep-alive",
+      "Accept-Encoding",
+      "gzip, deflate",
+    ]);
+  });
+});
+
+describe("setWebhook and getWebhookInfo", () => {
+  it("refuses a webhook URL, secret token, certificate or address Telegram refuses, dropping the previous webhook", async () => {
+    const { fake, api } = await setup();
+    const bad = (description) => ({ status: 400, ok: false, description });
+    const url = "Bad Request: invalid webhook URL specified";
+
+    expect(await api("setWebhook", { url: "not a url" })).toMatchObject(
+      bad(url),
+    );
+    expect(await api("setWebhook", { url: "/relative/path" })).toMatchObject(
+      bad(url),
+    );
+    expect(
+      await api("setWebhook", { url: "ftp://127.0.0.1/hook" }),
+    ).toMatchObject(bad(url));
+    expect(
+      await api("setWebhook", {
+        url: "https://example.com/hook",
+        secret_token: "a".repeat(257),
+      }),
+    ).toMatchObject(bad("Bad Request: secret token is too long"));
+    expect(
+      await api("setWebhook", {
+        url: "https://example.com/hook",
+        secret_token: "abc+def/ghi=",
+      }),
+    ).toMatchObject(
+      bad("Bad Request: secret token contains illegal characters"),
+    );
+    const big = new FormData();
+    big.set("url", "https://example.com/hook");
+    big.set("certificate", new Blob([Buffer.alloc((3 << 20) + 1)]), "c.pem");
+    expect(
+      await (
+        await fetch(`${fake.origin}/bot${TOKEN}/setWebhook`, {
+          method: "POST",
+          body: big,
+        })
+      ).json(),
+    ).toMatchObject({
+      ok: false,
+      description: `Bad Request: certificate size is too big (${(3 << 20) + 1} bytes)`,
+    });
+    expect(
+      await api("setWebhook", {
+        url: "https://example.com/hook",
+        ip_address: "not-an-ip",
+      }),
+    ).toMatchObject(
+      bad("Bad Request: bad webhook: Invalid IP address specified"),
+    );
+    // Without a scheme, the URL is taken as https.
+    expect(
+      await api("setWebhook", { url: "127.0.0.1:3000/hook" }),
+    ).toMatchObject({ ok: true, result: true });
+    expect((await api("getWebhookInfo")).result.url).toBe(
+      "127.0.0.1:3000/hook",
+    );
+
+    expect(await api("setWebhook", { url: "not a url" })).toMatchObject(
+      bad(url),
+    );
+    expect((await api("getWebhookInfo")).result.url).toBe("");
+  });
+
+  it("describes what setWebhook and deleteWebhook changed", async () => {
+    const { api } = await setup();
+    const url = "https://example.com/hook";
+    const said = async (method, params) =>
+      (await api(method, params)).description;
+
+    expect(await said("setWebhook", { url })).toBe("Webhook was set");
+    expect(await said("setWebhook", { url })).toBe("Webhook is already set");
+    expect(await said("deleteWebhook")).toBe("Webhook was deleted");
+    expect(await said("deleteWebhook")).toBe("Webhook is already deleted");
+    expect(await said("setWebhook", { url: "" })).toBe(
+      "Webhook is already deleted",
+    );
+  });
+
+  it("drops pending updates when asked even with an empty URL", async () => {
+    const { fake, api, newUser } = await setup();
+    await fake.sendDirectMessage(await newUser(), "queued");
+    expect((await api("getWebhookInfo")).result.pending_update_count).toBe(1);
+
+    expect(
+      await api("setWebhook", { url: "", drop_pending_updates: true }),
+    ).toMatchObject({ ok: true, description: "Webhook is already deleted" });
+    expect((await api("getWebhookInfo")).result.pending_update_count).toBe(0);
+    expect((await api("getUpdates")).result).toEqual([]);
+  });
+
+  it("reports the webhook's connections, address, subscription, certificate and last error", async () => {
+    const { fake, api, newUser } = await setup();
+    const closed = http.createServer();
+    await new Promise((resolve) => closed.listen(0, "127.0.0.1", resolve));
+    const port = closed.address().port;
+    await new Promise((resolve) => closed.close(resolve));
+    const url = `http://127.0.0.1:${port}/hook`;
+
+    expect((await api("getWebhookInfo")).result).toEqual({
+      url: "",
+      has_custom_certificate: false,
+      pending_update_count: 0,
+    });
+    await api("setWebhook", {
+      url,
+      max_connections: 1000,
+      allowed_updates: [],
+    });
+    expect((await api("getWebhookInfo")).result).toEqual({
+      url,
+      has_custom_certificate: false,
+      pending_update_count: 0,
+      max_connections: 100,
+      ip_address: "127.0.0.1",
+    });
+
+    await fake.sendDirectMessage(await newUser(), "hello");
+    const info = (await api("getWebhookInfo")).result;
+    expect(info).toMatchObject({
+      pending_update_count: 1,
+      last_error_message: "Connection refused",
+    });
+    expect(info.last_error_date).toBeGreaterThan(0);
+
+    const form = new FormData();
+    form.set("url", url);
+    form.set("allowed_updates", JSON.stringify(["chat_member", "message"]));
+    form.set("certificate", new Blob(["-----BEGIN CERTIFICATE-----"]), "c.pem");
+    await fetch(`${fake.origin}/bot${TOKEN}/setWebhook`, {
+      method: "POST",
+      body: form,
+    });
+    expect((await api("getWebhookInfo")).result).toMatchObject({
+      url,
+      has_custom_certificate: true,
+      pending_update_count: 1,
+      max_connections: 40,
+      ip_address: "127.0.0.1",
+      allowed_updates: ["message", "chat_member"],
+    });
+  });
+
+  it("sends to the ip_address given instead of resolving the host", async () => {
+    const { fake, api, newUser } = await setup();
+    const hook = await startScriptedReceiver();
+    const url = `http://bot.invalid:${hook.port}/hook`;
+    await api("setWebhook", { url, ip_address: "127.0.0.1" });
+    await fake.sendDirectMessage(await newUser(), "hello");
+
+    expect(hook.requests[0].rawHeaders.slice(0, 2)).toEqual([
+      "Host",
+      `bot.invalid:${hook.port}`,
+    ]);
+    expect((await api("getWebhookInfo")).result).toMatchObject({
+      url,
+      pending_update_count: 0,
+      ip_address: "127.0.0.1",
+    });
+  });
+
+  it("reads allowed_updates sent as a JSON string inside a JSON body", async () => {
+    const { api, control, newUser } = await setup();
+    const hook = await startReceiver();
+    await api("setWebhook", {
+      url: hook.url,
+      allowed_updates: JSON.stringify(["message", "chat_member"]),
+    });
+    await control("POST", `chats/${GROUP}/join`, { user_id: await newUser() });
+
+    expect(hook.ofType("chat_member")).toHaveLength(1);
+    expect((await api("getWebhookInfo")).result.allowed_updates).toEqual([
+      "message",
+      "chat_member",
+    ]);
+  });
+
+  it("matches allowed_updates names in any case and falls back to the default when none is known", async () => {
+    const { fake, api, newUser } = await setup();
+    const user = await newUser();
+
+    await api("getUpdates", { allowed_updates: ["Message"] });
+    await fake.sendDirectMessage(user, "one");
+    expect((await api("getUpdates")).result).toHaveLength(1);
+    expect((await api("getWebhookInfo")).result.allowed_updates).toEqual([
+      "message",
+    ]);
+
+    await api("getUpdates", { allowed_updates: ["messages"] });
+    expect((await api("getWebhookInfo")).result).not.toHaveProperty(
+      "allowed_updates",
+    );
+    await fake.join(GROUP, user);
+    expect(
+      (await api("getUpdates")).result.map((update) => Object.keys(update)[1]),
+    ).toEqual(["message", "message"]);
   });
 });
 

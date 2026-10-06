@@ -73,8 +73,10 @@ Both grammY and Telegraf are tested against the server, with polling and with a 
 ## Test actions
 
 `startTestServer()` returns the server with these actions. Each resolves once the update it causes
-has been handed to the bot (sent to its webhook, or queued for `getUpdates`); what the bot does in
-response happens after that, so wait for the outcome rather than checking it immediately.
+has been handed to the bot: its first webhook attempt has finished (with any call the webhook
+answered with), it waits behind an update the webhook refused, or it is queued for `getUpdates`.
+What the bot does in response happens after that, so wait for the outcome rather than checking it
+immediately.
 
 | Action                                                                                                                                | What happens                                                                                                                                                                |
 | ------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -83,7 +85,7 @@ response happens after that, so wait for the outcome rather than checking it imm
 | `getBusinessConnection(connectionId)`                                                                                                 | The `BusinessConnection`.                                                                                                                                                   |
 | `sayInBusinessChat(connectionId, userId, sender, text)`                                                                               | `"person"` writes to the owner, or `"owner"` answers by hand; the bot gets `business_message`. Returns `{ message_id, date, update_id }`.                                   |
 | `getBusinessChat(connectionId, userId)`                                                                                               | The business chat, newest first: `[{ direction: "inbound" \| "owner" \| "bot", deleted, message }]`.                                                                        |
-| `redeliverUpdate(updateId)`                                                                                                           | Telegram delivers that update again, byte for byte, to the same bot's webhook.                                                                                              |
+| `redeliverUpdate(updateId, { botId })`                                                                                                | Telegram delivers that update again, byte for byte, to the same bot's webhook; `botId` names the bot when two bots got that `update_id`.                                    |
 | `updateProfile(userId, fields)`                                                                                                       | The user changes their name, username or bio.                                                                                                                               |
 | `addProfilePhoto(userId, bytes)`                                                                                                      | The user adds a profile photo.                                                                                                                                              |
 | `join(chatId, userId)`                                                                                                                | The user joins the group.                                                                                                                                                   |
@@ -453,18 +455,62 @@ field named like a session, token, hash, key, secret, password or phone is recor
 
 ## Update delivery
 
-- With a webhook set, updates are delivered in order to its URL, with the
-  `X-Telegram-Bot-Api-Secret-Token` header when a secret was set.
-- Without one, updates queue for `getUpdates`, which supports `offset`, `limit`, `allowed_updates`
-  and long polling with `timeout`. As on Telegram, calling it while a webhook is set fails with 409,
-  and updates queued before a webhook is set are delivered to it.
-- `allowed_updates`, from `setWebhook` or `getUpdates`, is respected. As on Telegram,
-  `chat_member`, `message_reaction` and `message_reaction_count` updates are only sent when
-  explicitly requested.
+Each bot has its own update queue, as on Telegram, where
+[Telegram's Bot API server](https://github.com/tdlib/telegram-bot-api) settles what the docs leave
+out. Its updates are numbered in sequence, so two bots can get the same `update_id`. An update
+stays pending until the bot confirms it: with a `getUpdates` offset, or by answering it from its
+webhook with a 2XX status. A pending update expires a day after it happened, and a button press
+after 150 seconds.
+
+- **Webhook requests** carry only the headers Telegram sends: `Host`, `Authorization` when the URL
+  holds a user name and password, `X-Telegram-Bot-Api-Secret-Token` when a secret was set,
+  `Content-Type: application/json`, `Content-Length`, `Connection: keep-alive` and
+  `Accept-Encoding: gzip, deflate`.
+- **Order.** Updates wait in queues keyed as Telegram keys them: messages and `my_chat_member` by
+  chat, `chat_member`, join requests and button presses by user, reactions by chat. A queue's updates
+  arrive one at a time, in order; different queues are delivered at once, up to `max_connections`
+  requests (1 to 100, default 40). Telegram also opens its connections gradually; this server does
+  not.
+- **Retries.** An update the webhook does not answer with 2XX (another status, a refused or reset
+  connection, or a minute without an answer) is sent again: at once after the first failure, then
+  after 2, 4, 8 ... seconds up to a random 60 to 120, or after the answer's `Retry-After` (at most an
+  hour). An update whose next try would come after it expires is dropped. These waits run on the
+  server's clock, so on a manual clock `advanceTime` moves them.
+- **Calls in the webhook's answer.** A webhook may answer an update with a Bot API call (JSON, form or
+  multipart with a `method` field), as Telegraf does by default. It runs as that bot and appears in
+  `getCalls()`; its result goes nowhere. `setWebhook`, `deleteWebhook`, `close`, `logOut` and any
+  `get` method are not run.
+- **`getWebhookInfo`** reports `pending_update_count`, `last_error_date` and `last_error_message`
+  (`Wrong response from the webhook: 500 Internal Server Error`, `Connection refused`,
+  `Read timeout expired`; other connection errors give Node's message), `max_connections`,
+  `ip_address` (the `ip_address` given, or the address last connected to; `<unknown>` before the first
+  delivery to a host name), `has_custom_certificate`, and `allowed_updates` unless it is the default.
+- **`setWebhook`** answers `Webhook was set` or `Webhook is already set`, and `deleteWebhook`
+  `Webhook was deleted` or `Webhook is already deleted`. It refuses a URL Telegram cannot read
+  (`invalid webhook URL specified`; a URL without a scheme is taken as https) and a `secret_token`
+  longer than 256 characters or with characters other than `A-Z`, `a-z`, `0-9`, `_` and `-`. A new
+  webhook replaces the old one first, so a refused URL leaves none. `drop_pending_updates` empties the
+  queue, even with an empty URL. Like a Bot API server run with `--local`, this one takes `http` URLs,
+  any port and local addresses, and it does not check that a host name resolves.
+- **Removing or replacing the webhook** ends its requests in progress. Every update it has not
+  confirmed stays pending, the one in flight included, for `getUpdates` or the new webhook.
+- **`getUpdates`** supports `offset`, `limit`, `allowed_updates` and long polling with `timeout`.
+  Calling it while a webhook is set fails with 409. A new waiting poll ends the one before it with
+  409 and this description:
+  `Conflict: terminated by other getUpdates request; make sure that only one bot instance is running`.
+  `setWebhook` ends it with 409 `Conflict: terminated by setWebhook request`. As on Telegram, a
+  second conflict within 3 seconds is answered 3 seconds later. A poll whose client hangs up stops
+  waiting.
+- **`allowed_updates`**, from `setWebhook` or `getUpdates`, is a list or the same list as a JSON
+  string, in any body. Names match in any case and unknown ones are skipped; an empty list, or one
+  with no known name, means the default: every update but `chat_member`, `message_reaction` and
+  `message_reaction_count`.
 - When the bot restricts, bans, unbans or approves a member, the server sends the resulting
   `chat_member` update back to the bot, as Telegram does. Nothing is sent when nothing changed.
 - Joining, leaving and an approved join request produce both a `chat_member` update and the
   `new_chat_members` / `left_chat_member` service message.
+- Bot API calls answer without waiting for the updates they cause, so a webhook bot that leaves a
+  chat or promotes someone inside its handler does not wait for itself.
 
 The fake delivers resulting updates asynchronously. Tests should wait for the exact update
 rather than depend on response/update ordering; the Bot API does not promise that ordering.
@@ -481,7 +527,7 @@ The test actions above, over HTTP, for tests written in other languages. All rou
 | `GET business/connections/:id`                         | The `BusinessConnection`.                                                                                                                                                                                                                                                |
 | `POST business/connections/:id/chats/:userId/messages` | `{ sender: "person" \| "owner", text }`; returns `{ message_id, date, update_id }`.                                                                                                                                                                                      |
 | `GET business/connections/:id/chats/:userId/messages`  | The business chat, newest first, as `[{ direction, deleted, message }]`.                                                                                                                                                                                                 |
-| `POST updates/:updateId/redeliver`                     | Deliver that update again to its bot's webhook; 404 for an unknown update, 409 when the bot has no webhook. Returns `{ update_id }`.                                                                                                                                     |
+| `POST updates/:updateId/redeliver`                     | Deliver that update again to its bot's webhook `{ bot_id? }`; 404 for an unknown update, 409 when the bot has no webhook or `bot_id` must name one of several bots that got it. Returns `{ update_id }`.                                                                 |
 | `GET users/:id`                                        | The user, with bio and photos.                                                                                                                                                                                                                                           |
 | `POST users/:id/profile`                               | Change `first_name`, `last_name`, `bio` or `username`.                                                                                                                                                                                                                   |
 | `POST users/:id/photos`                                | Add a profile photo `{ base64 }`.                                                                                                                                                                                                                                        |
@@ -557,8 +603,6 @@ and MIME type when reused by `file_id` ([Document](https://core.telegram.org/bot
   (a test makes a call fail with a 429 through `POST failures` instead). Channels have no
   subscribers and forum topics cannot be closed or deleted.
 - Expiry is evaluated on state access, without a scheduler or an automatic expiry webhook. Restarting loses all state; restart recovery belongs to the application under test.
-- Webhook retries: an update the webhook rejects, or does not answer within 10 seconds, is logged and
-  dropped rather than retried.
 - In Telegram Login: the `phone` scope's `phone_number` (test users have no phone numbers), the
   ES256, EdDSA and ES256K signing options (only the default RS256), the redirect URLs registered
   with BotFather (any `redirect_uri` is accepted), the `telegram-login.js` popup and native SDKs, and
@@ -691,7 +735,8 @@ journal, not a new ChatMember status; decline leaves the requester outside.
 
 Snapshot handles are opaque strings owned by one server. `snapshot()` and
 `restore(handle)` require quiescence: no active HTTP/control/owner request,
-long poll, webhook attempt, response delay or clock advance. Idle finite-expiry
+long poll, webhook attempt (an update waiting to be retried counts until it is
+delivered, dropped or its webhook removed), response delay or clock advance. Idle finite-expiry
 timers and unused fault rules are allowed. Drain existing deliveries and finish
 requests before taking a snapshot; restore fails explicitly with outstanding
 work instead of silently mixing in-flight execution with restored state.
@@ -712,13 +757,15 @@ runs due fake expiry and Bot/owner response-fault delays in deadline order. It
 also controls fake message/login/business timestamps. Real mode remains the
 default; real time is not rewound by restore. Manual time is restored with the
 fixture. Global `Date`, timers and the consuming application's jobs are untouched.
-Webhook network I/O, its safety deadline, long polling and diagnostic waits still
-use wall time. A clock advance is not a network-delivery or enforcement barrier.
+Webhook retry waits and delayed getUpdates conflicts run on it too. Webhook network
+I/O and its one-minute timeout, long polling and diagnostic waits still use wall
+time. A clock advance is not a network-delivery or enforcement barrier.
 
 `drainDeliveries({ botId?, timeoutMs? })` waits for that server's queued/in-flight
-webhook attempts to settle. It does not consume `getUpdates` queues, assert HTTP
-success, or wait for the bot's moderation work after acknowledging a webhook.
-Inspect `getDeliveries()` for update ID, bot ID, replay attempt, epoch, enqueue/start/
+webhook attempts to settle, including retries still due and calls a webhook answered
+with. It does not consume `getUpdates` queues, assert HTTP success, or wait for the
+bot's moderation work after acknowledging a webhook. Inspect `getDeliveries()` for
+update ID, bot ID, replay attempt (each retry is one), epoch, enqueue/start/
 completion times, status and outcome. Saved updates and delivery evidence survive
 until an explicit restore. `stop()` cancels waits/delays, aborts current deliveries,
 prevents queued deliveries starting, clears scheduled work and closes connections.
@@ -743,8 +790,8 @@ Each Bot API receipt has an instance/epoch/sequence `request_id` and a bounded
 `timeline`: `received`, `validated`, `state_applied`, `handler_completed`, and
 `response_sent` or `response_lost`. `received` timestamps HTTP arrival. Shared
 message creation/edit/deletion and membership mutation paths checkpoint known
-physical application before any awaited webhook finishes. Other handlers, and
-successful reads/no-ops, retain a completion checkpoint. `handler_completed`
+physical application as it happens. Other handlers, and successful reads/no-ops,
+retain a completion checkpoint. `handler_completed`
 separately records successful handler return; it can occur later than application.
 `validated` records successful validation at that checkpoint, not an instrumented
 pretransaction barrier. Not every intermediate mutation is instrumented. Use exact

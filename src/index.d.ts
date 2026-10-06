@@ -303,8 +303,10 @@ export interface FakeDelivery {
 /**
  * The running server. Besides the Bot API at `origin`, it exposes the actions
  * a test takes on Telegram's side. Each resolves after the resulting update has
- * been handed to the bot's webhook, or queued for getUpdates. The same actions
- * are available over HTTP under `${origin}/_fake/` for tests in other languages.
+ * been handed to the bot: its first webhook attempt finished (with any call the
+ * webhook answered with), it waits behind an update the webhook refused, or it
+ * is queued for getUpdates. The same actions are available over HTTP under
+ * `${origin}/_fake/` for tests in other languages.
  */
 export interface TelegramBotTestServer {
   waitFor(
@@ -335,7 +337,11 @@ export interface TelegramBotTestServer {
   releaseSnapshot(snapshot: string): Promise<{ ok: true }>;
   getClock(): Promise<FakeClockState>;
   advanceTime(ms: number): Promise<FakeClockState>;
-  /** Wait for queued/in-flight webhook attempts, not downstream enforcement or queued getUpdates consumption. */
+  /**
+   * Wait for queued/in-flight webhook attempts, including retries Telegram
+   * would still make and calls a webhook answered with, not downstream
+   * enforcement or queued getUpdates consumption.
+   */
   drainDeliveries(
     options?: FakeWaitOptions & { botId?: number },
   ): Promise<{ drained: true }>;
@@ -523,8 +529,14 @@ export interface TelegramBotTestServer {
     connectionId: string,
     userId: number,
   ): Promise<BusinessChatEntry[]>;
-  /** Deliver an update again, byte for byte, to the webhook it went to. */
-  redeliverUpdate(updateId: number): Promise<{ update_id: number }>;
+  /**
+   * Deliver an update again, byte for byte, to the webhook it went to. Each bot
+   * numbers its own updates, so name the bot when two bots got the same id.
+   */
+  redeliverUpdate(
+    updateId: number,
+    options?: { botId?: number },
+  ): Promise<{ update_id: number }>;
   updateProfile(userId: number, fields: UserFields): Promise<unknown>;
   addProfilePhoto(userId: number, bytes: Uint8Array): Promise<unknown>;
   /** The user joins a chat directly. */

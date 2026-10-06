@@ -780,78 +780,107 @@ it("uses only restored request receipts across repeated restore epochs, retainin
   await fake.releaseSnapshot(saved);
 });
 
-it("records membership application before a held webhook settles, with request-scoped evidence and later handler completion", async () => {
-  const initial = 1800000000000;
-  const { fake, api } = await setup({ clock: { now: initial } });
-  let arrived;
-  let release;
-  const received = new Promise((resolve) => {
-    arrived = resolve;
+it("answers Bot API calls at once while the updates they cause wait for a held webhook", async () => {
+  const { fake, api, user } = await setup();
+  const OTHER = "987654:HELD";
+  await fake.addBot({ token: OTHER, username: "held" });
+  await fake.setBotMembership(CHAT, 987654, { status: "member" });
+  await fake.setBotMembership(CHAT, BOT, {
+    status: "administrator",
+    rights: { can_promote_members: true },
   });
+  let holding = false;
+  let arrived;
+  const both = new Promise((resolve) => {
+    let count = 0;
+    arrived = () => ++count === 2 && resolve();
+  });
+  let release;
   const held = new Promise((resolve) => {
     release = resolve;
   });
-  const url = await receiver(async (update, res) => {
-    if (update.my_chat_member) {
+  const url = await receiver(async (_update, res) => {
+    if (holding) {
       arrived();
       await held;
     }
     res.end();
   });
-  await api("setWebhook", {
+  // One connection each, so every later update to either bot waits.
+  const hook = {
     url,
-    allowed_updates: ["my_chat_member"],
+    max_connections: 1,
+    allowed_updates: [
+      "message",
+      "chat_member",
+      "my_chat_member",
+      "message_reaction",
+    ],
     drop_pending_updates: true,
-  });
-  const leaving = api("leaveChat", { chat_id: CHAT });
+  };
+  await api("setWebhook", hook);
+  await api("setWebhook", hook, OTHER);
+  const reacted = await fake.post(CHAT, user, "react here");
+  await fake.react(CHAT, reacted, user, "👍");
+  holding = true;
+  const posting = fake.post(CHAT, user, "hold");
+  await both;
+
   try {
-    await received;
-    expect((await fake.getMember(CHAT, BOT)).status).toBe("left");
-    const applied = await fake.waitFor(
-      {
-        kind: "call",
-        botId: BOT,
-        method: "leaveChat",
-        chatId: CHAT,
-        stage: "state_applied",
-      },
-      { timeoutMs: 15 },
+    const photo = new FormData();
+    photo.set("chat_id", String(CHAT));
+    photo.set("photo", new Blob([Buffer.from("photo bytes")]), "p.jpg");
+    const calls = [
+      () =>
+        api("promoteChatMember", {
+          chat_id: CHAT,
+          user_id: user,
+          can_invite_users: true,
+        }),
+      () =>
+        api("setChatAdministratorCustomTitle", {
+          chat_id: CHAT,
+          user_id: user,
+          custom_title: "Boss",
+        }),
+      () => api("setChatTitle", { chat_id: CHAT, title: "Renamed" }),
+      async () =>
+        (
+          await fetch(`${fake.origin}/bot${TOKEN}/setChatPhoto`, {
+            method: "POST",
+            body: photo,
+          })
+        ).json(),
+      () => api("deleteChatPhoto", { chat_id: CHAT }),
+      () =>
+        api("deleteMessageReaction", {
+          chat_id: CHAT,
+          message_id: reacted,
+          user_id: user,
+        }),
+      () => api("leaveChat", { chat_id: CHAT }),
+    ];
+    for (const call of calls) expect(await call()).toMatchObject({ ok: true });
+    const left = (await fake.getCalls()).calls.find(
+      (call) => call.method === "leaveChat",
     );
-    expect(applied).toMatchObject({ applied: true, outcome: "pending" });
-    expect(applied.timeline).toContainEqual({
-      stage: "state_applied",
-      at: initial,
-    });
-    expect(
-      applied.timeline.some((event) => event.stage === "handler_completed"),
-    ).toBe(false);
-    await api("getMe");
-    expect(
-      (await fake.getCalls()).calls.find((call) => call.method === "getMe"),
-    ).toMatchObject({ method: "getMe", applied: true, outcome: "succeeded" });
-    await fake.advanceTime(50);
+    expect(left.timeline.map((event) => event.stage)).toEqual([
+      "received",
+      "validated",
+      "state_applied",
+      "handler_completed",
+      "response_sent",
+    ]);
+    expect((await fake.getMember(CHAT, BOT)).status).toBe("left");
   } finally {
     release();
-    await leaving;
+    await posting;
   }
-  const finished = await fake.waitFor({
-    kind: "call",
-    botId: BOT,
-    method: "leaveChat",
-    stage: "response_sent",
-  });
-  expect(
-    finished.timeline.filter((event) => event.stage === "state_applied"),
-  ).toEqual([{ stage: "state_applied", at: initial }]);
-  expect(finished.timeline).toContainEqual({
-    stage: "handler_completed",
-    at: initial + 50,
-  });
 });
 
-it("preserves applied-state evidence if a handler fails after a membership change", async () => {
+it("reports a webhook delivery error raised by the log option when the server stops", async () => {
   let failures = 0;
-  const { fake, api, stopCleanup } = await setup({
+  const { fake, api, user, stopCleanup } = await setup({
     log: (line) => {
       if (line.startsWith("webhook") && failures++ < 2)
         throw new Error("fixture logger unavailable");
@@ -861,35 +890,46 @@ it("preserves applied-state evidence if a handler fails after a membership chang
     res.writeHead(503);
     res.end();
   });
-  await api("setWebhook", {
-    url,
-    allowed_updates: ["my_chat_member"],
-    drop_pending_updates: true,
-  });
+  await api("setWebhook", { url, drop_pending_updates: true });
   try {
-    expect(await api("leaveChat", { chat_id: CHAT })).toMatchObject({
-      ok: false,
-      status: 500,
-    });
-    expect((await fake.getMember(CHAT, BOT)).status).toBe("left");
-    const receipt = (await fake.getCalls()).calls.find(
-      (call) => call.method === "leaveChat",
-    );
-    expect(receipt).toMatchObject({
-      applied: true,
-      failed: 500,
-      outcome: "failed_after_apply",
-    });
-    expect(receipt.timeline.map((event) => event.stage)).toEqual([
-      "received",
-      "validated",
-      "state_applied",
-      "response_sent",
-    ]);
+    await fake.post(CHAT, user, "refused");
+    expect((await api("getWebhookInfo")).result.pending_update_count).toBe(1);
   } finally {
     cleanups.splice(cleanups.indexOf(stopCleanup), 1);
     // This deliberately failing logger is the operation failure under test.
     // Shutdown still closes resources and reports that exact delivery error.
     await expect(stopCleanup()).rejects.toThrow("fixture logger unavailable");
   }
+});
+
+it("forgets a long poll whose client hung up, so a snapshot need not wait for its timeout", async () => {
+  const { fake, api } = await setup();
+  const queued = (await api("getUpdates")).result;
+  const abort = new AbortController();
+  const polling = fetch(`${fake.origin}/bot${TOKEN}/getUpdates`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      offset: queued.at(-1).update_id + 1,
+      timeout: 30,
+    }),
+    signal: abort.signal,
+  }).catch(() => null);
+  await fake.waitFor({
+    kind: "call",
+    botId: BOT,
+    method: "getUpdates",
+    afterSeq: 1,
+  });
+  abort.abort();
+  await polling;
+
+  await expect
+    .poll(() =>
+      fake.snapshot().then(
+        () => "taken",
+        (error) => error.message,
+      ),
+    )
+    .toBe("taken");
 });

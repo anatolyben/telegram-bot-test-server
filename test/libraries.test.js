@@ -1,6 +1,6 @@
 import http from "node:http";
 import { Bot, InlineKeyboard, webhookCallback } from "grammy";
-import { Telegraf } from "telegraf";
+import { Markup, Telegraf } from "telegraf";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { startTestServer } from "../src/index.js";
@@ -14,10 +14,11 @@ afterEach(async () => {
   while (cleanups.length) await cleanups.pop()();
 });
 
-async function startServer() {
+async function startServer(options = {}) {
   const server = await startTestServer({
     botToken: TOKEN,
     chats: [{ id: GROUP, title: "Test Group", ownerId: OWNER }],
+    ...options,
   });
   cleanups.push(() => server.stop());
   return server;
@@ -115,6 +116,48 @@ describe("Telegraf", () => {
       .poll(async () => (await server.getDirectMessages(ann))[0]?.text)
       .toBe("Hi Ann");
   });
+
+  it("runs a webhook bot whose calls ride back on the webhook answer, as Telegraf sends them by default", async () => {
+    const server = await startServer();
+
+    const bot = new Telegraf(TOKEN, { telegram: { apiRoot: server.origin } });
+    bot.on("message", async (ctx) => {
+      if (ctx.message.text?.includes("example.com")) await ctx.deleteMessage();
+    });
+    bot.action("human", (ctx) => ctx.answerCbQuery("Welcome!"));
+    const receiver = http.createServer(bot.webhookCallback("/"));
+    await new Promise((resolve) => receiver.listen(0, "127.0.0.1", resolve));
+    cleanups.push(
+      () =>
+        new Promise((resolve) => {
+          receiver.close(resolve);
+          receiver.closeAllConnections();
+        }),
+    );
+    await bot.telegram.setWebhook(
+      `http://127.0.0.1:${receiver.address().port}/`,
+    );
+
+    const ann = await server.createUser({ first_name: "Ann" });
+    await server.join(GROUP, ann);
+    const spam = await server.post(
+      GROUP,
+      ann,
+      "cheap followers at example.com",
+    );
+    await expect
+      .poll(async () => (await server.getMessage(GROUP, spam)).deleted)
+      .toBe(true);
+
+    const prompt = await bot.telegram.sendMessage(
+      GROUP,
+      "Press the button",
+      Markup.inlineKeyboard([Markup.button.callback("I am human", "human")]),
+    );
+    expect(
+      await server.pressButton(GROUP, prompt.message_id, ann, "human"),
+    ).toMatchObject({ answered: true, text: "Welcome!" });
+  });
 });
 
 describe("polling", () => {
@@ -148,6 +191,42 @@ describe("polling", () => {
     const { result } = await polled;
     expect(result[0].message.text).toBe("ping");
     expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it("ends a waiting long poll with 409 when another long poll or setWebhook replaces it", async () => {
+    const server = await startServer({ clock: { now: 1_800_000_000_000 } });
+    const first = getUpdates(server, { timeout: 5 });
+    await server.waitFor({ kind: "call", botId: 123456, method: "getUpdates" });
+    const second = getUpdates(server, { timeout: 5 });
+    expect(await first).toMatchObject({
+      status: 409,
+      description:
+        "Conflict: terminated by other getUpdates request; make sure that only one bot instance is running",
+    });
+
+    await fetch(`${server.origin}/bot${TOKEN}/setWebhook`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: "http://127.0.0.1:9/" }),
+    });
+    // A second conflict within 3 seconds is answered 3 seconds later.
+    expect((await server.getClock()).scheduled).toBe(1);
+    await server.advanceTime(3000);
+    expect(await second).toMatchObject({
+      status: 409,
+      description: "Conflict: terminated by setWebhook request",
+    });
+  });
+
+  it("forgets a queued update a day after it happened, as Telegram's queue does", async () => {
+    const server = await startServer({ clock: { now: 1_800_000_000_000 } });
+    const ann = await server.createUser();
+    await server.sendDirectMessage(ann, "old");
+    await server.advanceTime(86_400_000);
+    expect((await getUpdates(server)).result).toHaveLength(1);
+
+    await server.advanceTime(1000);
+    expect((await getUpdates(server)).result).toEqual([]);
   });
 
   it("refuses getUpdates while a webhook is set, as Telegram does", async () => {
