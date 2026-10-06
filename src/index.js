@@ -183,6 +183,59 @@ const MEMBER_MEDIA = Object.freeze({
 // The media a message can carry, one at a time, and editMessageMedia replaces.
 const MEDIA_KINDS = Object.freeze(["photo", "video", "animation", "document"]);
 
+// The field holding a message's content; a message with none of them is a
+// service message. An animation also carries document, and a venue location,
+// so they come first.
+const CONTENT_FIELDS = Object.freeze([
+  "text",
+  "animation",
+  "audio",
+  "document",
+  "photo",
+  "sticker",
+  "video",
+  "video_note",
+  "voice",
+  "contact",
+  "dice",
+  "venue",
+  "location",
+  "poll",
+]);
+// Content that takes a caption (TDLib can_have_message_content_caption).
+const CAPTIONED_CONTENT = Object.freeze([
+  "photo",
+  ...Object.keys(MEMBER_MEDIA).filter((type) => MEMBER_MEDIA[type].caption),
+]);
+// Content a bot can edit (TDLib is_editable_message_content), and what
+// editMessageMedia can replace (can_edit_message_media).
+const EDITABLE_CONTENT = Object.freeze(["text", ...CAPTIONED_CONTENT]);
+const MEDIA_EDITABLE_CONTENT = Object.freeze([
+  "text",
+  "photo",
+  "video",
+  "animation",
+  "audio",
+  "document",
+]);
+// The entities a quote keeps (https://core.telegram.org/bots/api#textquote).
+const QUOTE_ENTITIES = Object.freeze([
+  "bold",
+  "italic",
+  "underline",
+  "strikethrough",
+  "spoiler",
+  "custom_emoji",
+  "date_time",
+]);
+// Telegram's longest quote (TDLib's message_reply_quote_length_max default).
+const QUOTE_LENGTH_MAX = 1024;
+
+/** The content field a message carries, or null for a service message. */
+function contentType(message) {
+  return CONTENT_FIELDS.find((field) => message[field] !== undefined) ?? null;
+}
+
 class TelegramError extends Error {
   constructor(code, description, parameters = null) {
     super(description);
@@ -1724,20 +1777,21 @@ export async function startTestServer({
     },
     editMessageText: (p, caller) => {
       const formatted = textFields(p);
-      return editMessage(p, caller, (message) => {
-        message.text = formatted.text;
-        if (formatted.entities) message.entities = formatted.entities;
-        else delete message.entities;
+      return editMessage(p, caller, "text", (message) => {
+        delete message.entities;
+        delete message.link_preview_options;
+        Object.assign(message, formatted);
       });
     },
-    editMessageReplyMarkup: (p, caller) => editMessage(p, caller, () => {}),
+    editMessageReplyMarkup: (p, caller) =>
+      editMessage(p, caller, "reply_markup", () => {}),
+    // An empty caption removes it: Telegram leaves an empty one out.
     editMessageCaption: (p, caller) => {
       const formatted = captionFields(p);
-      return editMessage(p, caller, (message) => {
-        message.caption = formatted.caption ?? "";
-        if (formatted.caption_entities) {
-          message.caption_entities = formatted.caption_entities;
-        } else delete message.caption_entities;
+      return editMessage(p, caller, "caption", (message) => {
+        delete message.caption;
+        delete message.caption_entities;
+        Object.assign(message, formatted);
       });
     },
     // The new media is an upload attached as attach://<name>, or the file_id
@@ -1767,9 +1821,10 @@ export async function startTestServer({
         type === "photo" ? "jpg" : "bin",
       );
       const formatted = captionFields(input);
-      return editMessage(p, caller, (message) => {
+      return editMessage(p, caller, "media", (message) => {
         delete message.text;
         delete message.entities;
+        delete message.link_preview_options;
         for (const kind of MEDIA_KINDS) delete message[kind];
         message[type] =
           type === "photo"
@@ -1855,34 +1910,32 @@ export async function startTestServer({
       return entry.message.poll;
     },
     forwardMessage: (p, caller) => {
-      const { source, content } = forwardable(p, caller);
+      const { source, content } = forwardable(p, caller, false);
       return sendFrom(
-        { chat_id: p.chat_id, message_thread_id: p.message_thread_id },
+        {
+          chat_id: p.chat_id,
+          message_thread_id: p.message_thread_id,
+          protect_content: p.protect_content,
+        },
         caller,
         {
           ...content,
-          forward_origin:
-            source.chat.type === "channel"
-              ? {
-                  type: "channel",
-                  chat: source.message.chat,
-                  message_id: source.message.message_id,
-                  date: source.message.date,
-                }
-              : {
-                  type: "user",
-                  sender_user: source.message.from,
-                  date: source.message.date,
-                },
+          forward_origin: messageOrigin(source.chat, source.message),
         },
       );
     },
+    // A caption given replaces the original's on media that takes one, and an
+    // empty one removes it; a text message keeps no caption (TDLib
+    // dup_message_content). It is parsed first either way.
     copyMessage: (p, caller) => {
-      const { content } = forwardable(p, caller);
-      const copy = sendFrom(p, caller, {
-        ...content,
-        ...(p.caption !== undefined ? { caption: String(p.caption) } : {}),
-      });
+      const caption = p.caption !== undefined ? captionFields(p) : null;
+      const { content } = forwardable(p, caller, true);
+      if (caption && CAPTIONED_CONTENT.includes(contentType(content))) {
+        delete content.caption;
+        delete content.caption_entities;
+        Object.assign(content, caption);
+      }
+      const copy = sendFrom(p, caller, content);
       return { message_id: copy.message_id };
     },
     pinChatMessage: (p, caller) => {
@@ -2236,8 +2289,16 @@ export async function startTestServer({
             "Bad Request: wrong file identifier/HTTP URL specified",
           );
         }
+        // Every item answers the same message, as one album send does.
         return sendFrom(
-          { chat_id: p.chat_id, message_thread_id: p.message_thread_id },
+          {
+            chat_id: p.chat_id,
+            message_thread_id: p.message_thread_id,
+            reply_parameters: p.reply_parameters,
+            reply_to_message_id: p.reply_to_message_id,
+            allow_sending_without_reply: p.allow_sending_without_reply,
+            protect_content: p.protect_content,
+          },
           caller,
           {
             ...mediaFields(item.type, file, {}),
@@ -2513,10 +2574,24 @@ export async function startTestServer({
       : undefined;
   }
 
+  /**
+   * A reply keyboard, its removal or ForceReply. Telegram keeps it on the
+   * message without showing it in Message.reply_markup, and such a message
+   * can't be edited (TDLib can_edit_message).
+   */
+  function isReplyKeyboard(markup) {
+    return (
+      (Array.isArray(markup?.keyboard) && markup.keyboard.length > 0) ||
+      (!inlineMarkup(markup) &&
+        (isTrue(markup?.remove_keyboard) || isTrue(markup?.force_reply)))
+    );
+  }
+
   function sendFrom(p, caller, fields) {
     // Message.reply_markup only ever carries an inline keyboard; reply
     // keyboards and ForceReply are shown to the user, not echoed back.
-    const markup = inlineMarkup(p.reply_markup);
+    const keyboard = isReplyKeyboard(p.reply_markup);
+    const markup = keyboard ? undefined : inlineMarkup(p.reply_markup);
     // An ephemeral message (Bot API 10.2) is shown to one member only. Telegram
     // gives it message_id 0; here it keeps the chat's message id, so tests can
     // find and press it like any message, and reuses it as ephemeral_message_id.
@@ -2524,10 +2599,10 @@ export async function startTestServer({
     const chat = botChat(p.chat_id);
     requireCanSend(chat, caller);
     requireTopic(chat, p.message_thread_id);
-    const replyTo = replyTarget(chat, p);
+    const reply = replyFields(chat, p, caller);
     const message = addMessage(chat, caller, {
       ...fields,
-      ...(replyTo ? { reply_to_message: replyTo } : {}),
+      ...reply,
       ...(markup ? { reply_markup: markup } : {}),
       ...(p.message_thread_id && chat.topics
         ? {
@@ -2538,16 +2613,22 @@ export async function startTestServer({
       ...(receiverId != null
         ? { receiver_user: userObject(requireUser(receiverId)) }
         : {}),
+      ...(isTrue(p.protect_content) ? { has_protected_content: true } : {}),
     });
     if (receiverId != null) message.ephemeral_message_id = message.message_id;
+    if (keyboard) chat.messages.get(message.message_id).replyKeyboard = true;
     return message;
   }
 
   /**
-   * The message a bot send answers: reply_parameters (or the older
-   * reply_to_message_id), else, in a forum topic, the topic's creation message.
+   * The reply fields of a bot send. reply_parameters (or the older
+   * reply_to_message_id) answer a message in this chat with reply_to_message,
+   * or, with chat_id, one in another chat the bot can read with
+   * external_reply; a quote must be found in the message it answers. Else, in
+   * a forum topic, the send answers the topic's creation message.
+   * https://core.telegram.org/bots/api#replyparameters
    */
-  function replyTarget(chat, p) {
+  function replyFields(chat, p, caller) {
     const parameters =
       p.reply_parameters ??
       (p.reply_to_message_id != null
@@ -2556,39 +2637,195 @@ export async function startTestServer({
             allow_sending_without_reply: p.allow_sending_without_reply,
           }
         : null);
-    if (parameters?.message_id != null) {
-      if (
-        parameters.chat_id != null &&
-        String(parameters.chat_id) !== String(chat.id) &&
-        String(parameters.chat_id) !== String(p.chat_id)
-      ) {
-        throw new TelegramError(
-          400,
-          "Bad Request: replies to other chats are not supported here",
-        );
-      }
-      const entry = chat.messages.get(Number(parameters.message_id));
-      if (entry && !entry.deleted) {
-        const { reply_to_message: _nested, ...original } = entry.message;
-        return original;
-      }
-      if (parameters.allow_sending_without_reply === true) return null;
+    if (parameters?.message_id == null) {
+      const topic =
+        p.message_thread_id && chat.topics
+          ? chat.messages.get(Number(p.message_thread_id))
+          : null;
+      if (!topic) return {};
+      const { reply_to_message: _nested, ...original } = topic.message;
+      return { reply_to_message: original };
+    }
+    // A chat_id naming the send's own chat is an ordinary reply (Client.cpp
+    // check_reply_parameters).
+    const source =
+      parameters.chat_id == null ||
+      String(parameters.chat_id) === String(p.chat_id)
+        ? chat
+        : (chats.get(Number(parameters.chat_id)) ??
+          privateChats.get(Number(parameters.chat_id)));
+    if (!source) throw new TelegramError(400, "Bad Request: chat not found");
+    // Only members read a supergroup's or a channel's messages (Client.cpp
+    // have_message_access).
+    if (
+      ["supergroup", "channel"].includes(source.type) &&
+      !isInChat(source, caller.id)
+    ) {
       throw new TelegramError(
         400,
         "Bad Request: message to be replied not found",
       );
     }
-    if (p.message_thread_id && chat.topics) {
-      const topic = chat.messages.get(Number(p.message_thread_id));
-      if (topic) {
-        const { reply_to_message: _nested, ...original } = topic.message;
-        return original;
-      }
+    const entry = source.messages.get(Number(parameters.message_id));
+    if (
+      !entry ||
+      entry.deleted ||
+      (source.type === "group" && !isInChat(source, caller.id))
+    ) {
+      if (isTrue(parameters.allow_sending_without_reply)) return {};
+      throw new TelegramError(
+        400,
+        "Bad Request: message to be replied not found",
+      );
     }
-    return null;
+    const quote = replyQuote(entry.message, parameters);
+    if (source === chat) {
+      const { reply_to_message: _nested, ...original } = entry.message;
+      return { reply_to_message: original, ...(quote ? { quote } : {}) };
+    }
+    const automatic = quote ?? automaticQuote(entry.message);
+    return {
+      external_reply: externalReply(source, entry.message),
+      ...(automatic ? { quote: automatic } : {}),
+    };
   }
 
-  /** text and entities of a bot's message, after parse_mode or explicit entities. */
+  /** The text a quote is taken from: a message's text, or its caption. */
+  function quotable(message) {
+    return message.text !== undefined
+      ? { text: message.text, entities: message.entities ?? [] }
+      : {
+          text: message.caption ?? "",
+          entities: message.caption_entities ?? [],
+        };
+  }
+
+  function quoteEntities(entities) {
+    return entities.filter((entity) => QUOTE_ENTITIES.includes(entity.type));
+  }
+
+  /**
+   * reply_parameters.quote: an exact substring of the replied message,
+   * including its bold, italic, underline, strikethrough, spoiler,
+   * custom_emoji and date_time entities, else the send fails with
+   * QUOTE_TEXT_INVALID (https://core.telegram.org/method/messages.sendMessage).
+   * Its position is the one the sender gives.
+   */
+  function replyQuote(message, parameters) {
+    if (parameters.quote == null || parameters.quote === "") return null;
+    const quote = formatOrFail(
+      String(parameters.quote),
+      parameters.quote_parse_mode,
+      parameters.quote_entities,
+    );
+    if (!quote.text) return null;
+    const entities = quoteEntities(quote.entities);
+    const original = quotable(message);
+    const kept = quoteEntities(original.entities);
+    const key = (list) =>
+      list
+        .map((entity) => JSON.stringify(Object.entries(entity).sort()))
+        .sort()
+        .join();
+    const length = quote.text.length;
+    let found = false;
+    for (
+      let at = original.text.indexOf(quote.text);
+      at !== -1 && !found;
+      at = original.text.indexOf(quote.text, at + 1)
+    ) {
+      // The original's entities over that stretch, cut to it.
+      const within = kept
+        .map((entity) => {
+          const start = Math.max(entity.offset, at);
+          const end = Math.min(entity.offset + entity.length, at + length);
+          return { ...entity, offset: start - at, length: end - start };
+        })
+        .filter((entity) => entity.length > 0);
+      found = key(within) === key(entities);
+    }
+    if (!found) throw new TelegramError(400, "Bad Request: QUOTE_TEXT_INVALID");
+    return {
+      text: quote.text,
+      ...(entities.length > 0 ? { entities } : {}),
+      position: Number(parameters.quote_position ?? 0),
+      is_manual: true,
+    };
+  }
+
+  /**
+   * The quote Telegram adds to a reply to another chat that chose none: the
+   * replied message's text or caption, up to 1024 characters, with the
+   * entities a quote keeps (TDLib RepliedMessageInfo.cpp and
+   * MessageQuote::create_automatic_quote).
+   */
+  function automaticQuote(message) {
+    const original = quotable(message);
+    if (!original.text) return null;
+    const text = [...original.text].slice(0, QUOTE_LENGTH_MAX).join("");
+    const entities = quoteEntities(original.entities)
+      .filter((entity) => entity.offset < text.length)
+      .map((entity) => ({
+        ...entity,
+        length: Math.min(entity.length, text.length - entity.offset),
+      }));
+    return {
+      text,
+      ...(entities.length > 0 ? { entities } : {}),
+      position: 0,
+    };
+  }
+
+  /**
+   * Where a message came from, as a forward or an external reply shows it: a
+   * forward keeps its first origin, a channel post names the channel, and
+   * anything else its sender (TDLib get_forwarded_message_origin).
+   */
+  function messageOrigin(chat, message) {
+    if (message.forward_origin) return structuredClone(message.forward_origin);
+    return chat.type === "channel"
+      ? {
+          type: "channel",
+          chat: message.chat,
+          message_id: message.message_id,
+          date: message.date,
+        }
+      : { type: "user", sender_user: message.from, date: message.date };
+  }
+
+  /**
+   * ExternalReplyInfo for a reply to another chat: the message's origin, its
+   * chat and id when the chat is a supergroup or a channel, and its media
+   * without the caption, or a text's link preview options (TDLib
+   * RepliedMessageInfo.cpp, Client.cpp JsonExternalReplyInfo).
+   * https://core.telegram.org/bots/api#externalreplyinfo
+   */
+  function externalReply(chat, message) {
+    const origin = messageOrigin(chat, message);
+    const type = contentType(message);
+    const content =
+      type === "text"
+        ? message.link_preview_options
+          ? { link_preview_options: message.link_preview_options }
+          : {}
+        : type
+          ? { [type]: message[type] }
+          : {};
+    return {
+      origin,
+      ...(origin.type === "channel"
+        ? { chat: origin.chat, message_id: origin.message_id }
+        : ["supergroup", "channel"].includes(chat.type)
+          ? { chat: chatObject(chat), message_id: message.message_id }
+          : {}),
+      ...structuredClone(content),
+    };
+  }
+
+  /**
+   * text, entities and link_preview_options of a bot's message, after
+   * parse_mode or explicit entities.
+   */
   function textFields(p) {
     const formatted = formatOrFail(
       String(p.text ?? ""),
@@ -2598,12 +2835,62 @@ export async function startTestServer({
     if (!formatted.text.trim()) {
       throw new TelegramError(400, "Bad Request: message text is empty");
     }
+    const options = linkPreviewOptions(p, formatted);
     return {
       text: formatted.text,
       ...(formatted.entities.length > 0
         ? { entities: formatted.entities }
         : {}),
+      ...(options ? { link_preview_options: options } : {}),
     };
+  }
+
+  /**
+   * Message.link_preview_options: the options a send or edit gave, only when
+   * they differ from the defaults. As TDLib keeps them, a disabled preview
+   * drops the URL, small or large media need an explicit URL
+   * (InputMessageText.cpp), and disabling the preview of a text without a
+   * link changes nothing (MessageContent.cpp).
+   */
+  function linkPreviewOptions(p, formatted) {
+    const given =
+      p.link_preview_options ??
+      (isTrue(p.disable_web_page_preview) ? { is_disabled: true } : null);
+    if (given === null || typeof given !== "object") return null;
+    const disabled = isTrue(given.is_disabled);
+    const url = disabled ? "" : String(given.url ?? "");
+    const options = {
+      ...(disabled && hasPreviewLink(formatted) ? { is_disabled: true } : {}),
+      ...(url ? { url } : {}),
+      ...(url && isTrue(given.prefer_small_media)
+        ? { prefer_small_media: true }
+        : {}),
+      ...(url && isTrue(given.prefer_large_media)
+        ? { prefer_large_media: true }
+        : {}),
+      ...(isTrue(given.show_above_text) ? { show_above_text: true } : {}),
+    };
+    return Object.keys(options).length > 0 ? options : null;
+  }
+
+  /** Whether a text has a link a preview could show (TDLib get_first_url). */
+  function hasPreviewLink({ text, entities }) {
+    return entities.some((entity) => {
+      const url =
+        entity.type === "url" && entity.length > 4
+          ? text.slice(entity.offset, entity.offset + entity.length)
+          : entity.type === "text_link"
+            ? String(entity.url ?? "")
+            : "";
+      const scheme = url.slice(0, 8).toLowerCase();
+      return (
+        url !== "" &&
+        !["ton:", "ftp:", "tonsite:"].includes(scheme) &&
+        !scheme.startsWith("tg:") &&
+        // A bare domain gets no preview.
+        (entity.type !== "url" || /[/?#]/.test(url))
+      );
+    });
   }
 
   /** caption and caption_entities of a bot's media message. */
@@ -2740,14 +3027,14 @@ export async function startTestServer({
   }
 
   /**
-   * The bot answers in a business chat, as the owner. It needs an enabled
-   * connection with can_reply, and can_reply covers only chats "that had
-   * incoming messages in the last 24 hours"
+   * The business chat the bot sends or edits in, as the owner. It needs an
+   * enabled connection with can_reply, and can_reply covers sending and
+   * editing only in chats "that had incoming messages in the last 24 hours"
    * (https://core.telegram.org/bots/api#businessbotrights); past that,
    * Telegram answers BUSINESS_PEER_USAGE_MISSING
    * (https://core.telegram.org/method/messages.sendMessage).
    */
-  function sendBusinessMessage(p, caller) {
+  function businessReplyChat(p, caller) {
     const connection = requireBusinessConnection(
       p.business_connection_id,
       caller,
@@ -2772,6 +3059,12 @@ export async function startTestServer({
     ) {
       throw new TelegramError(400, "Bad Request: BUSINESS_PEER_USAGE_MISSING");
     }
+    return { connection, userId, chat };
+  }
+
+  /** The bot answers in a business chat, as the owner. */
+  function sendBusinessMessage(p, caller) {
+    const { connection, userId } = businessReplyChat(p, caller);
     return addBusinessMessage(
       connection,
       userId,
@@ -2782,6 +3075,45 @@ export async function startTestServer({
         sender_business_bot: userObject(caller),
       },
     );
+  }
+
+  /**
+   * The business message a bot edits for the owner. The person's messages are
+   * not the owner's to edit, and the owner's own messages without an inline
+   * keyboard only within 48 hours of being sent
+   * (https://core.telegram.org/bots/api#editmessagetext). The errors are
+   * messages.editMessage's (https://core.telegram.org/method/messages.editMessage),
+   * all Bad Request through the Bot API (Client.cpp fail_query_with_error);
+   * which one Telegram gives in each case is UNVERIFIED. Business chats here
+   * hold text messages only, so caption and media edits are not modelled.
+   */
+  function businessEditEntry(p, caller, kind) {
+    if (kind === "caption" || kind === "media") {
+      const method =
+        kind === "caption" ? "editMessageCaption" : "editMessageMedia";
+      throw new TelegramError(
+        404,
+        `Not Found: method ${method} with business_connection_id is not implemented by telegram-bot-test-server`,
+      );
+    }
+    const { chat } = businessReplyChat(p, caller);
+    const entry = chat.entries.find(
+      (each) => each.message.message_id === Number(p.message_id),
+    );
+    if (!entry || entry.deleted) {
+      throw new TelegramError(400, "Bad Request: MESSAGE_ID_INVALID");
+    }
+    if (entry.direction === "inbound") {
+      throw new TelegramError(400, "Bad Request: MESSAGE_AUTHOR_REQUIRED");
+    }
+    if (
+      entry.direction === "owner" &&
+      !inlineMarkup(entry.message.reply_markup) &&
+      now() - entry.message.date >= 48 * 3600
+    ) {
+      throw new TelegramError(400, "Bad Request: MESSAGE_EDIT_TIME_EXPIRED");
+    }
+    return entry;
   }
 
   /**
@@ -2879,8 +3211,13 @@ export async function startTestServer({
     };
   }
 
-  /** The message a forward or copy reads, when the bot can see it. */
-  function forwardable(p, caller) {
+  /**
+   * The message a forward or copy reads, when the bot can see it. A service
+   * message can be neither forwarded nor copied, and a protected one only
+   * copied by a bot (TDLib can_forward_message). Only the content goes along:
+   * a single album item leaves its album behind (get_forwarded_messages).
+   */
+  function forwardable(p, caller, copy) {
     const sourceChat = botChat(p.from_chat_id);
     const entry = sourceChat.messages.get(Number(p.message_id));
     if (
@@ -2890,6 +3227,17 @@ export async function startTestServer({
     ) {
       throw new TelegramError(400, "Bad Request: message to forward not found");
     }
+    if (
+      contentType(entry.message) === null ||
+      (!copy && entry.message.has_protected_content)
+    ) {
+      throw new TelegramError(
+        400,
+        copy
+          ? "Bad Request: the message can't be copied"
+          : "Bad Request: the message can't be forwarded",
+      );
+    }
     const {
       message_id: _id,
       from: _from,
@@ -2898,29 +3246,84 @@ export async function startTestServer({
       edit_date: _edited,
       reply_markup: _markup,
       reply_to_message: _reply,
+      external_reply: _external,
+      quote: _quote,
       receiver_user: _receiver,
       ephemeral_message_id: _ephemeral,
       forward_origin: _origin,
       message_thread_id: _thread,
       is_topic_message: _topic,
+      media_group_id: _album,
+      has_protected_content: _protected,
       ...content
     } = structuredClone(entry.message);
     return { source: { chat: sourceChat, message: entry.message }, content };
   }
 
   /**
-   * Apply a bot edit to a stored message, as Telegram does: only the bot's own
-   * messages can be edited, an edit without reply_markup removes the inline
-   * keyboard, and an edit that changes nothing is refused.
+   * Whether a bot may make this kind of edit ("text", "caption", "media" or
+   * "reply_markup") to its message, as TDLib's can_edit_message and edit
+   * methods decide (MessagesManager.cpp). A forward, or a message sent with a
+   * reply keyboard, can't be edited at all; text edits need a text message,
+   * caption edits media that takes a caption, and media edits media or text.
+   * Other content only has its inline keyboard changed; an open poll counts as
+   * editable, since it can still be stopped.
    */
-  function editMessage(p, caller, apply) {
-    const chat = botChat(p.chat_id);
-    const entry = chat.messages.get(Number(p.message_id));
-    if (!entry || entry.deleted) {
-      throw new TelegramError(400, "Bad Request: message to edit not found");
+  function requireEditable(entry, kind) {
+    const message = entry.message;
+    const type = contentType(message);
+    const editable =
+      !message.forward_origin &&
+      !entry.replyKeyboard &&
+      (EDITABLE_CONTENT.includes(type) ||
+        (kind === "reply_markup" && type !== null) ||
+        (type === "poll" && !message.poll.is_closed));
+    if (kind === "media") {
+      if (!editable || !MEDIA_EDITABLE_CONTENT.includes(type)) {
+        throw new TelegramError(
+          400,
+          "Bad Request: message media can't be edited",
+        );
+      }
+      return;
     }
-    if (entry.message.from.id !== caller.id) {
+    if (!editable) {
       throw new TelegramError(400, "Bad Request: message can't be edited");
+    }
+    if (kind === "text" && type !== "text") {
+      throw new TelegramError(
+        400,
+        "Bad Request: there is no text in the message to edit",
+      );
+    }
+    if (kind === "caption" && !CAPTIONED_CONTENT.includes(type)) {
+      throw new TelegramError(
+        400,
+        "Bad Request: there is no caption in the message to edit",
+      );
+    }
+  }
+
+  /**
+   * Apply a bot edit to a stored message, as Telegram does: only the bot's own
+   * messages can be edited, and only as requireEditable allows; an edit
+   * without reply_markup removes the inline keyboard, and an edit that changes
+   * nothing is refused. With business_connection_id it edits a business chat.
+   */
+  function editMessage(p, caller, kind, apply) {
+    let entry;
+    if (p.business_connection_id) {
+      entry = businessEditEntry(p, caller, kind);
+    } else {
+      const chat = botChat(p.chat_id);
+      entry = chat.messages.get(Number(p.message_id));
+      if (!entry || entry.deleted) {
+        throw new TelegramError(400, "Bad Request: message to edit not found");
+      }
+      if (entry.message.from.id !== caller.id) {
+        throw new TelegramError(400, "Bad Request: message can't be edited");
+      }
+      requireEditable(entry, kind);
     }
     const previous = structuredClone(entry.message);
     const edited = structuredClone(entry.message);

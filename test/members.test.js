@@ -349,6 +349,26 @@ describe("more send methods", () => {
     });
     expect(single.status).toBe(400);
   });
+
+  it("sends an album as a reply", async () => {
+    const { fake, upload, member } = await setup();
+    const asked = await fake.post(GROUP, member, "send the photos");
+
+    const sent = await upload("sendMediaGroup", {
+      chat_id: String(GROUP),
+      media: [
+        { type: "photo", media: "attach://one" },
+        { type: "photo", media: "attach://two" },
+      ],
+      one: BYTES,
+      two: BYTES,
+      reply_parameters: { message_id: asked },
+    });
+
+    expect(
+      sent.result.map((message) => message.reply_to_message?.message_id),
+    ).toEqual([asked, asked]);
+  });
 });
 
 describe("administrators and chat settings", () => {

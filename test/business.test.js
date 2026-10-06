@@ -327,6 +327,98 @@ describe("answering in a business chat", () => {
   });
 });
 
+describe("editing in a business chat", () => {
+  /** A business chat with the person's greeting and the bot's answer. */
+  async function answered() {
+    const context = await connected();
+    const { fake, api, connection, person } = context;
+    await fake.sayInBusinessChat(connection.id, person, "person", "hi");
+    const sent = await api("sendMessage", {
+      business_connection_id: connection.id,
+      chat_id: person,
+      text: "reply",
+    });
+    const edit = (messageId, text = "edited") =>
+      api("editMessageText", {
+        business_connection_id: connection.id,
+        chat_id: person,
+        message_id: messageId,
+        text,
+      });
+    return { ...context, sent: sent.result, edit };
+  }
+
+  it("edits the bot's and the owner's messages for the owner, never the person's", async () => {
+    const { fake, api, connection, person, sent, edit } = await answered();
+
+    const edited = await edit(sent.message_id);
+    expect(edited.result).toMatchObject({
+      message_id: sent.message_id,
+      text: "edited",
+      business_connection_id: connection.id,
+      edit_date: expect.any(Number),
+    });
+    const [latest] = await fake.getBusinessChat(connection.id, person);
+    expect(latest.message.text).toBe("edited");
+    const { message_id: owners } = await fake.sayInBusinessChat(
+      connection.id,
+      person,
+      "owner",
+      "by hand",
+    );
+    expect((await edit(owners)).ok).toBe(true);
+    const { message_id: theirs } = await fake.sayInBusinessChat(
+      connection.id,
+      person,
+      "person",
+      "hello?",
+    );
+    expect(await edit(theirs)).toMatchObject({
+      status: 400,
+      description: "Bad Request: MESSAGE_AUTHOR_REQUIRED",
+    });
+    expect(await edit(999)).toMatchObject({
+      status: 400,
+      description: "Bad Request: MESSAGE_ID_INVALID",
+    });
+    expect(
+      await api("editMessageCaption", {
+        business_connection_id: connection.id,
+        chat_id: person,
+        message_id: sent.message_id,
+        caption: "x",
+      }),
+    ).toMatchObject({ status: 404 });
+  });
+
+  it("edits the owner's own messages for 48 hours, in a chat with a message from the last 24", async () => {
+    const { fake, connection, person, sent, edit } = await answered();
+    const { message_id: owners } = await fake.sayInBusinessChat(
+      connection.id,
+      person,
+      "owner",
+      "by hand",
+    );
+
+    vi.useFakeTimers({ toFake: ["Date"], now: Date.now() + 49 * 3600_000 });
+    expect(await edit(sent.message_id, "late")).toMatchObject({
+      status: 400,
+      description: "Bad Request: BUSINESS_PEER_USAGE_MISSING",
+    });
+    await fake.sayInBusinessChat(
+      connection.id,
+      person,
+      "person",
+      "still there?",
+    );
+    expect(await edit(owners)).toMatchObject({
+      status: 400,
+      description: "Bad Request: MESSAGE_EDIT_TIME_EXPIRED",
+    });
+    expect((await edit(sent.message_id, "late")).ok).toBe(true);
+  });
+});
+
 describe("the owner's private chat", () => {
   it("lets the connected bot message the owner, and shows it in their chat", async () => {
     const { fake, api, owner } = await setup();
