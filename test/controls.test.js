@@ -883,11 +883,17 @@ it("answers Bot API calls at once while the updates they cause wait for a held w
       "chat_member",
       "my_chat_member",
       "message_reaction",
+      "poll",
     ],
     drop_pending_updates: true,
   };
   await api("setWebhook", hook);
   await api("setWebhook", hook, OTHER);
+  const poll = await api("sendPoll", {
+    chat_id: CHAT,
+    question: "Lunch?",
+    options: [{ text: "Yes" }, { text: "No" }],
+  });
   const reacted = await fake.post(CHAT, user, "react here");
   await fake.react(CHAT, reacted, user, "👍");
   holding = true;
@@ -925,6 +931,11 @@ it("answers Bot API calls at once while the updates they cause wait for a held w
           chat_id: CHAT,
           message_id: reacted,
           user_id: user,
+        }),
+      () =>
+        api("stopPoll", {
+          chat_id: CHAT,
+          message_id: poll.result.message_id,
         }),
       () => api("leaveChat", { chat_id: CHAT }),
     ];

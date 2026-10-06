@@ -242,9 +242,10 @@ describe("webhook delivery", () => {
         { "Content-Type": "application/json" },
         JSON.stringify({ method: "sendMessage", chat_id: user, text: "json" }),
       ],
+      // The content type is read in any case.
       [
         200,
-        { "Content-Type": "application/x-www-form-urlencoded" },
+        { "Content-Type": "Application/X-WWW-Form-Urlencoded" },
         `method=SendMessage&chat_id=${user}&text=form`,
       ],
       // Telegram asks for gzip and deflate, and reads either.

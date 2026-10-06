@@ -2181,7 +2181,7 @@ export async function startTestServer({
     const type = String(answer.headers["content-type"] ?? "");
     if (
       !answer.body.length ||
-      !/application\/json|application\/x-www-form-urlencoded|multipart\/form-data/.test(
+      !/application\/json|application\/x-www-form-urlencoded|multipart\/form-data/i.test(
         type,
       )
     )
@@ -3313,8 +3313,10 @@ export async function startTestServer({
         },
       });
     },
-    // The bot that stops its poll gets the closed poll as a poll update.
-    stopPoll: async (p, caller) => {
+    // The bot that stops its poll gets the closed poll as a poll update. The
+    // answer comes from TDLib's result, not after the update is delivered
+    // (telegram-bot-api TdOnStopPollCallback).
+    stopPoll: (p, caller) => {
       const chat = botChat(p.chat_id);
       const entry = chat.messages.get(Number(p.message_id));
       if (!entry || entry.deleted || !entry.message.poll) {
@@ -3337,7 +3339,7 @@ export async function startTestServer({
         media: _media,
         ...state
       } = entry.message.poll;
-      await emit("poll", structuredClone(state), { to: [caller] });
+      void emit("poll", structuredClone(state), { to: [caller] });
       return entry.message.poll;
     },
     forwardMessage: (p, caller) => {
