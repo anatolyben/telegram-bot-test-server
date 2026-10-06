@@ -196,7 +196,11 @@ The details a moderation bot depends on, each covered by a test:
 - **Editing.** Only the bot's own messages can be edited; an edit that changes nothing fails with
   `message is not modified`; an edit without `reply_markup` removes the inline keyboard, after which
   its buttons can no longer be pressed.
-- **Private chats.** The bot cannot message a user who has not written to it first (403).
+- **Private chats.** The bot cannot message a user who has not written to it first (403). The
+  exception is a join request: a bot that receives it may message its `user_chat_id` for five
+  minutes, until the request is approved or declined, as
+  [ChatJoinRequest](https://core.telegram.org/bots/api#chatjoinrequest) documents. The five
+  minutes follow the server's clock, so `advanceTime` can end them.
 - **Ephemeral messages.** A send with `ephemeral_message_parameters` (Bot API 10.2) returns a message
   with `receiver_user` and `ephemeral_message_id`. Unlike Telegram, which gives it `message_id` 0, it
   keeps an ordinary message id, so tests can find it in the chat and press its buttons. The

@@ -623,25 +623,50 @@ export async function startTestServer({
         nextMessageId: 1,
       });
     }
-    return privateChats.get(id);
+    const chat = privateChats.get(id);
+    // The user opened it, so it no longer depends on a join request.
+    delete chat.contactOnly;
+    return chat;
   }
 
   /**
    * The chat a Bot API call addresses. A bot cannot open a private chat: it
-   * can only write to users who have messaged it first, as on Telegram.
+   * can only write to users who have messaged it first, as on Telegram, or,
+   * for a send (`sender`), to someone whose join request it may answer.
    */
-  function botChat(chatId) {
+  function botChat(chatId, sender = null) {
     const id = Number(chatId);
     if (chats.has(id)) return chats.get(id);
     if (privateChats.has(id)) return privateChats.get(id);
     const user = users.get(id);
     if (user && !user.is_bot) {
+      if (sender && joinRequestContact(id, sender)) {
+        const chat = messageChat(id);
+        chat.contactOnly = true;
+        return chat;
+      }
       throw new TelegramError(
         403,
         "Forbidden: bot can't initiate conversation with a user",
       );
     }
     throw new TelegramError(400, "Bad Request: chat not found");
+  }
+
+  /**
+   * Whether the bot may message a user through ChatJoinRequest.user_chat_id:
+   * "for 5 minutes ... until the join request is processed", in a chat where
+   * it receives join requests.
+   */
+  function joinRequestContact(userId, record) {
+    return [...chats.values()].some((chat) => {
+      const request = chat.joinRequests.get(Number(userId));
+      return (
+        request != null &&
+        now() < request.date + 300 &&
+        receives(chat, record, "chat_join_request")
+      );
+    });
   }
 
   function requireUser(userId) {
@@ -795,9 +820,12 @@ export async function startTestServer({
     // A private chat here is with the first bot: users write only to it, and
     // no other bot may message someone who never wrote to that bot.
     if (chat.type === "private") {
+      if (joinRequestContact(chat.id, caller)) return;
       // A business connection gives its bot the owner's private chat
       // (BusinessConnection.user_chat_id).
-      if (caller.id !== bot.id && !chat.openTo?.has(caller.id)) {
+      if (
+        caller.id === bot.id ? chat.contactOnly : !chat.openTo?.has(caller.id)
+      ) {
         throw new TelegramError(
           403,
           "Forbidden: bot can't initiate conversation with a user",
@@ -2279,7 +2307,7 @@ export async function startTestServer({
       });
     },
     sendChatAction: (p, caller) => {
-      const chat = botChat(p.chat_id);
+      const chat = botChat(p.chat_id, caller);
       if (!CHAT_ACTIONS.has(p.action)) {
         throw new TelegramError(
           400,
@@ -2314,7 +2342,7 @@ export async function startTestServer({
           );
         }
       }
-      const chat = botChat(p.chat_id);
+      const chat = botChat(p.chat_id, caller);
       requireCanSend(chat, caller);
       // Telegram parses every InputMedia caption before issuing an album send.
       const prepared = items.map((item) => {
@@ -2669,7 +2697,7 @@ export async function startTestServer({
     // gives it message_id 0; here it keeps the chat's message id, so tests can
     // find and press it like any message, and reuses it as ephemeral_message_id.
     const receiverId = p.ephemeral_message_parameters?.receiver_user_id;
-    const chat = botChat(p.chat_id);
+    const chat = botChat(p.chat_id, caller);
     requireCanSend(chat, caller);
     requireTopic(chat, p.message_thread_id);
     const replyTo = replyTarget(chat, p);

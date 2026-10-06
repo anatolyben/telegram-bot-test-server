@@ -710,6 +710,49 @@ describe("reactions and join request queries", () => {
     expect((await fake.getMember(GROUP, applicant)).status).toBe("member");
   });
 
+  it("lets a bot message a join requester for five minutes, until the request is processed", async () => {
+    const fake = await startTestServer({
+      botToken: TOKEN,
+      chats: [{ id: GROUP, title: "Test Group", ownerId: OWNER }],
+      clock: { now: 1_800_000_000_000 },
+    });
+    cleanups.push(() => fake.stop());
+    const api = async (method, params) => {
+      const response = await fetch(`${fake.origin}/bot${TOKEN}/${method}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(params),
+      });
+      return { status: response.status, ...(await response.json()) };
+    };
+    const link = (
+      await api("createChatInviteLink", {
+        chat_id: GROUP,
+        creates_join_request: true,
+      })
+    ).result.invite_link;
+    const write = (userId) =>
+      api("sendMessage", { chat_id: userId, text: "Why do you want to join?" });
+    const refused = {
+      status: 403,
+      description: "Forbidden: bot can't initiate conversation with a user",
+    };
+
+    const ann = await fake.createUser();
+    await fake.joinByLink(link, ann);
+    expect((await write(ann)).ok).toBe(true);
+    await api("approveChatJoinRequest", { chat_id: GROUP, user_id: ann });
+    expect(await write(ann)).toMatchObject(refused);
+
+    const bob = await fake.createUser();
+    await fake.joinByLink(link, bob);
+    await fake.advanceTime(299_000);
+    expect((await write(bob)).ok).toBe(true);
+    await fake.advanceTime(1_000);
+    expect(await write(bob)).toMatchObject(refused);
+    expect(await fake.getDirectMessages(bob)).toHaveLength(1);
+  });
+
   it("reads a join request query's result trimmed and in any case, and checks it first", async () => {
     const { fake, api } = await setup();
     const guard = await fake.addBot({
