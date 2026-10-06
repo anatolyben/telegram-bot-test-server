@@ -108,7 +108,7 @@ export function createWaits() {
       for (const waiter of [...pending]) waiter.fail(new Error(reason));
     },
     wait(read, timeoutMs = 1000, describe = () => "exact fake state") {
-      if (stopped) return Promise.reject(new Error("Fake server stopped"));
+      if (stopped) return Promise.reject(new Error("Server stopped"));
       if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30000)
         return Promise.reject(new TypeError("timeoutMs must be 1-30000"));
       return new Promise((resolve, reject) => {
@@ -135,7 +135,7 @@ export function createWaits() {
             waiter.fail(
               Object.assign(
                 new Error(
-                  `Fake wait deadline ${timeoutMs}ms exceeded: ${describe()}`,
+                  `Wait deadline ${timeoutMs}ms exceeded: ${describe()}`,
                 ),
                 { timedOut: true },
               ),

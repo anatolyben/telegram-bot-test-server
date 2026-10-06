@@ -82,7 +82,7 @@ for (let round = -1; round < rounds; round++) {
       results.some(
         ({ value, error }) =>
           error ||
-          value.params.user_id !== user ||
+          value.params.user_id !== String(user) ||
           value.seq !== history + requests + 1 ||
           value.outcome !== "succeeded",
       )

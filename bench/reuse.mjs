@@ -40,8 +40,13 @@ async function exercise(user) {
   await api("banChatMember", { chat_id: chatId, user_id: user });
   if ((await fake.getMember(chatId, user)).status !== "kicked")
     throw new Error("Ban missing");
+  // A ban leaves the user's messages, as on Telegram; the bot deletes them itself.
+  const theirs = (await fake.getMessages(chatId))
+    .filter((m) => m.from?.id === user)
+    .map((m) => m.message_id);
+  await api("deleteMessages", { chat_id: chatId, message_ids: theirs });
   if ((await fake.getMessages(chatId)).some((m) => m.from?.id === user))
-    throw new Error("History not revoked");
+    throw new Error("History not deleted");
 }
 async function run(strategy) {
   const at = performance.now();

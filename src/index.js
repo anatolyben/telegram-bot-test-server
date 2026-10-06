@@ -1349,7 +1349,7 @@ export async function startTestServer({
     const id = Number(String(token).split(":")[0]);
     if (!Number.isSafeInteger(id) || !String(token).includes(":")) {
       throw new TypeError(
-        "Fake Telegram needs a bot token of the form <id>:<secret>",
+        "telegram-bot-test-server needs a bot token of the form <id>:<secret>",
       );
     }
     if (bots.has(token)) return bots.get(token);
@@ -6613,7 +6613,7 @@ export async function startTestServer({
       !condition ||
       !["message", "member", "joinRequest", "call"].includes(condition.kind)
     )
-      throw new TypeError("Unknown fake wait kind");
+      throw new TypeError("Unknown wait kind");
     if (condition.kind === "call") {
       if (
         !Number.isSafeInteger(condition.botId) ||
@@ -6708,7 +6708,7 @@ export async function startTestServer({
     ) {
       throw new TelegramError(
         409,
-        `Fake fixture is busy; outstanding ${JSON.stringify(work)}`,
+        `Fixture is busy; outstanding ${JSON.stringify(work)}`,
       );
     }
   }
@@ -6777,7 +6777,7 @@ export async function startTestServer({
       throw new TelegramError(404, "Unknown snapshot for this server");
     requireQuiescent();
     const state = structuredClone(snapshots.get(id));
-    waits.cancel("Fake fixture restored");
+    waits.cancel("Fixture restored");
     clock.clear();
     expiryTasks.clear();
     clock.restore(state.time);
@@ -6881,7 +6881,7 @@ export async function startTestServer({
       "deliveries",
     ].includes(parts[0]);
     if (stopped && method !== "GET")
-      throw new TelegramError(409, "Fake server stopped");
+      throw new TelegramError(409, "Server stopped");
     if (!managed) activeControls += 1;
     try {
       return await controlInner(method, parts, body);
@@ -7405,7 +7405,7 @@ export async function startTestServer({
     if (resource === "webhook" && method === "GET") return bot.webhook;
     throw new TelegramError(
       404,
-      `Unknown fake control ${method} /${parts.join("/")}`,
+      `Unknown control ${method} /${parts.join("/")}`,
     );
   }
 
@@ -9018,7 +9018,7 @@ ${buttons}
     stop: () =>
       (stopPromise ??= (async () => {
         stopped = true;
-        waits.cancel("Fake server stopped", true);
+        waits.cancel("Server stopped", true);
         for (const record of bots.values()) {
           wakePollers(record);
           closeAttempts(record, "cancelled");

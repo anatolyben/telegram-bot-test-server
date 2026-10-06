@@ -49,7 +49,8 @@ This timing improvement measures the fake helper and local HTTP receiver only.
 with one excluded warmup round. Each strategy runs 20 cases against the same
 0.10.0 implementation, dependencies and manual time. Fixtures contain 20 users,
 joins, inbound messages and formatted HTTP sends. Each case verifies a real
-HTTP ban, physical membership and exact author-history revocation. Restore also
+HTTP ban and physical membership. (Since 0.11.0 a ban keeps the user's messages,
+as on Telegram, so the case deletes them with `deleteMessages` and checks that.) Restore also
 verifies the member is admitted again before the next case. Initial fixture
 creation, snapshot capture/release and all teardown are included.
 
@@ -70,8 +71,8 @@ iterations. Raw samples:
 
 ## Second review: long histories and concurrent observers
 
-The comparison baseline is the preserved pre-review 0.10.0 candidate at
-`/tmp/fake-package-review-before-20261005/src/index.js`, not a different server.
+The comparison baseline is a preserved copy of the pre-review 0.10.0 candidate's
+`src/index.js`, not a different server.
 Both runs use `node --expose-gc bench/scaling.mjs`, the same Node/dependencies,
 one excluded warmup and ten measured rounds. Each fixture has 3,000 real HTTP
 getMe receipts, 1,000 inbound messages and 100 exact future ban-call observers.
@@ -208,9 +209,8 @@ BENCH_LOGIN=1 BENCH_ITERATIONS=10 npm run bench
 npm pack --dry-run --json
 ```
 
-Actual baseline test checkout for these runs:
-`/tmp/fake-package-baseline-384c837` (release archive, using the same installed
-dependencies). `npm test --prefix /tmp/fake-package-baseline-384c837` produced the
+The baseline test checkout for these runs was an archive of release commit
+`384c837`, using the same installed dependencies. `npm test` there produced the
 red result after copying the current owning controls and fidelity files plus the corrected startgroup
 fixture there. No original unique assertion was removed. The candidate ran
 `npm test` in the package repository. Benchmark raw JSON was emitted by
@@ -251,67 +251,13 @@ The fake remains a documented Telegram subset. Complete methods/parameters,
 rate limits, automatic Telegram retry policies and exact callback expiry timing
 are not claimed. The existing owner client remains a fixture model of its stated
 API subset. Supported formatting/membership contracts are referenced in the
-[README](../README.md#verification-and-upgrading); all new test controls are
+[README](../README.md#how-closely-it-matches-telegram); all new test controls are
 package design choices rather than Telegram platform guarantees. No downstream
-E2E acceleration was measured or claimed. The implementation and measurements did not change consumer files, production
-behavior, scenarios, runners or databases. The later release task updates only
-the ModerationOS dependency pin, its preserved patch and lockfile.
+E2E acceleration was measured or claimed.
 
 Changed package files: `src/index.js`, `src/owner.js`, `src/index.d.ts`, new
 `src/test-controls.js`; new `test/controls.test.js`, additions to
 `test/fidelity.test.js` and the corrected fixture in `test/groups.test.js`;
 `README.md`, this report, `bench/server.mjs`, `bench/reuse.mjs`,
-`bench/scaling.mjs`, the external observer `bench/downstream.mjs`, and eight raw result files. `package.json` sets version 0.10.0
+`bench/scaling.mjs`, and eight raw result files. `package.json` sets version 0.10.0
 and adds the bench command. No dependency or `pnpm-lock.yaml` change is required.
-
-## Downstream comparison stopped by task steering
-
-The owner removed all CAS scenarios from this task and then directed the work
-back to the already improved fake package. The downstream comparison was stopped;
-it does not establish downstream compatibility or acceleration. No CAS case ran,
-no candidate stack run or measured pair completed, and no ModerationOS source,
-scenario, runner or original dependency pin was changed.
-
-Preparation used two isolated archives of ModerationOS commit
-`df7ab6522bb21fa9bd4eb58f57f7f6cc7fd962a4`, Node v24.19.0, pnpm 11.22.0,
-identical non-fake dependency resolutions, headless Chromium, deterministic model
-fixtures and fresh disposable PostgreSQL/Redis. The actual installed baseline
-matched the original consumer's patched 0.9.2 source. The candidate's existing
-private-chat pinned-message patch was rebased without changing its behavior;
-four isolated HTTP patch assertions passed, zero failed/skipped. Installs and
-image downloads completed before timing. Original release commit:
-`384c837930236afc5b6d2d9fecd6076a64354008`.
-
-| Local package                | SHA-256 of packed tarball                                          |
-| ---------------------------- | ------------------------------------------------------------------ |
-| Baseline 0.9.2               | `bae5255c264287fb6b6fa8b9b6ace373bc971a0cee7ae48b406b8c568bb76ad7` |
-| Uncommitted 0.10.0 candidate | `0da6bf72913add9f0e0940d5a5546614d1dc948536ea901881d35ca3303fc03d` |
-
-The baseline warmup used this unchanged command:
-
-```sh
-node apps/telegram-manager/scripts/telegram-dashboard-stack-e2e.mjs --bot-defense
-```
-
-It confirmed all 56 native checkpoints and 13 of the 17 browser/interaction
-cases before interruption. BDT-11 was interrupted; BDT-12, BDU-05 and BDU-01 did
-not run. Thus 70 of 73 selected checkpoints were attempted, 69 passed, one was
-interrupted, and three remained unexecuted. The raw harness report records five
-FAIL rows: the interrupted case, three `not run` cases, and an additional segment
-settings-restore failure after shutdown. Those rows are retained; they are not
-converted to passes or claimed as demonstrated package defects. This command
-exited 143 after the explicit SIGTERM and took 2017.079 seconds (33m 37s),
-including its normal cleanup. An interrupted baseline warmup is not a comparable
-before/after performance measurement; speedup remains unmeasured.
-
-Full preparation metadata, source paths/hashes, patch-contract results and
-observer records remain in `/tmp/fake-telegram-downstream-20261005`. Existing
-runner logs, reports, JSON evidence and screenshots remain in
-`/tmp/modos-bot-dashboard-e2e-1791242341563-47638`. Native report timestamps are
-external log-receipt times, not per-case execution durations. Existing browser
-case durations are preserved in `appeals/results.json`.
-
-The runner closed its services and removed its exact owned containers. The
-observer confirmed zero remaining owned processes or containers and required no
-cleanup intervention. A final `docker ps` was empty; recorded process IDs,
-including the waiting observer, were absent. No task-owned service remains.

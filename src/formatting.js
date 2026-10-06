@@ -3,7 +3,7 @@
  * Markdown) turned into plain text plus MessageEntity objects, the text
  * cleaned and trimmed, and the entities Telegram finds by itself, all with
  * UTF-16 offsets as Telegram reports them. Supported contracts are documented
- * in README.md.
+ * in docs/telegram-behavior.md.
  */
 
 export class FormattingError extends Error {}

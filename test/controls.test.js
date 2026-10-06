@@ -480,14 +480,14 @@ it("answers failed HTTP waits, drains, clock advances and bad media as control e
 
   expect(await control("wait", { condition: { kind: "nope" } })).toEqual([
     400,
-    "Unknown fake wait kind",
+    "Unknown wait kind",
   ]);
   expect(
     await control("wait", { condition: { ...kicked, userId: 42 } }),
   ).toEqual([400, "Bad Request: user not found"]);
   expect(await control("wait", { condition: kicked, timeoutMs: 20 })).toEqual([
     408,
-    expect.stringContaining("Fake wait deadline 20ms exceeded"),
+    expect.stringContaining("Wait deadline 20ms exceeded"),
   ]);
   expect(await control("deliveries", { timeoutMs: 0 })).toEqual([
     400,
