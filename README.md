@@ -95,7 +95,7 @@ response happens after that, so wait for the outcome rather than checking it imm
 | `react(chatId, messageId, userId, emoji)`                                                                                             | The user reacts to a message, or takes the reaction back with `null`.                                                                                                       |
 | `pressButton(chatId, messageId, userId, data)`                                                                                        | The user presses an inline button; resolves with the bot's `answerCallbackQuery` answer.                                                                                    |
 | `postGuestBotReply(chatId, userId, botUsername, text)`                                                                                | The user calls a guest bot (Bot API 10.0 guest mode); its answer appears in the group from that bot, with `guest_bot_caller_user` set.                                      |
-| `sendDirectMessage(userId, text)`                                                                                                     | The user messages the bot privately.                                                                                                                                        |
+| `sendDirectMessage(userId, text)`                                                                                                     | The user messages the bot privately; empty text fails with `MESSAGE_EMPTY`.                                                                                                 |
 | `pressDirectButton(userId, messageId, data)`                                                                                          | The user presses a button in their private chat with the bot.                                                                                                               |
 | `getMessages(chatId)`, `getMessage(chatId, id)`                                                                                       | The chat's messages, and whether one was deleted.                                                                                                                           |
 | `getDirectMessages(userId)`                                                                                                           | The private chat between the user and the bot.                                                                                                                              |
@@ -201,8 +201,11 @@ The details a moderation bot depends on, each covered by a test:
 - **Callback queries.** Answering a query that was never sent fails.
 - **Invite links.** Exporting a new primary link revokes the previous one; joining through a
   revoked link fails.
-- **Entities.** Member messages and captions carry `bot_command`, `mention`, `email` and `url`
-  entities with UTF-16 offsets, in groups and in private chats.
+- **Entities.** Member messages and captions carry the entities Telegram finds by itself, found
+  the way TDLib finds them: `mention`, `bot_command` (anywhere it does not touch a letter, digit,
+  `_`, `/`, `<` or `>`), `hashtag`, `cashtag`, `url` and `email`, with UTF-16 offsets, in groups
+  and in private chats. A link without a protocol needs a common top-level domain, so `example.com` is a
+  link and `package.json` is not. Phone numbers are not marked.
 - **Media.** Sent photos, documents, videos, animations and stickers carry the fields the Bot API
   requires and resolve through `getFile`. `editMessageMedia` replaces a message's media with an
   upload (`attach://`) or a held `file_id`.
@@ -223,7 +226,9 @@ The details a moderation bot depends on, each covered by a test:
   `document` too), stickers, voice notes, audio, video notes and documents, each needing its own
   permission (`can_send_videos`, `can_send_voice_notes`, ...), plus albums sharing a
   `media_group_id` and forwards with `forward_origin` (a user, a hidden user or a channel post).
-  An edit by the author reaches bots as `edited_message` with `edit_date`.
+  An edit by the author reaches bots as `edited_message` with `edit_date`. A member's text and
+  captions are trimmed of spaces and newlines at both ends, as Telegram's apps send them, and a
+  post or private message whose text is then empty fails with `MESSAGE_EMPTY`.
 - **Reactions.** A member's reaction reaches the chat's administrator bots as `message_reaction`,
   only when they list it in `allowed_updates`, as on Telegram. A bot sets at most one reaction, and
   removes a member's with `deleteMessageReaction` and `can_delete_messages`.
@@ -529,10 +534,31 @@ A button press waits up to 10 seconds for the bot to call `answerCallbackQuery` 
 ## Formatting, replies and uploads
 
 Bot text and media captions support `parse_mode` (`HTML`, `MarkdownV2` and legacy
-`Markdown`) and explicit `entities` / `caption_entities`. The stored response has plain
-text and UTF-16 entity offsets. Formatting also applies to album captions, media edits
-and business text sends. Links, mentions and commands can be detected inside styles;
-code, pre and explicit links suppress overlapping automatic detection.
+`Markdown`) and explicit `entities` / `caption_entities`. As on Telegram, a `parse_mode`
+other than `none` wins and the explicit entities are ignored; `none` (in any letter case)
+sends the text as it is, and an unknown mode fails with `unsupported parse_mode`. The
+stored response has plain text and UTF-16 entity offsets. Formatting also applies to
+album captions, media edits and business text sends. Links, mentions, commands, hashtags
+and cashtags can be detected inside styles; code, pre and explicit links suppress
+overlapping automatic detection.
+
+Text is then kept the way Telegram keeps it. Control characters become spaces, `\r` is
+dropped, and spaces and newlines are cut from both ends (from the start only up to the
+first entity), with the entities moved to match. Text that is empty after that fails with
+`text must be non-empty`, and a caption that is only spaces is dropped. After parsing, text
+may have 4096 characters and a caption 1024, counted as Unicode code points, so an emoji
+counts once. Longer sends fail with `message is too long` or `message caption is too long`
+(also `editMessageMedia`); Telegram's server answers a longer `editMessageText` with
+`MESSAGE_TOO_LONG` and a longer `editMessageCaption` with `MEDIA_CAPTION_TOO_LONG`. Raw
+text over 32 KB fails before parsing with `text is too long`.
+
+`<tg-time unix="1647531900" format="wDT">…</tg-time>` in HTML and
+`![…](tg://time?unix=1647531900&format=wDT)` in MarkdownV2 make a `date_time` entity with
+`unix_time` and `date_time_format`, the format written back in Telegram's order (`w`, then
+`d` or `D`, then `t` or `T`, or `r`) and empty when none was given. A `text_mention`, from
+a `tg://user?id=` link or an explicit entity, carries the whole `User`; a user the server
+has never seen has only its id, `is_bot: false` and an empty `first_name`, as the Bot API
+server writes it.
 
 The contract cases cover malformed markup, crossed Markdown delimiters, invalid entity
 ranges (including surrogate-pair boundaries), style splitting around code, and overlapping

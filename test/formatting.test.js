@@ -170,15 +170,16 @@ describe("bot sends", () => {
       entities: [{ type: "bold", offset: 0, length: 3 }],
     });
 
-    const explicit = await api("sendMessage", {
+    // A parse_mode wins: Telegram ignores entities sent with it.
+    const both = await api("sendMessage", {
       chat_id: GROUP,
       text: "<b>raw</b>",
       parse_mode: "HTML",
       entities: [{ type: "italic", offset: 0, length: 3 }],
     });
-    expect(explicit.result).toMatchObject({
-      text: "<b>raw</b>",
-      entities: [{ type: "italic", offset: 0, length: 3 }],
+    expect(both.result).toMatchObject({
+      text: "raw",
+      entities: [{ type: "bold", offset: 0, length: 3 }],
     });
 
     expect(
@@ -200,7 +201,302 @@ describe("bot sends", () => {
       }),
     ).toMatchObject({
       status: 400,
+      description: "Bad Request: text must be non-empty",
+    });
+    expect(
+      await api("sendMessage", { chat_id: GROUP, text: "" }),
+    ).toMatchObject({
+      status: 400,
       description: "Bad Request: message text is empty",
+    });
+  });
+
+  it("takes parse_mode none as no parsing, and refuses an unknown mode without naming it", async () => {
+    const { api } = await setup();
+    const none = await api("sendMessage", {
+      chat_id: GROUP,
+      text: "<b>raw</b>",
+      parse_mode: "none",
+    });
+    expect(none.result.text).toBe("<b>raw</b>");
+    expect(none.result.entities).toBeUndefined();
+    // Explicit entities still apply with "none", in any letter case.
+    const withEntities = await api("sendMessage", {
+      chat_id: GROUP,
+      text: "<b>raw</b>",
+      parse_mode: "None",
+      entities: [{ type: "italic", offset: 0, length: 3 }],
+    });
+    expect(withEntities.result).toMatchObject({
+      text: "<b>raw</b>",
+      entities: [{ type: "italic", offset: 0, length: 3 }],
+    });
+    expect(
+      await api("sendMessage", {
+        chat_id: GROUP,
+        text: "x",
+        parse_mode: "Foo",
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: unsupported parse_mode",
+    });
+  });
+
+  it("refuses text over 4096 and captions over 1024 characters after parsing", async () => {
+    const { server, api } = await setup();
+    // Telegram counts characters, so an emoji (two UTF-16 units) counts once.
+    expect(
+      (await api("sendMessage", { chat_id: GROUP, text: "😀".repeat(4096) }))
+        .ok,
+    ).toBe(true);
+    expect(
+      (
+        await api("sendMessage", {
+          chat_id: GROUP,
+          text: `<b>${"x".repeat(4096)}</b>`,
+          parse_mode: "HTML",
+        })
+      ).ok,
+    ).toBe(true);
+    const photo = "https://example.com/a.jpg";
+    expect(
+      (
+        await api("sendPhoto", {
+          chat_id: GROUP,
+          photo,
+          caption: "y".repeat(1024),
+        })
+      ).ok,
+    ).toBe(true);
+    const before = await server.getMessages(GROUP);
+    for (const text of ["x".repeat(4097), `<b>${"x".repeat(4097)}</b>`]) {
+      expect(
+        await api("sendMessage", { chat_id: GROUP, text, parse_mode: "HTML" }),
+      ).toMatchObject({
+        status: 400,
+        description: "Bad Request: message is too long",
+      });
+    }
+    // The raw text is limited too, before any parsing.
+    expect(
+      await api("sendMessage", { chat_id: GROUP, text: "x".repeat(32769) }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: text is too long",
+    });
+    expect(
+      await api("sendPhoto", {
+        chat_id: GROUP,
+        photo,
+        caption: "y".repeat(1025),
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: message caption is too long",
+    });
+    expect(await server.getMessages(GROUP)).toEqual(before);
+  });
+
+  it("answers over-long edits with Telegram's errors", async () => {
+    const { api } = await setup();
+    const text = await api("sendMessage", { chat_id: GROUP, text: "short" });
+    expect(
+      await api("editMessageText", {
+        chat_id: GROUP,
+        message_id: text.result.message_id,
+        text: "x".repeat(4097),
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: MESSAGE_TOO_LONG",
+    });
+    const photo = await api("sendPhoto", {
+      chat_id: GROUP,
+      photo: "https://example.com/a.jpg",
+      caption: "short",
+    });
+    expect(
+      await api("editMessageCaption", {
+        chat_id: GROUP,
+        message_id: photo.result.message_id,
+        caption: "y".repeat(1025),
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: MEDIA_CAPTION_TOO_LONG",
+    });
+    expect(
+      await api("editMessageMedia", {
+        chat_id: GROUP,
+        message_id: photo.result.message_id,
+        media: {
+          type: "photo",
+          media: photo.result.photo[0].file_id,
+          caption: "y".repeat(1025),
+        },
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: message caption is too long",
+    });
+  });
+
+  it("trims spaces and newlines around text and captions, moving entities with the text", async () => {
+    const { api } = await setup();
+    const send = async (params) =>
+      (await api("sendMessage", { chat_id: GROUP, ...params })).result;
+    expect((await send({ text: "  hi  \n" })).text).toBe("hi");
+    expect(
+      await send({ text: "\n  <b>hi</b> there  ", parse_mode: "HTML" }),
+    ).toMatchObject({
+      text: "hi there",
+      entities: [{ type: "bold", offset: 0, length: 2 }],
+    });
+    // Nothing is cut before the first entity starts, and an entity ends with
+    // the text.
+    expect(
+      await send({
+        text: "  hi  ",
+        entities: [{ type: "bold", offset: 0, length: 6 }],
+      }),
+    ).toMatchObject({
+      text: "  hi",
+      entities: [{ type: "bold", offset: 0, length: 4 }],
+    });
+    // Control characters turn into spaces and \r is dropped first.
+    expect((await send({ text: "\ta\r\nb\tc\t" })).text).toBe("a\nb c");
+    expect(
+      await api("sendMessage", { chat_id: GROUP, text: " \n " }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: text must be non-empty",
+    });
+
+    const photo = "https://example.com/a.jpg";
+    const captioned = await api("sendPhoto", {
+      chat_id: GROUP,
+      photo,
+      caption: " <i>cap</i> \n",
+      parse_mode: "HTML",
+    });
+    expect(captioned.result).toMatchObject({
+      caption: "cap",
+      caption_entities: [{ type: "italic", offset: 0, length: 3 }],
+    });
+    const blank = await api("sendPhoto", {
+      chat_id: GROUP,
+      photo,
+      caption: "  ",
+    });
+    expect(blank.result.caption).toBeUndefined();
+  });
+
+  it("turns <tg-time> and tg://time links into date_time entities", async () => {
+    const { api } = await setup();
+    const send = (text, parse_mode) =>
+      api("sendMessage", { chat_id: GROUP, text, parse_mode });
+    expect(
+      (
+        await send(
+          '<tg-time unix="1647531900" format="wDT">22:45 tomorrow</tg-time>',
+          "HTML",
+        )
+      ).result.entities,
+    ).toEqual([
+      {
+        type: "date_time",
+        offset: 0,
+        length: 14,
+        unix_time: 1647531900,
+        date_time_format: "wDT",
+      },
+    ]);
+    // The format comes back in Telegram's order; without one it is empty.
+    expect(
+      (
+        await send(
+          "![22:45](tg://time?unix=1647531900&format=Tw) ![now](tg://time?unix=1647531900)",
+          "MarkdownV2",
+        )
+      ).result.entities,
+    ).toEqual([
+      {
+        type: "date_time",
+        offset: 0,
+        length: 5,
+        unix_time: 1647531900,
+        date_time_format: "wT",
+      },
+      {
+        type: "date_time",
+        offset: 6,
+        length: 3,
+        unix_time: 1647531900,
+        date_time_format: "",
+      },
+    ]);
+    expect(
+      await send(
+        '<tg-time unix="1647531900" format="x">22:45</tg-time>',
+        "HTML",
+      ),
+    ).toMatchObject({
+      status: 400,
+      description:
+        "Bad Request: can't parse entities: Invalid date format used",
+    });
+    expect(
+      await send("![22:45](tg://time?unix=0)", "MarkdownV2"),
+    ).toMatchObject({
+      status: 400,
+      description:
+        "Bad Request: can't parse entities: Invalid tg://emoji or tg://time URL specified",
+    });
+  });
+
+  it("gives a text_mention the whole mentioned user", async () => {
+    const { server, api } = await setup();
+    const ann = await server.createUser({
+      first_name: "Ann",
+      username: "ann_x",
+      language_code: "de",
+    });
+    const user = {
+      id: ann,
+      is_bot: false,
+      first_name: "Ann",
+      username: "ann_x",
+      language_code: "de",
+    };
+    const html = await api("sendMessage", {
+      chat_id: GROUP,
+      text: `<a href="tg://user?id=${ann}">Ann</a>`,
+      parse_mode: "HTML",
+    });
+    expect(html.result.entities).toEqual([
+      { type: "text_mention", offset: 0, length: 3, user },
+    ]);
+    const explicit = await api("sendMessage", {
+      chat_id: GROUP,
+      text: "Ann",
+      entities: [
+        { type: "text_mention", offset: 0, length: 3, user: { id: ann } },
+      ],
+    });
+    expect(explicit.result.entities).toEqual([
+      { type: "text_mention", offset: 0, length: 3, user },
+    ]);
+    // A user the bot has never seen has no name to show.
+    const unknown = await api("sendMessage", {
+      chat_id: GROUP,
+      text: '<a href="tg://user?id=42">x</a>',
+      parse_mode: "HTML",
+    });
+    expect(unknown.result.entities[0].user).toEqual({
+      id: 42,
+      is_bot: false,
+      first_name: "",
     });
   });
 

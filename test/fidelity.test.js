@@ -375,6 +375,30 @@ describe("messages and buttons", () => {
       ["url", "example.org"],
     ]);
   });
+
+  it("finds commands anywhere, hashtags and cashtags, and links only under a known domain", async () => {
+    const { server, member } = await setup();
+    const ann = await member();
+    await server.post(
+      GROUP,
+      ann,
+      "hi /help #news $USD +1-212-555-0123 see package.json or example.com, please /report@bot",
+    );
+
+    const [post] = await server.getMessages(GROUP);
+    expect(
+      post.entities.map((entity) => [
+        entity.type,
+        post.text.slice(entity.offset, entity.offset + entity.length),
+      ]),
+    ).toEqual([
+      ["bot_command", "/help"],
+      ["hashtag", "#news"],
+      ["cashtag", "$USD"],
+      ["url", "example.com"],
+      ["bot_command", "/report@bot"],
+    ]);
+  });
 });
 
 describe("guest bots", () => {
