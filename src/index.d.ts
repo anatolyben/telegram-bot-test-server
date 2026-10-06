@@ -577,6 +577,16 @@ export interface TelegramBotTestServer {
     data: string,
   ): Promise<ButtonAnswer>;
   /**
+   * The receiver of an ephemeral message presses one of its inline buttons;
+   * the message is named by its ephemeral_message_id (its message_id is 0).
+   */
+  pressEphemeralButton(
+    chatId: number,
+    ephemeralMessageId: number,
+    userId: number,
+    data: string,
+  ): Promise<ButtonAnswer>;
+  /**
    * A user calls a guest bot (Bot API 10.0 guest mode) that is not a member of
    * the chat; its answer appears in the chat from that bot, with
    * guest_bot_caller_user naming the caller. Returns the message_id.
@@ -595,11 +605,19 @@ export interface TelegramBotTestServer {
     messageId: number,
     data: string,
   ): Promise<ButtonAnswer>;
-  /** Messages not deleted, newest first. */
+  /**
+   * Messages not deleted, newest first, with ephemeral messages (message_id 0,
+   * receiver_user set) in the order they were sent.
+   */
   getMessages(chatId: number): Promise<Message[]>;
   getMessage(
     chatId: number,
     messageId: number,
+  ): Promise<{ exists: boolean; deleted: boolean; message?: Message }>;
+  /** An ephemeral message by its ephemeral_message_id. */
+  getEphemeralMessage(
+    chatId: number,
+    ephemeralMessageId: number,
   ): Promise<{ exists: boolean; deleted: boolean; message?: Message }>;
   /** The private chat's messages, newest first. */
   getDirectMessages(userId: number): Promise<Message[]>;

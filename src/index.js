@@ -104,6 +104,10 @@ function normalizePermissions(input = {}, independent = false) {
 }
 // How long a webhook may take to answer before the update is given up on.
 const WEBHOOK_TIMEOUT_MS = 10_000;
+// How long after a callback query a bot that is not an administrator may send
+// the user an ephemeral message.
+// https://core.telegram.org/bots/api#ephemeral-messages-and-commands
+const EPHEMERAL_REPLY_MS = 15_000;
 const OBJECT_PARAMS = new Set([
   "allowed_updates",
   "permissions",
@@ -520,6 +524,9 @@ export async function startTestServer({
   const callbackAnswers = new Map();
   // Callback queries awaiting an answer; any other id is refused.
   const openQueries = new Map();
+  // Callback queries sent to bots in the last 15 seconds, by id: a bot that is
+  // not an administrator may answer one with an ephemeral message.
+  const recentQueries = new Map();
   const calls = [];
   const rejectedRequests = [];
   const callIndex = new Map();
@@ -1228,6 +1235,7 @@ export async function startTestServer({
         [...chat.members].map(([id, member]) => [id, structuredClone(member)]),
       ),
       messages: new Map(),
+      ephemeral: new Map(),
       inviteLinks: new Map(),
       joinRequests: new Map(),
       pinned: [],
@@ -1302,6 +1310,35 @@ export async function startTestServer({
       ...fields,
     };
     chat.messages.set(message.message_id, { message, deleted: false });
+    appliedCheckpoint();
+    waits.notify();
+    return message;
+  }
+
+  /**
+   * An ephemeral message has message_id 0 and its own ephemeral_message_id in
+   * the chat (https://core.telegram.org/bots/api#message). It takes no chat
+   * message id, so only the editEphemeralMessage… and deleteEphemeralMessage
+   * methods reach it.
+   */
+  function addEphemeralMessage(chat, from, receiver, fields) {
+    chat.ephemeral ??= new Map();
+    chat.nextEphemeralMessageId ??= 1;
+    const message = {
+      message_id: 0,
+      ephemeral_message_id: chat.nextEphemeralMessageId++,
+      from: userObject(from),
+      receiver_user: userObject(receiver),
+      chat: chatObject(chat),
+      date: now(),
+      ...fields,
+    };
+    // `after` places it among the chat's messages when they are listed.
+    chat.ephemeral.set(message.ephemeral_message_id, {
+      message,
+      deleted: false,
+      after: chat.nextMessageId - 1,
+    });
     appliedCheckpoint();
     waits.notify();
     return message;
@@ -1722,67 +1759,25 @@ export async function startTestServer({
         },
       });
     },
-    editMessageText: (p, caller) => {
-      const formatted = textFields(p);
-      return editMessage(p, caller, (message) => {
-        message.text = formatted.text;
-        if (formatted.entities) message.entities = formatted.entities;
-        else delete message.entities;
-      });
-    },
+    editMessageText: (p, caller) => editMessage(p, caller, textEdit(p)),
     editMessageReplyMarkup: (p, caller) => editMessage(p, caller, () => {}),
-    editMessageCaption: (p, caller) => {
-      const formatted = captionFields(p);
-      return editMessage(p, caller, (message) => {
-        message.caption = formatted.caption ?? "";
-        if (formatted.caption_entities) {
-          message.caption_entities = formatted.caption_entities;
-        } else delete message.caption_entities;
-      });
-    },
-    // The new media is an upload attached as attach://<name>, or the file_id
-    // of a file this server holds.
-    editMessageMedia: (p, caller) => {
-      const input = p.media ?? {};
-      const type = input.type ?? "photo";
-      if (!MEDIA_KINDS.includes(type)) {
-        throw new TelegramError(400, "Bad Request: unsupported media type");
-      }
-      const reference =
-        typeof input.media === "string" && input.media.startsWith("attach://")
-          ? p[input.media.slice("attach://".length)]
-          : input.media;
-      if (
-        !Buffer.isBuffer(reference) &&
-        !(typeof reference === "string" && files.has(reference))
-      ) {
-        throw new TelegramError(
-          400,
-          "Bad Request: wrong file identifier/HTTP URL specified",
-        );
-      }
-      const file = sentFile(
-        reference,
-        `${type}s`,
-        type === "photo" ? "jpg" : "bin",
-      );
-      const formatted = captionFields(input);
-      return editMessage(p, caller, (message) => {
-        delete message.text;
-        delete message.entities;
-        for (const kind of MEDIA_KINDS) delete message[kind];
-        message[type] =
-          type === "photo"
-            ? photoSizes(file)
-            : {
-                file_id: file.file_id,
-                file_unique_id: file.file_unique_id,
-                file_size: file.size,
-              };
-        delete message.caption;
-        delete message.caption_entities;
-        Object.assign(message, formatted);
-      });
+    editMessageCaption: (p, caller) => editMessage(p, caller, captionEdit(p)),
+    editMessageMedia: (p, caller) => editMessage(p, caller, mediaEdit(p)),
+    // Ephemeral messages are edited and deleted by the bot that sent them,
+    // through their own methods, which return True.
+    editEphemeralMessageText: (p, caller) =>
+      editEphemeralMessage(p, caller, textEdit(p)),
+    editEphemeralMessageReplyMarkup: (p, caller) =>
+      editEphemeralMessage(p, caller, () => {}),
+    editEphemeralMessageCaption: (p, caller) =>
+      editEphemeralMessage(p, caller, captionEdit(p)),
+    editEphemeralMessageMedia: (p, caller) =>
+      editEphemeralMessage(p, caller, mediaEdit(p)),
+    deleteEphemeralMessage: (p, caller) => {
+      ownEphemeralMessage(p, caller).deleted = true;
+      appliedCheckpoint();
+      waits.notify();
+      return true;
     },
     // A poll may carry a photo, uploaded with it as attach://<name>.
     sendPoll: (p, caller) => {
@@ -2517,15 +2512,16 @@ export async function startTestServer({
     // Message.reply_markup only ever carries an inline keyboard; reply
     // keyboards and ForceReply are shown to the user, not echoed back.
     const markup = inlineMarkup(p.reply_markup);
-    // An ephemeral message (Bot API 10.2) is shown to one member only. Telegram
-    // gives it message_id 0; here it keeps the chat's message id, so tests can
-    // find and press it like any message, and reuses it as ephemeral_message_id.
-    const receiverId = p.ephemeral_message_parameters?.receiver_user_id;
+    const ephemeral = p.ephemeral_message_parameters;
     const chat = botChat(p.chat_id);
     requireCanSend(chat, caller);
     requireTopic(chat, p.message_thread_id);
+    const receiver =
+      ephemeral?.receiver_user_id != null
+        ? ephemeralReceiver(chat, caller, ephemeral)
+        : null;
     const replyTo = replyTarget(chat, p);
-    const message = addMessage(chat, caller, {
+    const content = {
       ...fields,
       ...(replyTo ? { reply_to_message: replyTo } : {}),
       ...(markup ? { reply_markup: markup } : {}),
@@ -2535,12 +2531,46 @@ export async function startTestServer({
             is_topic_message: true,
           }
         : {}),
-      ...(receiverId != null
-        ? { receiver_user: userObject(requireUser(receiverId)) }
-        : {}),
-    });
-    if (receiverId != null) message.ephemeral_message_id = message.message_id;
-    return message;
+    };
+    return receiver
+      ? addEphemeralMessage(chat, caller, receiver, content)
+      : addMessage(chat, caller, content);
+  }
+
+  /**
+   * The member an ephemeral message (Bot API 10.2) may go to: one who is not a
+   * bot, in a group or supergroup. A bot that administers the chat may send one
+   * at any time; any other bot only within 15 seconds of an eligible action,
+   * named by callback_query_id or reply_parameters.ephemeral_message_id
+   * (https://core.telegram.org/bots/api#ephemeral-messages-and-commands).
+   * Members cannot send ephemeral messages here, so only a callback query from
+   * the receiver in this chat qualifies.
+   * UNVERIFIED: Telegram does not document these errors.
+   */
+  function ephemeralReceiver(chat, caller, ephemeral) {
+    const receiver = requireUser(ephemeral.receiver_user_id);
+    if (!["group", "supergroup"].includes(chat.type)) {
+      throw new TelegramError(400, "Bad Request: PEER_ID_INVALID");
+    }
+    if (receiver.is_bot) {
+      throw new TelegramError(400, "Bad Request: USER_IS_BOT");
+    }
+    if (!isInChat(chat, receiver.id)) {
+      throw new TelegramError(400, "Bad Request: USER_NOT_PARTICIPANT");
+    }
+    if (memberStatus(chat, caller.id).status === "administrator") {
+      return receiver;
+    }
+    const query = recentQueries.get(String(ephemeral.callback_query_id ?? ""));
+    if (
+      query?.botId !== caller.id ||
+      query.chatId !== chat.id ||
+      query.userId !== receiver.id ||
+      clock.now() - query.at > EPHEMERAL_REPLY_MS
+    ) {
+      throw new TelegramError(400, "Bad Request: CHAT_ADMIN_REQUIRED");
+    }
+    return receiver;
   }
 
   /**
@@ -2922,12 +2952,7 @@ export async function startTestServer({
     if (entry.message.from.id !== caller.id) {
       throw new TelegramError(400, "Bad Request: message can't be edited");
     }
-    const previous = structuredClone(entry.message);
-    const edited = structuredClone(entry.message);
-    apply(edited);
-    const markup = inlineMarkup(p.reply_markup);
-    if (markup) edited.reply_markup = markup;
-    else delete edited.reply_markup;
+    const edited = editedMessage(entry.message, p, apply);
     const same = (message) =>
       JSON.stringify([
         message.text,
@@ -2937,17 +2962,139 @@ export async function startTestServer({
         message.reply_markup,
         ...MEDIA_KINDS.map((kind) => message[kind]),
       ]);
-    if (same(edited) === same(previous)) {
+    if (same(edited) === same(entry.message)) {
       throw new TelegramError(
         400,
         "Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message",
       );
     }
-    edited.edit_date = now();
     entry.message = edited;
     appliedCheckpoint();
     waits.notify();
     return edited;
+  }
+
+  /**
+   * Edit an ephemeral message the bot sent; the editEphemeralMessage… methods
+   * return True. UNVERIFIED: Telegram does not document whether an edit without
+   * reply_markup removes the keyboard, as a regular edit does, or whether one
+   * that changes nothing is refused; this server removes it and accepts the
+   * edit.
+   */
+  function editEphemeralMessage(p, caller, apply) {
+    const entry = ownEphemeralMessage(p, caller);
+    entry.message = editedMessage(entry.message, p, apply);
+    appliedCheckpoint();
+    waits.notify();
+    return true;
+  }
+
+  /** A copy of the message with the edit, reply_markup and edit_date applied. */
+  function editedMessage(message, p, apply) {
+    const edited = structuredClone(message);
+    apply(edited);
+    const markup = inlineMarkup(p.reply_markup);
+    if (markup) edited.reply_markup = markup;
+    else delete edited.reply_markup;
+    edited.edit_date = now();
+    return edited;
+  }
+
+  /**
+   * The ephemeral message chat_id, receiver_user_id and ephemeral_message_id
+   * name, sent by the calling bot. The Bot API server reads receiver_user_id
+   * before the chat (get_user_id in telegram-bot-api's Client.cpp).
+   * UNVERIFIED: Telegram does not document the error for a message that does
+   * not exist or was deleted.
+   */
+  function ownEphemeralMessage(p, caller) {
+    if (!(Number(p.receiver_user_id) > 0)) {
+      throw new TelegramError(
+        400,
+        "Bad Request: invalid receiver_user_id specified",
+      );
+    }
+    const entry = botChat(p.chat_id).ephemeral?.get(
+      Number(p.ephemeral_message_id),
+    );
+    if (
+      !entry ||
+      entry.deleted ||
+      entry.message.from.id !== caller.id ||
+      String(entry.message.receiver_user.id) !== String(p.receiver_user_id)
+    ) {
+      throw new TelegramError(400, "Bad Request: MESSAGE_ID_INVALID");
+    }
+    return entry;
+  }
+
+  /** The text edit of editMessageText and editEphemeralMessageText. */
+  function textEdit(p) {
+    const formatted = textFields(p);
+    return (message) => {
+      message.text = formatted.text;
+      if (formatted.entities) message.entities = formatted.entities;
+      else delete message.entities;
+    };
+  }
+
+  /** The caption edit of editMessageCaption and editEphemeralMessageCaption. */
+  function captionEdit(p) {
+    const formatted = captionFields(p);
+    return (message) => {
+      message.caption = formatted.caption ?? "";
+      if (formatted.caption_entities) {
+        message.caption_entities = formatted.caption_entities;
+      } else delete message.caption_entities;
+    };
+  }
+
+  /**
+   * The media edit of editMessageMedia and editEphemeralMessageMedia. The new
+   * media is an upload attached as attach://<name>, or the file_id of a file
+   * this server holds.
+   */
+  function mediaEdit(p) {
+    const input = p.media ?? {};
+    const type = input.type ?? "photo";
+    if (!MEDIA_KINDS.includes(type)) {
+      throw new TelegramError(400, "Bad Request: unsupported media type");
+    }
+    const reference =
+      typeof input.media === "string" && input.media.startsWith("attach://")
+        ? p[input.media.slice("attach://".length)]
+        : input.media;
+    if (
+      !Buffer.isBuffer(reference) &&
+      !(typeof reference === "string" && files.has(reference))
+    ) {
+      throw new TelegramError(
+        400,
+        "Bad Request: wrong file identifier/HTTP URL specified",
+      );
+    }
+    const file = sentFile(
+      reference,
+      `${type}s`,
+      type === "photo" ? "jpg" : "bin",
+    );
+    const formatted = captionFields(input);
+    return (message) => {
+      delete message.text;
+      delete message.entities;
+      for (const kind of MEDIA_KINDS) delete message[kind];
+      message[type] =
+        type === "photo"
+          ? photoSizes(file)
+          : {
+              file_id: file.file_id,
+              file_unique_id: file.file_unique_id,
+              file_size: file.size,
+            };
+      delete message.caption;
+      delete message.caption_entities;
+      Object.assign(message, formatted);
+    };
   }
 
   /** A group, forum or channel with its owner and no bot in it yet. */
@@ -3104,7 +3251,7 @@ export async function startTestServer({
     if (condition.kind === "message") {
       const entries =
         condition.messageId == null
-          ? [...chat.messages.values()]
+          ? [...chat.messages.values(), ...(chat.ephemeral?.values() ?? [])]
           : [chat.messages.get(condition.messageId)].filter(Boolean);
       const matching = entries.filter(
         (entry) =>
@@ -3293,6 +3440,7 @@ export async function startTestServer({
       files,
       callbackAnswers,
       openQueries,
+      recentQueries,
       calls,
       rejectedRequests,
       requestSequence,
@@ -3340,6 +3488,7 @@ export async function startTestServer({
       [files, state.files],
       [callbackAnswers, state.callbackAnswers],
       [openQueries, state.openQueries],
+      [recentQueries, state.recentQueries],
       [publicByUsername, state.publicByUsername],
       [joinDecisions, state.joinDecisions],
       [loginCodes, state.loginCodes],
@@ -3680,10 +3829,38 @@ export async function startTestServer({
       if (sub === "messages" && method === "POST" && !subId)
         return post(chat, body);
       if (sub === "messages" && method === "GET" && !subId) {
-        return [...chat.messages.values()]
+        // Ephemeral messages have message_id 0; each takes its place from the
+        // message sent just before it.
+        const order = (entry) => [
+          entry.message.message_id || entry.after,
+          entry.message.ephemeral_message_id ?? 0,
+        ];
+        return [...chat.messages.values(), ...(chat.ephemeral?.values() ?? [])]
           .filter((entry) => !entry.deleted)
-          .map((entry) => entry.message)
-          .sort((left, right) => right.message_id - left.message_id);
+          .sort((left, right) => {
+            const [a, b] = [order(left), order(right)];
+            return b[0] - a[0] || b[1] - a[1];
+          })
+          .map((entry) => entry.message);
+      }
+      if (sub === "ephemeral-messages" && subId) {
+        const entry = chat.ephemeral?.get(Number(subId));
+        if (method === "GET" && !parts[4]) {
+          return entry
+            ? { exists: true, deleted: entry.deleted, message: entry.message }
+            : { exists: false, deleted: false };
+        }
+        if (method === "POST" && parts[4] === "callback") {
+          // Only the receiver sees an ephemeral message.
+          const user = requireUser(body.user_id);
+          if (entry && entry.message.receiver_user.id !== user.id) {
+            throw new TelegramError(
+              400,
+              "Only the receiver of an ephemeral message can press its buttons",
+            );
+          }
+          return pressButton(chat, user, entry, body.data);
+        }
       }
       if (sub === "messages" && method === "GET" && subId) {
         const entry = chat.messages.get(Number(subId));
@@ -3767,7 +3944,12 @@ export async function startTestServer({
       }
       if (method === "POST" && subId && parts[4] === "callback") {
         if (!existing) throw new TelegramError(400, "MESSAGE_ID_INVALID");
-        return pressButton(existing, requireUser(id), Number(subId), body.data);
+        return pressButton(
+          existing,
+          requireUser(id),
+          existing.messages.get(Number(subId)),
+          body.data,
+        );
       }
       const chat = messageChat(id);
       if (method === "POST" && !subId) {
@@ -3812,7 +3994,13 @@ export async function startTestServer({
       parts[4] === "callback"
     ) {
       const user = requireUser(body.user_id);
-      return pressButton(requireChat(id), user, Number(subId), body.data);
+      const chat = requireChat(id);
+      return pressButton(
+        chat,
+        user,
+        chat.messages.get(Number(subId)),
+        body.data,
+      );
     }
     if (
       resource === "chats" &&
@@ -3914,8 +4102,7 @@ export async function startTestServer({
    * A member presses an inline button: Telegram sends the bot a callback_query
    * and waits for its answer, which it hands back to the member.
    */
-  async function pressButton(chat, user, messageId, data) {
-    const entry = chat.messages.get(messageId);
+  async function pressButton(chat, user, entry, data) {
     if (!entry || entry.deleted) {
       throw new TelegramError(400, "MESSAGE_ID_INVALID");
     }
@@ -3934,6 +4121,15 @@ export async function startTestServer({
       (record) => record.id === entry.message.from?.id,
     );
     openQueries.set(queryId, (sender ?? bot).id);
+    for (const [id, query] of recentQueries) {
+      if (clock.now() - query.at > EPHEMERAL_REPLY_MS) recentQueries.delete(id);
+    }
+    recentQueries.set(queryId, {
+      botId: (sender ?? bot).id,
+      chatId: chat.id,
+      userId: user.id,
+      at: clock.now(),
+    });
     await emit(
       "callback_query",
       {
@@ -5395,6 +5591,12 @@ ${buttons}
         user_id: userId,
         data,
       }),
+    pressEphemeralButton: (chatId, ephemeralMessageId, userId, data) =>
+      act(
+        "POST",
+        `chats/${chatId}/ephemeral-messages/${ephemeralMessageId}/callback`,
+        { user_id: userId, data },
+      ),
     sendDirectMessage: async (userId, text) =>
       (await act("POST", `users/${userId}/dm`, { text })).message_id,
     postGuestBotReply: async (chatId, callerUserId, botUsername, text) =>
@@ -5410,6 +5612,8 @@ ${buttons}
     getMessages: (chatId) => act("GET", `chats/${chatId}/messages`),
     getMessage: (chatId, messageId) =>
       act("GET", `chats/${chatId}/messages/${messageId}`),
+    getEphemeralMessage: (chatId, ephemeralMessageId) =>
+      act("GET", `chats/${chatId}/ephemeral-messages/${ephemeralMessageId}`),
     getDirectMessages: (userId) => act("GET", `users/${userId}/dm`),
     getMember: (chatId, userId) =>
       act("GET", `chats/${chatId}/members/${userId}`),

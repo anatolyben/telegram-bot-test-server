@@ -15,10 +15,11 @@ afterEach(async () => {
   while (cleanups.length) await cleanups.pop()();
 });
 
-async function setup() {
+async function setup(options = {}) {
   const server = await startTestServer({
     botToken: TOKEN,
     chats: [{ id: GROUP, title: "Test Group", ownerId: OWNER }],
+    ...options,
   });
   cleanups.push(() => server.stop());
   async function api(method, params = {}) {
@@ -374,6 +375,321 @@ describe("messages and buttons", () => {
       ["email", "ann@example.com"],
       ["url", "example.org"],
     ]);
+  });
+});
+
+describe("ephemeral messages", () => {
+  const button = { inline_keyboard: [[{ text: "OK", callback_data: "ok" }]] };
+
+  /** The first callback query waiting in the bot's getUpdates queue. */
+  async function callbackQuery(api) {
+    let query;
+    await expect
+      .poll(async () => {
+        const updates = (await api("getUpdates")).result;
+        query = updates.find((update) => update.callback_query)?.callback_query;
+        return query;
+      })
+      .toBeTruthy();
+    return query;
+  }
+
+  it("gives an ephemeral message message_id 0 and an ephemeral_message_id outside the chat's message ids", async () => {
+    const { server, api, member } = await setup();
+    const ann = await member();
+    const before = (await api("sendMessage", { chat_id: GROUP, text: "one" }))
+      .result;
+
+    const ephemeral = (
+      await api("sendMessage", {
+        chat_id: GROUP,
+        text: "only you",
+        ephemeral_message_parameters: { receiver_user_id: ann },
+      })
+    ).result;
+    const after = (await api("sendMessage", { chat_id: GROUP, text: "two" }))
+      .result;
+
+    expect(ephemeral).toMatchObject({
+      message_id: 0,
+      receiver_user: { id: ann },
+    });
+    expect(ephemeral.ephemeral_message_id).toBeGreaterThan(0);
+    expect(after.message_id).toBe(before.message_id + 1);
+    expect((await server.getMessages(GROUP)).slice(0, 3)).toEqual([
+      after,
+      ephemeral,
+      before,
+    ]);
+  });
+
+  it("refuses the regular edit and delete methods for an ephemeral message", async () => {
+    const { server, api, member } = await setup();
+    const ann = await member();
+    const sent = (
+      await api("sendMessage", {
+        chat_id: GROUP,
+        text: "only you",
+        ephemeral_message_parameters: { receiver_user_id: ann },
+      })
+    ).result;
+
+    expect(
+      await api("editMessageText", {
+        chat_id: GROUP,
+        message_id: sent.message_id,
+        text: "changed",
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: message to edit not found",
+    });
+    expect(
+      await api("deleteMessage", {
+        chat_id: GROUP,
+        message_id: sent.message_id,
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: message to delete not found",
+    });
+    expect(
+      await server.getEphemeralMessage(GROUP, sent.ephemeral_message_id),
+    ).toMatchObject({ deleted: false, message: { text: "only you" } });
+  });
+
+  it("edits the text and keyboard of an ephemeral message and deletes it through the ephemeral methods", async () => {
+    const { server, api, member } = await setup();
+    const ann = await member();
+    const bob = await member();
+    const id = (
+      await api("sendMessage", {
+        chat_id: GROUP,
+        text: "only you",
+        reply_markup: button,
+        ephemeral_message_parameters: { receiver_user_id: ann },
+      })
+    ).result.ephemeral_message_id;
+    const target = {
+      chat_id: GROUP,
+      receiver_user_id: ann,
+      ephemeral_message_id: id,
+    };
+
+    expect(
+      await api("editEphemeralMessageText", {
+        ...target,
+        text: "<b>done</b>",
+        parse_mode: "HTML",
+        reply_markup: button,
+      }),
+    ).toMatchObject({ ok: true, result: true });
+    expect((await server.getEphemeralMessage(GROUP, id)).message).toMatchObject(
+      {
+        message_id: 0,
+        text: "done",
+        entities: [{ type: "bold", offset: 0, length: 4 }],
+        reply_markup: button,
+        edit_date: expect.any(Number),
+      },
+    );
+    expect(await api("editEphemeralMessageReplyMarkup", target)).toMatchObject({
+      ok: true,
+      result: true,
+    });
+    expect(
+      (await server.getEphemeralMessage(GROUP, id)).message,
+    ).not.toHaveProperty("reply_markup");
+    expect(
+      await api("editEphemeralMessageText", {
+        ...target,
+        receiver_user_id: bob,
+        text: "not theirs",
+      }),
+    ).toMatchObject({ ok: false, status: 400 });
+    expect(
+      await api("deleteEphemeralMessage", {
+        chat_id: GROUP,
+        ephemeral_message_id: id,
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: invalid receiver_user_id specified",
+    });
+
+    expect(await api("deleteEphemeralMessage", target)).toMatchObject({
+      ok: true,
+      result: true,
+    });
+    expect(await server.getEphemeralMessage(GROUP, id)).toMatchObject({
+      exists: true,
+      deleted: true,
+    });
+    expect(await api("deleteEphemeralMessage", target)).toMatchObject({
+      ok: false,
+      status: 400,
+    });
+  });
+
+  it("edits the caption and media of an ephemeral message", async () => {
+    const { server, api, member } = await setup();
+    const ann = await member();
+    const id = (
+      await api("sendPhoto", {
+        chat_id: GROUP,
+        photo: "x",
+        caption: "old",
+        ephemeral_message_parameters: { receiver_user_id: ann },
+      })
+    ).result.ephemeral_message_id;
+    const target = {
+      chat_id: GROUP,
+      receiver_user_id: ann,
+      ephemeral_message_id: id,
+    };
+    const document = (
+      await api("sendDocument", { chat_id: GROUP, document: "y" })
+    ).result.document;
+
+    expect(
+      await api("editEphemeralMessageCaption", { ...target, caption: "new" }),
+    ).toMatchObject({ ok: true, result: true });
+    expect((await server.getEphemeralMessage(GROUP, id)).message).toMatchObject(
+      { caption: "new", photo: expect.any(Array) },
+    );
+    expect(
+      await api("editEphemeralMessageMedia", {
+        ...target,
+        media: { type: "document", media: document.file_id },
+      }),
+    ).toMatchObject({ ok: true, result: true });
+    const { message } = await server.getEphemeralMessage(GROUP, id);
+    expect(message).toMatchObject({
+      document: { file_id: document.file_id },
+    });
+    expect(message).not.toHaveProperty("photo");
+  });
+
+  it("sends the receiver's button press with the ephemeral message, which no one else can press", async () => {
+    const { server, api, member } = await setup();
+    const ann = await member();
+    const bob = await member();
+    const sent = (
+      await api("sendMessage", {
+        chat_id: GROUP,
+        text: "Verify",
+        reply_markup: button,
+        ephemeral_message_parameters: { receiver_user_id: ann },
+      })
+    ).result;
+
+    await expect(
+      server.pressEphemeralButton(GROUP, sent.ephemeral_message_id, bob, "ok"),
+    ).rejects.toThrow();
+    const press = server.pressEphemeralButton(
+      GROUP,
+      sent.ephemeral_message_id,
+      ann,
+      "ok",
+    );
+    const query = await callbackQuery(api);
+    await api("answerCallbackQuery", {
+      callback_query_id: query.id,
+      text: "thanks",
+    });
+
+    expect(await press).toMatchObject({ answered: true, text: "thanks" });
+    expect(query).toMatchObject({
+      from: { id: ann },
+      data: "ok",
+      message: {
+        message_id: 0,
+        ephemeral_message_id: sent.ephemeral_message_id,
+        receiver_user: { id: ann },
+      },
+    });
+  });
+
+  it("sends ephemeral messages only to non-bot members of a group or supergroup", async () => {
+    const { server, api, member } = await setup();
+    const ann = await member();
+    const stranger = await server.createUser();
+    await server.addBot({ token: "222:SECOND", username: "second_bot" });
+    await server.setBotMembership(GROUP, 222, { status: "member" });
+    await server.sendDirectMessage(ann, "hi");
+    const basic = await server.createChat({ type: "group", ownerId: OWNER });
+    await server.setBotMembership(basic, BOT, { status: "administrator" });
+    await server.join(basic, ann);
+    const channel = await server.createChat({
+      type: "channel",
+      ownerId: OWNER,
+    });
+    await server.setBotMembership(channel, BOT, { status: "administrator" });
+    const send = (chat, receiver) =>
+      api("sendMessage", {
+        chat_id: chat,
+        text: "psst",
+        ephemeral_message_parameters: { receiver_user_id: receiver },
+      });
+
+    expect(await send(basic, ann)).toMatchObject({ ok: true });
+    for (const [chat, receiver] of [
+      [ann, ann],
+      [channel, OWNER],
+      [GROUP, stranger],
+      [GROUP, 222],
+    ]) {
+      expect(await send(chat, receiver)).toMatchObject({
+        ok: false,
+        status: 400,
+      });
+    }
+  });
+
+  it("lets a bot that is not an administrator send one only within 15 seconds of the receiver's callback query", async () => {
+    const { server, api, member } = await setup({
+      clock: { now: 1_800_000_000_000 },
+    });
+    const ann = await member();
+    const bob = await member();
+    const prompt = (
+      await api("sendMessage", {
+        chat_id: GROUP,
+        text: "Verify",
+        reply_markup: button,
+      })
+    ).result;
+    await server.setBotMembership(GROUP, BOT, { status: "member" });
+    const send = (receiver, callbackQueryId) =>
+      api("sendMessage", {
+        chat_id: GROUP,
+        text: "verified",
+        ephemeral_message_parameters: {
+          receiver_user_id: receiver,
+          ...(callbackQueryId ? { callback_query_id: callbackQueryId } : {}),
+        },
+      });
+
+    expect(await send(ann)).toMatchObject({ ok: false, status: 400 });
+    const press = server.pressButton(GROUP, prompt.message_id, ann, "ok");
+    const query = await callbackQuery(api);
+    await api("answerCallbackQuery", { callback_query_id: query.id });
+    await press;
+    await server.advanceTime(15_000);
+
+    expect(await send(bob, query.id)).toMatchObject({
+      ok: false,
+      status: 400,
+    });
+    expect(await send(ann, query.id)).toMatchObject({
+      ok: true,
+      result: { receiver_user: { id: ann } },
+    });
+    await server.advanceTime(1);
+    expect(await send(ann, query.id)).toMatchObject({
+      ok: false,
+      status: 400,
+    });
   });
 });
 

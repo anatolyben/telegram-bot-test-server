@@ -94,10 +94,12 @@ response happens after that, so wait for the outcome rather than checking it imm
 | `editMessage(chatId, messageId, userId, { text, caption })`                                                                           | The author edits their message; bots get `edited_message`.                                                                                                                  |
 | `react(chatId, messageId, userId, emoji)`                                                                                             | The user reacts to a message, or takes the reaction back with `null`.                                                                                                       |
 | `pressButton(chatId, messageId, userId, data)`                                                                                        | The user presses an inline button; resolves with the bot's `answerCallbackQuery` answer.                                                                                    |
+| `pressEphemeralButton(chatId, ephemeralMessageId, userId, data)`                                                                      | The receiver presses an inline button on an ephemeral message; resolves like `pressButton`.                                                                                 |
 | `postGuestBotReply(chatId, userId, botUsername, text)`                                                                                | The user calls a guest bot (Bot API 10.0 guest mode); its answer appears in the group from that bot, with `guest_bot_caller_user` set.                                      |
 | `sendDirectMessage(userId, text)`                                                                                                     | The user messages the bot privately.                                                                                                                                        |
 | `pressDirectButton(userId, messageId, data)`                                                                                          | The user presses a button in their private chat with the bot.                                                                                                               |
-| `getMessages(chatId)`, `getMessage(chatId, id)`                                                                                       | The chat's messages, and whether one was deleted.                                                                                                                           |
+| `getMessages(chatId)`, `getMessage(chatId, id)`                                                                                       | The chat's messages, ephemeral ones included, and whether one was deleted.                                                                                                  |
+| `getEphemeralMessage(chatId, ephemeralMessageId)`                                                                                     | An ephemeral message by its `ephemeral_message_id`, and whether it was deleted.                                                                                             |
 | `getDirectMessages(userId)`                                                                                                           | The private chat between the user and the bot.                                                                                                                              |
 | `getMember(chatId, userId)`                                                                                                           | The member as `getChatMember` returns them: status, restrictions, ban.                                                                                                      |
 | `getJoinRequests(chatId)`                                                                                                             | User ids waiting for approval.                                                                                                                                              |
@@ -157,9 +159,11 @@ These read or change the server's state:
 `getChatAdministrators`, `getChatMemberCount`, `getUserProfilePhotos`, `getFile`, `sendMessage`,
 `sendPhoto`, `sendDocument`, `sendVideo`, `sendAnimation`, `sendSticker`, `sendPoll`, `stopPoll`,
 `forwardMessage`, `copyMessage`, `editMessageText`, `editMessageReplyMarkup`, `editMessageCaption`,
-`editMessageMedia`, `pinChatMessage`, `unpinChatMessage`, `unpinAllChatMessages`, `leaveChat`,
-`deleteMessage`, `deleteMessages`, `sendVoice`, `sendAudio`, `sendVideoNote`, `sendMediaGroup`,
-`sendLocation`, `sendVenue`, `sendContact`, `sendDice`, `sendChatAction`, `setMessageReaction`,
+`editMessageMedia`, `editEphemeralMessageText`, `editEphemeralMessageCaption`,
+`editEphemeralMessageMedia`, `editEphemeralMessageReplyMarkup`, `deleteEphemeralMessage`,
+`pinChatMessage`, `unpinChatMessage`, `unpinAllChatMessages`, `leaveChat`, `deleteMessage`,
+`deleteMessages`, `sendVoice`, `sendAudio`, `sendVideoNote`, `sendMediaGroup`, `sendLocation`,
+`sendVenue`, `sendContact`, `sendDice`, `sendChatAction`, `setMessageReaction`,
 `deleteMessageReaction`, `restrictChatMember`, `banChatMember`, `unbanChatMember`,
 `promoteChatMember`, `setChatAdministratorCustomTitle`, `setChatPermissions`, `setChatTitle`,
 `setChatDescription`, `setChatPhoto`, `deleteChatPhoto`, `approveChatJoinRequest`,
@@ -194,10 +198,21 @@ The details a moderation bot depends on, each covered by a test:
   `message is not modified`; an edit without `reply_markup` removes the inline keyboard, after which
   its buttons can no longer be pressed.
 - **Private chats.** The bot cannot message a user who has not written to it first (403).
-- **Ephemeral messages.** A send with `ephemeral_message_parameters` (Bot API 10.2) returns a message
-  with `receiver_user` and `ephemeral_message_id`. Unlike Telegram, which gives it `message_id` 0, it
-  keeps an ordinary message id, so tests can find it in the chat and press its buttons. The
-  `editEphemeralMessage…` and `deleteEphemeralMessage` methods are not modelled.
+- **Ephemeral messages** ([Bot API](https://core.telegram.org/bots/api#ephemeral-messages-and-commands)).
+  A send with `ephemeral_message_parameters` is shown to one member. It returns `message_id` 0,
+  `receiver_user` and an `ephemeral_message_id` of its own, and takes no message id from the chat.
+  The regular edit and delete methods cannot reach it; the `editEphemeralMessage…` methods and
+  `deleteEphemeralMessage` change it and return `true`. The receiver must be a member of the group or
+  supergroup and not a bot. A bot that administers the chat may send one at any time; any other bot
+  needs the `callback_query_id` of the receiver's button press in that chat, at most 15 seconds old.
+  Members cannot send ephemeral commands here, so `reply_parameters.ephemeral_message_id` never
+  qualifies. Unverified: Telegram does not document the errors (`PEER_ID_INVALID` outside groups,
+  `USER_IS_BOT`, `USER_NOT_PARTICIPANT`, `CHAT_ADMIN_REQUIRED` without an eligible action, and
+  `MESSAGE_ID_INVALID` for an unknown or deleted ephemeral message), or whether an ephemeral edit
+  without `reply_markup` removes the keyboard (it does here) and an edit that changes nothing fails
+  (it does not here). Tests see these messages in `getMessages`, with their receiver, and find one
+  by `ephemeral_message_id` with `getEphemeralMessage`; `pressEphemeralButton` presses its buttons as
+  the receiver. A `message` wait by author and exact text finds them too.
 - **Callback queries.** Answering a query that was never sent fails.
 - **Invite links.** Exporting a new primary link revokes the previous one; joining through a
   revoked link fails.
@@ -492,7 +507,9 @@ The test actions above, over HTTP, for tests written in other languages. All rou
 | `POST chats/:id/albums`                                | The user posts an album `{ user_id, items: [{ type: "photo" \| "video", base64, caption? }] }`; returns `{ media_group_id, message_ids }`.                                                                                                                               |
 | `POST chats/:id/messages/:messageId/edit`              | The author `{ user_id }` edits the `text` or `caption`.                                                                                                                                                                                                                  |
 | `POST chats/:id/messages/:messageId/reactions`         | The user `{ user_id, emoji }` reacts, or takes the reaction back with `emoji: null`.                                                                                                                                                                                     |
-| `GET chats/:id/messages`                               | Messages not deleted, newest first.                                                                                                                                                                                                                                      |
+| `GET chats/:id/messages`                               | Messages not deleted, newest first, ephemeral ones (`message_id` 0, with `receiver_user`) included in the order they were sent.                                                                                                                                          |
+| `GET chats/:id/ephemeral-messages/:eid`                | `{ exists, deleted, message }` for the ephemeral message with `ephemeral_message_id` `:eid`.                                                                                                                                                                             |
+| `POST chats/:id/ephemeral-messages/:eid/callback`      | Its receiver `{ user_id, data }` presses an inline button; returns the bot's answer.                                                                                                                                                                                     |
 | `GET chats/:id/messages/:messageId`                    | `{ exists, deleted, message, reactions }`, reactions by user id.                                                                                                                                                                                                         |
 | `POST chats/:id/messages/:messageId/callback`          | The user `{ user_id, data }` presses an inline button; returns the bot's answer.                                                                                                                                                                                         |
 | `GET chats/:id/members/:userId`                        | The member as `getChatMember` would return it.                                                                                                                                                                                                                           |
