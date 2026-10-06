@@ -425,6 +425,45 @@ it("cancels pending exact waits on restore and stop and exposes controls over HT
   await fake.stop();
   await stopCheck;
 });
+it("answers failed HTTP waits, drains, clock advances and bad media as control errors, not internal errors", async () => {
+  const lines = [];
+  const { fake, user } = await setup({ log: (line) => lines.push(line) });
+  const control = async (path, body) => {
+    const response = await fetch(`${fake.origin}/_fake/${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return [response.status, (await response.json()).error];
+  };
+  const kicked = {
+    kind: "member",
+    chatId: CHAT,
+    userId: user,
+    status: "kicked",
+  };
+
+  expect(await control("wait", { condition: { kind: "nope" } })).toEqual([
+    400,
+    "Unknown fake wait kind",
+  ]);
+  expect(await control("wait", { condition: kicked, timeoutMs: 20 })).toEqual([
+    408,
+    expect.stringContaining("Fake wait deadline 20ms exceeded"),
+  ]);
+  expect(await control("deliveries", { timeoutMs: 0 })).toEqual([
+    400,
+    "timeoutMs must be 1-30000",
+  ]);
+  expect(await control("clock", { ms: 5 })).toEqual([
+    409,
+    "advanceTime requires a manual clock",
+  ]);
+  expect(
+    await control(`chats/${CHAT}/messages`, { user_id: user, photo_base64: 5 }),
+  ).toEqual([400, "photo_base64 must be a base64 string"]);
+  expect(lines.filter((line) => line.startsWith("internal error"))).toEqual([]);
+});
 it("refuses callback answers from a different bot without consuming the legitimate query", async () => {
   const { fake, api, user } = await setup();
   const other = "987654:OTHER";

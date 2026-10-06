@@ -3824,10 +3824,24 @@ export async function startTestServer({
     }
   }
 
+  /**
+   * A failed wait, drain or clock advance over HTTP is a normal control
+   * answer, not a server failure: bad input (400), a deadline (408), or work
+   * that was cancelled or is not allowed (409).
+   */
+  function controlFailure(error) {
+    throw new TelegramError(
+      error instanceof TypeError ? 400 : error.timedOut ? 408 : 409,
+      error.message,
+    );
+  }
+
   async function controlInner(method, parts, body) {
     const [resource, id, sub, subId] = parts;
     if (resource === "wait" && method === "POST")
-      return waitFor(body.condition, { timeoutMs: body.timeoutMs });
+      return waitFor(body.condition, { timeoutMs: body.timeoutMs }).catch(
+        controlFailure,
+      );
     if (resource === "snapshots" && method === "POST") return snapshot();
     if (resource === "snapshots" && id && method === "DELETE") {
       if (!snapshots.delete(id))
@@ -3838,14 +3852,14 @@ export async function startTestServer({
       return restore(body.snapshot);
     if (resource === "clock" && method === "GET") return clock.state();
     if (resource === "clock" && method === "POST") {
-      const state = await clock.advance(body.ms);
+      const state = await clock.advance(body.ms).catch(controlFailure);
       waits.notify();
       return state;
     }
     if (resource === "deliveries" && method === "GET")
       return structuredClone(deliveryJournal);
     if (resource === "deliveries" && method === "POST")
-      return drainDeliveries(body);
+      return drainDeliveries(body).catch(controlFailure);
     if (resource === "owners") {
       try {
         return ownerModel.control(method, parts.slice(1), body);
@@ -4630,7 +4644,14 @@ export async function startTestServer({
     }
     const fields = {};
     if (type) {
-      const bytes = Buffer.from(photoBase64 ?? media.base64 ?? "", "base64");
+      const base64 = photoBase64 ?? media.base64 ?? "";
+      if (typeof base64 !== "string") {
+        throw new TelegramError(
+          400,
+          `${photoBase64 != null ? "photo_base64" : "media.base64"} must be a base64 string`,
+        );
+      }
+      const bytes = Buffer.from(base64, "base64");
       const file =
         type === "photo"
           ? registerPhoto(bytes)
