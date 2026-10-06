@@ -253,9 +253,10 @@ The details a moderation bot depends on, each covered by a test:
   supergroups.
   `setChatTitle`, `setChatDescription`, `setChatPhoto` and `deleteChatPhoto` need `can_change_info`,
   refuse a change that changes nothing, and post Telegram's service messages.
-- **Join request queries (Bot API 10.x).** A guard bot (`supportsJoinRequestQueries`) gets each join
-  request with a `query_id`, which it answers with `answerChatJoinRequestQuery`
-  (`chat_join_request_query_id`, `result`: `approve`, `decline` or `queue`, in any case).
+- **Join request queries (Bot API 10.x).** A guard bot (`supportsJoinRequestQueries`) with
+  `can_invite_users` gets each join request with a `query_id`, which it answers with
+  `answerChatJoinRequestQuery` (`chat_join_request_query_id`, `result`: `approve`, `decline` or
+  `queue`, in any case).
 - **Business connections** ([Bot API](https://core.telegram.org/bots/api#businessconnection),
   [connected business bots](https://core.telegram.org/api/bots/connected-business-bots)). An owner
   connects the bot to their account; the bot gets `business_connection` on every change, and
