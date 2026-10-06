@@ -1543,7 +1543,7 @@ export async function startTestServer({
   // the control API read any file on the host through the file download URL.
   function registerFile(bytes, folder, extension) {
     const data = bytes;
-    const fileId = `AgACAgQAAx0Cfake${randomBytes(9).toString("base64url")}`;
+    const fileId = `AgACAgQAAx0C${randomBytes(12).toString("base64url")}`;
     const uniqueId = fileUniqueId();
     const fileName = bytes.fileName;
     const mimeType =
@@ -2344,7 +2344,7 @@ export async function startTestServer({
     },
     createChatInviteLink: (p, caller) => {
       const chat = requireChat(p.chat_id);
-      const link = `https://t.me/+fake${randomBytes(9).toString("base64url")}`;
+      const link = `https://t.me/+${randomBytes(12).toString("base64url")}`;
       const invite = {
         invite_link: link,
         creator: userObject(caller),
@@ -3056,18 +3056,33 @@ export async function startTestServer({
   }
 
   /**
-   * The caller's connection with that id. Telegram names an unknown one
-   * BUSINESS_CONNECTION_INVALID (400) at the MTProto layer; the Bot API's
-   * exact wording is UNVERIFIED.
-   * https://core.telegram.org/method/messages.sendMessage
-   * https://core.telegram.org/api/bots/connected-business-bots
+   * The caller's connection with that id. The Bot API answers any failure
+   * to find one with "business connection not found" (telegram-bot-api
+   * TdOnCheckBusinessConnectionCallback).
    */
   function requireBusinessConnection(id, caller) {
     const connection = businessConnections.get(String(id ?? ""));
     if (!connection || connection.botId !== caller.id) {
-      throw new TelegramError(400, "Bad Request: BUSINESS_CONNECTION_INVALID");
+      throw new TelegramError(
+        400,
+        "Bad Request: business connection not found",
+      );
     }
     return connection;
+  }
+
+  /** A business send's chat_id, as Client::get_business_connection_chat_id reads it. */
+  function businessChatId(value) {
+    if (value == null || value === "") {
+      throw new TelegramError(400, "Bad Request: chat identifier is empty");
+    }
+    if (!/^-?\d+$/.test(String(value))) {
+      throw new TelegramError(
+        400,
+        "Bad Request: chat identifier must be a valid Integer",
+      );
+    }
+    return Number(value);
   }
 
   function businessChat(connection, userId) {
@@ -3121,6 +3136,8 @@ export async function startTestServer({
    * (https://core.telegram.org/method/messages.sendMessage).
    */
   function sendBusinessMessage(p, caller) {
+    const text = textFields(p);
+    const userId = businessChatId(p.chat_id);
     const connection = requireBusinessConnection(
       p.business_connection_id,
       caller,
@@ -3132,11 +3149,11 @@ export async function startTestServer({
     }
     // BOT_ACCESS_FORBIDDEN is Telegram's error for an operation a business
     // connection does not allow (connected-business-bots page); that a missing
-    // can_reply right produces it, with 403, is UNVERIFIED.
+    // can_reply right produces it is UNVERIFIED. The Bot API answers an
+    // upper-case 403 server error as a 400 (Client::fail_query_with_error).
     if (connection.rights.can_reply !== true) {
-      throw new TelegramError(403, "Forbidden: BOT_ACCESS_FORBIDDEN");
+      throw new TelegramError(400, "Bad Request: BOT_ACCESS_FORBIDDEN");
     }
-    const userId = Number(p.chat_id);
     requireUser(userId);
     const chat = businessChat(connection, userId);
     if (
@@ -3151,7 +3168,7 @@ export async function startTestServer({
       "bot",
       requireUser(connection.ownerId),
       {
-        ...textFields(p),
+        ...text,
         sender_business_bot: userObject(caller),
       },
     );
@@ -3180,9 +3197,7 @@ export async function startTestServer({
           ? requireBot(existing.botId)
           : bot;
     const connection = existing ?? {
-      id: String(
-        body.id ?? `fake-business-${randomBytes(9).toString("base64url")}`,
-      ),
+      id: String(body.id ?? randomBytes(12).toString("base64url")),
       ownerId,
       botId: record.id,
       date: now(),
@@ -4679,7 +4694,7 @@ export async function startTestServer({
   function requireLoginKey() {
     return (loginKey ??= generateKeyPairSync("rsa", { modulusLength: 2048 }));
   }
-  const loginKid = `fake-${randomBytes(6).toString("hex")}`;
+  const loginKid = randomBytes(8).toString("hex");
   const loginCodes = new Map();
   // `sub` is an opaque id, not the Telegram id (the documented example has a
   // different sub and id); it is stable for a user ("public" subject type).

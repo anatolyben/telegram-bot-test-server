@@ -459,6 +459,30 @@ describe("Bot API details", () => {
       ok: true,
     });
   });
+
+  it("gives file ids, invite links, business connections and login keys opaque identifiers", async () => {
+    const { server, api } = await setup();
+    const owner = await server.createUser();
+    const fileId = (await api("sendVideo", { chat_id: GROUP, video: "x" }))
+      .result.video.file_id;
+    const identifiers = [
+      fileId,
+      (await api("getFile", { file_id: fileId })).result.file_path,
+      (await api("createChatInviteLink", { chat_id: GROUP })).result
+        .invite_link,
+      (await api("exportChatInviteLink", { chat_id: GROUP })).result,
+      (await server.connectBusiness({ ownerId: owner, rights: {} })).connection
+        .id,
+      ...(
+        await (await fetch(`${server.origin}/.well-known/jwks.json`)).json()
+      ).keys.map((key) => key.kid),
+    ];
+
+    expect(identifiers).toHaveLength(6);
+    for (const identifier of identifiers) {
+      expect(identifier).not.toContain("fake");
+    }
+  });
 });
 
 describe("moderation physical state", () => {

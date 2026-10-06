@@ -164,7 +164,7 @@ describe("business connections", () => {
       await api("getBusinessConnection", { business_connection_id: "nope" }),
     ).toMatchObject({
       status: 400,
-      description: "Bad Request: BUSINESS_CONNECTION_INVALID",
+      description: "Bad Request: business connection not found",
     });
   });
 });
@@ -249,28 +249,37 @@ describe("answering in a business chat", () => {
     });
   });
 
-  it("refuses an unknown connection, a disabled one, and one without can_reply", async () => {
+  it("refuses an unknown connection, a bad chat, a disabled connection, and one without can_reply", async () => {
     const { fake, api, owner, connection, person } = await connected();
     await fake.sayInBusinessChat(connection.id, person, "person", "hi");
-    const send = (id = connection.id) =>
+    const send = (id = connection.id, chatId = person) =>
       api("sendMessage", {
         business_connection_id: id,
-        chat_id: person,
+        chat_id: chatId,
         text: "x",
       });
 
     expect(await send("unknown")).toMatchObject({
       status: 400,
-      description: "Bad Request: BUSINESS_CONNECTION_INVALID",
+      description: "Bad Request: business connection not found",
+    });
+    expect(await send(connection.id, "")).toMatchObject({
+      status: 400,
+      description: "Bad Request: chat identifier is empty",
+    });
+    expect(await send(connection.id, "@sam")).toMatchObject({
+      status: 400,
+      description: "Bad Request: chat identifier must be a valid Integer",
     });
     await fake.connectBusiness({
       id: connection.id,
       ownerId: owner,
       rights: {},
     });
+    // The Bot API turns a 403 with an upper-case server error into a 400.
     expect(await send()).toMatchObject({
-      status: 403,
-      description: "Forbidden: BOT_ACCESS_FORBIDDEN",
+      status: 400,
+      description: "Bad Request: BOT_ACCESS_FORBIDDEN",
     });
     await fake.connectBusiness({
       id: connection.id,
