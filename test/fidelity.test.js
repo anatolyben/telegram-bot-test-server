@@ -432,16 +432,11 @@ describe("Bot API details", () => {
 
 describe("moderation physical state", () => {
   it.each([true, "true", false, undefined])(
-    "revokes only the banned author's messages in a supergroup (revoke=%s)",
+    "bans in a supergroup without deleting the banned author's messages (revoke=%s)",
     async (revoke) => {
       const { server, api, member } = await setup();
-      const ann = await member(),
-        bob = await member();
-      const other = await server.createChat({ ownerId: OWNER, title: "Other" });
-      await server.join(other, ann);
-      const a = await server.post(GROUP, ann, "ann"),
-        b = await server.post(GROUP, bob, "bob");
-      const elsewhere = await server.post(other, ann, "elsewhere");
+      const ann = await member();
+      const a = await server.post(GROUP, ann, "ann");
       expect(
         await api("banChatMember", {
           chat_id: GROUP,
@@ -450,14 +445,11 @@ describe("moderation physical state", () => {
         }),
       ).toMatchObject({ ok: true });
       expect(await server.getMessage(GROUP, a)).toMatchObject({
-        deleted: true,
-      });
-      expect(await server.getMessage(GROUP, b)).toMatchObject({
         deleted: false,
       });
-      expect(await server.getMessage(other, elsewhere)).toMatchObject({
-        deleted: false,
-      });
+      expect(
+        await api("deleteMessage", { chat_id: GROUP, message_id: a }),
+      ).toMatchObject({ ok: true });
       expect(
         (await api("getChatMember", { chat_id: GROUP, user_id: ann })).result
           .status,
@@ -588,7 +580,7 @@ describe("moderation physical state", () => {
 });
 
 describe("documented moderation boundaries", () => {
-  it("honors form-encoded revocation in a basic group and ignores its ban deadline", async () => {
+  it("keeps messages after a form-encoded revocation in a basic group and ignores its ban deadline", async () => {
     const { server } = await setup();
     const group = await server.createChat({ type: "group", ownerId: OWNER });
     await server.setBotMembership(group, BOT, { status: "administrator" });
@@ -606,7 +598,7 @@ describe("documented moderation boundaries", () => {
     });
     expect(await response.json()).toMatchObject({ ok: true });
     expect(await server.getMessage(group, message)).toMatchObject({
-      deleted: true,
+      deleted: false,
     });
     expect(await server.getMember(group, ann)).toMatchObject({
       status: "kicked",

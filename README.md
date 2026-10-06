@@ -570,9 +570,10 @@ and MIME type when reused by `file_id` ([Document](https://core.telegram.org/bot
 
 ## Moderation fidelity and operation receipts
 
-Bans revoke only the target author's messages in the addressed chat. Revocation is
-mandatory in supergroups/channels; basic groups honor `revoke_messages`, including
-form-encoded `"true"`. `restrictChatMember` accepts supergroups only.
+A ban deletes no messages, as on Telegram: `revoke_messages` only decides what the
+removed user can still see, which this server does not model. A bot that wants a
+banned user's messages gone deletes them with `deleteMessage` or `deleteMessages`.
+`restrictChatMember` accepts supergroups only.
 Restrict/ban/unban require `can_restrict_members` and protect
 administrators; approval/decline require `can_invite_users` before touching pending
 requests. Pending requests are not members. Unban leaves a banned user outside;
@@ -798,8 +799,8 @@ that cost at first use; this is deferred work, not cheaper cryptography.
 
 The retained suites cover stored plain text versus original HTML/`parse_mode`,
 UTF-16 entities, literal user markup, emoji/nested/link/mention formatting,
-permissions and membership, join decisions, edit/delete, callbacks, mandatory
-supergroup ban revocation, mute history preservation, response-loss faults,
+permissions and membership, join decisions, edit/delete, callbacks, bans that
+leave messages in place, mute history preservation, response-loss faults,
 replay and bot/chat isolation. Contracts:
 [MessageEntity](https://core.telegram.org/bots/api#messageentity),
 [formatting](https://core.telegram.org/bots/api#formatting-options),

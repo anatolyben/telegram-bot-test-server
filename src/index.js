@@ -2017,14 +2017,8 @@ export async function startTestServer({
           ? restrictionUntil(p.until_date)
           : 0,
       });
-      if (
-        ["supergroup", "channel"].includes(chat.type) ||
-        isTrue(p.revoke_messages)
-      ) {
-        for (const entry of chat.messages.values()) {
-          if (Number(entry.message.from?.id) === userId) entry.deleted = true;
-        }
-      }
+      // revoke_messages decides what the removed user can still see; a ban
+      // deletes nothing for the chat's other members (only deleteMessage does).
       memberChanged(chat, userId, before, caller);
       return true;
     },
