@@ -302,7 +302,8 @@ The details a moderation bot depends on, each covered by a test:
   `has_protected_content`; it can't be forwarded, but the bot can still copy it. One item of an
   album is forwarded or copied without its `media_group_id`. A copy's `caption` replaces the
   original on media that takes one, formatted with `parse_mode` or `caption_entities`, and an empty
-  one removes it; a text message gets no caption.
+  one removes it; a text message gets no caption, so the 1024-character limit applies only to
+  media.
 - **Pins** ([unpinChatMessage](https://core.telegram.org/bots/api#unpinchatmessage)). Pinned
   messages are kept newest first by sending date. `getChat` returns the most recent one as
   `pinned_message`, in groups, channels and private chats, and `unpinChatMessage` without
@@ -706,9 +707,10 @@ first entity), with the entities moved to match. Text that is empty after that f
 `text must be non-empty`, and a caption that is only spaces is dropped. After parsing, text
 may have 4096 characters and a caption 1024, counted as Unicode code points, so an emoji
 counts once. Longer sends fail with `message is too long` or `message caption is too long`
-(also `editMessageMedia`); Telegram's server answers a longer `editMessageText` with
-`MESSAGE_TOO_LONG` and a longer `editMessageCaption` with `MEDIA_CAPTION_TOO_LONG`. Raw
-text over 32 KB fails before parsing with `text is too long`.
+(also `editMessageMedia` and copies of media); Telegram's server answers a longer
+`editMessageText` with `MESSAGE_TOO_LONG` and a longer `editMessageCaption` with
+`MEDIA_CAPTION_TOO_LONG`. The ephemeral edits give the same answers, though Telegram does not
+document them. Raw text over 32 KB fails before parsing with `text is too long`.
 
 `<tg-time unix="1647531900" format="wDT">…</tg-time>` in HTML and
 `![…](tg://time?unix=1647531900&format=wDT)` in MarkdownV2 make a `date_time` entity with

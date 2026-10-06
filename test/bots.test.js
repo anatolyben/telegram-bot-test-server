@@ -813,6 +813,23 @@ describe("polls, forwards and media", () => {
     expect(
       await copy(photo.result.message_id, { caption: "" }),
     ).not.toHaveProperty("caption");
+
+    // The 1024-character limit holds only where the caption is kept.
+    const long = "a".repeat(1025);
+    expect(
+      await copy(text.result.message_id, { caption: long }),
+    ).not.toHaveProperty("caption");
+    expect(
+      await api("copyMessage", {
+        chat_id: GROUP,
+        from_chat_id: GROUP,
+        message_id: photo.result.message_id,
+        caption: long,
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: message caption is too long",
+    });
   });
 
   it("forwards and copies one item of an album without its media_group_id", async () => {

@@ -2376,14 +2376,21 @@ export async function startTestServer({
     },
     // A caption given replaces the original's on media that takes one, and an
     // empty one removes it; a text message keeps no caption (TDLib
-    // dup_message_content). It is parsed first either way.
+    // dup_message_content). It is parsed first either way (get_caption in the
+    // Bot API server); only a kept caption must fit 1024 characters, which
+    // Telegram's server checks (MEDIA_CAPTION_TOO_LONG).
     copyMessage: (p, caller) => {
-      const caption = p.caption !== undefined ? captionFields(p) : null;
+      if (p.caption != null) {
+        formatOrFail(String(p.caption), p.parse_mode, p.caption_entities);
+      }
       const { content } = forwardable(p, caller, true);
-      if (caption && CAPTIONED_CONTENT.includes(contentType(content))) {
+      if (
+        p.caption !== undefined &&
+        CAPTIONED_CONTENT.includes(contentType(content))
+      ) {
         delete content.caption;
         delete content.caption_entities;
-        Object.assign(content, caption);
+        Object.assign(content, captionFields(p));
       }
       const copy = sendFrom(p, caller, content);
       return { message_id: copy.message_id };
