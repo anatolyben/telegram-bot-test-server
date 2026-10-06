@@ -1606,11 +1606,16 @@ export async function startTestServer({
     return pinned;
   }
 
-  /** Whether the user may post, given their own and the chat's permissions. */
+  /**
+   * Whether the user may post, given their own and the chat's permissions. A
+   * channel's subscribers have none: TDLib keeps no member permissions in a
+   * broadcast channel (RestrictedRights with ChannelType::Broadcast).
+   */
   function canPost(chat, userId, permission = "can_send_messages") {
     const member = memberStatus(chat, userId);
     if (!isInChat(chat, userId)) return false;
     if (["creator", "administrator"].includes(member.status)) return true;
+    if (chat.type === "channel") return false;
     if (
       member.status === "restricted" &&
       member.permissions[permission] !== true
@@ -3474,7 +3479,9 @@ export async function startTestServer({
         },
       });
     },
-    // The bot that stops its poll gets the closed poll as a poll update. The
+    // Bots get updates about the polls they stop and the polls they sent
+    // (https://core.telegram.org/bots/api#update), so the bot that stops a
+    // poll and the bot that sent it get the closed poll as a poll update. The
     // answer comes from TDLib's result, not after the update is delivered
     // (telegram-bot-api TdOnStopPollCallback).
     stopPoll: (p, caller) => {
@@ -3486,7 +3493,7 @@ export async function startTestServer({
           "Bad Request: message with poll to stop not found",
         );
       }
-      requireEditable(chat, entry, caller);
+      requireEditable(chat, entry, caller, "poll");
       if (entry.message.poll.is_closed) {
         throw new TelegramError(
           400,
@@ -3500,7 +3507,12 @@ export async function startTestServer({
         media: _media,
         ...state
       } = entry.message.poll;
-      void emit("poll", structuredClone(state), { to: [caller] });
+      const sender = [...bots.values()].find(
+        (record) => record.id === entry.author && record.id !== caller.id,
+      );
+      void emit("poll", structuredClone(state), {
+        to: sender ? [caller, sender] : [caller],
+      });
       return entry.message.poll;
     },
     forwardMessage: (p, caller) => {
@@ -5386,7 +5398,7 @@ export async function startTestServer({
    * MessagesManager::can_edit_message decides: its own messages, and in a
    * channel any post with can_edit_messages, but its own only while it has
    * can_post_messages. A media edit is refused with its own text
-   * (edit_message_media).
+   * (edit_message_media), and stopPoll ("poll") with get_message_poll_id's.
    */
   function requireEditable(chat, entry, caller, kind) {
     const own = entry.author === caller.id;
@@ -5396,12 +5408,13 @@ export async function startTestServer({
           (own && hasRight(chat, caller.id, "can_post_messages"))
         : own;
     if (!allowed) {
-      throw new TelegramError(
-        400,
+      const refusal =
         kind === "media"
-          ? "Bad Request: message media can't be edited"
-          : "Bad Request: message can't be edited",
-      );
+          ? "message media can't be edited"
+          : kind === "poll"
+            ? "poll can't be stopped"
+            : "message can't be edited";
+      throw new TelegramError(400, `Bad Request: ${refusal}`);
     }
   }
 
@@ -5488,6 +5501,8 @@ export async function startTestServer({
       );
     }
     entry.message = edited;
+    // Its buttons' presses now go to this bot (pressButton).
+    if (markup) entry.keyboardBot = caller.id;
     appliedCheckpoint();
     waits.notify();
     return edited;
@@ -6784,9 +6799,13 @@ export async function startTestServer({
       );
     }
     const queryId = randomBytes(8).readBigUInt64BE().toString();
-    // Only the bot that sent the message hears its buttons pressed.
+    // Only the bot that put the keyboard on the message hears its buttons
+    // pressed: the bot that sent it, or the bot whose edit last set it.
+    // UNVERIFIED: Telegram does not document which bot hears a press on a
+    // keyboard a bot put on someone else's message, such as a channel post
+    // edited with can_edit_messages.
     const sender = [...bots.values()].find(
-      (record) => record.id === entry.author,
+      (record) => record.id === (entry.keyboardBot ?? entry.author),
     );
     openQueries.set(queryId, (sender ?? bot).id);
     for (const [id, query] of recentQueries) {

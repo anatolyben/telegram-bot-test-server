@@ -615,7 +615,11 @@ export interface TelegramBotTestServer {
     userId: number,
     emoji: string | null,
   ): Promise<{ reactions: Record<string, string[]> }>;
-  /** The user presses an inline button under a message in a chat. */
+  /**
+   * The user presses an inline button under a message in a chat. The bot that
+   * put the keyboard on the message, by sending it or by the last edit that
+   * set the keyboard, gets the callback_query.
+   */
   pressButton(
     chatId: number,
     messageId: number,

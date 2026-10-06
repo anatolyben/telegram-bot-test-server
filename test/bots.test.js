@@ -333,6 +333,132 @@ describe("channels and rights", () => {
     }
   });
 
+  it("refuses a channel's subscribers changing its title or photo", async () => {
+    const { fake, api } = await setup();
+    const me = (await api("getMe")).result;
+    const channel = await fake.createChat({ type: "channel", ownerId: OWNER });
+    await fake.setBotMembership(channel, me.id, { status: "administrator" });
+    const subscriber = await fake.createUser();
+    await fake.join(channel, subscriber);
+
+    await expect(
+      fake.renameChat(channel, { by: subscriber, title: "Mine" }),
+    ).rejects.toThrow(/CHAT_ADMIN_REQUIRED/);
+    await expect(
+      fake.changeChatPhoto(channel, { by: subscriber, bytes: PHOTO }),
+    ).rejects.toThrow(/CHAT_ADMIN_REQUIRED/);
+  });
+
+  it("lets a bot delete its own channel post with can_post_messages alone", async () => {
+    const { fake, api } = await setup();
+    const me = (await api("getMe")).result;
+    const channel = await fake.createChat({ type: "channel", ownerId: OWNER });
+    await fake.setBotMembership(channel, me.id, {
+      status: "administrator",
+      rights: { can_post_messages: true, can_delete_messages: false },
+    });
+    const own = (await api("sendMessage", { chat_id: channel, text: "mine" }))
+      .result.message_id;
+    const owners = await fake.post(channel, OWNER, "the owner's");
+
+    expect(
+      await api("deleteMessage", { chat_id: channel, message_id: owners }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: message can't be deleted",
+    });
+    expect(
+      await api("deleteMessage", { chat_id: channel, message_id: own }),
+    ).toMatchObject({ ok: true, result: true });
+  });
+
+  it("sends a press on a channel post to the bot that put the keyboard there", async () => {
+    const { fake, api, second } = await setup();
+    const me = (await api("getMe")).result;
+    const first = await startReceiver();
+    const other = await startReceiver();
+    await api("setWebhook", { url: first.url });
+    await api("setWebhook", { url: other.url }, SECOND_TOKEN);
+    const channel = await fake.createChat({ type: "channel", ownerId: OWNER });
+    await fake.setBotMembership(channel, me.id, { status: "administrator" });
+    await fake.setBotMembership(channel, second.id, {
+      status: "administrator",
+      rights: { can_post_messages: true, can_edit_messages: true },
+    });
+    const keyboard = {
+      inline_keyboard: [[{ text: "Like", callback_data: "like" }]],
+    };
+    const sent = (
+      await api(
+        "sendMessage",
+        { chat_id: channel, text: "the bot's", reply_markup: keyboard },
+        SECOND_TOKEN,
+      )
+    ).result.message_id;
+    const owners = await fake.post(channel, OWNER, "the owner's");
+    await api(
+      "editMessageReplyMarkup",
+      { chat_id: channel, message_id: owners, reply_markup: keyboard },
+      SECOND_TOKEN,
+    );
+    const subscriber = await fake.createUser();
+    await fake.join(channel, subscriber);
+
+    for (const [index, messageId] of [sent, owners].entries()) {
+      const press = fake.pressButton(channel, messageId, subscriber, "like");
+      await expect
+        .poll(() => other.ofType("callback_query").length)
+        .toBe(index + 1);
+      await api(
+        "answerCallbackQuery",
+        { callback_query_id: other.ofType("callback_query")[index].id },
+        SECOND_TOKEN,
+      );
+      await press;
+    }
+    expect(
+      other.ofType("callback_query").map((query) => query.message.message_id),
+    ).toEqual([sent, owners]);
+    expect(first.ofType("callback_query")).toEqual([]);
+  });
+
+  it("tells the bot that sent a poll when another bot stops it", async () => {
+    const { fake, api, second } = await setup();
+    const me = (await api("getMe")).result;
+    const first = await startReceiver();
+    const other = await startReceiver();
+    await api("setWebhook", { url: first.url });
+    await api("setWebhook", { url: other.url }, SECOND_TOKEN);
+    const channel = await fake.createChat({ type: "channel", ownerId: OWNER });
+    await fake.setBotMembership(channel, me.id, { status: "administrator" });
+    await fake.setBotMembership(channel, second.id, {
+      status: "administrator",
+      rights: { can_edit_messages: true },
+    });
+    const poll = (
+      await api("sendPoll", {
+        chat_id: channel,
+        question: "Which?",
+        options: ["A", "B"],
+      })
+    ).result;
+
+    expect(
+      await api(
+        "stopPoll",
+        { chat_id: channel, message_id: poll.message_id },
+        SECOND_TOKEN,
+      ),
+    ).toMatchObject({ ok: true, result: { is_closed: true } });
+    for (const hook of [first, other]) {
+      await expect
+        .poll(() => hook.ofType("poll"))
+        .toEqual([
+          expect.objectContaining({ id: poll.poll.id, is_closed: true }),
+        ]);
+    }
+  });
+
   it("edits and stops others' channel posts with can_edit_messages, and its own only while it may post", async () => {
     const { fake, api } = await setup();
     const me = (await api("getMe")).result;
@@ -376,7 +502,10 @@ describe("channels and rights", () => {
     expect(await addButton(own)).toMatchObject(refused);
     expect(
       await api("stopPoll", { chat_id: channel, message_id: poll }),
-    ).toMatchObject(refused);
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: poll can't be stopped",
+    });
   });
 
   it("leaves default member permissions out of a channel's getChat", async () => {

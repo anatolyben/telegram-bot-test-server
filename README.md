@@ -225,10 +225,15 @@ The details a moderation bot depends on, each covered by a test:
   message in a channel comes from the channel: `sender_chat` is the channel and there is no `from`,
   both for what bots send and for what people post (channel signatures are not modelled). Bots get
   the channel's messages, service messages such as `new_chat_title` included, as `channel_post` and
-  their edits as `edited_channel_post`, never as `message`. Only the creator and administrators with
-  `can_post_messages` post; `post()` refuses anyone else with `CHAT_WRITE_FORBIDDEN`. A bot with
-  `can_edit_messages` edits any post and stops any poll; without it, only its own, and only while it
-  has `can_post_messages`.
+  their edits as `edited_channel_post`, never as `message`. Subscribers have no permissions: only the
+  creator and administrators with `can_post_messages` post, and only the creator and administrators
+  with `can_change_info` change the title or photo; `post()` refuses anyone else with
+  `CHAT_WRITE_FORBIDDEN`, and `renameChat` and `changeChatPhoto` with `CHAT_ADMIN_REQUIRED`. A bot
+  with `can_edit_messages` edits any post and stops any poll; without it, only its own, and only
+  while it has `can_post_messages`. A bot deletes its own posts with `can_post_messages` and anyone's
+  with `can_delete_messages`. A press on a post's button goes to the bot that put the keyboard
+  there, also when it added the keyboard to someone else's post by an edit (unverified: Telegram
+  does not document which bot gets that press).
 - **Private chats.** The bot cannot message a user who has not written to it first (403). The
   exception is a join request: a bot that receives it may message its `user_chat_id` for five
   minutes, until the request is approved or declined, as
@@ -341,9 +346,10 @@ The details a moderation bot depends on, each covered by a test:
   as `my_chat_member`, whether the owner or another bot changed it; the chat's administrator bots
   hear of it as `chat_member`. `can_be_edited` is true only for the bot that promoted that
   administrator, and `getChatAdministrators` leaves out other bots unless `return_bots` is set. Only
-  the bot that sent a message hears its buttons pressed. Users write privately only to the first
-  bot, so no other bot can message them (403), except a join requester: any bot that receives the
-  request may message them for five minutes, as under **Private chats**.
+  the bot that put a keyboard on a message, by sending the message or by the last edit that set the
+  keyboard, hears its buttons pressed. Users write privately only to the first bot, so no other bot
+  can message them (403), except a join requester: any bot that receives the request may message
+  them for five minutes, as under **Private chats**.
 - **Which chats a bot may use.** Checked once a method has read its other arguments, as
   Telegram's Bot API server does, so a malformed argument is reported first. A chat the bot was
   never in is `400 Bad Request: chat not found`. A bot kicked from a supergroup or channel gets
@@ -360,7 +366,9 @@ The details a moderation bot depends on, each covered by a test:
   polls, off for quizzes), `members_only` (channels only), `is_closed`, `description` and an
   attached photo, and gives each option a `persistent_id`. A quiz needs `correct_option_ids` (or
   the older `correct_option_id`), and the bot that sent it sees them in the poll. `stopPoll` closes
-  a poll once, and the bot then gets the closed poll as a `poll` update. Members do not vote.
+  a poll once; a poll in a message the bot can't edit fails with `poll can't be stopped`. The bot
+  that stopped it and the bot that sent it then get the closed poll as a `poll` update, as
+  [Update](https://core.telegram.org/bots/api#update) says. Members do not vote.
 - **Forwards and copies.** A forward carries `forward_origin`; a copy does not. A forward of a
   forward keeps the first origin and its date. A bot cannot forward from a chat it is not in; the
   source chat gets the checks above for a call that needs only read access, before the chat the
@@ -877,8 +885,8 @@ Uploaded documents preserve their original filename and MIME type when reused by
 
 - Inline mode, payments, games, sticker sets, reaction counts, votes in polls, or Telegram's exact
   rate limits: `floodControl` applies only its published numbers (a test can also make any call
-  fail with a 429 through `POST failures`). Channels have no subscribers and forum topics cannot be
-  closed or deleted.
+  fail with a 429 through `POST failures`). Channel signatures are not modelled, and forum topics
+  cannot be closed or deleted.
 - Expiry is evaluated on state access, without a scheduler or an automatic expiry webhook. Restarting loses all state; restart recovery belongs to the application under test.
 - In Telegram Login: the `phone` scope's `phone_number` (test users have no phone numbers), the
   ES256, EdDSA and ES256K signing options (only the default RS256), the redirect URLs registered
