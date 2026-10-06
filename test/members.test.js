@@ -408,6 +408,87 @@ describe("administrators and chat settings", () => {
       .toBeGreaterThanOrEqual(2);
   });
 
+  it("promotes with any one right, including welcome messages and tags", async () => {
+    const { fake, api, member, me } = await setup();
+    await fake.setBotMembership(GROUP, me.id, {
+      status: "administrator",
+      rights: {
+        can_promote_members: true,
+        can_send_welcome_messages: true,
+        can_manage_tags: true,
+      },
+    });
+    for (const right of ["can_send_welcome_messages", "can_manage_tags"]) {
+      expect(
+        (
+          await api("promoteChatMember", {
+            chat_id: GROUP,
+            user_id: member,
+            [right]: true,
+          })
+        ).result,
+      ).toBe(true);
+      expect(await fake.getMember(GROUP, member)).toMatchObject({
+        status: "administrator",
+        [right]: true,
+      });
+    }
+  });
+
+  it("gives each kind of chat its own administrator rights, and channel admins can_restrict_members by default", async () => {
+    const { fake, api, me } = await setup();
+    const channel = await fake.createChat({ type: "channel", ownerId: OWNER });
+    await fake.setBotMembership(channel, me.id, {
+      status: "administrator",
+      rights: { can_promote_members: true },
+    });
+    const reader = await fake.createUser();
+    await fake.join(channel, reader);
+    await api("promoteChatMember", {
+      chat_id: channel,
+      user_id: reader,
+      can_post_messages: true,
+    });
+    const shared = [
+      "user",
+      "status",
+      "can_be_edited",
+      "can_manage_chat",
+      "can_change_info",
+      "can_delete_messages",
+      "can_invite_users",
+      "can_restrict_members",
+      "can_promote_members",
+      "can_manage_video_chats",
+      "can_post_stories",
+      "can_edit_stories",
+      "can_delete_stories",
+      "can_send_welcome_messages",
+      "is_anonymous",
+    ];
+    const channelAdmin = await fake.getMember(channel, reader);
+    expect(channelAdmin).toMatchObject({
+      can_post_messages: true,
+      can_restrict_members: true,
+    });
+    expect(Object.keys(channelAdmin).sort()).toEqual(
+      [
+        ...shared,
+        "can_post_messages",
+        "can_edit_messages",
+        "can_manage_direct_messages",
+      ].sort(),
+    );
+    expect(Object.keys(await fake.getMember(GROUP, me.id)).sort()).toEqual(
+      [
+        ...shared,
+        "can_pin_messages",
+        "can_manage_topics",
+        "can_manage_tags",
+      ].sort(),
+    );
+  });
+
   it("changes a chat's title, description and photo with can_change_info", async () => {
     const { fake, api, upload, me } = await setup();
     const hook = await startReceiver();

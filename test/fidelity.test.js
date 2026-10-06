@@ -220,6 +220,29 @@ describe("moderation", () => {
     });
   });
 
+  it("defaults can_manage_topics to can_pin_messages, and reactions to the can_send_messages passed", async () => {
+    const { server, api, member } = await setup();
+    const ann = await member();
+
+    await api("setChatPermissions", {
+      chat_id: GROUP,
+      permissions: { can_send_messages: true, can_pin_messages: true },
+    });
+    expect(
+      (await api("getChat", { chat_id: GROUP })).result.permissions,
+    ).toMatchObject({ can_pin_messages: true, can_manage_topics: true });
+    await api("restrictChatMember", {
+      chat_id: GROUP,
+      user_id: ann,
+      permissions: { can_send_polls: true },
+    });
+    expect(await server.getMember(GROUP, ann)).toMatchObject({
+      can_send_polls: true,
+      can_send_messages: true,
+      can_react_to_messages: false,
+    });
+  });
+
   it("checks the photo permission separately from the text permission", async () => {
     const { server, api, member } = await setup();
     const ann = await member();

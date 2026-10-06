@@ -75,9 +75,12 @@ const NO_GIFTS = Object.freeze({
 });
 
 /**
- * A ChatPermissions object as Telegram applies it: unspecified fields are
- * false, and unless use_independent_chat_permissions is set, the broader
- * permissions imply the narrower ones.
+ * A ChatPermissions object as Telegram's Bot API server reads it
+ * (get_chat_permissions): unspecified fields are false, except that
+ * can_manage_topics and can_edit_tag follow can_pin_messages and
+ * can_react_to_messages follows can_send_messages as passed; then, unless
+ * use_independent_chat_permissions is set, the broader permissions imply the
+ * narrower ones.
  */
 function normalizePermissions(input = {}, independent = false) {
   if (input === null || typeof input !== "object" || Array.isArray(input)) {
@@ -90,16 +93,19 @@ function normalizePermissions(input = {}, independent = false) {
   const result = Object.fromEntries(
     PERMISSION_KEYS.map((key) => [key, given(key)]),
   );
+  if (!("can_manage_topics" in input)) {
+    result.can_manage_topics = result.can_pin_messages;
+  }
+  if (!("can_edit_tag" in input)) result.can_edit_tag = result.can_pin_messages;
+  if (!("can_react_to_messages" in input)) {
+    result.can_react_to_messages = result.can_send_messages;
+  }
   if (!(independent === true || independent === "true")) {
     if (result.can_send_other_messages || result.can_add_web_page_previews) {
       for (const key of MEDIA_PERMISSIONS) result[key] = true;
     }
     if (result.can_send_polls) result.can_send_messages = true;
   }
-  if (!("can_react_to_messages" in input)) {
-    result.can_react_to_messages = result.can_send_messages;
-  }
-  if (!("can_edit_tag" in input)) result.can_edit_tag = result.can_pin_messages;
   return result;
 }
 // How long a webhook may take to answer before the update is given up on.
@@ -121,24 +127,49 @@ const OBJECT_PARAMS = new Set([
   "reaction",
 ]);
 
-// The administrator rights promoteChatMember sets.
+// The administrator rights promoteChatMember sets, in the order Telegram's
+// Bot API server writes them (json_store_administrator_rights).
 const ADMIN_RIGHTS = Object.freeze([
-  "is_anonymous",
   "can_manage_chat",
-  "can_delete_messages",
-  "can_manage_video_chats",
-  "can_restrict_members",
-  "can_promote_members",
   "can_change_info",
+  "can_post_messages",
+  "can_edit_messages",
+  "can_delete_messages",
   "can_invite_users",
+  "can_restrict_members",
+  "can_pin_messages",
+  "can_manage_topics",
+  "can_promote_members",
+  "can_manage_video_chats",
   "can_post_stories",
   "can_edit_stories",
   "can_delete_stories",
+  "can_manage_direct_messages",
+  "can_manage_tags",
+  "can_send_welcome_messages",
+  "is_anonymous",
+]);
+// Rights an administrator object has only in some kinds of chat.
+const CHANNEL_ONLY_RIGHTS = Object.freeze([
   "can_post_messages",
   "can_edit_messages",
-  "can_pin_messages",
-  "can_manage_topics",
+  "can_manage_direct_messages",
 ]);
+const GROUP_ONLY_RIGHTS = Object.freeze([
+  "can_pin_messages",
+  "can_manage_tags",
+]);
+// What an administrator the owner appointed may do unless told otherwise.
+const OWNER_ADMIN_RIGHTS = Object.freeze({
+  can_manage_chat: true,
+  can_change_info: true,
+  can_post_messages: true,
+  can_edit_messages: true,
+  can_delete_messages: true,
+  can_invite_users: true,
+  can_restrict_members: true,
+  can_pin_messages: true,
+});
 
 const CHAT_ACTIONS = new Set([
   "typing",
@@ -669,45 +700,21 @@ export async function startTestServer({
     const user = requireUser(userId);
     const base = { user: userObject(user), status: member.status };
     if (member.status === "administrator") {
-      // A channel administrator posts and edits; a group administrator pins.
-      const rights =
+      // A channel administrator posts and edits; a group administrator pins,
+      // and only a supergroup has topics.
+      const granted = { ...OWNER_ADMIN_RIGHTS, ...(member.rights ?? {}) };
+      const rights = ADMIN_RIGHTS.filter((right) =>
         chat.type === "channel"
-          ? {
-              can_manage_chat: true,
-              can_delete_messages: true,
-              can_restrict_members: true,
-              can_promote_members: false,
-              can_change_info: true,
-              can_invite_users: true,
-              can_post_messages: true,
-              can_edit_messages: true,
-              can_post_stories: false,
-              can_edit_stories: false,
-              can_delete_stories: false,
-              can_manage_video_chats: false,
-            }
-          : {
-              can_manage_chat: true,
-              can_delete_messages: true,
-              can_restrict_members: true,
-              can_promote_members: false,
-              can_change_info: true,
-              can_invite_users: true,
-              can_pin_messages: true,
-              can_post_stories: false,
-              can_edit_stories: false,
-              can_delete_stories: false,
-              can_manage_video_chats: false,
-              can_manage_topics: false,
-              can_send_welcome_messages: false,
-            };
+          ? !GROUP_ONLY_RIGHTS.includes(right) && right !== "can_manage_topics"
+          : !CHANNEL_ONLY_RIGHTS.includes(right) &&
+            (right !== "can_manage_topics" || chat.type === "supergroup"),
+      );
       return {
         ...base,
         can_be_edited: viewer != null && member.promotedBy === viewer.id,
-        is_anonymous: false,
-        ...rights,
-        // Rights the owner granted or withheld when promoting.
-        ...(member.rights ?? {}),
+        ...Object.fromEntries(
+          rights.map((right) => [right, granted[right] === true]),
+        ),
         ...(member.customTitle ? { custom_title: member.customTitle } : {}),
       };
     }
@@ -1637,7 +1644,10 @@ export async function startTestServer({
           ...(pinned && !pinned.deleted
             ? { pinned_message: pinned.message }
             : {}),
-          permissions: { ...chat.permissions },
+          // Default member permissions are for groups and supergroups only.
+          ...(chat.type !== "channel"
+            ? { permissions: { ...chat.permissions } }
+            : {}),
           ...(chat.description ? { description: chat.description } : {}),
           ...(chat.photo
             ? {
@@ -2362,6 +2372,15 @@ export async function startTestServer({
       const rights = Object.fromEntries(
         ADMIN_RIGHTS.map((right) => [right, isTrue(p[right])]),
       );
+      // "For backward compatibility, defaults to True for promotions of
+      // channel administrators."
+      if (
+        chat.type === "channel" &&
+        Object.values(rights).some(Boolean) &&
+        p.can_restrict_members === undefined
+      ) {
+        rights.can_restrict_members = true;
+      }
       for (const [right, granted] of Object.entries(rights)) {
         if (
           granted &&

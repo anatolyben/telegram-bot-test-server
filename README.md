@@ -181,10 +181,13 @@ or multipart form data, as with Telegram.
 
 The details a moderation bot depends on, each covered by a test:
 
-- **Permissions.** Unspecified permissions are false, and unless `use_independent_chat_permissions`
-  is set, broader permissions imply narrower ones (`can_send_other_messages` implies media and text).
+- **Permissions.** Unspecified permissions are false, except that `can_manage_topics` and
+  `can_edit_tag` follow `can_pin_messages`, and `can_react_to_messages` follows `can_send_messages`
+  as passed. Then, unless `use_independent_chat_permissions` is set, broader permissions imply
+  narrower ones (`can_send_other_messages` implies media and text, `can_send_polls` implies text).
   A member needs both their own permission and the chat's default from `setChatPermissions` to post;
-  a photo needs `can_send_photos`, not only `can_send_messages`.
+  a photo needs `can_send_photos`, not only `can_send_messages`. `getChat` returns the default
+  `permissions` for groups and supergroups, not for channels.
 - **Restrictions stick.** A restricted user who leaves and rejoins is still restricted.
 - **Protected members.** Restricting or banning the chat owner, an administrator or the bot itself
   fails with Telegram's error.
@@ -237,7 +240,13 @@ The details a moderation bot depends on, each covered by a test:
   only when they list it in `allowed_updates`, as on Telegram. A bot sets at most one reaction, and
   removes a member's with `deleteMessageReaction` and `can_delete_messages`.
 - **Administrators and chat settings.** `promoteChatMember` needs `can_promote_members` and grants
-  only rights the bot holds; the bot can then edit and title the administrators it promoted.
+  only rights the bot holds; any one right makes an administrator, `can_send_welcome_messages`,
+  `can_manage_tags` and `can_manage_direct_messages` included, and a channel promotion grants
+  `can_restrict_members` unless the call says otherwise. The bot can then edit and title the
+  administrators it promoted. An administrator carries the rights its kind of chat has, as
+  Telegram writes them: `can_post_messages`, `can_edit_messages` and `can_manage_direct_messages`
+  in channels, `can_pin_messages` and `can_manage_tags` in groups, and `can_manage_topics` in
+  supergroups.
   `setChatTitle`, `setChatDescription`, `setChatPhoto` and `deleteChatPhoto` need `can_change_info`,
   refuse a change that changes nothing, and post Telegram's service messages.
 - **Join request queries (Bot API 10.x).** A guard bot (`supportsJoinRequestQueries`) gets each join

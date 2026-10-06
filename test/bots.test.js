@@ -195,6 +195,20 @@ describe("channels and rights", () => {
     expect(sent.result.chat).toMatchObject({ id: channel, type: "channel" });
   });
 
+  it("leaves default member permissions out of a channel's getChat", async () => {
+    const { fake, api } = await setup();
+    const me = (await api("getMe")).result;
+    const channel = await fake.createChat({ type: "channel", ownerId: OWNER });
+    await fake.setBotMembership(channel, me.id, { status: "administrator" });
+
+    const chat = (await api("getChat", { chat_id: channel })).result;
+    expect(chat.type).toBe("channel");
+    expect(chat.permissions).toBeUndefined();
+    expect(
+      (await api("getChat", { chat_id: GROUP })).result.permissions,
+    ).toBeDefined();
+  });
+
   it("pins with the right to, and shows the pinned message on getChat", async () => {
     const { fake, api } = await setup();
     const me = (await api("getMe")).result;
