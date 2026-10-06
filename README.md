@@ -213,12 +213,13 @@ The details a moderation bot depends on, each covered by a test:
   inline keyboard, after which its buttons can no longer be pressed. As in TDLib's
   [`can_edit_message`](https://github.com/tdlib/td/blob/master/td/telegram/MessagesManager.cpp),
   a forward, and a message sent with a reply keyboard, `remove_keyboard` or `force_reply`, can't be
-  edited (`message can't be edited`; `message media can't be edited` from `editMessageMedia`).
+  edited either. Editing a message the bot can't edit fails with `message can't be edited`, or
+  `message media can't be edited` from `editMessageMedia`.
   `editMessageText` needs a text message (`there is no text in the message to edit`), and
   `editMessageCaption` a photo, video, animation, audio, document or voice message
-  (`there is no caption in the message to edit`); `editMessageMedia` replaces a photo, video,
-  animation, audio, document or text. A sticker, video note, location, contact or dice only has its
-  inline keyboard changed. An empty caption is left out of the message.
+  (`there is no caption in the message to edit`); `editMessageMedia` replaces a photo, live photo,
+  video, animation, audio, document or text. A sticker, video note, location, contact or dice only
+  has its inline keyboard changed. An empty caption is left out of the message.
 - **Channels** ([Update](https://core.telegram.org/bots/api#update),
   [ChatAdministratorRights](https://core.telegram.org/bots/api#chatadministratorrights)). Every
   message in a channel comes from the channel: `sender_chat` is the channel and there is no `from`,
@@ -298,28 +299,40 @@ The details a moderation bot depends on, each covered by a test:
   notes carry the fields the Bot API requires and resolve through `getFile`. They keep what the
   sender says: a video's or animation's `width`, `height` and `duration`, a video note's `length`,
   an audio's `title` and `performer`, an uploaded sticker's `emoji`, capped as the Bot API caps
-  them (sizes at 10000, durations at a day). What the sender leaves out gets a stand-in (1280x720,
+  them (sizes at 10000, durations at a day). A video note's `length` over 640 then fails with
+  `wrong video note length`, as in TDLib. What the sender leaves out gets a stand-in (1280x720,
   one second). An animation also carries `document`. A photo has one size: its image's, read from
   a PNG, GIF or JPEG header and scaled down to fit 2560x2560, Telegram's largest, or 800x800 when
   the header cannot be read. Telegram also lists smaller sizes. A contact keeps its `vcard`. A
   location with `live_period` is a live location with its `heading` and `proximity_alert_radius`,
-  refused out of Telegram's ranges. `sendMediaGroup` sends up to 10 items as one album; a single
-  item is sent as an ordinary message, as TDLib does.
+  refused out of Telegram's ranges, and off the map with `invalid live location specified`.
+  `sendMediaGroup` sends up to 10 items as one album; a single item is sent as an ordinary
+  message, as TDLib does.
 - **Files** ([sending files](https://core.telegram.org/bots/api#sending-files)). Each bot gets its
   own opaque `file_id` for a file, and `file_unique_id` is the same for every bot. A bot can send
   again, `getFile` and download (with its own token) only the file_ids it was given. `getFile` on
   another bot's fails with `wrong file_id or the file is temporarily unavailable`, and sending it
-  with `wrong file identifier/HTTP URL specified`. A string that is not a file_id fails with TDLib's
-  reason, such as `wrong remote file identifier specified: can't unserialize it`. As in TDLib, any
-  string with a dot is an HTTP URL; this server does not fetch it and stores a one-byte file
-  instead. A file sent again keeps its kind: a photo cannot stand in for any other kind, nor any
-  other kind for a photo (`can't use file of type Photo as Document`), and a document, video or the
-  like sent by another method stays what it was. The control API shows messages with the first bot's
-  file_ids.
+  with `wrong file identifier/HTTP URL specified`, the Bot API's text for Telegram's `MEDIA_EMPTY`.
+  `editMessageMedia` with it fails with `MEDIA_EMPTY` itself, since only sends translate it
+  (unverified: Telegram does not document its answer to an edit). A send without its file, or with
+  an `attach://` name that has no upload, fails with `there is no photo in the request` (`video`,
+  `video note`, `voice` and so on). A string that is not a file_id fails with TDLib's reason, such
+  as `wrong remote file identifier specified: can't unserialize it`. As in TDLib, any string with a
+  dot is an HTTP URL, refused when TDLib cannot parse it, such as
+  `invalid file HTTP URL specified: Unsupported URL protocol` for anything but `http` and `https`;
+  this server does not fetch it and stores a one-byte file instead. A file sent again keeps its
+  kind: a photo cannot stand in for any other kind, nor any other kind for a photo
+  (`can't use file of type Photo as Document`), and a document, video or the like sent by another
+  method stays what it was; a live photo's video sent on its own is a video. `getFile`'s
+  `file_path` starts with the directory TDLib keeps that kind of file in, such as `photos/`,
+  `voice/` or `music/`. The control API shows messages with the first bot's file_ids.
 - **Editing media.** `editMessageMedia` turns a text, or a photo, live photo, video, animation,
   audio or document message, into any of these, from an upload (`attach://`), a `file_id` or a
-  URL. In an album, a photo or video becomes only a photo, live photo or video, and an audio or
-  document keeps its kind. Other messages' media cannot be edited.
+  URL. It reads the `InputMedia` before the message, in the Bot API's order: the caption's markup,
+  `type`, which is required, `media`, then whether the type can be edited to, each failing with
+  `can't parse InputMedia: …`. A document with `disable_content_type_detection` is a plain file, so
+  a photo is refused `as DocumentAsFile`. In an album, a photo or video becomes only a photo, live
+  photo or video, and an audio or document keeps its kind. Other messages' media cannot be edited.
 - **More than one bot.** Each bot has its own webhook or update queue and its own membership and
   rights in each chat. A bot posts only where it is a member (a channel needs `can_post_messages`),
   edits and stops only its own messages and polls (in a channel, others' too with
@@ -448,7 +461,10 @@ The details a moderation bot depends on, each covered by a test:
   whether bots get `my_chat_member` on the upgrade, which this server does not send.
 - **People changing the chat.** A person with `can_change_info` renames the chat or sets its photo,
   with the same `new_chat_title` and `new_chat_photo` service messages as `setChatTitle` and
-  `setChatPhoto`; `getChat` returns the title and a `ChatPhoto`, and `getFile` serves the photo.
+  `setChatPhoto`; `getChat` returns the title and a `ChatPhoto`. Its small and big photos, like
+  those of a user's `ChatPhoto`, are files of their own, apart from the `new_chat_photo` sizes:
+  `getFile` serves them under `profile_photos/`, and no send takes them
+  (`can't use file of type ChatPhoto as Photo`).
 - **Forum topics.** In a forum, a send to a `message_thread_id` that is not a topic fails with
   `message thread not found`. A member's message in a topic that answers nothing replies to the
   topic's creation message, as on Telegram.

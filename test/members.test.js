@@ -362,15 +362,25 @@ describe("more send methods", () => {
         })
       ).animation,
     ).toMatchObject({ width: 100, height: 50, duration: 9 });
-    expect(
-      (
-        await send("sendVideoNote", {
-          video_note: BYTES,
-          length: "360",
-          duration: "5",
-        })
-      ).video_note,
-    ).toMatchObject({ length: 360, duration: 5 });
+    const { video_note: videoNote } = await send("sendVideoNote", {
+      video_note: BYTES,
+      length: "360",
+      duration: "5",
+    });
+    expect(videoNote).toMatchObject({ length: 360, duration: 5 });
+    // TDLib takes a video note at most 640 wide, also one sent again.
+    for (const video_note of [BYTES, videoNote.file_id]) {
+      expect(
+        await upload("sendVideoNote", {
+          chat_id: String(GROUP),
+          video_note,
+          length: "641",
+        }),
+      ).toMatchObject({
+        status: 400,
+        description: "Bad Request: wrong video note length",
+      });
+    }
     expect(
       (
         await send("sendAudio", {
@@ -415,7 +425,7 @@ describe("more send methods", () => {
     });
   });
 
-  it("refuses a live location's period, heading or alert radius out of range", async () => {
+  it("refuses a live location off the map, or its period, heading or alert radius out of range", async () => {
     const { api } = await setup();
     const live = (fields) =>
       api("sendLocation", {
@@ -426,6 +436,10 @@ describe("more send methods", () => {
         ...fields,
       });
 
+    expect(await live({ latitude: 100 })).toMatchObject({
+      status: 400,
+      description: "Bad Request: invalid live location specified",
+    });
     expect(await live({ live_period: 30 })).toMatchObject({
       status: 400,
       description: "Bad Request: wrong live location period specified",
@@ -517,6 +531,10 @@ describe("more send methods", () => {
       [
         [{ type: "audio", media: "attach://one" }, photo],
         "Bad Request: audio can't be mixed with other media types",
+      ],
+      [
+        [photo, { type: "photo", media: "attach://missing" }],
+        "Bad Request: can't parse InputMedia: media not found",
       ],
     ]) {
       expect(

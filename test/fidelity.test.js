@@ -1338,7 +1338,7 @@ describe("Bot API details", () => {
     }
   });
 
-  it("refuses a file_id string it cannot read, with TDLib's reason", async () => {
+  it("refuses a file_id or HTTP URL it cannot read, with TDLib's reason", async () => {
     const { api } = await setup();
     const reasons = {
       "not-a-real-file-id":
@@ -1348,6 +1348,13 @@ describe("Bot API details", () => {
       AAAA: "wrong remote file identifier specified: can't unserialize it. Wrong last symbol",
       AAAE: "wrong remote file identifier specified: can't unserialize it",
       AP8E: "invalid remote file identifier",
+      "ftp://example.com/a.jpg":
+        "invalid file HTTP URL specified: Unsupported URL protocol",
+      "https://example.com:99999/a.jpg":
+        "invalid file HTTP URL specified: Wrong port number specified in the URL",
+      "https:///a.jpg": "invalid file HTTP URL specified: URL host is empty",
+      "https://exa mple.com/a.jpg":
+        "invalid file HTTP URL specified: Disallowed character in URL host",
     };
 
     for (const [photo, reason] of Object.entries(reasons)) {

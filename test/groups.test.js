@@ -421,6 +421,34 @@ describe("people changing the chat", () => {
     expect(Buffer.from(await download.arrayBuffer())).toEqual(PHOTO);
   });
 
+  it("gives getChat's photo a ChatPhoto file of its own, which no send takes", async () => {
+    const { fake, api, me } = await setup();
+    const group = await fake.createChat({ ownerId: OWNER });
+    await fake.setBotMembership(group, me.id, { status: "member" });
+    await fake.changeChatPhoto(group, { by: OWNER, bytes: PHOTO });
+    await fake.addProfilePhoto(OWNER, PHOTO);
+    const chatPhoto = (await api("getChat", { chat_id: group })).result.photo;
+    const ownerPhoto = (await api("getChat", { chat_id: OWNER })).result.photo;
+
+    for (const photo of [chatPhoto.big_file_id, ownerPhoto.small_file_id]) {
+      expect(await api("sendPhoto", { chat_id: group, photo })).toMatchObject({
+        status: 400,
+        description: "Bad Request: can't use file of type ChatPhoto as Photo",
+      });
+    }
+    expect(
+      await api("sendDocument", {
+        chat_id: group,
+        document: chatPhoto.big_file_id,
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: can't use file of type ChatPhoto as Document",
+    });
+    const file = await api("getFile", { file_id: chatPhoto.big_file_id });
+    expect(file.result.file_path).toMatch(/^profile_photos\//);
+  });
+
   it("refuses someone without can_change_info", async () => {
     const { fake, api, me } = await setup();
     const group = await fake.createChat({ ownerId: OWNER });

@@ -263,7 +263,7 @@ const REACTION_EMOJI = new Set(
 );
 
 // What a member can post besides text and photos: the permission it needs,
-// the file's folder and extension, and whether it takes a caption.
+// the file's extension, and whether it takes a caption.
 const MEMBER_MEDIA = Object.freeze({
   video: { permission: "can_send_videos", ext: "mp4", caption: true },
   animation: {
@@ -289,19 +289,25 @@ const MEDIA_KINDS = Object.freeze([
   "document",
 ]);
 
-// TDLib's name for each kind of file, as its errors print it (FileType.cpp).
-// A photo cannot stand in for any other kind, nor any other kind for a photo.
-const FILE_TYPE_NAMES = Object.freeze({
-  photo: "Photo",
-  live_photo: "LivePhotoVideo",
-  video: "Video",
-  animation: "Animation",
-  document: "Document",
-  sticker: "Sticker",
-  voice: "VoiceNote",
-  audio: "Audio",
-  video_note: "VideoNote",
+// Each kind of file as TDLib has it (FileType.cpp): the name its errors
+// print, and the directory it keeps the file in, where file_path starts
+// (get_file_type_name). A chat photo is its ProfilePhoto.
+const FILE_TYPES = Object.freeze({
+  photo: { name: "Photo", directory: "photos" },
+  chat_photo: { name: "ChatPhoto", directory: "profile_photos" },
+  live_photo: { name: "LivePhotoVideo", directory: "photos" },
+  video: { name: "Video", directory: "videos" },
+  animation: { name: "Animation", directory: "animations" },
+  document: { name: "Document", directory: "documents" },
+  sticker: { name: "Sticker", directory: "stickers" },
+  voice: { name: "VoiceNote", directory: "voice" },
+  audio: { name: "Audio", directory: "music" },
+  video_note: { name: "VideoNote", directory: "video_notes" },
 });
+
+// The kinds in TDLib's Photo class, each of which stands in only for itself;
+// every other kind may stand in for any other (FileManager::check_input_file_id).
+const PHOTO_KINDS = new Set(["photo", "chat_photo"]);
 
 // The fields of a Bot API payload that hold a file_id, which differs per bot.
 const FILE_ID_FIELDS = new Set(["file_id", "small_file_id", "big_file_id"]);
@@ -976,6 +982,67 @@ function unreadableFileId(id) {
   return `${wrong}can't unserialize it`;
 }
 
+/**
+ * Why TDLib's parse_url cannot read a file's HTTP URL, or null when it can
+ * (tdutils HttpUrl.cpp). A URL without a protocol reads as http.
+ */
+function unparsableUrl(url) {
+  const protocol = /^([^:/?#@[\]]*):\/\//.exec(url);
+  if (protocol && !["http", "https"].includes(protocol[1].toLowerCase())) {
+    return "Unsupported URL protocol";
+  }
+  const authority = url
+    .slice(protocol ? protocol[0].length : 0)
+    .split(/[/?#]/)[0];
+  let colon = authority.length - 1;
+  while (colon > 0 && !":]@".includes(authority[colon])) colon -= 1;
+  let userinfoHost = authority;
+  if (colon > 0 && authority[colon] === ":") {
+    const port = authority.slice(colon + 1);
+    if (!/^0*[1-9]\d*$/.test(port) || Number(port) > 65535) {
+      return "Wrong port number specified in the URL";
+    }
+    userinfoHost = authority.slice(0, colon);
+  }
+  const at = userinfoHost.lastIndexOf("@");
+  const userinfo = at === -1 ? "" : userinfoHost.slice(0, at);
+  const host = userinfoHost.slice(at + 1);
+  const ipv6 = host.startsWith("[") && host.endsWith("]");
+  if (ipv6) {
+    const address = host.length > 2 ? host.slice(1, -1) : host;
+    // inet_pton takes no zone index.
+    if (!net.isIPv6(address) || address.includes("%")) {
+      return "Wrong IPv6 address specified in the URL";
+    }
+  }
+  if (host === "") return "URL host is empty";
+  if (host === ".") return "Host is invalid";
+  if (ipv6) return null;
+  // Letters, digits, RFC 3986's other allowed characters, percent-encoded
+  // bytes and any non-ASCII character.
+  const disallowed = (part, name, colonAllowed) => {
+    for (let i = 0; i < part.length; i += 1) {
+      const char = part[i];
+      if (
+        /[\w.\-!$,~*'();&+=]/.test(char) ||
+        (colonAllowed && char === ":") ||
+        char.charCodeAt(0) >= 128
+      ) {
+        continue;
+      }
+      if (char !== "%") return `Disallowed character in URL ${name}`;
+      if (!/^[\da-f]{2}$/i.test(part.slice(i + 1, i + 3))) {
+        return `Wrong percent-encoded symbol in URL ${name}`;
+      }
+      i += 2;
+    }
+    return null;
+  };
+  return (
+    disallowed(host, "host", false) ?? disallowed(userinfo, "userinfo", true)
+  );
+}
+
 function readBody(request) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -1113,6 +1180,9 @@ export async function startTestServer({
   // (https://core.telegram.org/bots/api#sending-files): every bot that sees a
   // file gets its own file_id for it, and all share its file_unique_id.
   const files = new Map();
+  // The ChatPhoto files of chat and user photos, by the photo's
+  // file_unique_id.
+  const chatPhotos = new Map();
   // Owner accounts: what a user sees on their own account (owner.js).
   const ownerModel = createOwnerModel({
     log,
@@ -2724,6 +2794,28 @@ export async function startTestServer({
     return registerFile(bytes, "photo");
   }
 
+  /**
+   * The ChatPhoto getChat shows for a chat's or user's photo. Its small and
+   * big photos are files of their own, of TDLib's ProfilePhoto type, which no
+   * send takes (PhotoSizeSource::get_file_type); both hold the whole image.
+   */
+  function chatPhotoObject(photo) {
+    if (!chatPhotos.has(photo.file_unique_id)) {
+      const { data } = files.get(photo.file_id).file;
+      chatPhotos.set(photo.file_unique_id, {
+        small: registerFile(data, "chat_photo"),
+        big: registerFile(data, "chat_photo"),
+      });
+    }
+    const { small, big } = chatPhotos.get(photo.file_unique_id);
+    return {
+      small_file_id: small.file_id,
+      small_file_unique_id: small.file_unique_id,
+      big_file_id: big.file_id,
+      big_file_unique_id: big.file_unique_id,
+    };
+  }
+
   /** The file_id one bot knows a stored file by, made when it first sees it. */
   function fileIdFor(file, botId) {
     if (!file.ids[botId]) {
@@ -2748,9 +2840,10 @@ export async function startTestServer({
 
   /** Where a bot downloads a file, under its own file_id. */
   function filePath(file, fileId) {
-    const extension =
-      file.kind === "photo" ? "jpg" : (MEMBER_MEDIA[file.kind]?.ext ?? "mp4");
-    return `${file.kind}s/${fileId}.${extension}`;
+    const extension = PHOTO_KINDS.has(file.kind)
+      ? "jpg"
+      : (MEMBER_MEDIA[file.kind]?.ext ?? "mp4");
+    return `${FILE_TYPES[file.kind].directory}/${fileId}.${extension}`;
   }
 
   /**
@@ -2767,12 +2860,15 @@ export async function startTestServer({
   }
 
   /**
-   * The file a send names, of the kind the method sends: an upload, also as
+   * The file a send or edit names, of the kind it sends: an upload, also as
    * attach://<name>; the file_id of a file the calling bot was given; or an
-   * HTTP URL, which TDLib takes any string with a dot for and this server
-   * stands in for with a one-byte file instead of fetching it. Null when it
-   * names nothing. A file keeps its kind when sent again, and a photo and any
-   * other kind cannot stand in for each other (FileManager::check_input_file_id).
+   * HTTP URL, which TDLib takes any string with a dot for and refuses when
+   * parse_url cannot read it (FileManager::from_persistent_id). This server
+   * stands in for a URL with a one-byte file instead of fetching it. Null when
+   * it names nothing. A file keeps its kind when sent again; a live photo's
+   * video sent on its own is a video (Client.cpp JsonLivePhoto). Telegram's
+   * server refuses another bot's file with MEDIA_EMPTY, which reaches the bot
+   * as `mediaEmpty`.
    */
   function sentFile(
     p,
@@ -2780,29 +2876,42 @@ export async function startTestServer({
     kind,
     caller,
     meta,
-    typeName = FILE_TYPE_NAMES[kind],
+    {
+      typeName = FILE_TYPES[kind].name,
+      mediaEmpty = "Bad Request: wrong file identifier/HTTP URL specified",
+    } = {},
   ) {
     const named = namedFile(p, value);
     if (named === null) return null;
     if (Buffer.isBuffer(named)) return registerFile(named, kind, meta);
     const held = files.get(named);
     if (held) {
-      if ((held.file.kind === "photo") !== (kind === "photo")) {
+      const heldKind = held.file.kind;
+      if (
+        heldKind !== kind &&
+        (PHOTO_KINDS.has(heldKind) || PHOTO_KINDS.has(kind))
+      ) {
         throw new TelegramError(
           400,
-          `Bad Request: can't use file of type ${FILE_TYPE_NAMES[held.file.kind]} as ${typeName}`,
+          `Bad Request: can't use file of type ${FILE_TYPES[heldKind].name} as ${typeName}`,
         );
       }
-      // Another bot's file_id reads as one, but Telegram refuses the send.
-      if (held.botId !== caller.id) {
-        throw new TelegramError(
-          400,
-          "Bad Request: wrong file identifier/HTTP URL specified",
-        );
-      }
-      return fileView(held.file);
+      if (held.botId !== caller.id) throw new TelegramError(400, mediaEmpty);
+      const view = fileView(held.file);
+      return heldKind === "live_photo" && kind !== "live_photo"
+        ? { ...view, kind: "video" }
+        : view;
     }
-    if (named.includes(".")) return registerFile(Buffer.alloc(1), kind, meta);
+    if (named.includes(".")) {
+      const unparsable = unparsableUrl(named);
+      if (unparsable) {
+        throw new TelegramError(
+          400,
+          `Bad Request: invalid file HTTP URL specified: ${unparsable}`,
+        );
+      }
+      return registerFile(Buffer.alloc(1), kind, meta);
+    }
     throw new TelegramError(400, `Bad Request: ${unreadableFileId(named)}`);
   }
 
@@ -3135,16 +3244,7 @@ export async function startTestServer({
           hasRight(chat, caller.id, "can_invite_users")
             ? { invite_link: primaryLink(chat, caller).invite_link }
             : {}),
-          ...(chat.photo
-            ? {
-                photo: {
-                  small_file_id: chat.photo.file_id,
-                  small_file_unique_id: chat.photo.file_unique_id,
-                  big_file_id: chat.photo.file_id,
-                  big_file_unique_id: chat.photo.file_unique_id,
-                },
-              }
-            : {}),
+          ...(chat.photo ? { photo: chatPhotoObject(chat.photo) } : {}),
           accent_color_id: 0,
           max_reaction_count: 11,
           accepted_gift_types: { ...NO_GIFTS },
@@ -3165,16 +3265,7 @@ export async function startTestServer({
         ...(user.last_name ? { last_name: user.last_name } : {}),
         ...(user.username ? { username: user.username } : {}),
         ...(user.bio ? { bio: user.bio } : {}),
-        ...(photo
-          ? {
-              photo: {
-                small_file_id: photo.file_id,
-                small_file_unique_id: photo.file_unique_id,
-                big_file_id: photo.file_id,
-                big_file_unique_id: photo.file_unique_id,
-              },
-            }
-          : {}),
+        ...(photo ? { photo: chatPhotoObject(photo) } : {}),
         ...(pinned ? { pinned_message: pinnedMessage(pinned.message) } : {}),
         accent_color_id: 0,
         max_reaction_count: 11,
@@ -3723,10 +3814,15 @@ export async function startTestServer({
     sendVoice: (p, caller) => sendMedia(p, caller, "voice"),
     sendAudio: (p, caller) => sendMedia(p, caller, "audio"),
     sendVideoNote: (p, caller) => sendMedia(p, caller, "video_note"),
+    // A live_period other than 0 sends a live location, which TDLib checks
+    // with its own text (Client.cpp process_send_location_query, Location.cpp
+    // process_live_location).
     sendLocation: (p, caller) => {
       const location = coordinates(
         p,
-        "Bad Request: invalid location specified",
+        Math.trunc(numberParam(p.live_period, 0)) !== 0
+          ? "Bad Request: invalid live location specified"
+          : "Bad Request: invalid location specified",
       );
       return sendFrom(p, caller, () => ({
         location: { ...location, ...liveLocation(p) },
@@ -3826,7 +3922,7 @@ export async function startTestServer({
         if (namedFile(p, item.media) === null) {
           throw new TelegramError(
             400,
-            "Bad Request: wrong file identifier/HTTP URL specified",
+            "Bad Request: can't parse InputMedia: media not found",
           );
         }
         return caption;
@@ -3835,14 +3931,9 @@ export async function startTestServer({
       // the album.
       const media = items.map((item) =>
         // An album's documents go as plain files (Client.cpp get_input_media).
-        sentFile(
-          p,
-          item.media,
-          item.type,
-          caller,
-          senderMeta(item),
-          item.type === "document" ? "DocumentAsFile" : undefined,
-        ),
+        sentFile(p, item.media, item.type, caller, senderMeta(item), {
+          typeName: item.type === "document" ? "DocumentAsFile" : undefined,
+        }),
       );
       if (items.length > 10) {
         throw new TelegramError(
@@ -4853,11 +4944,17 @@ export async function startTestServer({
 
   /**
    * A bot sends a photo, document, video, animation, sticker, voice note, audio
-   * file or video note. A file sent again by file_id keeps its kind and what
-   * its first sender said about it. A send that names no file stores a
-   * one-byte file.
+   * file or video note. A send that names no file fails first (Client.cpp
+   * process_send_photo_query and the like). A file sent again by file_id
+   * keeps its kind and what its first sender said about it.
    */
   function sendMedia(p, caller, type) {
+    if (namedFile(p, p[type]) === null) {
+      throw new TelegramError(
+        400,
+        `Bad Request: there is no ${type.replace("_", " ")} in the request`,
+      );
+    }
     const caption =
       type === "photo" || MEMBER_MEDIA[type].caption ? captionFields(p) : {};
     // sendDocument's disable_content_type_detection sends a plain file
@@ -4868,9 +4965,12 @@ export async function startTestServer({
         : undefined;
     return sendFrom(p, caller, () => {
       const meta = senderMeta(p);
-      const file =
-        sentFile(p, p[type], type, caller, meta, typeName) ??
-        registerFile(Buffer.alloc(1), type, meta);
+      const file = sentFile(p, p[type], type, caller, meta, { typeName });
+      // TDLib takes a video note at most 640 wide, after the Bot API caps it
+      // at 10000 (MessageContent.cpp create_input_message_content).
+      if (type === "video_note" && meta.length > 640) {
+        throw new TelegramError(400, "Bad Request: wrong video note length");
+      }
       return { ...mediaFields(file.kind, file), ...caption };
     });
   }
@@ -5285,9 +5385,10 @@ export async function startTestServer({
    * Whether the bot may edit a message or stop its poll, as TDLib's
    * MessagesManager::can_edit_message decides: its own messages, and in a
    * channel any post with can_edit_messages, but its own only while it has
-   * can_post_messages.
+   * can_post_messages. A media edit is refused with its own text
+   * (edit_message_media).
    */
-  function requireEditable(chat, entry, caller) {
+  function requireEditable(chat, entry, caller, kind) {
     const own = entry.author === caller.id;
     const allowed =
       chat.type === "channel"
@@ -5295,7 +5396,12 @@ export async function startTestServer({
           (own && hasRight(chat, caller.id, "can_post_messages"))
         : own;
     if (!allowed) {
-      throw new TelegramError(400, "Bad Request: message can't be edited");
+      throw new TelegramError(
+        400,
+        kind === "media"
+          ? "Bad Request: message media can't be edited"
+          : "Bad Request: message can't be edited",
+      );
     }
   }
 
@@ -5361,7 +5467,7 @@ export async function startTestServer({
       if (!entry || entry.deleted) {
         throw new TelegramError(400, "Bad Request: message to edit not found");
       }
-      requireEditable(chat, entry, caller);
+      requireEditable(chat, entry, caller, kind);
       requireEditableContent(entry, kind);
     }
     requireButtonData(markup);
@@ -5510,43 +5616,86 @@ export async function startTestServer({
   /**
    * The media edit of editMessageMedia and editEphemeralMessageMedia. The new
    * media is an upload attached as attach://<name>, a file_id the bot was
-   * given or an HTTP URL; a live photo names its still photo too. In an album
-   * it may change only to a kind the album allows
-   * (MessagesManager::edit_message_media).
+   * given or an HTTP URL; a live photo names its still photo too. The Bot API
+   * reads it before the message, in get_input_media's order (Client.cpp): the
+   * caption's markup, the type, the file, a live photo's still photo, then
+   * whether an edit takes the type. TDLib reads the files and checks the
+   * caption's length once it has the message (MessageContent.cpp
+   * get_input_message_content). In an album the media may change only to a
+   * kind the album allows (MessagesManager::edit_message_media).
    */
   function mediaEdit(p, caller) {
-    const input = p.media ?? {};
-    const type = input.type ?? "photo";
-    // The Bot API reads the InputMedia before the message (Client.cpp
-    // get_input_media).
-    const unreadable = !MEDIA_KINDS.includes(type)
-      ? `type "${type}" is unsupported`
-      : namedFile(p, input.media) === null
+    if (p.media === undefined || p.media === "") {
+      throw new TelegramError(
+        400,
+        'Bad Request: parameter "media" is required',
+      );
+    }
+    if (typeof p.media === "string") {
+      throw new TelegramError(
+        400,
+        "Bad Request: can't parse input media JSON object",
+      );
+    }
+    const input = p.media;
+    const unreadable = (reason) =>
+      new TelegramError(400, `Bad Request: can't parse InputMedia: ${reason}`);
+    if (!isObject(input)) throw unreadable("expected an Object");
+    if (input.caption != null && input.caption !== "") {
+      try {
+        // The markup only; TDLib checks entities and length later.
+        formatOrFail(String(input.caption), input.parse_mode);
+      } catch (error) {
+        if (!(error instanceof TelegramError)) throw error;
+        const reason = error.message.replace(/^Bad Request: /, "");
+        throw unreadable(reason[0].toUpperCase() + reason.slice(1));
+      }
+    }
+    let type;
+    try {
+      type = requiredString(input, "type");
+    } catch (error) {
+      throw unreadable(error.message);
+    }
+    const reason =
+      namedFile(p, input.media) === null
         ? "media not found"
         : type === "live_photo" && namedFile(p, input.photo) === null
           ? "Photo not found"
-          : null;
-    if (unreadable) {
-      throw new TelegramError(
-        400,
-        `Bad Request: can't parse InputMedia: ${unreadable}`,
-      );
-    }
-    const formatted = captionFields(input);
+          : type === "voice_note"
+            ? `type "${type}" is not allowed`
+            : !MEDIA_KINDS.includes(type)
+              ? `type "${type}" is unsupported`
+              : null;
+    if (reason) throw unreadable(reason);
+    // Only a send turns Telegram's MEDIA_EMPTY into the Bot API's text
+    // (MessagesManager.cpp process_send_message_fail_error); an edit gets it
+    // as it is (EditMessageQuery::on_error).
+    const refused = { mediaEmpty: "Bad Request: MEDIA_EMPTY" };
     return (message) => {
       const current = MEDIA_KINDS.find((kind) => message[kind]);
-      // InputMediaLivePhoto gives no size or duration for its video.
+      const photo =
+        type === "live_photo"
+          ? sentFile(p, input.photo, "photo", caller, {}, refused)
+          : null;
+      // InputMediaLivePhoto gives no size or duration for its video, and an
+      // InputMediaDocument with disable_content_type_detection is a plain
+      // file (Client.cpp get_input_media).
       const file = sentFile(
         p,
         input.media,
         type,
         caller,
         type === "live_photo" ? {} : senderMeta(input),
+        {
+          ...refused,
+          typeName:
+            type === "document" && input.disable_content_type_detection === true
+              ? "DocumentAsFile"
+              : undefined,
+        },
       );
-      const photo =
-        type === "live_photo"
-          ? sentFile(p, input.photo, "photo", caller, {})
-          : null;
+      const formatted = captionFields(input);
       const albumKind = (kind) => (kind === "live_photo" ? "photo" : kind);
       if (message.media_group_id && albumKind(current) !== albumKind(type)) {
         if (type === "animation") {
@@ -7461,10 +7610,9 @@ ${buttons}
           return;
         }
         response.writeHead(200, {
-          "Content-Type":
-            held.file.kind === "photo"
-              ? "image/jpeg"
-              : "application/octet-stream",
+          "Content-Type": PHOTO_KINDS.has(held.file.kind)
+            ? "image/jpeg"
+            : "application/octet-stream",
         });
         response.end(held.file.data);
         return;

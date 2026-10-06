@@ -355,6 +355,25 @@ describe("bad input", () => {
         { chat_id: GROUP, latitude: 100, longitude: 0, ...venue },
         "Bad Request: wrong venue location specified",
       ],
+      ...[
+        ["sendPhoto", "photo"],
+        ["sendAnimation", "animation"],
+        ["sendAudio", "audio"],
+        ["sendDocument", "document"],
+        ["sendSticker", "sticker"],
+        ["sendVideo", "video"],
+        ["sendVideoNote", "video note"],
+        ["sendVoice", "voice"],
+      ].map(([method, name]) => [
+        method,
+        { chat_id: GROUP },
+        `Bad Request: there is no ${name} in the request`,
+      ]),
+      [
+        "sendPhoto",
+        { chat_id: GROUP, photo: "attach://missing" },
+        "Bad Request: there is no photo in the request",
+      ],
     ]) {
       expect(await api(method, params)).toMatchObject({
         error_code: 400,
