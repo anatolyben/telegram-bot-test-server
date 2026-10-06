@@ -51,10 +51,19 @@ const ann = await server.createUser({ first_name: "Ann" });
 await server.join(GROUP, ann);
 const spam = await server.post(GROUP, ann, "cheap followers at example.com");
 
-// Then check what the bot did. It runs asynchronously, so wait for the result:
-// with Vitest, `await expect.poll(async () => (await server.getMember(GROUP, ann)).status).toBe("kicked")`.
-(await server.getMember(GROUP, ann)).status; // "kicked"
-(await server.getMessage(GROUP, spam)).deleted; // true
+// Then wait for what the bot did: it runs asynchronously.
+await server.waitFor({
+  kind: "message",
+  chatId: GROUP,
+  messageId: spam,
+  deleted: true,
+});
+await server.waitFor({
+  kind: "member",
+  chatId: GROUP,
+  userId: ann,
+  status: "kicked",
+});
 
 await bot.stop();
 await server.stop();
@@ -180,11 +189,11 @@ These read or change the server's state:
 These are not modelled: `setMyDescription`, `setMyShortDescription`,
 `setChatMenuButton`, `setMyDefaultAdministratorRights`.
 
-They and any other method not listed get Telegram's answer to a method it does not know: 404
-`Not Found: method not found`, so a test cannot pass against behaviour the server does not have;
-so do `editMessageCaption` and `editMessageMedia` with `business_connection_id`. `getCalls()`
-(`GET /_fake/calls`) lists the unsupported methods called (those two as, for example,
-`editMessageCaption with business_connection_id`), and `log` reports each once. With
+They, any other method not listed, and `editMessageCaption` and `editMessageMedia` with
+`business_connection_id` get Telegram's answer to a method it does not know: 404
+`Not Found: method not found`, so a test cannot pass against behavior the server does not have.
+`getCalls()` (`GET /_fake/calls`) lists the unsupported methods called (the business edits as,
+for example, `editMessageCaption with business_connection_id`), and `log` reports each once. With
 `unimplemented: "ok"`, an unsupported method that Telegram documents as returning `True` answers
 `true` instead; any other still gets the 404. Methods are added when a real bot needs them; the
 goal is not full coverage of the Bot API.
