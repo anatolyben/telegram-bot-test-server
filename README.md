@@ -93,7 +93,7 @@ immediately.
 | `leave(chatId, userId)`                                                                                                               | The user leaves.                                                                                                                                                            |
 | `post(chatId, userId, text)`                                                                                                          | The user posts a message; returns its `message_id`. Also takes `{ text, photo, media, caption, replyTo, threadId, forwardFrom }`. Fails if the user is not allowed to post. |
 | `postAlbum(chatId, userId, items)`                                                                                                    | The user posts 2 to 10 photos or videos as one album (`media_group_id`).                                                                                                    |
-| `editMessage(chatId, messageId, userId, { text, caption })`                                                                           | The author edits their message; bots get `edited_message` (`edited_channel_post` in a channel).                                                                             |
+| `editMessage(chatId, messageId, userId, { text, caption })`                                                                           | The author edits their message; bots get `edited_message` (`edited_channel_post` in a channel). Text that shows nothing fails with `MESSAGE_EMPTY`.                         |
 | `react(chatId, messageId, userId, emoji)`                                                                                             | The user reacts to a message, or takes the reaction back with `null`.                                                                                                       |
 | `pinMessage(chatId, messageId, userId)`                                                                                               | A person with `can_pin_messages` (in a channel, `can_edit_messages`) pins the message; bots get the `pinned_message` service message.                                       |
 | `pressButton(chatId, messageId, userId, data)`                                                                                        | The user presses an inline button; resolves with the bot's `answerCallbackQuery` answer.                                                                                    |
@@ -286,7 +286,12 @@ The details a moderation bot depends on, each covered by a test:
   object, an unknown `type`, an empty `chat_id`, or a `chat_member` scope without a positive
   `user_id`. A chat scope's chat must be one the bot can see (`chat not found` otherwise); a private
   chat takes only the `chat` scope, and a channel takes none. `language_code` must be empty or two
-  lower-case letters (`invalid language code specified`).
+  lower-case letters (`invalid language code specified`). After the scope and language, each command
+  is trimmed and loses a leading `/`, and its description is trimmed; they are stored that way. An
+  empty command or description fails with `command must be non-empty` or
+  `command description must be non-empty`, and one over 32 or 256 characters with
+  `command length must not exceed 32` or `command description length must not exceed 256`. The
+  characters a command may use are not checked here.
 - **Parameters.** A boolean is true when it reads `true`, `yes` or `1`, in any case. A
   JSON-serialized parameter (`reply_markup`, `reply_parameters`, `message_ids`, `media`, ...) may
   also come as a JSON string; one that cannot be read fails with Telegram's parse error, such as
@@ -415,9 +420,10 @@ The details a moderation bot depends on, each covered by a test:
   permission (`can_send_videos`, `can_send_voice_notes`, ...), plus albums sharing a
   `media_group_id` and forwards with `forward_origin` (a user, a hidden user or a channel post).
   An edit by the author reaches bots as `edited_message` (in a channel, `edited_channel_post`) with
-  `edit_date`. A member's text and captions are trimmed of spaces and newlines at both ends, as
-  Telegram's apps send them, and a post or private message whose text is then empty fails with
-  `MESSAGE_EMPTY`.
+  `edit_date`. A member's text and captions, in posts and in edits, are trimmed of spaces and
+  newlines at both ends, as Telegram's apps send them. A post, private message or edit whose text
+  then shows nothing (only spaces, zero-width or other blank characters) fails with
+  `MESSAGE_EMPTY`; such a caption is dropped.
 - **Reactions.** A member's reaction reaches the chat's administrator bots as `message_reaction`,
   only when they list it in `allowed_updates`, as on Telegram. A bot sets at most one reaction,
   and only an emoji from the [ReactionTypeEmoji](https://core.telegram.org/bots/api#reactiontypeemoji)
@@ -879,26 +885,41 @@ album captions, media edits, copy captions, reply quotes and business text sends
 mentions, commands, hashtags and cashtags can be detected inside styles; code, pre and
 explicit links suppress overlapping automatic detection.
 
-Text is then kept the way Telegram keeps it. Control characters become spaces, `\r` is
-dropped, and spaces and newlines are cut from both ends (from the start only up to the
-first entity), with the entities moved to match. Text that is empty after that fails with
-`text must be non-empty`, and a caption that is only spaces is dropped. After parsing, text
-may have 4096 characters and a caption 1024, counted as Unicode code points, so an emoji
-counts once. Longer sends fail with `message is too long` or `message caption is too long`
-(also `editMessageMedia` and copies of media); Telegram's server answers a longer
-`editMessageText` with `MESSAGE_TOO_LONG` and a longer `editMessageCaption` with
-`MEDIA_CAPTION_TOO_LONG`. The ephemeral edits give the same answers, though Telegram does not
-document them; a text edit of an ephemeral media message sets its caption, so more than 1024
-characters fail with `MEDIA_CAPTION_TOO_LONG`. Raw text over 32 KB fails before parsing with
-`text is too long`.
+Text is then kept the way Telegram keeps it. Control characters become spaces; `\r`,
+U+2028 to U+202E and the combining marks U+030A, U+0333 and U+033F are dropped; in a run of
+left-to-right and right-to-left marks all but the last become zero-width non-joiners; and
+spaces and newlines are cut from both ends (from the start only up to the first entity),
+with the entities moved to match. Text that then shows nothing, being only spaces or blank
+characters such as zero-width spaces, direction marks, no-break, Braille or ideographic
+spaces, fails with `text must be non-empty`, unless `link_preview_options` gives a `url` and
+does not disable the preview: then the message is sent with empty text. A caption that is
+only spaces is dropped; other blank characters stay in a bot's caption.
+
+After parsing, text may have 4096 characters and a caption 1024, counted as Unicode code
+points, so an emoji counts once. Longer sends fail with `message is too long` or
+`message caption is too long` (also `editMessageMedia` and copies of media); Telegram's
+server answers a longer `editMessageText` with `MESSAGE_TOO_LONG` and a longer
+`editMessageCaption` with `MEDIA_CAPTION_TOO_LONG`. The ephemeral edits give the same
+answers, though Telegram does not document them; a text edit of an ephemeral media message
+sets its caption, so more than 1024 characters fail with `MEDIA_CAPTION_TOO_LONG`. An empty
+`text` and raw text over 32 KB (`text is too long`) fail as the request is read, as do
+markup errors; whether text shows nothing and how long it is are checked only after the
+chat, the reply and the edited message, so a missing chat or message is reported first.
 
 `<tg-time unix="1647531900" format="wDT">…</tg-time>` in HTML and
 `![…](tg://time?unix=1647531900&format=wDT)` in MarkdownV2 make a `date_time` entity with
 `unix_time` and `date_time_format`, the format written back in Telegram's order (`w`, then
-`d` or `D`, then `t` or `T`, or `r`) and empty when none was given. A `text_mention`, from
-a `tg://user?id=` link or an explicit entity, carries the whole `User`; a user the server
-has never seen has only its id, `is_bot: false` and an empty `first_name`, as the Bot API
-server writes it.
+`d` or `D`, then `t` or `T`, or `r`) and empty when none was given; a format naming both
+precisions keeps the shorter one. Explicit entities are read as the Bot API reads them:
+`mention`, `hashtag`, `cashtag`, `bot_command`, `url`, `email`, `phone_number` and
+`bank_card_number` are ignored, since Telegram finds those by itself, and an unknown type
+fails with `can't parse MessageEntity: Unsupported type specified`. An explicit `date_time`
+needs `unix_time`, refuses a format other than `r`, `R` or letters from `tTdDwW`
+(`Invalid date-time format specified`) and a `unix_time` of 0 or less
+(`invalid date specified`), and there the last of `d`/`D` and of `t`/`T` wins. A
+`text_mention`, from a `tg://user?id=` link or an explicit entity, carries the whole `User`;
+a user the server has never seen has only its id, `is_bot: false` and an empty `first_name`,
+as the Bot API server writes it.
 
 The contract cases cover malformed markup, crossed Markdown delimiters, invalid entity
 ranges (including surrogate-pair boundaries), style splitting around code, and overlapping
@@ -923,7 +944,8 @@ was kicked from. A missing or deleted message fails with `message to be replied 
 including its bold, italic, underline, strikethrough, spoiler, custom emoji and date entities, or
 the send fails with `QUOTE_TEXT_INVALID`
 ([messages.sendMessage](https://core.telegram.org/method/messages.sendMessage)); the message then
-carries `quote` with `is_manual` and the `quote_position` given. Forum-topic sends without an
+carries `quote` with `is_manual` and the `quote_position` given, moved past the spaces trimmed
+from the quote's start (0 when it is below 0 or above 1000000). Forum-topic sends without an
 explicit reply attach the topic's creation message. Not implemented: replies to another forum
 topic as `external_reply`, reply metadata in business sends, and `checklist_task_id` and
 `poll_option_id`; see [ReplyParameters](https://core.telegram.org/bots/api#replyparameters).

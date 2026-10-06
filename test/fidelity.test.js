@@ -1491,6 +1491,41 @@ describe("Bot API details", () => {
     ).toMatchObject({ ok: true });
   });
 
+  it("trims commands and descriptions, and refuses ones Telegram refuses", async () => {
+    const { api } = await setup();
+    const set = (command, description, params = {}) =>
+      api("setMyCommands", { commands: [{ command, description }], ...params });
+    const refused = (description) => ({
+      status: 400,
+      description: `Bad Request: ${description}`,
+    });
+
+    expect(await set(" /start \n", "  Start the bot ")).toMatchObject({
+      ok: true,
+    });
+    expect((await api("getMyCommands")).result).toEqual([
+      { command: "start", description: "Start the bot" },
+    ]);
+    expect(await set("  /  ", "d")).toMatchObject(
+      refused("command must be non-empty"),
+    );
+    expect(await set("x".repeat(33), "d")).toMatchObject(
+      refused("command length must not exceed 32"),
+    );
+    expect(await set("help", " \n ")).toMatchObject(
+      refused("command description must be non-empty"),
+    );
+    expect(await set("help", "d".repeat(257))).toMatchObject(
+      refused("command description length must not exceed 256"),
+    );
+    // Characters count, not bytes.
+    expect(await set("help", "é".repeat(256))).toMatchObject({ ok: true });
+    // The scope is checked first.
+    expect(await set("", "", { scope: { type: "bogus" } })).toMatchObject(
+      refused("can't parse BotCommandScope: Unsupported type specified"),
+    );
+  });
+
   it("returns media with the fields the Bot API requires, and files getFile can resolve", async () => {
     const { api } = await setup();
     const video = (

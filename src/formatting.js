@@ -189,6 +189,19 @@ function dateTimeFormat(format) {
   return (/[wW]/.test(format) ? "w" : "") + pick("d", "D") + pick("t", "T");
 }
 
+/**
+ * The date_time_format of an explicit date_time entity, as the Bot API reads
+ * it (Client.cpp get_date_time_formatting_type) and writes it back: "r" or
+ * "R" alone, or any of tTdDwW where the last of d and D and the last of t and
+ * T win; null for anything else.
+ */
+function givenDateTimeFormat(format) {
+  if (format === "r" || format === "R") return "r";
+  if (!/^[tTdDwW]*$/.test(format)) return null;
+  const last = (pattern) => format.match(pattern)?.at(-1) ?? "";
+  return (/[wW]/.test(format) ? "w" : "") + last(/[dD]/g) + last(/[tT]/g);
+}
+
 /** td::to_integer<int32>: the leading digits, wrapped to 32 bits. */
 function int32Prefix(value) {
   const [, sign, digits] = /^(-?)(\d*)/.exec(value);
@@ -725,13 +738,85 @@ export function parseMarkdown(input) {
   return { text, entities: sortEntities(entities) };
 }
 
+// The entity types Telegram finds by itself, and the ones a bot may give
+// (Client.cpp get_text_entity_type).
+const FOUND_TYPES = new Set([
+  "mention",
+  "hashtag",
+  "cashtag",
+  "bot_command",
+  "url",
+  "email",
+  "phone_number",
+  "bank_card_number",
+]);
+const GIVEN_TYPES = new Set([
+  ...STYLES,
+  ...QUOTES,
+  "code",
+  "pre",
+  "text_link",
+  "text_mention",
+  "custom_emoji",
+  "date_time",
+]);
+
+/**
+ * An explicit entity as the Bot API reads it (Client.cpp get_text_entity,
+ * get_text_entity_type): null for a type Telegram finds by itself, which it
+ * ignores, and an unknown type refused. A date_time needs a positive
+ * unix_time (TDLib FormattedDate::get_formatted_date) and comes back with its
+ * format in Telegram's order.
+ */
+function givenEntity(entity) {
+  const refuse = (reason) => {
+    throw new FormattingError(
+      `Bad Request: can't parse MessageEntity: ${reason}`,
+    );
+  };
+  // JsonObject::get_*_string_field: a string, or a number as written.
+  const string = (name) => {
+    const value = entity[name];
+    if (value === undefined || ["string", "number"].includes(typeof value))
+      return value === undefined ? undefined : String(value);
+    refuse(`Field "${name}" must be of type String`);
+  };
+  if (entity === null || typeof entity !== "object" || Array.isArray(entity))
+    refuse("expected an Object");
+  const type = string("type");
+  if (type === undefined) refuse(`Can't find field "type"`);
+  if (type === "") refuse("Type is not specified");
+  if (FOUND_TYPES.has(type)) return null;
+  if (!GIVEN_TYPES.has(type)) refuse("Unsupported type specified");
+  if (type !== "date_time") return { ...entity };
+  const time = entity.unix_time;
+  if (time === undefined) refuse(`Can't find field "unix_time"`);
+  if (!["string", "number"].includes(typeof time))
+    refuse(`Field "unix_time" must be a Number`);
+  const unix = exactInteger(String(time), 32);
+  if (unix == null) refuse(`Field "unix_time" must be a valid Number`);
+  const format = givenDateTimeFormat(string("date_time_format") ?? "");
+  if (format == null) refuse("Invalid date-time format specified");
+  if (unix <= 0n) {
+    throw new FormattingError("Bad Request: invalid date specified");
+  }
+  return {
+    type,
+    offset: entity.offset,
+    length: entity.length,
+    unix_time: Number(unix),
+    date_time_format: format,
+  };
+}
+
 /**
  * The text and entities a message ends up with, as the Bot API server and
  * TDLib make them. A parse_mode other than "none" wins over explicit entities
  * (Client.cpp get_formatted_text); then the text is cleaned and trimmed, and
  * the links, mentions, commands, hashtags and cashtags Telegram finds by
- * itself are added outside code, pre and explicit links. `user` gives the
- * User a text_mention shows for a user id.
+ * itself are added outside code, pre and explicit links. `ltrim` is how many
+ * characters were cut from the start. `user` gives the User a text_mention
+ * shows for a user id.
  */
 export function formatText(text, { parseMode, entities, user } = {}) {
   const mode = typeof parseMode === "string" ? parseMode.toLowerCase() : "";
@@ -745,7 +830,7 @@ export function formatText(text, { parseMode, entities, user } = {}) {
     parsed = {
       text,
       entities: Array.isArray(entities)
-        ? entities.map((entity) => ({ ...entity }))
+        ? entities.map(givenEntity).filter(Boolean)
         : [],
     };
   }
@@ -772,8 +857,22 @@ export function formatText(text, { parseMode, entities, user } = {}) {
           ? { ...entity, user: user(Number(entity.user.id)) }
           : entity,
     ),
+    ltrim: trimmed.ltrim,
   };
 }
+
+/**
+ * Whether cleaned text shows nothing (TDLib is_empty_string): it has only
+ * spaces, newlines and the characters TDLib's strip_empty_characters counts
+ * as blank. Those are the no-break, Ogham, U+2000 to U+200A, narrow no-break,
+ * medium mathematical and ideographic spaces, the Mongolian vowel separator,
+ * zero-width characters and direction marks, U+202E, the Braille blank, the
+ * byte order mark, the object replacement character and tag characters.
+ */
+export const isEmptyText = (text) =>
+  /^[\n \u00a0\u1680\u180e\u2000-\u200f\u202e\u202f\u205f\u2800\u3000\ufeff\ufffc\u{e0000}-\u{e007f}]*$/u.test(
+    text,
+  );
 
 /**
  * TDLib fix_formatted_text for a message being sent. clean_input_string turns
@@ -781,8 +880,8 @@ export function formatText(text, { parseMode, entities, user } = {}) {
  * and the combining marks U+030A, U+0333 and U+033F; in a run of
  * left-to-right and right-to-left marks all but the last become zero-width
  * non-joiners. Then spaces and newlines are cut from the end, and from the
- * start up to the first entity. Entities move with the text; empty text comes
- * back empty.
+ * start up to the first entity; `ltrim` counts those cut from the start.
+ * Entities move with the text; empty text comes back empty.
  */
 function cleanAndTrim(text, entities) {
   let clean = "";
@@ -812,7 +911,7 @@ function cleanAndTrim(text, entities) {
   );
   let end = clean.length;
   while (end > 0 && (clean[end - 1] === " " || clean[end - 1] === "\n")) end--;
-  if (end === 0) return { text: "", entities: [] };
+  if (end === 0) return { text: "", entities: [], ltrim: 0 };
   moved = moved
     .filter((entity) => entity.offset < end)
     .map((entity) =>
@@ -827,6 +926,7 @@ function cleanAndTrim(text, entities) {
     entities: sortEntities(
       moved.map((entity) => ({ ...entity, offset: entity.offset - start })),
     ),
+    ltrim: start,
   };
 }
 

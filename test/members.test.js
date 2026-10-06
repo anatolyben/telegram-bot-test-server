@@ -124,7 +124,7 @@ describe("what members post", () => {
       entities: [{ type: "bot_command", offset: 3, length: 5 }],
     });
     const before = await fake.getMessages(GROUP);
-    for (const text of ["", " \n "]) {
+    for (const text of ["", " \n ", "\u200b\u00a0"]) {
       await expect(fake.post(GROUP, member, text)).rejects.toThrow(
         /MESSAGE_EMPTY/,
       );
@@ -218,6 +218,36 @@ describe("what members post", () => {
         text: "buy followers at spam.example.com",
       }),
     ).rejects.toThrow(/MESSAGE_NOT_MODIFIED/);
+  });
+
+  it("trims a member's edit, refuses one that empties the text and drops an empty caption", async () => {
+    const { fake, member } = await setup();
+    const id = await fake.post(GROUP, member, "hello");
+    await fake.editMessage(GROUP, id, member, { text: "  hi /help \n" });
+    expect((await fake.getMessage(GROUP, id)).message).toMatchObject({
+      text: "hi /help",
+      entities: [{ type: "bot_command", offset: 3, length: 5 }],
+    });
+    for (const text of ["", " \n ", "\u200b"]) {
+      await expect(
+        fake.editMessage(GROUP, id, member, { text }),
+      ).rejects.toThrow(/MESSAGE_EMPTY/);
+    }
+    await expect(
+      fake.editMessage(GROUP, id, member, { text: "hi /help " }),
+    ).rejects.toThrow(/MESSAGE_NOT_MODIFIED/);
+    expect((await fake.getMessage(GROUP, id)).message.text).toBe("hi /help");
+
+    const photo = await fake.post(GROUP, member, {
+      photo: BYTES,
+      caption: "cap",
+    });
+    await fake.editMessage(GROUP, photo, member, { caption: " new \n" });
+    expect((await fake.getMessage(GROUP, photo)).message.caption).toBe("new");
+    await fake.editMessage(GROUP, photo, member, { caption: " \u200b " });
+    expect((await fake.getMessage(GROUP, photo)).message).not.toHaveProperty(
+      "caption",
+    );
   });
 
   it("tells administrator bots that asked for it when a member reacts", async () => {

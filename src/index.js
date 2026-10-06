@@ -25,7 +25,12 @@
  * Nothing here talks to Telegram.
  */
 import { createOwnerModel, OwnerError } from "./owner.js";
-import { findEntities, formatText, FormattingError } from "./formatting.js";
+import {
+  findEntities,
+  formatText,
+  FormattingError,
+  isEmptyText,
+} from "./formatting.js";
 import { lookup } from "node:dns/promises";
 import http from "node:http";
 import https from "node:https";
@@ -1428,6 +1433,31 @@ export async function startTestServer({
     const user = users.get(Number(userId));
     if (!user) throw new TelegramError(400, "Bad Request: user not found");
     return user;
+  }
+
+  /**
+   * A command as TDLib's set_commands keeps it (BotCommand.cpp): cleaned and
+   * trimmed, without a leading "/", at most 32 characters, with a description
+   * of 1 to 256 characters.
+   */
+  function botCommand({ command, description, is_ephemeral }) {
+    const refuse = (reason) => new TelegramError(400, `Bad Request: ${reason}`);
+    let name = formatText(String(command)).text;
+    if (name.startsWith("/")) name = name.slice(1);
+    if (!name) throw refuse("command must be non-empty");
+    if ([...name].length > 32) {
+      throw refuse("command length must not exceed 32");
+    }
+    const about = formatText(String(description)).text;
+    if (!about) throw refuse("command description must be non-empty");
+    if ([...about].length > 256) {
+      throw refuse("command description length must not exceed 256");
+    }
+    return {
+      command: name,
+      description: about,
+      ...(is_ephemeral === true ? { is_ephemeral: true } : {}),
+    };
   }
 
   /**
@@ -3385,7 +3415,8 @@ export async function startTestServer({
       }
       return queue.slice(0, limit);
     },
-    // The commands are read before the scope (process_set_my_commands_query).
+    // The commands are read before the scope (process_set_my_commands_query)
+    // and checked after it.
     setMyCommands: (p, caller) => {
       const commands =
         p.commands === undefined || p.commands === ""
@@ -3396,7 +3427,8 @@ export async function startTestServer({
               requiredString(command, "description");
               return command;
             });
-      caller.commands.set(commandsKey(p, caller), commands);
+      const key = commandsKey(p, caller);
+      caller.commands.set(key, commands.map(botCommand));
       return true;
     },
     deleteMyCommands: (p, caller) => {
@@ -3589,13 +3621,16 @@ export async function startTestServer({
     editEphemeralMessageReplyMarkup: (p, caller) =>
       editEphemeralMessage(p, caller, () => {}),
     editEphemeralMessageCaption: (p, caller) => {
-      const formatted = captionFields(p, "Bad Request: MEDIA_CAPTION_TOO_LONG");
+      const caption = captionFields(p, "Bad Request: MEDIA_CAPTION_TOO_LONG");
       return editEphemeralMessage(
         p,
         caller,
-        ephemeralTextEdit({
-          text: formatted.caption,
-          entities: formatted.caption_entities,
+        ephemeralTextEdit(() => {
+          const formatted = caption();
+          return {
+            text: formatted.caption,
+            entities: formatted.caption_entities,
+          };
         }),
       );
     },
@@ -3766,22 +3801,21 @@ export async function startTestServer({
     // A caption given replaces the original's on media that takes one, and an
     // empty one removes it; a text message keeps no caption (TDLib
     // dup_message_content). It is parsed first either way (get_caption in the
-    // Bot API server); only a kept caption must fit 1024 characters, which
-    // Telegram's server checks (MEDIA_CAPTION_TOO_LONG).
+    // Bot API server); only a kept caption must fit 1024 characters, checked
+    // once the chat and reply are found.
     copyMessage: async (p, caller) => {
-      if (p.caption != null) {
-        formatOrFail(String(p.caption), p.parse_mode, p.caption_entities);
-      }
+      const caption = captionFields(p);
       const { content } = forwardable(p, caller, true);
-      if (
+      const replaced =
         p.caption !== undefined &&
-        CAPTIONED_CONTENT.includes(contentType(content))
-      ) {
+        CAPTIONED_CONTENT.includes(contentType(content));
+      if (replaced) {
         delete content.caption;
         delete content.caption_entities;
-        Object.assign(content, captionFields(p));
       }
-      const copy = await sendFrom(p, caller, content);
+      const copy = await sendFrom(p, caller, () =>
+        replaced ? { ...content, ...caption() } : content,
+      );
       return { message_id: copy.message_id };
     },
     // The message is looked up before the rights: the Bot API server's
@@ -4159,7 +4193,8 @@ export async function startTestServer({
       }
       requireCanSend(chat, caller);
       // Telegram parses every InputMedia caption before it checks the reply,
-      // and sends none of the album if one fails.
+      // and sends none of the album if one fails; their lengths are checked
+      // with the files.
       const formatted = items.map((item) => {
         const caption = captionFields(item);
         if (namedFile(p, item.media) === null) {
@@ -4182,13 +4217,14 @@ export async function startTestServer({
         },
         caller,
         () => {
-          const media = items.map((item) =>
+          const media = items.map((item, index) => ({
             // An album's documents go as plain files (Client.cpp
             // get_input_media).
-            sentFile(p, item.media, item.type, caller, senderMeta(item), {
+            file: sentFile(p, item.media, item.type, caller, senderMeta(item), {
               typeName: item.type === "document" ? "DocumentAsFile" : undefined,
             }),
-          );
+            caption: formatted[index](),
+          }));
           if (items.length > 10) {
             throw new TelegramError(
               400,
@@ -4205,9 +4241,9 @@ export async function startTestServer({
           }
           const mediaGroupId =
             items.length > 1 ? String(nextMediaGroupId++) : undefined;
-          return media.map((file, index) => ({
+          return media.map(({ file, caption }) => ({
             ...mediaFields(file.kind, file),
-            ...formatted[index],
+            ...caption,
             ...(mediaGroupId ? { media_group_id: mediaGroupId } : {}),
           }));
         },
@@ -4957,7 +4993,8 @@ export async function startTestServer({
    * including its bold, italic, underline, strikethrough, spoiler,
    * custom_emoji and date_time entities, else the send fails with
    * QUOTE_TEXT_INVALID (https://core.telegram.org/method/messages.sendMessage).
-   * Its position is the one the sender gives.
+   * Its position is the one the sender gives, moved past the spaces trimmed
+   * from the quote's start, or 0 when out of range (TDLib MessageQuote).
    */
   function replyQuote(message, parameters) {
     if (parameters.quote == null || parameters.quote === "") return null;
@@ -4993,10 +5030,12 @@ export async function startTestServer({
       found = key(within) === key(entities);
     }
     if (!found) throw new TelegramError(400, "Bad Request: QUOTE_TEXT_INVALID");
+    const position = Number(parameters.quote_position ?? 0);
     return {
       text: quote.text,
       ...(entities.length > 0 ? { entities } : {}),
-      position: Number(parameters.quote_position ?? 0),
+      position:
+        position >= 0 && position <= 1000000 ? position + quote.ltrim : 0,
       is_manual: true,
     };
   }
@@ -5073,10 +5112,13 @@ export async function startTestServer({
 
   /**
    * text, entities and link_preview_options of a bot's message, after
-   * parse_mode or explicit entities. Telegram allows 4096 characters (code
-   * points, as TDLib's utf8_length counts them) after parsing: a send is
-   * refused by TDLib with "message is too long", an edit by Telegram's server
-   * with MESSAGE_TOO_LONG.
+   * parse_mode or explicit entities. The Bot API server refuses an empty text
+   * and parses the rest as the request is read. The returned step is called
+   * once the chat, reply and message are found, where TDLib refuses text that
+   * shows nothing unless a link preview URL goes with it
+   * (InputMessageText.cpp). Telegram allows 4096 characters (code points, as
+   * TDLib's utf8_length counts them): a send is refused by TDLib with
+   * "message is too long", an edit by Telegram's server with MESSAGE_TOO_LONG.
    */
   function textFields(p, tooLong = "Bad Request: message is too long") {
     const preview = jsonParam(p.link_preview_options, "link preview options");
@@ -5091,18 +5133,20 @@ export async function startTestServer({
       throw new TelegramError(400, "Bad Request: message text is empty");
     }
     const formatted = formatOrFail(text, p.parse_mode, p.entities);
-    if (!formatted.text) {
-      throw new TelegramError(400, "Bad Request: text must be non-empty");
-    }
-    if ([...formatted.text].length > 4096)
-      throw new TelegramError(400, tooLong);
     const options = linkPreviewOptions(p, formatted);
-    return {
-      text: formatted.text,
-      ...(formatted.entities.length > 0
-        ? { entities: formatted.entities }
-        : {}),
-      ...(options ? { link_preview_options: options } : {}),
+    return () => {
+      if (isEmptyText(formatted.text) && !options?.url) {
+        throw new TelegramError(400, "Bad Request: text must be non-empty");
+      }
+      if ([...formatted.text].length > 4096)
+        throw new TelegramError(400, tooLong);
+      return {
+        text: formatted.text,
+        ...(formatted.entities.length > 0
+          ? { entities: formatted.entities }
+          : {}),
+        ...(options ? { link_preview_options: options } : {}),
+      };
     };
   }
 
@@ -5156,26 +5200,30 @@ export async function startTestServer({
 
   /**
    * caption and caption_entities of a bot's media message; a caption that is
-   * only spaces is none. 1024 characters at most, refused like text.
+   * only spaces is none. It is parsed as the request is read, and, like text,
+   * its length (1024 characters at most) is checked when the returned step
+   * is called.
    */
   function captionFields(
     p,
     tooLong = "Bad Request: message caption is too long",
   ) {
-    if (p.caption == null || p.caption === "") return {};
+    if (p.caption == null || p.caption === "") return () => ({});
     const formatted = formatOrFail(
       String(p.caption),
       p.parse_mode,
       p.caption_entities,
     );
-    if (!formatted.text) return {};
-    if ([...formatted.text].length > 1024)
-      throw new TelegramError(400, tooLong);
-    return {
-      caption: formatted.text,
-      ...(formatted.entities.length > 0
-        ? { caption_entities: formatted.entities }
-        : {}),
+    return () => {
+      if (!formatted.text) return {};
+      if ([...formatted.text].length > 1024)
+        throw new TelegramError(400, tooLong);
+      return {
+        caption: formatted.text,
+        ...(formatted.entities.length > 0
+          ? { caption_entities: formatted.entities }
+          : {}),
+      };
     };
   }
 
@@ -5196,16 +5244,35 @@ export async function startTestServer({
 
   /**
    * text and entities of a member's message. The member's app cleans and
-   * trims the text as TDLib does, and Telegram refuses an empty message with
-   * MESSAGE_EMPTY (https://core.telegram.org/method/messages.sendMessage).
+   * trims the text as TDLib does, and Telegram refuses a message that shows
+   * nothing with MESSAGE_EMPTY
+   * (https://core.telegram.org/method/messages.sendMessage).
    */
   function memberText(text) {
     const formatted = formatText(String(text ?? ""));
-    if (!formatted.text) throw new TelegramError(400, "MESSAGE_EMPTY");
+    if (isEmptyText(formatted.text)) {
+      throw new TelegramError(400, "MESSAGE_EMPTY");
+    }
     return {
       text: formatted.text,
       ...(formatted.entities.length > 0
         ? { entities: formatted.entities }
+        : {}),
+    };
+  }
+
+  /**
+   * caption and caption_entities of a member's media, cleaned and trimmed as
+   * their text; one that shows nothing is none (TDLib fix_formatted_text
+   * clears it for a user).
+   */
+  function memberCaption(caption) {
+    const formatted = formatText(String(caption ?? ""));
+    if (isEmptyText(formatted.text)) return {};
+    return {
+      caption: formatted.text,
+      ...(formatted.entities.length > 0
+        ? { caption_entities: formatted.entities }
         : {}),
     };
   }
@@ -5234,7 +5301,9 @@ export async function startTestServer({
       );
     }
     const caption =
-      type === "photo" || MEMBER_MEDIA[type].caption ? captionFields(p) : {};
+      type === "photo" || MEMBER_MEDIA[type].caption
+        ? captionFields(p)
+        : () => ({});
     // sendDocument's disable_content_type_detection sends a plain file
     // (MessageContent.cpp get_input_message_content).
     const typeName =
@@ -5244,12 +5313,13 @@ export async function startTestServer({
     return sendFrom(p, caller, () => {
       const meta = senderMeta(p);
       const file = sentFile(p, p[type], type, caller, meta, { typeName });
+      const fields = caption();
       // TDLib takes a video note at most 640 wide, after the Bot API caps it
       // at 10000 (MessageContent.cpp create_input_message_content).
       if (type === "video_note" && meta.length > 640) {
         throw new TelegramError(400, "Bad Request: wrong video note length");
       }
-      return { ...mediaFields(file.kind, file), ...caption };
+      return { ...mediaFields(file.kind, file), ...fields };
     });
   }
 
@@ -5459,6 +5529,7 @@ export async function startTestServer({
     const text = textFields(p);
     const markup = inlineMarkup(p.reply_markup);
     const { connection, userId } = businessReplyChat(p, caller);
+    const fields = text();
     requireButtonData(markup);
     return addBusinessMessage(
       connection,
@@ -5466,7 +5537,7 @@ export async function startTestServer({
       "bot",
       requireUser(connection.ownerId),
       {
-        ...text,
+        ...fields,
         sender_business_bot: userObject(caller),
       },
     );
@@ -5845,13 +5916,14 @@ export async function startTestServer({
   }
 
   /**
-   * The text edit of editMessageText. TDLib does not check an edit's length
-   * (edit_message_text); Telegram's server refuses a long one with
-   * MESSAGE_TOO_LONG.
+   * The text edit of editMessageText, checked once the message is found.
+   * TDLib does not check an edit's length (edit_message_text); Telegram's
+   * server refuses a long one with MESSAGE_TOO_LONG.
    */
   function textEdit(p) {
-    const formatted = textFields(p, "Bad Request: MESSAGE_TOO_LONG");
+    const text = textFields(p, "Bad Request: MESSAGE_TOO_LONG");
     return (message) => {
+      const formatted = text();
       delete message.entities;
       delete message.link_preview_options;
       Object.assign(message, formatted);
@@ -5864,8 +5936,9 @@ export async function startTestServer({
    * a long caption edit (TDLib checks only sends).
    */
   function captionEdit(p) {
-    const formatted = captionFields(p, "Bad Request: MEDIA_CAPTION_TOO_LONG");
+    const caption = captionFields(p, "Bad Request: MEDIA_CAPTION_TOO_LONG");
     return (message) => {
+      const formatted = caption();
       delete message.caption;
       delete message.caption_entities;
       Object.assign(message, formatted);
@@ -5882,8 +5955,9 @@ export async function startTestServer({
    * caption edit does, and an empty text leaves a text message as it was, as
    * any text leaves content that takes no caption.
    */
-  function ephemeralTextEdit({ text = "", entities, link_preview_options }) {
+  function ephemeralTextEdit(read) {
     return (message) => {
+      const { text = "", entities, link_preview_options } = read();
       const type = contentType(message);
       if (type === "text") {
         if (!text) return;
@@ -5993,7 +6067,7 @@ export async function startTestServer({
               : undefined,
         },
       );
-      const formatted = captionFields(input);
+      const formatted = captionFields(input)();
       const albumKind = (kind) => (kind === "live_photo" ? "photo" : kind);
       if (message.media_group_id && albumKind(current) !== albumKind(type)) {
         if (type === "animation") {
@@ -7299,7 +7373,8 @@ export async function startTestServer({
 
   /**
    * The author edits their message: the bots in the chat get edited_message
-   * with the whole message and its edit_date.
+   * with the whole message and its edit_date. The text or caption is cleaned
+   * and trimmed as when it was posted.
    */
   async function editByMember(
     chat,
@@ -7319,14 +7394,15 @@ export async function startTestServer({
     if (value === undefined || value === null) {
       throw new TelegramError(400, `the edit needs ${field}`);
     }
-    if (String(value) === (message[field] ?? "")) {
+    const fields = field === "text" ? memberText(value) : memberCaption(value);
+    if ((fields[field] ?? "") === (message[field] ?? "")) {
       throw new TelegramError(400, "MESSAGE_NOT_MODIFIED");
     }
-    message[field] = String(value);
-    const entities = findEntities(message[field]);
     const entityField = field === "text" ? "entities" : "caption_entities";
-    if (entities.length > 0) message[entityField] = entities;
-    else delete message[entityField];
+    for (const key of [field, entityField]) {
+      if (fields[key] !== undefined) message[key] = fields[key];
+      else delete message[key];
+    }
     message.edit_date = now();
     await emit("edited_message", structuredClone(message));
     return { message_id: message.message_id, edit_date: message.edit_date };
@@ -7423,14 +7499,8 @@ export async function startTestServer({
         duration: media?.duration,
       });
       Object.assign(fields, mediaFields(type, file));
-      const formatted =
-        caption && (type === "photo" || MEMBER_MEDIA[type].caption)
-          ? formatText(String(caption))
-          : null;
-      if (formatted?.text) {
-        fields.caption = formatted.text;
-        if (formatted.entities.length > 0)
-          fields.caption_entities = formatted.entities;
+      if (caption && (type === "photo" || MEMBER_MEDIA[type].caption)) {
+        Object.assign(fields, memberCaption(caption));
       }
     } else {
       Object.assign(fields, memberText(text));

@@ -581,7 +581,8 @@ export interface TelegramBotTestServer {
    * trimmed as Telegram's apps send them. Fails if they may not post: in a
    * channel, only the creator and administrators with can_post_messages may,
    * and bots get the post as channel_post. Fails with MESSAGE_EMPTY when the
-   * text is empty once trimmed.
+   * text shows nothing once trimmed (only spaces or blank characters such as
+   * zero-width spaces); such a caption is dropped.
    */
   post(
     chatId: number,
@@ -600,8 +601,9 @@ export interface TelegramBotTestServer {
     options?: { threadId?: number },
   ): Promise<{ media_group_id: string; message_ids: number[] }>;
   /**
-   * The author edits their message's text or caption; bots get edited_message
-   * (edited_channel_post in a channel).
+   * The author edits their message's text or caption, trimmed as when posted;
+   * bots get edited_message (edited_channel_post in a channel). Text that shows
+   * nothing fails with MESSAGE_EMPTY, and such a caption removes the caption.
    */
   editMessage(
     chatId: number,
@@ -662,8 +664,8 @@ export interface TelegramBotTestServer {
     text: string,
   ): Promise<number>;
   /**
-   * The user sends the bot a direct message; returns the message_id. Empty
-   * text, once trimmed, fails with MESSAGE_EMPTY.
+   * The user sends the bot a direct message; returns the message_id. Text
+   * that shows nothing once trimmed fails with MESSAGE_EMPTY.
    */
   sendDirectMessage(userId: number, text: string): Promise<number>;
   /** The user presses an inline button in their private chat with the bot. */

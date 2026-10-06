@@ -392,6 +392,161 @@ describe("bot sends", () => {
     expect(blank.result.caption).toBeUndefined();
   });
 
+  it("refuses text of characters that show nothing, unless a link preview URL goes with it", async () => {
+    const { api } = await setup();
+    const empty = {
+      status: 400,
+      description: "Bad Request: text must be non-empty",
+    };
+    // Spaces of every width, zero-width and direction marks, the Braille
+    // blank, the byte order mark and tag characters show nothing.
+    for (const text of [
+      "\u200b",
+      "\u00a0",
+      "\u3000",
+      "\u2800",
+      "\ufeff",
+      "\u{e0020}",
+      " \u200b\n",
+      "\u200f\u200f  \u200e\u200e\u200e\u200c \u200f\u200e \u200f",
+    ]) {
+      expect(await api("sendMessage", { chat_id: GROUP, text })).toMatchObject(
+        empty,
+      );
+    }
+    // A Hangul filler is not one of them.
+    expect(
+      (await api("sendMessage", { chat_id: GROUP, text: "\u3164" })).result
+        .text,
+    ).toBe("\u3164");
+    const sent = await api("sendMessage", { chat_id: GROUP, text: "x" });
+    expect(
+      await api("editMessageText", {
+        chat_id: GROUP,
+        message_id: sent.result.message_id,
+        text: "\u200b",
+      }),
+    ).toMatchObject(empty);
+    // A bot's caption keeps them.
+    const photo = await api("sendPhoto", {
+      chat_id: GROUP,
+      photo: "https://example.com/a.jpg",
+      caption: "\u200b",
+    });
+    expect(photo.result.caption).toBe("\u200b");
+    // A link preview may go without text, unless the preview is disabled.
+    const url = "https://example.com/a";
+    const preview = await api("sendMessage", {
+      chat_id: GROUP,
+      text: "   ",
+      link_preview_options: { url },
+    });
+    expect(preview.result).toMatchObject({
+      text: "",
+      link_preview_options: { url },
+    });
+    expect(
+      await api("sendMessage", {
+        chat_id: GROUP,
+        text: "   ",
+        link_preview_options: { url, is_disabled: true },
+      }),
+    ).toMatchObject(empty);
+  });
+
+  it("drops separators, overrides and three combining marks, and turns runs of direction marks into joiners", async () => {
+    const { api } = await setup();
+    const cleaned = await api("sendMessage", {
+      chat_id: GROUP,
+      text: "a\u2028b\u202ec\u030ad\u0333e\u033f f",
+      entities: [{ type: "bold", offset: 11, length: 1 }],
+    });
+    expect(cleaned.result).toMatchObject({
+      text: "abcde f",
+      entities: [{ type: "bold", offset: 6, length: 1 }],
+    });
+    // All but the last mark of a run become zero-width non-joiners.
+    const marks = await api("sendMessage", {
+      chat_id: GROUP,
+      text: "\u200f\u200f  \u200e\u200e\u200e\u200c \u200f\u200e \u200f a",
+    });
+    expect(marks.result.text).toBe(
+      "\u200c\u200f  \u200c\u200c\u200e\u200c \u200c\u200e \u200f a",
+    );
+  });
+
+  it("checks a text's emptiness and length only after the chat, the reply and the message", async () => {
+    const { api } = await setup();
+    const unknown = -1009999999999;
+    const photo = "https://example.com/a.jpg";
+    const long = "y".repeat(2000);
+    const refused = (description) => ({
+      status: 400,
+      description: `Bad Request: ${description}`,
+    });
+    for (const text of ["x".repeat(5000), "\u200b"]) {
+      expect(
+        await api("sendMessage", { chat_id: unknown, text }),
+      ).toMatchObject(refused("chat not found"));
+      expect(
+        await api("sendMessage", {
+          chat_id: GROUP,
+          text,
+          reply_parameters: { message_id: 999999 },
+        }),
+      ).toMatchObject(refused("message to be replied not found"));
+    }
+    // An empty text is refused as the request is read.
+    expect(
+      await api("sendMessage", { chat_id: unknown, text: "" }),
+    ).toMatchObject(refused("message text is empty"));
+    expect(
+      await api("sendPhoto", { chat_id: unknown, photo, caption: long }),
+    ).toMatchObject(refused("chat not found"));
+    expect(
+      await api("sendMediaGroup", {
+        chat_id: GROUP,
+        reply_parameters: { message_id: 999999 },
+        media: [
+          { type: "photo", media: photo, caption: long },
+          { type: "photo", media: photo },
+        ],
+      }),
+    ).toMatchObject(refused("message to be replied not found"));
+    const sent = await api("sendPhoto", { chat_id: GROUP, photo });
+    expect(
+      await api("copyMessage", {
+        chat_id: unknown,
+        from_chat_id: GROUP,
+        message_id: sent.result.message_id,
+        caption: long,
+      }),
+    ).toMatchObject(refused("chat not found"));
+    expect(
+      await api("editMessageText", {
+        chat_id: GROUP,
+        message_id: 999999,
+        text: "x".repeat(5000),
+      }),
+    ).toMatchObject(refused("message to edit not found"));
+    expect(
+      await api("editMessageCaption", {
+        chat_id: GROUP,
+        message_id: 999999,
+        caption: long,
+      }),
+    ).toMatchObject(refused("message to edit not found"));
+    for (const text of ["x".repeat(5000), "  "]) {
+      expect(
+        await api("editMessageText", {
+          chat_id: GROUP,
+          message_id: sent.result.message_id,
+          text,
+        }),
+      ).toMatchObject(refused("there is no text in the message to edit"));
+    }
+  });
+
   it("turns <tg-time> and tg://time links into date_time entities", async () => {
     const { api } = await setup();
     const send = (text, parse_mode) =>
@@ -436,6 +591,15 @@ describe("bot sends", () => {
         date_time_format: "",
       },
     ]);
+    // A format that names both precisions gets the shorter one.
+    expect(
+      (
+        await send(
+          '<tg-time unix="1647531900" format="tTdD">22:45</tg-time>',
+          "HTML",
+        )
+      ).result.entities[0].date_time_format,
+    ).toBe("dt");
     expect(
       await send(
         '<tg-time unix="1647531900" format="x">22:45</tg-time>',
@@ -453,6 +617,71 @@ describe("bot sends", () => {
       description:
         "Bad Request: can't parse entities: Invalid tg://emoji or tg://time URL specified",
     });
+  });
+
+  it("reads explicit entities as the Bot API does", async () => {
+    const { api } = await setup();
+    const at = { offset: 0, length: 5 };
+    const send = (entity) =>
+      api("sendMessage", {
+        chat_id: GROUP,
+        text: "hello",
+        entities: [{ ...at, ...entity }],
+      });
+    // Telegram finds these by itself and ignores them when given.
+    for (const type of [
+      "mention",
+      "hashtag",
+      "cashtag",
+      "bot_command",
+      "url",
+      "email",
+      "phone_number",
+      "bank_card_number",
+    ]) {
+      expect((await send({ type })).result.entities).toBeUndefined();
+    }
+    const date = (fields) =>
+      send({ type: "date_time", unix_time: 1647531900, ...fields });
+    // The format comes back in Telegram's order, the last of t and T
+    // winning; without one it is empty.
+    expect((await date({ date_time_format: "Tw" })).result.entities).toEqual([
+      {
+        type: "date_time",
+        ...at,
+        unix_time: 1647531900,
+        date_time_format: "wT",
+      },
+    ]);
+    expect(
+      (await date({ date_time_format: "tT" })).result.entities[0]
+        .date_time_format,
+    ).toBe("T");
+    expect((await date({})).result.entities[0].date_time_format).toBe("");
+    const refused = (description) => ({
+      status: 400,
+      description: `Bad Request: ${description}`,
+    });
+    const unparsable = (reason) =>
+      refused(`can't parse MessageEntity: ${reason}`);
+    expect(await send({ type: "nope" })).toMatchObject(
+      unparsable("Unsupported type specified"),
+    );
+    expect(await send({ type: "" })).toMatchObject(
+      unparsable("Type is not specified"),
+    );
+    expect(await send({})).toMatchObject(
+      unparsable('Can\'t find field "type"'),
+    );
+    expect(await date({ date_time_format: "x" })).toMatchObject(
+      unparsable("Invalid date-time format specified"),
+    );
+    expect(await send({ type: "date_time" })).toMatchObject(
+      unparsable('Can\'t find field "unix_time"'),
+    );
+    expect(await date({ unix_time: 0 })).toMatchObject(
+      refused("invalid date specified"),
+    );
   });
 
   it("gives a text_mention the whole mentioned user", async () => {
@@ -606,6 +835,33 @@ describe("bot sends", () => {
     expect(
       await reply(styled.result.message_id, { quote: "quick brown" }),
     ).toMatchObject(invalid);
+  });
+
+  it("moves a quote's position past the spaces cut from its start", async () => {
+    const { api } = await setup();
+    const original = await api("sendMessage", {
+      chat_id: GROUP,
+      text: "hello  world",
+    });
+    const quote = async (quote_position) =>
+      (
+        await api("sendMessage", {
+          chat_id: GROUP,
+          text: "yes",
+          reply_parameters: {
+            message_id: original.result.message_id,
+            quote: "  world",
+            quote_position,
+          },
+        })
+      ).result.quote;
+    expect(await quote(5)).toEqual({
+      text: "world",
+      position: 7,
+      is_manual: true,
+    });
+    // A position out of range becomes 0.
+    expect((await quote(-1)).position).toBe(0);
   });
 
   it("replies to a message in another chat with external_reply and an automatic quote", async () => {
@@ -874,6 +1130,23 @@ describe("formatting contract regressions", () => {
     expect(quote.result.entities).toEqual([
       { type: "blockquote", offset: 0, length: 3 },
     ]);
+    // A date_time keeps styles out, as code does.
+    const date = await api("sendMessage", {
+      chat_id: GROUP,
+      text: '<b>a<tg-time unix="5">bc</tg-time>d</b>',
+      parse_mode: "HTML",
+    });
+    expect(date.result.entities).toEqual([
+      { type: "bold", offset: 0, length: 1 },
+      {
+        type: "date_time",
+        offset: 1,
+        length: 2,
+        unix_time: 5,
+        date_time_format: "",
+      },
+      { type: "bold", offset: 3, length: 1 },
+    ]);
   });
 
   it("rejects crossed Markdown delimiters without posting", async () => {
@@ -914,6 +1187,46 @@ describe("formatting contract regressions", () => {
       expect(sent.result.entities).toHaveLength(1);
       expect(sent.result.entities[0].type).not.toBe("url");
     }
+  });
+
+  it("finds short mentions, $1INCH, tg:// links and mailto: emails, and drops what overlaps an earlier match", async () => {
+    const { server, api } = await setup();
+    const found = (text, entities = []) =>
+      entities.map((entity) => [
+        entity.type,
+        text.slice(entity.offset, entity.offset + entity.length),
+      ]);
+    const sent = async (text) =>
+      found(
+        text,
+        (await api("sendMessage", { chat_id: GROUP, text })).result.entities,
+      );
+    // A username under four characters is a mention only for a few bots.
+    expect(await sent("@ya @gif @vid @pic @cap @bing")).toEqual([
+      ["mention", "@gif"],
+      ["mention", "@vid"],
+      ["mention", "@pic"],
+      ["mention", "@bing"],
+    ]);
+    expect(await sent("$1INCH $1INCHA $USD")).toEqual([
+      ["cashtag", "$1INCH"],
+      ["cashtag", "$USD"],
+    ]);
+    expect(await sent("tg://resolve?domain=a ton://site")).toEqual([
+      ["url", "tg://resolve?domain=a"],
+      ["url", "ton://site"],
+    ]);
+    expect(await sent("Look mailto:test@example.com")).toEqual([
+      ["email", "test@example.com"],
+    ]);
+    // A hashtag inside a link is not one of its own.
+    const ann = await server.createUser();
+    await server.join(GROUP, ann);
+    const text = "https://e.com/#tag";
+    const reply = await server.postGuestBotReply(GROUP, ann, "guide_bot", text);
+    expect(
+      found(text, (await server.getMessage(GROUP, reply)).message.entities),
+    ).toEqual([["url", text]]);
   });
 
   it("formats album captions and replaces stale entities on media edits", async () => {
