@@ -89,23 +89,34 @@ describe("Bot API basics", () => {
     });
   });
 
-  it("rejects a method it does not implement, and records it", async () => {
+  it("rejects a method it does not implement with Telegram's answer, and records it", async () => {
     const { api, control } = await setup();
 
-    const answer = await api("sendInvoice", { chat_id: GROUP });
-    expect(answer).toMatchObject({ status: 404, ok: false, error_code: 404 });
-    expect(answer.description).toContain("sendInvoice");
+    for (const method of ["sendInvoice", "sendMesage"]) {
+      expect(await api(method, { chat_id: GROUP })).toEqual({
+        status: 404,
+        ok: false,
+        error_code: 404,
+        description: "Not Found: method not found",
+      });
+    }
     expect((await control("GET", "calls")).body.unimplemented).toEqual([
       "sendInvoice",
+      "sendMesage",
     ]);
   });
 
-  it("answers true to unimplemented methods only when asked to", async () => {
+  it("answers true when asked to only for methods Telegram answers with True", async () => {
     const { api } = await setup({ unimplemented: "ok" });
-    expect(await api("sendInvoice", { chat_id: GROUP })).toMatchObject({
-      ok: true,
-      result: true,
-    });
+    expect(
+      await api("setMyDescription", { description: "Hello" }),
+    ).toMatchObject({ ok: true, result: true });
+    for (const method of ["sendInvoice", "getMyName", "sendMesage"]) {
+      expect(await api(method, { chat_id: GROUP })).toMatchObject({
+        status: 404,
+        description: "Not Found: method not found",
+      });
+    }
   });
 
   it("resolves configured public chats by username and nothing else", async () => {

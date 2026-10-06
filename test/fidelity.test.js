@@ -403,6 +403,37 @@ describe("guest bots", () => {
 });
 
 describe("Bot API details", () => {
+  it("reads form-encoded booleans as Telegram does: true, yes or 1 in any case", async () => {
+    const { server, member } = await setup();
+    async function form(method, params) {
+      const response = await fetch(`${server.origin}/bot${TOKEN}/${method}`, {
+        method: "POST",
+        body: new URLSearchParams(params),
+      });
+      return response.json();
+    }
+    const ann = await member();
+    const gone = await server.post(GROUP, ann, "soon gone");
+    await form("deleteMessage", { chat_id: GROUP, message_id: gone });
+
+    const reply = await form("sendMessage", {
+      chat_id: GROUP,
+      text: "still sent",
+      reply_to_message_id: gone,
+      allow_sending_without_reply: "True",
+    });
+    expect(reply).toMatchObject({ ok: true, result: { text: "still sent" } });
+    expect(reply.result.reply_to_message).toBeUndefined();
+    for (const flag of ["True", "yes", " 1 "]) {
+      await form("unbanChatMember", {
+        chat_id: GROUP,
+        user_id: ann,
+        only_if_banned: flag,
+      });
+      expect((await server.getMember(GROUP, ann)).status).toBe("member");
+    }
+  });
+
   it("treats method names case-insensitively and remembers the bot's commands", async () => {
     const { api } = await setup();
     const commands = [{ command: "help", description: "Show help" }];

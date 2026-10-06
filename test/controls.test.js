@@ -587,11 +587,11 @@ it("records rejected malformed and unauthorized Bot API attempts without leaking
   const { fake } = await setup();
   const invalid = await fetch(`${fake.origin}/bot${TOKEN}/sendMessage`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "multipart/form-data" },
     body: "{broken",
   });
   expect(invalid.status).toBe(400);
-  await invalid.json();
+  await invalid.text();
   const unauthorized = await fetch(`${fake.origin}/bot999:BAD-SECRET/getMe`);
   expect(unauthorized.status).toBe(401);
   await unauthorized.json();
