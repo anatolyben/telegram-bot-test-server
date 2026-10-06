@@ -32,7 +32,7 @@ async function setup(options = {}) {
 }
 
 describe("update delivery", () => {
-  it("hands updates still waiting for the webhook to getUpdates when the webhook is removed", async () => {
+  it("hands every update the webhook has not confirmed to getUpdates when the webhook is removed", async () => {
     const { server, api } = await setup();
     const received = [];
     const slow = http.createServer((request, response) => {
@@ -66,7 +66,9 @@ describe("update delivery", () => {
 
     const polled = (await api("getUpdates")).result.map((u) => u.message.text);
     const delivered = received.map((u) => u.message.text).filter(Boolean);
-    expect([...delivered, ...polled].sort()).toEqual(["one", "three", "two"]);
+    // The update in flight was never confirmed, so it is pending too.
+    expect(delivered).toHaveLength(1);
+    expect([...polled].sort()).toEqual(["one", "three", "two"]);
   });
 
   it("does not rewrite an update after it was sent", async () => {

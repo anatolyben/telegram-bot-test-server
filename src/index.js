@@ -27,6 +27,10 @@
 import { createOwnerModel, OwnerError } from "./owner.js";
 import { findEntities, formatText, FormattingError } from "./formatting.js";
 import http from "node:http";
+import https from "node:https";
+import net from "node:net";
+import { domainToASCII } from "node:url";
+import { unzipSync } from "node:zlib";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createClock, createWaits, diagnostic } from "./test-controls.js";
 import {
@@ -107,8 +111,60 @@ function normalizePermissions(input = {}, independent = false) {
   }
   return result;
 }
-// How long a webhook may take to answer before the update is given up on.
-const WEBHOOK_TIMEOUT_MS = 10_000;
+// How long a webhook connection may stay silent before Telegram closes it and
+// tries the update again (telegram-bot-api WebhookActor creates its
+// HttpOutboundConnection with a 60-second idle timeout).
+const WEBHOOK_TIMEOUT_MS = 60_000;
+// Every update type allowed_updates may name, in the order getWebhookInfo
+// lists them (telegram-bot-api Client::UpdateType). custom_event and
+// custom_query are internal to Telegram and never listed.
+const UPDATE_TYPES = Object.freeze([
+  "message",
+  "edited_message",
+  "channel_post",
+  "edited_channel_post",
+  "inline_query",
+  "chosen_inline_result",
+  "callback_query",
+  "custom_event",
+  "custom_query",
+  "shipping_query",
+  "pre_checkout_query",
+  "poll",
+  "poll_answer",
+  "my_chat_member",
+  "chat_member",
+  "chat_join_request",
+  "chat_boost",
+  "removed_chat_boost",
+  "message_reaction",
+  "message_reaction_count",
+  "business_connection",
+  "business_message",
+  "edited_business_message",
+  "deleted_business_messages",
+  "purchased_paid_media",
+  "managed_bot",
+  "guest_message",
+  "subscription",
+  "stopped_message_generation",
+]);
+// Sent only to a bot that asks for them in allowed_updates.
+const DEFAULT_EXCLUDED_UPDATES = Object.freeze([
+  "chat_member",
+  "message_reaction",
+  "message_reaction_count",
+]);
+// What Telegram records as a webhook's last error when the connection fails:
+// the system's error text (td::Status::public_message is strerror on Linux).
+const CONNECTION_ERRORS = Object.freeze({
+  ECONNREFUSED: "Connection refused",
+  ECONNRESET: "Connection reset by peer",
+  ETIMEDOUT: "Connection timed out",
+  EHOSTUNREACH: "No route to host",
+  ENETUNREACH: "Network is unreachable",
+  EPIPE: "Broken pipe",
+});
 // How long after a callback query a bot that is not an administrator may send
 // the user an ephemeral message.
 // https://core.telegram.org/bots/api#ephemeral-messages-and-commands
@@ -402,6 +458,82 @@ function jsonParam(value, name) {
     );
   }
   return value;
+}
+
+/** A successful Bot API answer that also carries Telegram's description. */
+class Described {
+  constructor(result, description) {
+    this.result = result;
+    this.description = description;
+  }
+}
+
+/**
+ * A webhook URL as Telegram's Bot API server reads it (td::parse_url, with
+ * https when no scheme is given), or null when Telegram refuses it.
+ */
+function parseWebhookUrl(url) {
+  const scheme = /^[^:/?#@[\]]*/.exec(url)[0];
+  let rest = url;
+  let secure = true;
+  if (url.startsWith("://", scheme.length)) {
+    if (!["http", "https"].includes(scheme.toLowerCase())) return null;
+    secure = scheme.toLowerCase() === "https";
+    rest = url.slice(scheme.length + 3);
+  }
+  const authority = /^[^/?#]*/.exec(rest)[0];
+  let colon = authority.length - 1;
+  while (colon > 0 && !":]@".includes(authority[colon])) colon -= 1;
+  let port = 0;
+  let userinfoHost = authority;
+  if (colon > 0 && authority[colon] === ":") {
+    const digits = authority.slice(colon + 1).replace(/^0+(?=.)/, "");
+    port = /^\d{1,5}$/.test(digits) && Number(digits) > 0 ? Number(digits) : -1;
+    userinfoHost = authority.slice(0, colon);
+  }
+  if (port < 0 || port > 65535) return null;
+  const at = userinfoHost.lastIndexOf("@");
+  const userinfo = at < 0 ? "" : userinfoHost.slice(0, at);
+  const host = userinfoHost.slice(at + 1).toLowerCase();
+  const ipv6 = host.startsWith("[") && host.endsWith("]");
+  if (ipv6 && !/^[0-9a-f:.]+$/.test(host.slice(1, -1))) return null;
+  if (ipv6 && !net.isIPv6(host.slice(1, -1))) return null;
+  if (!host || host === ".") return null;
+  // Characters RFC 3986 allows, percent-encoded bytes and plain UTF-8.
+  const valid = (part, extra) =>
+    /^(?:[A-Za-z0-9.\-_!$,~*'();&+=\u0080-\uffff]|%[0-9A-Fa-f]{2})*$/.test(
+      extra ? part.replaceAll(":", "") : part,
+    );
+  if (!ipv6 && (!valid(host, false) || !valid(userinfo, true))) return null;
+  // Control characters and spaces in the path are sent percent-encoded.
+  const query = rest.slice(authority.length).replace(/[\t\n\v\f\r \0]+$/, "");
+  const path = (query.startsWith("/") ? "" : "/") + query;
+  const effectivePort = port || (secure ? 443 : 80);
+  const asciiHost = ipv6 ? host : domainToASCII(host) || host;
+  return {
+    https: secure,
+    userinfo,
+    hostname: ipv6 ? host.slice(1, -1) : asciiHost,
+    port: effectivePort,
+    hostHeader:
+      effectivePort === (secure ? 443 : 80)
+        ? asciiHost
+        : `${asciiHost}:${effectivePort}`,
+    path: path.replace(
+      /[\u0000-\u0020]/g,
+      (c) => `%${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`,
+    ),
+  };
+}
+
+/**
+ * An integer parameter as Telegram's Bot API server reads one: its leading
+ * digits, the fallback when it is empty, kept within min and max.
+ */
+function clampedInteger(value, fallback, min, max) {
+  const text = String(value ?? "");
+  const number = text === "" ? fallback : Number(/^-?\d+/.exec(text)?.[0] ?? 0);
+  return Math.min(max, Math.max(min, number));
 }
 
 /** A request number, or the fallback when it is missing or not a number. */
@@ -894,6 +1026,16 @@ export async function startTestServer({
   let stopped = false;
   let stopPromise;
   const responseClosures = new Set();
+  // Webhook connections are kept open between updates, as Telegram keeps them.
+  const agents = {
+    http: new http.Agent({ keepAlive: true }),
+    https: new https.Agent({ keepAlive: true }),
+  };
+  // For each Bot API call, a signal that its client hung up before an answer.
+  const clientGone = new WeakMap();
+  // Webhook attempts under way, and the first unexpected error one raised.
+  const deliveries = new Set();
+  let deliveryError = null;
   let activeControls = 0;
   let activeOwners = 0;
   let activeHttp = 0;
@@ -929,13 +1071,19 @@ export async function startTestServer({
       username,
       photos: [],
       token,
-      // The update types the bot subscribed to, set by setWebhook or getUpdates.
       webhook: null,
+      // The update types the bot subscribed to, set by setWebhook or
+      // getUpdates; null for Telegram's default.
       subscription: null,
-      // Updates waiting for getUpdates while no webhook is set, as on Telegram.
+      // Updates not yet confirmed, by getUpdates or by the webhook, in order:
+      // Telegram's update queue for the bot. Ids continue from the last one.
       queue: [],
+      lastUpdateId: Math.floor(clock.now() / 1000),
+      // The waiting getUpdates call and webhook attempts, by update_id.
       pollWaiters: new Set(),
-      delivery: Promise.resolve(),
+      sending: new Map(),
+      // When Telegram next answers a getUpdates conflict at once.
+      nextConflictAt: 0,
       // Command lists by scope and language (see commandsKey).
       commands: new Map(),
       // A guard bot that gets join request queries (Bot API 10.x).
@@ -1027,7 +1175,6 @@ export async function startTestServer({
   // treat a repeated one as already handled; counters start from the clock so
   // a restarted fake does not repeat the previous run's ids.
   const startSeconds = Math.floor(clock.now() / 1000);
-  let updateId = startSeconds;
   let nextUserId = 7_000_000_000 + startSeconds;
   let nextChatId = startSeconds;
   // Basic groups have their own ids: negative, without the -100 prefix.
@@ -1582,21 +1729,29 @@ export async function startTestServer({
     return emitMemberChange(chat, userId, before, actor, extra);
   }
 
-  function nextUpdateId() {
-    updateId += 1;
-    return updateId;
+  /**
+   * Apply allowed_updates as Telegram's Bot API server reads it
+   * (telegram-bot-api Client::get_allowed_update_types): names in any case,
+   * unknown names skipped, the default set when no name is known or the list
+   * is empty, and no change for anything that is not a list of strings.
+   */
+  function subscribe(record, value) {
+    if (!Array.isArray(value) || value.some((name) => typeof name !== "string"))
+      return;
+    const names = new Set(value.map((name) => name.toLowerCase()));
+    const known = UPDATE_TYPES.filter((type) => names.has(type));
+    const isDefault =
+      known.length === 0 ||
+      UPDATE_TYPES.every(
+        (type) => names.has(type) !== DEFAULT_EXCLUDED_UPDATES.includes(type),
+      );
+    record.subscription = isDefault ? null : known;
   }
 
   function allowed(record, type) {
-    const list = record.subscription;
-    if (!Array.isArray(list) || list.length === 0) {
-      return ![
-        "chat_member",
-        "message_reaction",
-        "message_reaction_count",
-      ].includes(type);
-    }
-    return list.includes(type);
+    return record.subscription
+      ? record.subscription.includes(type)
+      : !DEFAULT_EXCLUDED_UPDATES.includes(type);
   }
 
   /**
@@ -1642,8 +1797,10 @@ export async function startTestServer({
   }
 
   /**
-   * Deliver one update to one bot: to its webhook in order when one is set,
-   * otherwise to the queue its getUpdates reads.
+   * Deliver one update to one bot: to its webhook when one is set, otherwise
+   * to the queue its getUpdates reads. Resolves once the update has been
+   * handed over: queued for getUpdates, its first webhook attempt finished,
+   * or held behind an earlier update the webhook refused.
    */
   function emitTo(record, type, payload) {
     return emitOne(record, type, payload).delivered;
@@ -1654,39 +1811,93 @@ export async function startTestServer({
     if (!allowed(record, type)) {
       return { updateId: null, delivered: Promise.resolve() };
     }
+    // Each bot has its own update queue, numbered without gaps.
+    record.lastUpdateId += 1;
     const update = {
-      update_id: nextUpdateId(),
+      update_id: record.lastUpdateId,
       [type]: seenBy(record, inviteLinkSeenBy(record, payload)),
     };
-    sentUpdates.set(update.update_id, {
+    // Serialised now, so later state changes cannot rewrite a sent update.
+    const body = JSON.stringify(update);
+    // Telegram keeps an update for a day after it happened, a button press
+    // for 150 seconds (the timeouts of telegram-bot-api's add_update calls).
+    const happened =
+      type === "business_connection"
+        ? now()
+        : (payload.edit_date ?? payload.date ?? now());
+    sentUpdates.set(updateKey(record.id, update.update_id), {
       record,
-      body: JSON.stringify(update),
+      body,
+      expiresAt: type === "callback_query" ? now() + 150 : happened + 86_400,
+      queue: webhookQueue(type, payload, update.update_id),
     });
-    if (!record.webhook?.url) {
-      record.queue.push(structuredClone(update));
+    record.queue.push(JSON.parse(body));
+    if (!record.webhook || stopped) {
       wakePollers(record);
       return { updateId: update.update_id, delivered: Promise.resolve() };
     }
-    return {
-      updateId: update.update_id,
-      delivered: deliver(record, update),
-    };
+    const delivered = new Promise((handed) => {
+      record.sending.set(update.update_id, {
+        receipt: newAttempt(record, update.update_id),
+        delay: 1,
+        fails: 0,
+        handed,
+      });
+    });
+    pump(record);
+    return { updateId: update.update_id, delivered };
+  }
+
+  function updateKey(botId, updateId) {
+    return `${botId}:${updateId}`;
+  }
+
+  /**
+   * The queue an update waits in for the webhook, keyed as Telegram's Bot API
+   * server keys it (telegram-bot-api Client.cpp, the webhook_queue_id of each
+   * add_update): messages by chat, member changes, join requests and button
+   * presses by user. One queue's updates arrive in order, one at a time;
+   * different queues are delivered at once.
+   */
+  function webhookQueue(type, payload, updateId) {
+    switch (type) {
+      case "message":
+      case "edited_message":
+      case "channel_post":
+      case "edited_channel_post":
+        return `${payload.chat.id}`;
+      case "callback_query":
+        return `3:${payload.from.id}`;
+      case "my_chat_member":
+        return `5:${payload.chat.id}`;
+      case "chat_member":
+        return `6:${payload.new_chat_member.user.id}`;
+      case "chat_join_request":
+        return `6:${payload.from.id}`;
+      case "message_reaction":
+        return `8:${payload.chat.id}`;
+      case "business_connection":
+        return `10:${payload.user.id}`;
+      case "business_message":
+      case "edited_business_message":
+      case "deleted_business_messages":
+        return `11:${payload.chat.id}`;
+      default:
+        return `update:${updateId}`;
+    }
   }
 
   function wakePollers(record) {
     for (const waiter of record.pollWaiters) waiter.wake();
   }
 
-  function deliver(record, update, sentBody = null) {
-    const type = Object.keys(update).find((key) => key !== "update_id");
-    // Serialised now, so later state changes cannot rewrite a sent update.
-    if (stopped) return Promise.resolve();
-    const body = sentBody ?? JSON.stringify(update);
-    const attemptKey = `${record.id}:${update.update_id}`;
+  /** A webhook attempt's receipt, outstanding until the attempt settles. */
+  function newAttempt(record, updateId) {
+    const attemptKey = `${record.id}:${updateId}`;
     const attempt = (deliveryAttempts.get(attemptKey) ?? 0) + 1;
     deliveryAttempts.set(attemptKey, attempt);
     const receipt = {
-      update_id: update.update_id,
+      update_id: updateId,
       bot_id: record.id,
       attempt,
       epoch,
@@ -1695,57 +1906,434 @@ export async function startTestServer({
     };
     deliveryJournal.push(receipt);
     deliveryCount += 1;
-    record.delivery = record.delivery
-      .then(async () => {
-        // The webhook may have been removed while this update waited its turn;
-        // it then belongs to getUpdates, as on Telegram.
-        if (stopped) {
-          receipt.outcome = "cancelled";
-          return;
-        }
-        receipt.started_at = clock.now();
-        const target = record.webhook;
-        if (!target?.url) {
-          record.queue.push(JSON.parse(body));
-          wakePollers(record);
-          receipt.outcome = "poll_queue";
-          return;
-        }
-        const abort = new AbortController();
-        const timer = setTimeout(() => abort.abort(), WEBHOOK_TIMEOUT_MS);
-        inFlight.add(abort);
-        try {
-          const response = await fetch(target.url, {
+    return receipt;
+  }
+
+  function settle(receipt, outcome = receipt.outcome) {
+    receipt.outcome = outcome;
+    receipt.completed_at = clock.now();
+    deliveryCount -= 1;
+    waits.notify();
+  }
+
+  /** The update has gone as far as it can for now; whoever waits may go on. */
+  function hand(state) {
+    state.handed?.();
+    state.handed = null;
+  }
+
+  /**
+   * Send what the webhook may take now: the first unconfirmed update of each
+   * queue that is not waiting to be retried, up to max_connections requests
+   * at a time (telegram-bot-api WebhookActor::send_updates).
+   */
+  function pump(record) {
+    const webhook = record.webhook;
+    if (stopped || !webhook) return;
+    let busy = 0;
+    for (const state of record.sending.values()) if (state.request) busy += 1;
+    const started = new Set();
+    const waiting = new Set();
+    for (const update of record.queue) {
+      const { queue } = sentUpdates.get(updateKey(record.id, update.update_id));
+      let state = record.sending.get(update.update_id);
+      if (!state) {
+        state = {
+          receipt: newAttempt(record, update.update_id),
+          delay: 1,
+          fails: 0,
+        };
+        record.sending.set(update.update_id, state);
+      }
+      if (waiting.has(queue)) hand(state);
+      if (started.has(queue) || waiting.has(queue)) continue;
+      if (state.retry) {
+        waiting.add(queue);
+        continue;
+      }
+      started.add(queue);
+      if (state.request || busy >= webhook.max_connections) continue;
+      busy += 1;
+      const sending = attempt(record, webhook, update.update_id, state).catch(
+        (error) => {
+          deliveryError ??= error;
+        },
+      );
+      deliveries.add(sending);
+      sending.finally(() => deliveries.delete(sending));
+    }
+  }
+
+  /** One attempt to deliver a queued update, then a retry if it failed. */
+  async function attempt(record, webhook, updateId, state) {
+    const sent = sentUpdates.get(updateKey(record.id, updateId));
+    const { receipt } = state;
+    receipt.started_at = clock.now();
+    state.request = new AbortController();
+    const answer = await postUpdate(webhook, sent.body, state.request);
+    // A webhook removed or replaced meanwhile has already settled this attempt.
+    if (record.sending.get(updateId) !== state) return;
+    state.request = null;
+    if (answer.status) receipt.status = answer.status;
+    if (answer.status >= 200 && answer.status <= 299) {
+      receipt.outcome = "delivered";
+      forget(record, updateId);
+      pump(record);
+      await runWebhookAnswer(record, answer);
+      settle(receipt);
+      hand(state);
+      return;
+    }
+    settle(receipt, answer.status ? "rejected" : "failed");
+    // telegram-bot-api WebhookActor::on_update_error: the first failure is
+    // retried at once and later ones after twice the previous wait, up to a
+    // random 60 to 120 seconds. Retry-After, at most an hour, replaces the
+    // wait. An update whose next try would come after it expires is dropped.
+    const retryAfter = Math.min(3600, answer.retryAfter ?? 0);
+    let delay = state.delay;
+    let wait = retryAfter;
+    if (retryAfter === 0 && state.fails > 0) {
+      delay = Math.min(60 + Math.floor(Math.random() * 61), delay * 2);
+      wait = delay;
+    }
+    const expired = now() + wait > sent.expiresAt;
+    if (expired) {
+      forget(record, updateId);
+    } else {
+      state.delay = delay;
+      state.fails += 1;
+      state.receipt = newAttempt(record, updateId);
+      if (wait > 0) {
+        state.retry = clock.schedule(() => {
+          state.retry = null;
+          pump(record);
+        }, wait * 1000);
+      }
+    }
+    hand(state);
+    pump(record);
+    const type = Object.keys(JSON.parse(sent.body))[1];
+    log(
+      answer.status
+        ? `webhook answered ${answer.status} for ${type}`
+        : `webhook delivery failed for ${type}: ${answer.error.message}`,
+    );
+    if (expired) log(`webhook gave up on expired update ${updateId} (${type})`);
+  }
+
+  /** A test has Telegram send an update again: one attempt, never retried. */
+  function redeliver(sent) {
+    const { record } = sent;
+    const receipt = newAttempt(record, JSON.parse(sent.body).update_id);
+    receipt.started_at = clock.now();
+    const abort = new AbortController();
+    const resent = (async () => {
+      const answer = await postUpdate(record.webhook, sent.body, abort);
+      if (answer.status) receipt.status = answer.status;
+      const ok = answer.status >= 200 && answer.status <= 299;
+      if (ok) await runWebhookAnswer(record, answer);
+      settle(
+        receipt,
+        abort.signal.aborted
+          ? "cancelled"
+          : ok
+            ? "delivered"
+            : answer.status
+              ? "rejected"
+              : "failed",
+      );
+    })().catch((error) => {
+      deliveryError ??= error;
+    });
+    deliveries.add(resent);
+    resent.finally(() => deliveries.delete(resent));
+    return resent;
+  }
+
+  /** The bot's webhook confirmed an update, or Telegram dropped it. */
+  function forget(record, updateId) {
+    record.sending.delete(updateId);
+    const index = record.queue.findIndex(
+      (update) => update.update_id === updateId,
+    );
+    if (index >= 0) record.queue.splice(index, 1);
+  }
+
+  /**
+   * End the bot's webhook attempts when its webhook is removed or replaced, or
+   * the server stops. Updates not yet confirmed stay pending, as on Telegram.
+   */
+  function closeAttempts(record, outcome) {
+    for (const state of record.sending.values()) {
+      state.request?.abort();
+      state.retry?.();
+      settle(state.receipt, outcome);
+      hand(state);
+    }
+    record.sending.clear();
+  }
+
+  /**
+   * POST an update to a webhook with exactly the headers Telegram sends
+   * (telegram-bot-api WebhookActor::send_update). Resolves with the answer, or
+   * with the connection error, and records a failure for getWebhookInfo.
+   */
+  async function postUpdate(webhook, body, abort) {
+    const target = parseWebhookUrl(webhook.url);
+    inFlight.add(abort);
+    const answer = await new Promise((resolve) => {
+      let request;
+      try {
+        request = (target.https ? https : http).request(
+          {
+            host: webhook.fixed_ip ? webhook.ip_address : target.hostname,
+            port: target.port,
+            // The path's UTF-8 bytes, as Telegram writes them.
+            path: Buffer.from(target.path).toString("latin1"),
             method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              ...(target.secret_token
-                ? { "X-Telegram-Bot-Api-Secret-Token": target.secret_token }
-                : {}),
-            },
-            body,
+            setHost: false,
+            agent: target.https ? agents.https : agents.http,
+            ...(target.https && !net.isIP(target.hostname)
+              ? { servername: target.hostname }
+              : {}),
             signal: abort.signal,
-          });
-          receipt.status = response.status;
-          receipt.outcome = response.ok ? "delivered" : "rejected";
-          await response.body?.cancel();
-          if (!response.ok) {
-            log(`webhook answered ${response.status} for ${type}`);
-          }
-        } catch (error) {
-          receipt.outcome = stopped ? "cancelled" : "failed";
-          log(`webhook delivery failed for ${type}: ${error.message}`);
-        } finally {
-          clearTimeout(timer);
-          inFlight.delete(abort);
-        }
-      })
-      .finally(() => {
-        deliveryCount -= 1;
-        receipt.completed_at = clock.now();
-        waits.notify();
+            headers: {
+              Host: target.hostHeader,
+              ...(target.userinfo
+                ? {
+                    Authorization: `Basic ${Buffer.from(target.userinfo).toString("base64")}`,
+                  }
+                : {}),
+              ...(webhook.secret_token
+                ? { "X-Telegram-Bot-Api-Secret-Token": webhook.secret_token }
+                : {}),
+              "Content-Type": "application/json",
+              "Content-Length": Buffer.byteLength(body),
+              Connection: "keep-alive",
+              "Accept-Encoding": "gzip, deflate",
+            },
+          },
+          (response) => {
+            const chunks = [];
+            response.on("data", (chunk) => chunks.push(chunk));
+            response.on("error", (error) => resolve({ error }));
+            response.on("end", () =>
+              resolve({
+                status: response.statusCode,
+                reason: response.statusMessage,
+                headers: response.headers,
+                body: Buffer.concat(chunks),
+              }),
+            );
+          },
+        );
+      } catch (error) {
+        resolve({ error });
+        return;
+      }
+      request.on("socket", (socket) =>
+        socket.once("connect", () => {
+          if (!webhook.fixed_ip) webhook.ip_address = socket.remoteAddress;
+        }),
+      );
+      // Telegram closes a webhook connection that stays silent for a minute.
+      request.setTimeout(WEBHOOK_TIMEOUT_MS, () =>
+        request.destroy(new Error("Read timeout expired")),
+      );
+      request.on("error", (error) => resolve({ error }));
+      request.end(body);
+    });
+    inFlight.delete(abort);
+    if (abort.signal.aborted) return answer;
+    if (answer.error) {
+      // A connection the webhook closed without an error is retried quietly.
+      if (answer.error.message !== "socket hang up") {
+        recordWebhookError(
+          webhook,
+          CONNECTION_ERRORS[answer.error.code] ?? answer.error.message,
+        );
+      }
+    } else if (answer.status < 200 || answer.status > 299) {
+      const value = String(answer.headers["retry-after"] ?? "");
+      answer.retryAfter = /^-?\d{1,9}$/.test(value)
+        ? Math.max(0, Number(value))
+        : 0;
+      recordWebhookError(
+        webhook,
+        `Wrong response from the webhook: ${answer.status} ${answer.reason}`,
+      );
+    }
+    return answer;
+  }
+
+  function recordWebhookError(webhook, message) {
+    webhook.last_error_date = now();
+    webhook.last_error_message = message;
+  }
+
+  /**
+   * Run the Bot API call a webhook answered with, as the bot, the way
+   * Telegram does (bots/api#making-requests-when-getting-updates;
+   * telegram-bot-api WebhookActor::handle): any method but setWebhook,
+   * deleteWebhook, close, logOut and the get methods. Its result goes nowhere.
+   */
+  async function runWebhookAnswer(record, answer) {
+    const type = String(answer.headers["content-type"] ?? "");
+    if (
+      !answer.body.length ||
+      !/application\/json|application\/x-www-form-urlencoded|multipart\/form-data/.test(
+        type,
+      )
+    )
+      return;
+    try {
+      const body = /^(gzip|deflate)$/i.test(
+        String(answer.headers["content-encoding"] ?? ""),
+      )
+        ? unzipSync(answer.body)
+        : answer.body;
+      const params = await readRequestParams(
+        { url: "/", headers: { "content-type": type } },
+        body,
+      );
+      const method = String(params.method ?? "");
+      const name = method.toLowerCase();
+      if (
+        !name ||
+        ["setwebhook", "deletewebhook", "close", "logout"].includes(name) ||
+        name.startsWith("get")
+      )
+        return;
+      const response = await fetch(`${origin}/bot${record.token}/${method}`, {
+        method: "POST",
+        headers: { "content-type": type },
+        body,
       });
-    return record.delivery;
+      await response.arrayBuffer();
+    } catch {
+      // An answer Telegram cannot read runs nothing, nor does a stopping server.
+    }
+  }
+
+  /**
+   * setWebhook and deleteWebhook, as telegram-bot-api's
+   * process_set_webhook_query and do_set_webhook handle them. Like a Bot API
+   * server run with --local, this one takes http URLs, any port and local
+   * addresses.
+   */
+  function changeWebhook(record, p, url) {
+    const current = record.webhook;
+    const attached =
+      typeof p.certificate === "string" && p.certificate.startsWith("attach://")
+        ? p[p.certificate.slice("attach://".length)]
+        : p.certificate;
+    const certificate = url && Buffer.isBuffer(attached) ? attached : null;
+    const maxConnections = url
+      ? clampedInteger(p.max_connections, 40, 1, 100)
+      : 0;
+    const ipAddress = url ? String(p.ip_address ?? "") : "";
+    const secret = url ? String(p.secret_token ?? "") : "";
+    const drop = isTrue(p.drop_pending_updates);
+    if (
+      (current?.url ?? "") === url &&
+      !current?.has_custom_certificate &&
+      !certificate &&
+      (current?.max_connections ?? 0) === maxConnections &&
+      (current?.fixed_ip ? current.ip_address : "") === ipAddress &&
+      (current?.secret_token ?? "") === secret &&
+      !drop
+    ) {
+      subscribe(record, p.allowed_updates);
+      return new Described(
+        true,
+        url ? "Webhook is already set" : "Webhook is already deleted",
+      );
+    }
+    if (url)
+      abortLongPoll(record, "Conflict: terminated by setWebhook request");
+    // The old webhook goes first, even if the new one is then refused.
+    if (current) {
+      closeAttempts(record, url ? "cancelled" : "poll_queue");
+      record.webhook = null;
+    }
+    if (drop) record.queue.length = 0;
+    if (!url) {
+      return new Described(
+        true,
+        current ? "Webhook was deleted" : "Webhook is already deleted",
+      );
+    }
+    const target = parseWebhookUrl(url);
+    if (!target) {
+      throw new TelegramError(
+        400,
+        "Bad Request: invalid webhook URL specified",
+      );
+    }
+    if (Buffer.byteLength(secret) > 256) {
+      throw new TelegramError(400, "Bad Request: secret token is too long");
+    }
+    if (!/^[A-Za-z0-9_-]*$/.test(secret)) {
+      throw new TelegramError(
+        400,
+        "Bad Request: secret token contains illegal characters",
+      );
+    }
+    if (certificate?.length > 3 << 20) {
+      throw new TelegramError(
+        400,
+        `Bad Request: certificate size is too big (${certificate.length} bytes)`,
+      );
+    }
+    subscribe(record, p.allowed_updates);
+    if (ipAddress && !net.isIP(ipAddress)) {
+      throw new TelegramError(
+        400,
+        "Bad Request: bad webhook: Invalid IP address specified",
+      );
+    }
+    record.webhook = {
+      url,
+      secret_token: secret,
+      max_connections: maxConnections,
+      has_custom_certificate: certificate != null,
+      // The address Telegram sends to: the one given, or the host's.
+      fixed_ip: ipAddress !== "",
+      ip_address:
+        ipAddress || (net.isIP(target.hostname) ? target.hostname : ""),
+      last_error_date: 0,
+      last_error_message: "",
+    };
+    pump(record);
+    return new Described(true, "Webhook was set");
+  }
+
+  /** Telegram's update queue forgets an update once it expires. */
+  function dropExpired(record) {
+    const time = now();
+    for (let i = record.queue.length - 1; i >= 0; i -= 1) {
+      const { update_id: id } = record.queue[i];
+      if (sentUpdates.get(updateKey(record.id, id)).expiresAt < time) {
+        record.queue.splice(i, 1);
+      }
+    }
+  }
+
+  /** End the bot's waiting getUpdates call with a 409 conflict. */
+  function abortLongPoll(record, message) {
+    for (const waiter of [...record.pollWaiters]) waiter.abort(message);
+  }
+
+  /**
+   * Telegram answers a getUpdates conflict at once, but holds another one
+   * within 3 seconds for 3 seconds (telegram-bot-api fail_query_conflict).
+   */
+  function conflictPause(record) {
+    if (clock.now() >= record.nextConflictAt) {
+      record.nextConflictAt = clock.now() + 3000;
+      return Promise.resolve();
+    }
+    return delayResponse(3000);
   }
 
   /**
@@ -1782,16 +2370,17 @@ export async function startTestServer({
   /**
    * Someone adds, promotes, demotes or removes a bot. Telegram tells that bot
    * through my_chat_member, the chat's administrator bots through chat_member,
-   * and a group's members through a service message.
+   * and a group's members through a service message. The change is made at
+   * once; the returned promise settles when the updates have been handed over.
    */
-  async function setBotMembership(chat, record, { status, rights, actor }) {
+  function setBotMembership(chat, record, { status, rights, actor }) {
     const before = memberStatus(chat, record.id);
     const wasIn = isInChat(chat, record.id);
     const botsBefore = botsIn(chat);
     chat.members.set(record.id, { status, ...(rights ? { rights } : {}) });
     const after = chatMemberObject(chat, record.id);
     appliedCheckpoint();
-    await emitMemberChange(chat, record.id, before, actor);
+    const handed = [emitMemberChange(chat, record.id, before, actor)];
     const isIn = isInChat(chat, record.id);
     if (chat.type !== "channel" && wasIn !== isIn) {
       const service = addMessage(
@@ -1803,11 +2392,13 @@ export async function startTestServer({
       );
       // The bot itself gets it too: new_chat_members and left_chat_member
       // "may be the bot itself" (https://core.telegram.org/bots/api#message).
-      await emit("message", service, {
-        to: [...new Set([...botsBefore, ...botsIn(chat)])],
-      });
+      handed.push(
+        emit("message", service, {
+          to: [...new Set([...botsBefore, ...botsIn(chat)])],
+        }),
+      );
     }
-    return after;
+    return Promise.all(handed).then(() => after);
   }
 
   /**
@@ -2323,48 +2914,48 @@ export async function startTestServer({
       // Every bot here can be connected to a business account.
       can_connect_to_business: true,
     }),
-    setWebhook: (p, caller) => {
-      if (!p.url) {
-        caller.webhook = null;
-        return true;
-      }
-      caller.webhook = {
-        url: String(p.url),
-        secret_token: p.secret_token ?? null,
+    setWebhook: (p, caller) =>
+      changeWebhook(caller, p, p.url == null ? "" : String(p.url)),
+    deleteWebhook: (p, caller) => changeWebhook(caller, p, ""),
+    getWebhookInfo: (_p, caller) => {
+      const webhook = caller.webhook;
+      if (!webhook) dropExpired(caller);
+      // telegram-bot-api JsonWebhookInfo
+      return {
+        url: webhook?.url ?? "",
+        has_custom_certificate: webhook?.has_custom_certificate ?? false,
+        pending_update_count: caller.queue.length,
+        ...(webhook?.last_error_date
+          ? {
+              last_error_date: webhook.last_error_date,
+              last_error_message: webhook.last_error_message,
+            }
+          : {}),
+        ...(webhook
+          ? {
+              max_connections: webhook.max_connections,
+              ip_address: webhook.ip_address || "<unknown>",
+            }
+          : {}),
+        ...(caller.subscription
+          ? {
+              allowed_updates: caller.subscription.filter(
+                (type) => !type.startsWith("custom_"),
+              ),
+            }
+          : {}),
       };
-      if (Array.isArray(p.allowed_updates)) {
-        caller.subscription = p.allowed_updates;
-      }
-      // Updates that queued while nobody was listening go to the new webhook.
-      const pending = isTrue(p.drop_pending_updates)
-        ? []
-        : caller.queue.splice(0);
-      caller.queue.length = 0;
-      for (const update of pending) deliver(caller, update);
-      return true;
     },
-    deleteWebhook: (p, caller) => {
-      caller.webhook = null;
-      if (isTrue(p.drop_pending_updates)) caller.queue.length = 0;
-      return true;
-    },
-    getWebhookInfo: (_p, caller) => ({
-      url: caller.webhook?.url ?? "",
-      has_custom_certificate: false,
-      pending_update_count: caller.webhook?.url ? 0 : caller.queue.length,
-      ...(caller.subscription ? { allowed_updates: caller.subscription } : {}),
-    }),
     getUpdates: async (p, caller) => {
       const queue = caller.queue;
-      if (caller.webhook?.url) {
+      if (caller.webhook) {
+        await conflictPause(caller);
         throw new TelegramError(
           409,
           "Conflict: can't use getUpdates method while webhook is active; use deleteWebhook to delete the webhook first",
         );
       }
-      if (Array.isArray(p.allowed_updates)) {
-        caller.subscription = p.allowed_updates;
-      }
+      subscribe(caller, p.allowed_updates);
       const offset = numberParam(p.offset, 0);
       // An offset confirms every update before it: they are gone for good.
       if (offset > 0) {
@@ -2372,19 +2963,40 @@ export async function startTestServer({
       } else if (offset < 0) {
         queue.splice(0, Math.max(0, queue.length + offset));
       }
+      dropExpired(caller);
       const limit = Math.min(100, Math.max(1, numberParam(p.limit, 100)));
       const timeoutMs = Math.max(0, numberParam(p.timeout, 0)) * 1000;
       if (queue.length === 0 && timeoutMs > 0) {
-        await new Promise((resolve) => {
+        // A new waiting poll ends the one before it, as on Telegram
+        // (telegram-bot-api Client::abort_long_poll).
+        abortLongPoll(
+          caller,
+          "Conflict: terminated by other getUpdates request; make sure that only one bot instance is running",
+        );
+        // A client that hangs up stops waiting with it.
+        const hangup = clientGone.get(execution.getStore());
+        await new Promise((resolve, reject) => {
+          const finish = () => {
+            clearTimeout(waiter.timer);
+            caller.pollWaiters.delete(waiter);
+            hangup?.removeEventListener("abort", waiter.wake);
+          };
           const waiter = {
             wake: () => {
-              clearTimeout(waiter.timer);
-              caller.pollWaiters.delete(waiter);
+              finish();
               resolve();
+            },
+            abort: (message) => {
+              finish();
+              conflictPause(caller).then(() =>
+                reject(new TelegramError(409, message)),
+              );
             },
           };
           waiter.timer = setTimeout(waiter.wake, timeoutMs);
           caller.pollWaiters.add(waiter);
+          if (hangup?.aborted) waiter.wake();
+          else hangup?.addEventListener("abort", waiter.wake, { once: true });
         });
       }
       return queue.slice(0, limit);
@@ -2826,14 +3438,15 @@ export async function startTestServer({
       );
       return true;
     },
-    leaveChat: async (p, caller) => {
+    leaveChat: (p, caller) => {
       const chat = requireChat(p.chat_id);
       // TDLib refuses to leave a basic group that was upgraded.
       if (chat.migratedTo != null) {
         throw new TelegramError(400, "Bad Request: chat is deactivated");
       }
+      // Telegram answers at once; the updates follow on their own.
       if (isInChat(chat, caller.id)) {
-        await setBotMembership(chat, caller, { status: "left", actor: caller });
+        void setBotMembership(chat, caller, { status: "left", actor: caller });
       }
       return true;
     },
@@ -3199,7 +3812,7 @@ export async function startTestServer({
         ),
       );
     },
-    promoteChatMember: async (p, caller) => {
+    promoteChatMember: (p, caller) => {
       const userId = userIdParam(p.user_id);
       const chat = requireChat(p.chat_id);
       requireSupergroupOrChannel(chat);
@@ -3252,10 +3865,10 @@ export async function startTestServer({
       } else {
         chat.members.set(userId, { status: "member" });
       }
-      await memberChanged(chat, userId, current, caller);
+      void memberChanged(chat, userId, current, caller);
       return true;
     },
-    setChatAdministratorCustomTitle: async (p, caller) => {
+    setChatAdministratorCustomTitle: (p, caller) => {
       const userId = userIdParam(p.user_id);
       const chat = requireChat(p.chat_id);
       if (chat.type === "channel") {
@@ -3295,7 +3908,7 @@ export async function startTestServer({
         throw new TelegramError(400, "Bad Request: CUSTOM_TITLE_INVALID");
       }
       chat.members.set(userId, { ...member, customTitle: title || undefined });
-      await memberChanged(chat, userId, member, caller);
+      void memberChanged(chat, userId, member, caller);
       return true;
     },
     // TDLib cleans the title and cuts it to 128 characters, and setting the
@@ -3313,7 +3926,7 @@ export async function startTestServer({
       // The Bot API delivers the service message to the bot that made the
       // change too (need_skip_update_message keeps outgoing title, photo and
       // pin messages). Not awaited: the bot may be inside its webhook.
-      emit("message", addMessage(chat, caller, { new_chat_title: title }));
+      void emit("message", addMessage(chat, caller, { new_chat_title: title }));
       return true;
     },
     // The description is cut to 255 characters (ChatManager.cpp
@@ -3341,7 +3954,7 @@ export async function startTestServer({
         );
       }
       chat.photo = registerPhoto(p.photo);
-      emit(
+      void emit(
         "message",
         addMessage(chat, caller, { new_chat_photo: photoSizes(chat.photo) }),
       );
@@ -3354,7 +3967,10 @@ export async function startTestServer({
         throw new TelegramError(400, "Bad Request: CHAT_NOT_MODIFIED");
       }
       chat.photo = undefined;
-      emit("message", addMessage(chat, caller, { delete_chat_photo: true }));
+      void emit(
+        "message",
+        addMessage(chat, caller, { delete_chat_photo: true }),
+      );
       return true;
     },
     editChatInviteLink: (p, caller) => {
@@ -3445,7 +4061,7 @@ export async function startTestServer({
     },
     // Removes a user's reaction, or a chat's (actor_chat_id) when no user_id
     // is given; needs can_delete_messages.
-    deleteMessageReaction: async (p, caller) => {
+    deleteMessageReaction: (p, caller) => {
       const chat = requireChat(p.chat_id);
       if (!hasRight(chat, caller.id, "can_delete_messages")) {
         throw new TelegramError(
@@ -3474,7 +4090,7 @@ export async function startTestServer({
       }
       const user = requireUser(userIdParam(p.user_id));
       if (entry.reactions?.has(user.id)) {
-        await changeReaction(chat, entry, user, []);
+        void changeReaction(chat, entry, user, []);
       }
       return true;
     },
@@ -5143,7 +5759,7 @@ export async function startTestServer({
     requireQuiescent();
     const records = new Map(
       [...bots].map(([token, record]) => {
-        const { delivery, pollWaiters, ...fixture } = record;
+        const { pollWaiters, sending, ...fixture } = record;
         return [token, fixture];
       }),
     );
@@ -5184,7 +5800,6 @@ export async function startTestServer({
       recentSends,
       counters: {
         nextPublicId,
-        updateId,
         nextUserId,
         nextChatId,
         nextBasicGroupId,
@@ -5230,8 +5845,8 @@ export async function startTestServer({
       for (const [key, value] of source) target.set(key, value);
     }
     for (const record of bots.values()) {
-      record.delivery = Promise.resolve();
       record.pollWaiters = new Set();
+      record.sending = new Map();
     }
     for (const { file } of files.values()) {
       if (!Buffer.isBuffer(file.data)) file.data = Buffer.from(file.data);
@@ -5258,7 +5873,6 @@ export async function startTestServer({
     for (const method of state.unimplemented) unimplemented.add(method);
     ({
       nextPublicId,
-      updateId,
       nextUserId,
       nextChatId,
       nextBasicGroupId,
@@ -5537,13 +6151,26 @@ export async function startTestServer({
       method === "POST"
     ) {
       // Telegram delivers an update again when a webhook did not confirm it;
-      // this sends the same bytes to the same bot.
-      const sent = sentUpdates.get(Number(id));
-      if (!sent) throw new TelegramError(404, `No update ${id}`);
-      if (!sent.record.webhook?.url) {
+      // this sends the same bytes to the same bot. Each bot numbers its own
+      // updates, so bot_id says whose update it is when two bots share an id.
+      const matches = [...bots.values()]
+        .filter(
+          (record) => body.bot_id == null || record.id === Number(body.bot_id),
+        )
+        .map((record) => sentUpdates.get(updateKey(record.id, Number(id))))
+        .filter(Boolean);
+      if (matches.length === 0) throw new TelegramError(404, `No update ${id}`);
+      if (matches.length > 1) {
+        throw new TelegramError(
+          409,
+          `More than one bot got update ${id}; name one with bot_id`,
+        );
+      }
+      const [sent] = matches;
+      if (!sent.record.webhook) {
         throw new TelegramError(409, `The bot for update ${id} has no webhook`);
       }
-      await deliver(sent.record, JSON.parse(sent.body), sent.body);
+      await redeliver(sent);
       return { update_id: Number(id) };
     }
     if (resource === "users" && method === "POST" && !id) {
@@ -6829,6 +7456,11 @@ ${buttons}
           : {}),
       };
       recordCall(receipt, response);
+      const gone = new AbortController();
+      response.once("close", () => {
+        if (!response.writableFinished) gone.abort();
+      });
+      clientGone.set(receipt, gone.signal);
       if (failure && !failure.drop_after_apply && !failure.delay_only) {
         Object.assign(receipt, {
           failed: failure.error_code,
@@ -6908,7 +7540,17 @@ ${buttons}
           return;
         }
         if (failure?.delay_ms) await delayResponse(failure.delay_ms);
-        send(response, 200, { ok: true, result: seenBy(caller, result) });
+        send(
+          response,
+          200,
+          result instanceof Described
+            ? {
+                ok: true,
+                result: seenBy(caller, result.result),
+                description: result.description,
+              }
+            : { ok: true, result: seenBy(caller, result) },
+        );
       } catch (error) {
         Object.assign(receipt, {
           applied: receipt.applied,
@@ -7295,7 +7937,12 @@ ${buttons}
         "GET",
         `business/connections/${connectionId}/chats/${userId}/messages`,
       ),
-    redeliverUpdate: (updateId) => act("POST", `updates/${updateId}/redeliver`),
+    redeliverUpdate: (updateId, { botId } = {}) =>
+      act(
+        "POST",
+        `updates/${updateId}/redeliver`,
+        botId != null ? { bot_id: botId } : {},
+      ),
     updateProfile: (userId, fields) =>
       act("POST", `users/${userId}/profile`, fields),
     addProfilePhoto: (userId, bytes) =>
@@ -7426,7 +8073,10 @@ ${buttons}
       (stopPromise ??= (async () => {
         stopped = true;
         waits.cancel("Fake server stopped", true);
-        for (const record of bots.values()) wakePollers(record);
+        for (const record of bots.values()) {
+          wakePollers(record);
+          closeAttempts(record, "cancelled");
+        }
         for (const abort of [...inFlight]) abort.abort();
         clock.clear();
         expiryTasks.clear();
@@ -7437,7 +8087,10 @@ ${buttons}
           server.closeAllConnections();
         });
         await Promise.all(closing);
-        await Promise.all([...bots.values()].map((record) => record.delivery));
+        await Promise.all([...deliveries]);
+        agents.http.destroy();
+        agents.https.destroy();
+        if (deliveryError) throw deliveryError;
       })()),
   };
 }

@@ -57,10 +57,11 @@ async function upload(fake, method, fields) {
   return { status: response.status, ...(await response.json()) };
 }
 
-async function setup() {
+async function setup(options = {}) {
   const fake = await startTestServer({
     botToken: TOKEN,
     chats: [{ id: GROUP, title: "Test Group", ownerId: OWNER }],
+    ...options,
   });
   cleanups.push(() => fake.stop());
 
@@ -149,6 +150,54 @@ describe("more than one bot", () => {
       secondUpdates.result.map((update) => Object.keys(update)[1]),
     ).toEqual(["my_chat_member"]);
     expect(firstUpdates.result).toEqual([]);
+  });
+
+  it("numbers each bot's updates in its own sequence, and replays one by bot", async () => {
+    const { fake, api, second } = await setup();
+    await fake.setBotMembership(GROUP, second.id, { status: "member" });
+    const member = await fake.createUser();
+    await fake.join(GROUP, member);
+    for (const text of ["one", "two", "three"]) {
+      await fake.post(GROUP, member, text);
+    }
+
+    const ids = async (token) =>
+      (await api("getUpdates", {}, token)).result
+        .filter((update) => update.message?.text)
+        .map((update) => update.update_id);
+    const first = await ids(TOKEN);
+    const other = await ids(SECOND_TOKEN);
+    expect(first.map((id) => id - first[0])).toEqual([0, 1, 2]);
+    expect(other.map((id) => id - other[0])).toEqual([0, 1, 2]);
+  });
+
+  it("replays an update to the bot named when two bots got the same update_id", async () => {
+    const { fake, api, second } = await setup({
+      clock: { now: 1_800_000_000_000 },
+    });
+    const first = await startReceiver();
+    const other = await startReceiver();
+    await api("setWebhook", { url: first.url });
+    await api("setWebhook", { url: other.url }, SECOND_TOKEN);
+    await fake.setBotMembership(GROUP, second.id, { status: "member" });
+    // Both bots start counting from the same moment: the first bot's
+    // new_chat_members message and the second bot's my_chat_member share an id.
+    const sent = (await fake.getDeliveries()).map((d) => [
+      d.bot_id,
+      d.update_id,
+    ]);
+    const shared = Math.min(...sent.map(([, id]) => id));
+    expect(
+      sent
+        .filter(([, id]) => id === shared)
+        .map(([botId]) => botId)
+        .sort(),
+    ).toEqual([123456, second.id]);
+
+    await expect(fake.redeliverUpdate(shared)).rejects.toThrow(/bot/);
+    await fake.redeliverUpdate(shared, { botId: second.id });
+    await expect.poll(() => other.ofType("my_chat_member").length).toBe(2);
+    expect(first.ofType("message")).toHaveLength(1);
   });
 
   it("lets a bot edit and stop only its own messages", async () => {
