@@ -388,6 +388,7 @@ function readBody(request) {
  *   chats?: Array<{ id: number, title: string, ownerId: number, ownerName?: string }>,
  *   publicChats?: Array<{ username: string, type: "channel"|"supergroup"|"bot", title?: string }>,
  *   unimplemented?: "error" | "ok",
+ *   floodControl?: boolean,
  *   log?: (line: string) => void,
  * }} options
  */
@@ -403,6 +404,7 @@ export async function startTestServer({
   unimplemented: unimplementedMode = "error",
   loginClientSecret,
   clock: clockOptions,
+  floodControl = false,
   log = () => {},
 }) {
   if (unimplementedMode !== "error" && unimplementedMode !== "ok") {
@@ -2221,7 +2223,7 @@ export async function startTestServer({
         return { item, formatted, reference };
       });
       const mediaGroupId = String(nextMediaGroupId++);
-      return prepared.map(({ item, formatted, reference }) => {
+      return prepared.map(({ item, formatted, reference }, index) => {
         const file =
           typeof reference === "string" && files.has(reference)
             ? sentFile(reference)
@@ -2244,6 +2246,8 @@ export async function startTestServer({
             ...formatted,
             media_group_id: mediaGroupId,
           },
+          // Flood control counts the album as one send.
+          { counts: index === 0 },
         );
       });
     },
@@ -2513,7 +2517,7 @@ export async function startTestServer({
       : undefined;
   }
 
-  function sendFrom(p, caller, fields) {
+  function sendFrom(p, caller, fields, { counts = true } = {}) {
     // Message.reply_markup only ever carries an inline keyboard; reply
     // keyboards and ForceReply are shown to the user, not echoed back.
     const markup = inlineMarkup(p.reply_markup);
@@ -2525,6 +2529,9 @@ export async function startTestServer({
     requireCanSend(chat, caller);
     requireTopic(chat, p.message_thread_id);
     const replyTo = replyTarget(chat, p);
+    const receiver =
+      receiverId != null ? userObject(requireUser(receiverId)) : null;
+    if (counts) countSend(chat, caller);
     const message = addMessage(chat, caller, {
       ...fields,
       ...(replyTo ? { reply_to_message: replyTo } : {}),
@@ -2535,12 +2542,58 @@ export async function startTestServer({
             is_topic_message: true,
           }
         : {}),
-      ...(receiverId != null
-        ? { receiver_user: userObject(requireUser(receiverId)) }
-        : {}),
+      ...(receiver ? { receiver_user: receiver } : {}),
     });
     if (receiverId != null) message.ephemeral_message_id = message.message_id;
     return message;
+  }
+
+  // Flood control, when floodControl is set: the limits Telegram publishes for
+  // a bot's messages, not its internal algorithm.
+  // https://core.telegram.org/bots/faq#my-bot-is-hitting-limits-how-do-i-avoid-this
+  // Recent send times (server clock, ms), oldest first, for each bot in each
+  // chat and for each bot across its chats.
+  const recentSends = new Map();
+  function countSend(chat, caller) {
+    if (floodControl !== true) return;
+    const at = clock.now();
+    const inChat = `${caller.id}:${chat.id}`;
+    const limits = [
+      // "In a single chat, avoid sending more than one message per second."
+      [inChat, 1, 1000],
+      // "In a group, bots are not be able to send more than 20 messages per
+      // minute."
+      ...(chat.type === "group" || chat.type === "supergroup"
+        ? [[inChat, 20, 60_000]]
+        : []),
+      // "bots are not able to broadcast more than about 30 messages per second"
+      [String(caller.id), 30, 1000],
+    ];
+    let wakeupAt = 0;
+    for (const [key, count, windowMs] of limits) {
+      const oldest = recentSends.get(key)?.at(-count);
+      if (oldest !== undefined && oldest > at - windowMs) {
+        wakeupAt = Math.max(wakeupAt, oldest + windowMs);
+      }
+    }
+    if (wakeupAt > 0) {
+      // Whole seconds until the send fits, plus one, as the Bot API server
+      // answers its own limits (telegram-bot-api ClientManager.cpp), in its
+      // 429 shape (Query.cpp set_retry_after_error).
+      const retryAfter = Math.floor((wakeupAt - at) / 1000) + 1;
+      throw new TelegramError(
+        429,
+        `Too Many Requests: retry after ${retryAfter}`,
+        { retry_after: retryAfter },
+      );
+    }
+    for (const key of [inChat, String(caller.id)]) {
+      const sends = recentSends.get(key) ?? [];
+      sends.push(at);
+      // No limit looks further back than 30 sends.
+      if (sends.length > 30) sends.shift();
+      recentSends.set(key, sends);
+    }
   }
 
   /**
@@ -3303,6 +3356,7 @@ export async function startTestServer({
       deliveryJournal,
       deliveryAttempts,
       loginCodes,
+      recentSends,
       counters: {
         nextPublicId,
         updateId,
@@ -3344,6 +3398,7 @@ export async function startTestServer({
       [joinDecisions, state.joinDecisions],
       [loginCodes, state.loginCodes],
       [deliveryAttempts, state.deliveryAttempts],
+      [recentSends, state.recentSends],
     ]) {
       target.clear();
       for (const [key, value] of source) target.set(key, value);
@@ -4929,6 +4984,14 @@ ${buttons}
           completed_at: clock.now(),
         });
         if (!(error instanceof TelegramError)) throw error;
+        // The Bot API server repeats retry_after in a Retry-After header
+        // (telegram-bot-api HttpConnection.cpp).
+        if (error.parameters?.retry_after) {
+          response.setHeader(
+            "Retry-After",
+            String(error.parameters.retry_after),
+          );
+        }
         send(response, error.code, {
           ok: false,
           error_code: error.code,
