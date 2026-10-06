@@ -153,7 +153,8 @@ over HTTP through the control API described below, from Python, Go or anything e
 | `publicChats`                | `[]`             | Channels, groups and bots `{ username, type, title? }` resolvable by `getChat("@username")`. |
 | `unimplemented`              | `"error"`        | Telegram's 404 for an unsupported method, or `"ok"`: `true` for one that returns True.       |
 | `floodControl`               | `false`          | Hold or refuse sends over Telegram's published limits ([Flood control](#flood-control)).     |
-| `log`                        | none             | Receives one line per notable event (unsupported methods, webhook failures).                 |
+| `clock`                      | real time        | `{ now: <Unix ms> }`: a manual clock that only `advanceTime` moves ([Time](#time)).          |
+| `log`                        | none             | Receives one line per notable event: unsupported methods, webhook failures, internal errors. |
 
 ## Supported Bot API methods
 
@@ -207,13 +208,39 @@ The details a moderation bot depends on, each covered by a test:
   (`can't parse chat permissions: Field "can_send_polls" must be of type Boolean` otherwise), and
   `permissions` given empty fail with `can't parse permissions JSON object`.
   A member needs both their own permission and the chat's default from `setChatPermissions` to post;
-  a photo needs `can_send_photos`, not only `can_send_messages`. `getChat` returns the default
-  `permissions` for groups and supergroups, not for channels.
-- **Restrictions stick.** A restricted user who leaves and rejoins is still restricted.
+  a photo needs `can_send_photos`, not only `can_send_messages`. `setChatPermissions` needs
+  `can_restrict_members` (`not enough rights to change chat permissions`) and refuses a channel
+  (`can't change channel chat permissions`). `getChat` returns the default `permissions` for groups
+  and supergroups, not for channels.
+- **Restrictions stick.** A restricted user who leaves and rejoins is still restricted. An
+  `until_date` from 30 seconds to 366 days away ends the restriction or ban then, on the server's
+  clock; any other date makes it permanent. When it ends, a restricted user is a member again, or
+  `left` if they left meanwhile, and a banned user is `left`.
 - **Protected members.** Restricting or banning the chat owner, an administrator or the bot itself
   fails with Telegram's error.
-- **Unbanning.** `unbanChatMember` without `only_if_banned` removes a current member, as the docs
-  guarantee.
+- **Moderation rights** ([banChatMember](https://core.telegram.org/bots/api#banchatmember),
+  [approveChatJoinRequest](https://core.telegram.org/bots/api#approvechatjoinrequest)).
+  `restrictChatMember` works only in supergroups, and `promoteChatMember` and `unbanChatMember` only
+  in supergroups and channels. Restricting, banning and unbanning need `can_restrict_members`, and
+  approving or declining a join request `can_invite_users`, checked before anything changes.
+  Refusals carry Telegram's own texts, such as
+  `not enough rights to restrict/unrestrict chat member`, `method is available only in supergroups`
+  or, for a basic group that only an administrator may remove members from, `CHAT_ADMIN_REQUIRED`.
+  A pending join request does not make its user a member.
+- **Bans.** A ban deletes no messages, as on Telegram: `revoke_messages` only decides what the
+  removed user can still see, which this server does not model. A bot that wants a banned user's
+  messages gone deletes them with `deleteMessage` or `deleteMessages`. A basic group keeps no ban
+  list, so a person banned there is then `left`, as TDLib reports someone no longer in the group; a
+  bot removed from one sees itself `kicked`.
+- **Unbanning.** `unbanChatMember` leaves a banned user outside the chat. Without `only_if_banned`
+  it removes a current member, as the docs guarantee; with it, a user who is not banned stays as
+  they are.
+- **Deleting messages** ([deleteMessage](https://core.telegram.org/bots/api#deletemessage)). A bot
+  deletes its own messages, others' with `can_delete_messages`, and any message in a private chat.
+  A message sent 48 hours ago or earlier, the service message that created a supergroup, channel or
+  forum topic, and a dice in a private chat less than a day old can't be deleted
+  (`message can't be deleted`). `deleteMessages` skips ids it does not find and, as TDLib does,
+  checks every other message before deleting any, so one it can't delete fails the whole call.
 - **Editing.** Only the bot's own messages can be edited, except in a channel (below); an edit that
   changes nothing fails with `message is not modified`; an edit without `reply_markup` removes the
   inline keyboard, after which its buttons can no longer be pressed. As in TDLib's
@@ -432,10 +459,11 @@ The details a moderation bot depends on, each covered by a test:
   works in groups, channels and private chats; a private chat's pin shows only to the first bot,
   since that is the bot users write to. The message is checked before the bot's rights: a missing
   message fails with `message to pin not found` or `message to unpin not found` (also when nothing
-  is pinned), and only an existing one with `not enough rights to manage pinned messages in the
-  chat`. Each pin, by a bot or by a person (`pinMessage`), posts the `pinned_message` service
-  message, which reaches every bot in the chat, the pinning bot included. Neither `pinned_message`
-  carries the pinned message's `reply_to_message`.
+  is pinned), and only an existing one with
+  `not enough rights to manage pinned messages in the chat`. Each pin, by a bot or by a person
+  (`pinMessage`), posts the `pinned_message` service message, which reaches every bot in the chat,
+  the pinning bot included. Neither `pinned_message` carries the pinned message's
+  `reply_to_message`.
 - **What members send.** Besides text and photos, members post videos, animations (which carry a
   `document` too), stickers, voice notes, audio, video notes and documents, each needing its own
   permission (`can_send_videos`, `can_send_voice_notes`, ...), plus albums sharing a
@@ -494,8 +522,9 @@ The details a moderation bot depends on, each covered by a test:
   person's message (`MESSAGE_AUTHOR_REQUIRED`), an unknown one (`MESSAGE_ID_INVALID`) and the 48
   hours (`MESSAGE_EDIT_TIME_EXPIRED`). The connected bot may also message the owner's private chat
   (`user_chat_id`). `getMe` reports `can_connect_to_business`.
-- **Redelivery.** A test can have Telegram deliver any update again, byte for byte, as it does when a
-  webhook does not confirm one.
+- **Redelivery.** A test can have Telegram deliver any update again, byte for byte, callback queries
+  included, as it does when a webhook does not confirm one. It sends the saved update, so do not
+  restore an earlier snapshot between the steps of a replay.
 - **Adding the bot through a link** ([links](https://core.telegram.org/api/links#group-channel-bot-links),
   [deep linking](https://core.telegram.org/bots/features#deep-linking)). With admin rights
   requested, only the creator or an administrator with `can_promote_members` may add it; without,
@@ -601,6 +630,8 @@ page with a "Log in as ..." button per test user, and Cancel) and `POST /token`.
   same for a user, not their Telegram id, as in Telegram's example. The `profile` scope adds `id`,
   `name`, `given_name`, `family_name`, `preferred_username` and `picture` (served by this server).
 - `telegram:bot_access` lets the bot message the user afterwards, as documented.
+- Each server makes its own signing key the first time a token or `jwks.json` needs it, so tests
+  that never log in do not wait for it.
 
 ## Owner accounts (GramJS)
 
@@ -741,9 +772,10 @@ The owner client itself calls `POST /_owner/:ownerId/:method`; tests use the cli
 | `dropped`                              | The call runs, then the connection closes unanswered; the client rejects with `TIMEOUT`.               |
 | (none, with `errorMessage` and `code`) | Any other `RPCError`, e.g. `CHANNEL_PRIVATE`, 400.                                                     |
 
-`getOwnerCalls` records every call with its outcome (`ok`, `error`, `malformed`, `dropped`); any
-field named like a session, token, hash, key, secret, password or phone is recorded as
-`[redacted]`.
+`getOwnerCalls` returns a copy of every call with its outcome: `pending` until it answers, then
+`ok`, `error`, `malformed` or `dropped`, or `cancelled` when the server stops during its delay.
+Times follow the server's clock. Any field named like a session, token, hash, key, secret, password
+or phone is recorded as `[redacted]`.
 
 ### Not modelled, and unverified
 
@@ -837,13 +869,13 @@ after 150 seconds.
 - Bot API calls answer without waiting for the updates they cause, so a webhook bot that leaves a
   chat or promotes someone inside its handler does not wait for itself.
 
-The fake delivers resulting updates asynchronously. Tests should wait for the exact update
+The server delivers resulting updates asynchronously. Tests should wait for the exact update
 rather than depend on response/update ordering; the Bot API does not promise that ordering.
 
 ## Control API
 
 The test actions above, over HTTP, for tests written in other languages. All routes live under
-`/_fake/` and take and return JSON.
+`/_fake/` and take and return JSON. A route that fails answers `{ error }` with an HTTP status.
 
 | Route                                                  | Effect                                                                                                                                                                                                                                                                   |
 | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -879,11 +911,11 @@ The test actions above, over HTTP, for tests written in other languages. All rou
 | `POST users/:id/dm/:messageId/callback`                | The user presses a button in the private chat `{ data }`.                                                                                                                                                                                                                |
 | `GET bot`                                              | The first bot's user, with its `login_client_secret`.                                                                                                                                                                                                                    |
 | `GET webhook`                                          | The first bot's registered webhook.                                                                                                                                                                                                                                      |
-| `POST bots`                                            | Add a bot `{ token, username, first_name?, login_client_secret? }`; it is in no chat yet.                                                                                                                                                                                |
+| `POST bots`                                            | Add a bot `{ token, username, first_name?, login_client_secret?, supports_join_request_queries? }`; it is in no chat yet.                                                                                                                                                |
 | `POST login/approve`                                   | The user `{ auth_url, user_id }` logs in; returns `{ redirect_url }` with the code and state.                                                                                                                                                                            |
 | `POST login/cancel`                                    | The user cancels `{ auth_url }`; returns `{ redirect_url }` with `error=access_denied`.                                                                                                                                                                                  |
 | `GET bots`                                             | Every bot, with its webhook URL and `login_client_secret`.                                                                                                                                                                                                               |
-| `POST chats`                                           | Create `{ owner_id, title?, type?: "supergroup" \| "channel", owner_name?, is_forum? }`; returns the chat.                                                                                                                                                               |
+| `POST chats`                                           | Create `{ owner_id, title?, type?: "supergroup" \| "group" \| "channel", owner_name?, is_forum? }`; returns the chat.                                                                                                                                                    |
 | `GET chats/:id`                                        | The chat with its pinned message ids and members.                                                                                                                                                                                                                        |
 | `POST chats/:id/bots`                                  | Add, promote, demote or remove a bot `{ bot_id, status?, rights?, by? }`, as the owner would.                                                                                                                                                                            |
 | `POST chats/:id/bots` with `start_parameter`           | A person `{ by?, bot_id, start_parameter, rights? }` adds the bot through its `startgroup` link, or, with `rights` and an empty `start_parameter`, a channel's `startchannel` link.                                                                                      |
@@ -984,141 +1016,110 @@ the defaults, kept as Telegram keeps them: `is_disabled` only when the text has 
 Uploaded documents preserve their original filename and MIME type when reused by `file_id`
 ([Document](https://core.telegram.org/bots/api#document)).
 
-## What it does not do
+## Injected failures
 
-- Inline mode, payments, games, sticker sets, reaction counts, votes in polls, or Telegram's exact
-  rate limits: `floodControl` applies only its published numbers (a test can also make any call
-  fail with a 429 through `POST failures`). Channel signatures are not modelled, and forum topics
-  cannot be closed or deleted.
-- Expiry is evaluated on state access, without a scheduler or an automatic expiry webhook. Restarting loses all state; restart recovery belongs to the application under test.
-- In Telegram Login: the `phone` scope's `phone_number` (test users have no phone numbers), the
-  ES256, EdDSA and ES256K signing options (only the default RS256), the redirect URLs registered
-  with BotFather (any `redirect_uri` is accepted), the `telegram-login.js` popup and native SDKs, and
-  the legacy Login Widget's hash check. Telegram has no UserInfo endpoint, and neither does this
-  server.
-- Fetching media from HTTP URLs (a URL stands in as a one-byte file), several sizes per photo,
-  `sendLivePhoto` and `editMessageLiveLocation`.
-- Persistence. All state lives in memory and is lost when the server stops.
-- Anything security-related. It is a test tool: bind it to localhost and never expose it to a
-  network you do not control.
+`failNext(rule)` (`POST /_fake/failures`) makes the next matching Bot API calls fail. A rule counts
+only calls with its `method` and, where given, its `chatId`, `botId`, `userId` and `messageId`;
+other calls do not use it up. `userId` is the user the call is about: its `user_id`, an ephemeral
+message's receiver, or the author of the message `deleteMessage` deletes. `messageId` also matches
+one id in a `deleteMessages` list. `attempt: 2` starts at the second matching call after the rule
+is added, and `times` (default 1) is how many matching calls in a row it applies to.
 
-## Moderation fidelity and operation receipts
+- With `errorCode`, the call fails before it runs. Without `description`, the error reads as
+  Telegram's does for its code (`Bad Request`, `Forbidden`, `Conflict`, ...). A 429 needs
+  `retryAfter`, a whole number of seconds: it reads `Too Many Requests: retry after N` and carries
+  the `Retry-After` header, as on Telegram.
+- With `dropAfterApply`, the call takes effect once, then the connection closes without an answer.
+- `delayMs` (at most 30 seconds) delays the answer; on its own, the call runs normally. Delays end
+  when the server stops.
 
-A ban deletes no messages, as on Telegram: `revoke_messages` only decides what the
-removed user can still see, which this server does not model. A bot that wants a
-banned user's messages gone deletes them with `deleteMessage` or `deleteMessages`.
-A basic group keeps no ban list, so a person banned there is then `left`, as TDLib
-reports someone no longer in the group; a bot removed from one sees itself `kicked`.
-`restrictChatMember` works only in supergroups, and `promoteChatMember` and
-`unbanChatMember` only in supergroups and channels.
-Restrict/ban/unban require `can_restrict_members` and protect
-administrators; approval/decline require `can_invite_users` before touching pending
-requests. Refusals carry Telegram's own texts, such as `not enough rights to
-restrict/unrestrict chat member`, `method is available only in supergroups` or, for a
-basic group that only an administrator may remove members from, `CHAT_ADMIN_REQUIRED`.
-Pending requests are not members. Unban leaves a banned user outside;
-`only_if_banned` keeps an admitted user unchanged. Bulk deletion validates permissions
-before changing any existing target and skips missing message IDs. Deletion enforces
-the 48-hour limit, private dice minimum age, and undeletable creation service messages.
+`clearFailures()` (`DELETE /_fake/failures`) drops the rules not used up.
 
-Finite restriction/ban dates from 30 seconds through 366 days are inclusive;
-outside that range they are permanent. Expired restrictions become member/left
-according to physical membership; expired bans become left. These contracts follow
-[ban/unban/restrict](https://core.telegram.org/bots/api#banchatmember),
-[join approval/decline](https://core.telegram.org/bots/api#approvechatjoinrequest), and
-[deletion](https://core.telegram.org/bots/api#deletemessages).
+## Call receipts
 
-Fault rules count only operations matching their method, chat, bot, user and message
-selectors. `userId` identifies the method target, ephemeral recipient, or
-`deleteMessage` author. `messageId` also matches an ID in a `deleteMessages` batch.
-`attempt: 2` starts at the second matching request after installation;
-`times` controls consecutive matching faulted attempts. Unrelated operations do not
-consume the rule. `delayMs` alone executes normally and delays only the response.
-Adding `errorCode` rejects before execution; `dropAfterApply` executes once then drops
-the connection. Delays are bounded to 30 seconds and cancelled on server stop.
-Without `description`, an injected error reads as Telegram's does for its code
-(`Bad Request`, `Forbidden`, `Conflict`, ...). A 429 needs `retryAfter`, a whole number of
-seconds: it reads `Too Many Requests: retry after N` and carries the `Retry-After` header, as on
-Telegram.
+`getCalls()` (`GET /_fake/calls`) returns copies, so changing them changes nothing on the server.
+`calls` lists every Bot API call made with a known token and a body that could be read.
+`rejected_requests` lists the calls refused before that: an unknown token (its numeric part as
+`bot_id`; the token itself is not kept) or form data that cannot be read (kept as `raw_body`, and
+left out of wait failure reports). `unimplemented` names the unsupported methods called.
 
-`getCalls()` / `GET /_fake/calls` retain append-only receipts with `seq`, `outcome`,
-`applied`, `status`, `completed_at`, and matching `fault_id` / `attempt` / `delay_ms`.
-Each receipt's `params` are the parameters as Telegram's server reads them: text, with the
-JSON-serialized ones (`reply_markup`, `media`, `permissions`, ...) parsed, so a call wait that
+Each receipt has `seq` (its place in its list), `method`, `bot_id`, `params`, `at`, `outcome`,
+`status`, `completed_at`, and `target_user_id`, the user the call is about (as `userId` above),
+read before the call runs. `params` are the parameters as Telegram's server reads them: text, with
+the JSON-serialized ones (`reply_markup`, `media`, `permissions`, ...) parsed, so a call wait that
 narrows by `params` gives `chat_id` as text, such as `"-100123"`.
-`applied` means the handler succeeded, including reads/no-ops, rather than claiming a
-state change. Actual permission rejection records `failed` as well as injected
-rejection. A failed handler never records a successful response loss. Compare these
-receipts with `getMember` / `getMessage` for physical-state proof.
 
-Use `redeliverUpdate(updateId)` to replay the exact saved webhook bytes, including
-callback queries. Do not clear messages, update history or receipts between replay
-steps. Clear unused failure rules at scenario boundaries; use a fresh server or restore a
-quiescent fixture snapshot for an independent fake fixture. This fake does not emulate application persistence or
-Telegram's complete permission, media, rate-limit or delivery model. Bulk permission
-validation before mutation is this fake's failure-isolation policy; Telegram's docs
-do not specify partial execution of invalid mixed batches.
+- `applied` is true once the call took effect, or, for a read or a call that changes nothing, once
+  it succeeded. It stays true when the call fails after taking effect (`failed_after_apply`).
+- A call refused, by Telegram's rules or by a failure rule, is `rejected`, with its status in
+  `failed`, and is never `applied`. `response_lost` (with `dropped: true`) means the call took
+  effect and its answer never reached the bot.
+- A call a failure rule matched carries the rule's `fault_id`, `attempt` and `delay_ms`, and
+  `fault_injected` says whether the rule had started failing calls yet.
+- `request_id` is unique across both lists, also after a restore. `timeline` holds the stages the
+  call reached, with their times: `received` (when the request arrived), `validated`,
+  `state_applied` (when a message or member changed), `handler_completed`, then `response_sent`
+  (written out, not necessarily read by the bot) or `response_lost`. `completed_at` includes any
+  injected delay.
 
-## Exact waits, reusable fixtures and fake-owned time (0.10.0)
+Not every change records `state_applied`, so prove what a call changed with a `message` or `member`
+wait, `getMember` or `getMessage`.
 
-These are test controls, not additional Telegram methods. Existing bot URLs,
-fixture helpers, scoped `failNext`, delayed responses, `dropAfterApply` and exact
-update replay continue to work.
+## Waits, snapshots and time
+
+These are test controls, not Telegram methods.
 
 ```js
-const fake = await startTestServer({
+const GROUP = -1001234567890;
+const server = await startTestServer({
   botToken: "123456:TEST",
   clock: { now: 1_800_000_000_000 }, // optional; omit for real time
-  chats: [{ id: -1001234567890, title: "Test", ownerId: 5000000001 }],
+  chats: [{ id: GROUP, title: "Test", ownerId: 5000000001 }],
 });
 try {
-  const userId = await fake.createUser();
-  await fake.join(-1001234567890, userId);
-  const saved = await fake.snapshot();
+  const userId = await server.createUser();
+  await server.join(GROUP, userId);
+  const saved = await server.snapshot();
   try {
-    const banned = fake.waitFor(
-      {
-        kind: "member",
-        chatId: -1001234567890,
-        userId,
-        status: "kicked",
-      },
+    const banned = server.waitFor(
+      { kind: "member", chatId: GROUP, userId, status: "kicked" },
       { timeoutMs: 1000 },
     );
     await Promise.all([
       banned,
       (async () => {
-        // A real HTTP call to this local fake, without a production service.
+        // A real Bot API call, as a bot would make it.
         const response = await fetch(
-          `${fake.origin}/bot123456:TEST/banChatMember`,
+          `${server.origin}/bot123456:TEST/banChatMember`,
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ chat_id: -1001234567890, user_id: userId }),
+            body: JSON.stringify({ chat_id: GROUP, user_id: userId }),
           },
         );
         const answer = await response.json();
         if (!answer.ok) throw new Error(answer.description);
       })(),
     ]);
-    await fake.restore(saved);
-    await fake.waitFor({
+    await server.restore(saved);
+    await server.waitFor({
       kind: "member",
-      chatId: -1001234567890,
+      chatId: GROUP,
       userId,
       status: "member",
     });
   } finally {
-    await fake.releaseSnapshot(saved);
+    await server.releaseSnapshot(saved);
   }
 } finally {
-  await fake.stop();
+  await server.stop();
 }
 ```
 
-For application enforcement, trigger the application instead of directly calling
-the fake Bot API and await the same physical-state condition. The following
-selectors are supported:
+### Waiting for an outcome
+
+In a real test, trigger your app instead of calling the Bot API directly, and wait for the same
+condition. `waitFor` takes these conditions:
 
 | `kind`        | Required identity                                                                   | Expected state / optional narrowing                                                                 |
 | ------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
@@ -1127,57 +1128,73 @@ selectors are supported:
 | `joinRequest` | `chatId`, `userId`, `state`                                                         | `pending`, `approved`, `declined`; `botId` identifies the resolving bot                             |
 | `call`        | `botId`, `method`                                                                   | `chatId`, `userId`, `messageId`, exact `params` fields, `afterSeq`, `requestId`, `outcome`, `stage` |
 
-`waitFor(condition, { timeoutMs })` evaluates at registration and on changes; it
-never polls. Deadlines use wall time, default 1000 ms, range 1–30000 ms. Results
-are detached copies. Failure reports include the exact expectation, observed
-state or up to eight matching requests, and outstanding fake work. Diagnostics
-are capped at 8000 characters and redact credentials; raw request journals remain
-original evidence and may contain fixture secrets. Do not dump them indiscriminately.
-`userId` or `botId` on a message identifies its author, also in a channel, where
-the message itself names only the channel. Membership is physical chat/user
-state, shared by the bots in that chat. Join decisions are a test observation
-journal, not a new ChatMember status; decline leaves the requester outside.
+`waitFor(condition, { timeoutMs })` checks the condition when it is called and again whenever the
+server's state changes; it never polls. Its deadline is wall time: 1000 ms by default, 1 to 30000
+ms. It resolves with a copy of what matched. A wait that times out fails with the exact
+expectation, what was observed (or up to eight matching requests) and the work still outstanding,
+in at most 8000 characters with credentials redacted. `getCalls()` itself keeps requests as they
+came, fixture secrets included, so do not dump it indiscriminately.
 
-Snapshot handles are opaque strings owned by one server. `snapshot()` and
-`restore(handle)` require quiescence: no active HTTP/control/owner request,
-long poll, webhook attempt (an update waiting to be retried counts until it is
-delivered, dropped or its webhook removed), response delay or clock advance. Idle finite-expiry
-timers and unused fault rules are allowed. Drain existing deliveries and finish
-requests before taking a snapshot; restore fails explicitly with outstanding
-work instead of silently mixing in-flight execution with restored state.
+- `userId` or `botId` on a message identifies its author, also in a channel, where the message
+  itself names only the channel.
+- A `member` condition reads the member's status in the chat, which every bot in it shares.
+- A `joinRequest` state is what the test observed, not a `ChatMember` status; a declined requester
+  stays outside.
+- A `call` wait looks in `calls`; with `includeRejectedRequests: true`, in `rejected_requests` too.
+  `afterSeq` counts within each list. Without `outcome` or `stage`, it can resolve as soon as the
+  call is received, before it runs.
 
-Restore replaces users, bots, chat/private/business/owner fixtures, media bytes,
-memberships, messages, invite/join state, counters, calls, fault rules and their
-attempt counters, saved update bytes, queues, webhook/subscription settings,
-login codes and flood control's recent sends. Aliases between bot/user/update
-records are retained. Finite expiry
-work is reconstructed from restored membership. Snapshots are detached and reusable;
-`releaseSnapshot(handle)` frees them. Restore cancels older waits. A monotonically
-increasing restore epoch prevents request identities colliding when fixture IDs
-and journals intentionally rewind. Server origin and per-instance login signing
-identity remain fixed. External webhook consumers, sockets, timers, databases
-and application state are not snapshotted.
+### Snapshots
 
-With `clock: { now: milliseconds }`, `advanceTime(ms)` serializes advances and
-runs due fake expiry, Bot/owner response-fault delays and sends held by flood control in deadline
-order. It also controls fake message/login/business timestamps and flood control. Real
-mode remains the default; real time is not rewound by restore. Manual time is restored with the
-fixture. Global `Date`, timers and the consuming application's jobs are untouched.
-Webhook retry waits and delayed getUpdates conflicts run on it too. Webhook network
-I/O and its one-minute timeout, long polling and diagnostic waits still use wall
-time. A clock advance is not a network-delivery or enforcement barrier.
+`snapshot()` returns an opaque handle that only this server accepts. `snapshot()` and
+`restore(handle)` need the server to be idle: no Bot API, control or owner request in progress, no
+long poll, no webhook attempt (an update waiting for a retry counts until it is delivered, dropped
+or its webhook removed), no response delay, no send held by flood control and no clock advance.
+Pending restriction and ban expiries and unused failure rules are fine. Drain deliveries and finish
+requests before taking a snapshot; `restore` fails with outstanding work rather than mix it with
+the restored state.
 
-`drainDeliveries({ botId?, timeoutMs? })` waits for that server's queued/in-flight
-webhook attempts to settle, including retries still due and calls a webhook answered
-with. It does not consume `getUpdates` queues, assert HTTP success, or wait for the
-bot's moderation work after acknowledging a webhook. Inspect `getDeliveries()` for
-update ID, bot ID, replay attempt (each retry is one), epoch, enqueue/start/
-completion times, status and outcome. Saved updates and delivery evidence survive
-until an explicit restore. `stop()` cancels waits/delays, aborts current deliveries,
-prevents queued deliveries starting, clears scheduled work and closes connections.
-Read-only in-process controls remain available after stopping for diagnostics.
+`restore` puts back users, bots, chats (groups, private and business chats, owner accounts), file
+bytes, members, messages, invite links and join requests, id counters, call receipts, failure
+rules and how far they have counted, sent updates with their bytes and queues, webhook and
+`allowed_updates` settings, login codes and flood control's recent sends. Expiries are scheduled
+again from the restored members. A snapshot can be restored any number of times;
+`releaseSnapshot(handle)` frees it. A restore cancels waits in progress and starts a new `epoch`,
+which keeps later `request_id`s apart from earlier ones although ids and receipts go back. The
+origin and the login signing key stay the same. Nothing outside the server is restored: your
+webhook receiver, its sockets and timers, your database and your app's state.
 
-The HTTP equivalents use camel-case control fields:
+Between independent scenarios, drop unused failure rules with `clearFailures()`, then restore a
+snapshot or start a fresh server.
+
+### Time
+
+By default the server runs on real time. With `clock: { now: milliseconds }` it keeps a manual
+clock that only `advanceTime(ms)` moves; `getClock()` returns `{ mode, now, scheduled }`. Advances
+run one at a time, and each runs what has come due, in deadline order: restriction and ban expiry,
+response delays (`delayMs`, and owner call delays), sends held by flood control, webhook retries
+and delayed `getUpdates` conflicts. Message, login and business dates, the five minutes a bot may
+message a join requester, and flood control follow this clock too. A restore sets a manual clock
+back to the snapshot's time; real time is never rewound. The global `Date`, timers and your app's
+jobs are untouched. Webhook connections and their one-minute timeout, long polling and `waitFor`
+deadlines use wall time, so an advance does not wait for deliveries or for your bot to act.
+
+### Webhook deliveries
+
+`drainDeliveries({ botId?, timeoutMs? })` waits until the server's queued and in-flight webhook
+attempts have settled, retries still due and calls a webhook answered with included. It does not
+empty `getUpdates` queues, check that the webhook answered 2XX, or wait for what the bot does after
+answering. `getDeliveries()` lists each attempt with its update and bot id, attempt number (each
+retry is one), restore epoch, when it was queued, started and completed, its status and outcome.
+Sent updates and this list are kept until a restore.
+
+`stop()` cancels waits and delays, aborts deliveries in progress, starts no queued ones, clears
+scheduled work and closes connections. Read-only controls still answer in-process after `stop()`,
+for diagnostics.
+
+### Over HTTP
+
+These controls take camelCase fields:
 
 | Request                           | Body/result                                          |
 | --------------------------------- | ---------------------------------------------------- |
@@ -1187,124 +1204,99 @@ The HTTP equivalents use camel-case control fields:
 | `DELETE /_fake/snapshots/:handle` | release handle                                       |
 | `GET /_fake/clock`                | `{ mode, now, scheduled }`                           |
 | `POST /_fake/clock`               | `{ ms }` → advanced clock; manual mode required      |
-| `GET /_fake/deliveries`           | delivery journal                                     |
-| `POST /_fake/deliveries`          | `{ botId?, timeoutMs? }` → drain fake deliveries     |
+| `GET /_fake/deliveries`           | the deliveries `getDeliveries()` lists               |
+| `POST /_fake/deliveries`          | `{ botId?, timeoutMs? }` → drain deliveries          |
 
-A wait, drain or clock advance that fails answers `{ error }`: 400 for bad input, 408
-when the deadline passes, and 409 when the wait is cancelled or the clock is not manual.
+A wait, drain or clock advance that fails answers `{ error }`: 400 for bad input, 408 when the
+deadline passes, and 409 when the wait is cancelled or the clock is not manual. A snapshot or
+restore while the server is busy answers 409, and an unknown handle 404.
 
-### Request timelines and compatibility
+## What it does not do
 
-Each Bot API receipt has an instance/epoch/sequence `request_id` and a bounded
-`timeline`: `received`, `validated`, `state_applied`, `handler_completed`, and
-`response_sent` or `response_lost`. `received` timestamps HTTP arrival. Shared
-message creation/edit/deletion and membership mutation paths checkpoint known
-physical application as it happens. Other handlers, and successful reads/no-ops,
-retain a completion checkpoint. `handler_completed`
-separately records successful handler return; it can occur later than application.
-`validated` records successful validation at that checkpoint, not an instrumented
-pretransaction barrier. Not every intermediate mutation is instrumented. Use exact
-message/member waits for physical proof. Request context is scoped through
-AsyncLocalStorage, so concurrent calls cannot borrow one another's checkpoints.
-`applied` remains true if an instrumented mutation is followed by a handler
-failure; `failed_after_apply` distinguishes that from a rejection before execution.
-`response_sent` means Node finished writing locally, not that the remote
-application processed the answer. Completion time includes injected response delays.
-Lost responses preserve known application separately from transport loss;
-permission/injected rejections do not record successful application.
-`target_user_id` captures the target argument, ephemeral recipient, or
-`deleteMessage` author before execution without altering original `params`.
-Matching attempts before fault injection starts now retain
-`fault_id`, `attempt`, and `fault_injected: false`; injected attempts set it true.
-
-`getCalls()` is now detached: mutating its result cannot rewrite evidence.
-Existing `calls` retains its authenticated, parsed-request scope. New
-`rejected_requests` records unauthorized attempts and form data that cannot be read
-separately, preserving 0.9.x call counts. Call waits use `calls` by default; set
-`includeRejectedRequests: true` to observe the early-rejection journal too. Its
-`bot_id` is the attempted numeric token prefix, not authenticated identity.
-`afterSeq` is local to each journal; `requestId` is unique across both. A call
-wait without an outcome/stage can resolve at receipt, before execution.
-Unauthorized URL tokens are not journaled; unreadable bodies
-are retained as `raw_body` and suppressed in diagnostics. Calls refused for chat
-access (including an upgraded basic group) receive the same identity/timeline as
-other parsed calls. Owner RPCs retain their
-existing owner ledger and duration fields. Owner receipts now use fake time,
-start as `pending`, and become `cancelled` if shutdown interrupts a delay before
-execution. `getOwnerCalls()` is detached too. These are diagnostic outcomes of
-the fake, not invented Telegram RPC errors. Successful owner response shapes are
-unchanged. Call observers use derived per-bot/method indexes and journal sequence
-bounds; restore rebuilds the indexes without removing replay evidence. Large
-restored journals are copied without exceeding JavaScript function argument limits.
-
-Four former no-op setters (`setMyDescription`, `setMyShortDescription`,
-`setChatMenuButton`, `setMyDefaultAdministratorRights`) now report unsupported in
-strict mode instead of claiming to store state. This is an intentional compatibility
-change. The explicitly selected `unimplemented: "ok"` mode remains for existing
-consumers: it answers `true` only where Telegram's result is `True`, and stores
-nothing. Strict `"error"` is the default.
-`setChatPermissions` now requires a group/supergroup and the caller’s
-`can_restrict_members` right; an unauthorized call cannot change default
-permissions. Consumers whose fixtures depended on unauthorized success must
-correct their administrator setup. Dependency versions remain unchanged.
-
-RSA login keys are generated only on first signing/JWKS use, separately per
-instance. Bot-only tests avoid the key-generation cost. Login tests still pay
-that cost at first use; this is deferred work, not cheaper cryptography.
-
-### Verification and upgrading
-
-The retained suites cover stored plain text versus original HTML/`parse_mode`,
-UTF-16 entities, literal user markup, emoji/nested/link/mention formatting,
-permissions and membership, join decisions, edit/delete, callbacks, bans that
-leave messages in place, mute history preservation, response-loss faults,
-replay and bot/chat isolation. Contracts:
-[MessageEntity](https://core.telegram.org/bots/api#messageentity),
-[formatting](https://core.telegram.org/bots/api#formatting-options),
-[ban](https://core.telegram.org/bots/api#banchatmember),
-[restrict](https://core.telegram.org/bots/api#restrictchatmember),
-[default permissions](https://core.telegram.org/bots/api#setchatpermissions),
-[join decisions](https://core.telegram.org/bots/api#approvechatjoinrequest), and
-[callback queries](https://core.telegram.org/bots/api#callbackquery).
-These do not imply complete Telegram compatibility or verified Telegram callback
-expiry/retry timing; the fake's callback wait deadline remains its own test policy.
-
-See the [measurements and regression record](https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/performance.md)
-for reproducible commands, raw samples, observed costs and remaining gaps.
-In a source checkout, run `npm test`, `npm run bench`, `node bench/reuse.mjs`,
-and `node --expose-gc bench/scaling.mjs`. The scaling benchmark accepts
-`BENCH_HISTORY`, `BENCH_MESSAGES`, `BENCH_OBSERVERS` and `BENCH_ROUNDS` for
-explicit capacity runs; do not interpret a small sample as a throughput guarantee.
-Version **0.10.0** adds these test controls and fidelity fixes. Pin it explicitly:
-
-```sh
-pnpm add -D --save-exact telegram-bot-test-server@0.10.0
-# or: npm install --save-dev --save-exact telegram-bot-test-server@0.10.0
-```
-
-Existing consumers can keep using real time and their current helpers. Adopt
-exact waits first, then snapshots only with fake and application state reset
-under each component's ownership. Do not apply 0.9.x source patches blindly to
-0.10.0; rebase and verify only still-needed patches against this source. No
-consumer repository or downstream test runner is changed by this package work.
+- Inline mode, payments, games, sticker sets, reaction counts, votes in polls, or Telegram's exact
+  rate limits: `floodControl` applies only its published numbers (a test can also make any call
+  fail with a 429 through `POST failures`). Channel signatures are not modelled, and forum topics
+  cannot be closed or deleted.
+- Updates when a restriction or ban runs out: the member's status changes on time, and no update is
+  sent.
+- In Telegram Login: the `phone` scope's `phone_number` (test users have no phone numbers), the
+  ES256, EdDSA and ES256K signing options (only the default RS256), the redirect URLs registered
+  with BotFather (any `redirect_uri` is accepted), the `telegram-login.js` popup and native SDKs, and
+  the legacy Login Widget's hash check. Telegram has no UserInfo endpoint, and neither does this
+  server.
+- Fetching media from HTTP URLs (a URL stands in as a one-byte file), several sizes per photo,
+  `sendLivePhoto` and `editMessageLiveLocation`.
+- Persistence. All state lives in memory and is lost when the server stops; recovering from a
+  restart belongs to the application under test.
+- Anything security-related. It is a test tool: bind it to localhost and never expose it to a
+  network you do not control.
 
 ## Changes
 
-- **0.10.0**: exact event-driven waits, fixture snapshots/restoration,
-  instance-owned manual time, delivery drains/journals, request timelines, detached
-  request evidence, callback ownership protection and lazy login key generation.
-  Former unmodelled metadata setters now fail explicitly in strict mode.
-  Default chat permissions enforce administrator restriction rights; shared physical
-  checkpoints precede webhook completion. Owner receipts preserve pending/cancelled
-  outcomes and fake time. Exact call observers avoid unrelated history scans; large
-  journals restore without argument-limit failures.
+- **0.11.0**: the server answers as Telegram does wherever 0.10.0 did not, checked against the Bot
+  API docs and the source of Telegram's Bot API server and TDLib: channel posts, who receives which
+  update, webhook retries and concurrency, per-bot updates and file ids, ephemeral messages, invite
+  links, text cleaning and limits, entity detection, inline keyboards, command scopes, polls, pins,
+  reactions, media, and Telegram's own error texts and order of checks. New: the `floodControl`
+  option (off by default), the `editEphemeralMessage…` and `deleteEphemeralMessage` methods, and the
+  `pinMessage`, `getEphemeralMessage` and `pressEphemeralButton` test actions. Tests written for
+  0.10.0 may need these changes:
+  - Error descriptions are Telegram's, so tests that matched 0.10.0's texts need the new ones. A
+    method the server lacks answers `Not Found: method not found`; with `unimplemented: "ok"`, only
+    a method documented to return `True` answers `true`.
+  - Channel messages reach bots as `channel_post` and `edited_channel_post`, sent by the channel
+    (`sender_chat`, no `from`). `post()` in a channel needs the creator or `can_post_messages`.
+  - `banChatMember` deletes no messages. A person banned in a basic group is `left`.
+    `promoteChatMember` and `unbanChatMember` refuse basic groups.
+  - A bot never in a chat gets `chat not found`; one kicked from or no longer in a supergroup or
+    channel gets a 403 for every call there, reads included.
+  - `chat_member` and `message_reaction` reach only administrator bots, and `chat_join_request` only
+    bots with `can_invite_users`. `getChatAdministrators` leaves out other bots unless
+    `return_bots`.
+  - Each bot numbers its own updates, so two bots can get the same `update_id`; `redeliverUpdate`
+    then needs `botId`. Each bot has its own `file_id`s: another bot's, or a string that is neither
+    a file id nor a URL, is refused. File ids, invite links and business connection ids are random.
+  - A webhook that does not answer 2XX gets the update again instead of losing it, a Bot API call in
+    its answer runs, and different chats' updates go out at once, up to `max_connections`.
+    `setWebhook` refuses URLs and secret tokens Telegram refuses, and resolves the host name. A new
+    long poll ends the one before with 409.
+  - Ephemeral messages have `message_id` 0 and an `ephemeral_message_id` of their own; the regular
+    edit and delete methods no longer reach them.
+  - Text and captions are cleaned, trimmed and limited to 4096 and 1024 characters, and text that
+    shows nothing fails; `parse_mode` wins over explicit entities. Members' text is trimmed too, and
+    a blank post fails with `MESSAGE_EMPTY`. In members' text, `bot_command` is found anywhere,
+    `hashtag` and `cashtag` are found too, and `package.json` is not a link.
+  - `editMessageText` needs a text message and `editMessageCaption` media; forwards and messages
+    sent with a reply keyboard can't be edited. A text-only inline button, or `callback_data` over
+    64 bytes, is refused, and a press reaches the bot that put the keyboard on the message.
+  - Commands are kept per scope and language. Invite links need `can_invite_users`, and each
+    administrator has its own primary link.
+  - Pins post a `pinned_message` service message, and a bot gets the service messages its own
+    calls post. `stopPoll` sends the closed poll as a `poll` update.
+  - `sendMediaGroup` with one item sends an ordinary message, and `reply_parameters.chat_id` replies
+    to another chat; both were refused. The current chat title set again succeeds, and a longer
+    title or description is cut instead of refused. A business send without `can_reply` is a 400,
+    not a 403.
+  - Call receipts keep `params` as text (`chat_id: "-100123"`), so call waits that narrow by
+    `params` need strings. An injected failure's default description follows its code, and a 429
+    needs `retryAfter`. A failed HTTP wait, drain or clock advance answers `{ error }` with 400, 408
+    or 409 instead of a 500.
+- **0.10.0**: exact event-driven waits, fixture snapshots/restoration, a manual clock per
+  server, delivery drains/journals, request timelines, detached request evidence, callback
+  ownership protection and lazy login key generation. `setMyDescription`,
+  `setMyShortDescription`, `setChatMenuButton` and `setMyDefaultAdministratorRights`, which
+  stored nothing, get the unsupported-method error unless `unimplemented: "ok"`.
+  `setChatPermissions` needs a group or supergroup and `can_restrict_members`, so fixtures whose
+  bot changed default permissions without that right must give it. Receipts record state
+  changes before webhook delivery completes. Owner receipts keep pending/cancelled outcomes and
+  the server's time. Call waits avoid scanning unrelated history; large journals restore
+  without argument-limit failures. Unauthorized and unreadable requests go to
+  `rejected_requests`, so `calls` counts as in 0.9.x.
 - **0.9.2**: plain stored text and validated UTF-16 entities, HTML/Markdown formatting,
   preserved original requests, and file/reply metadata.
-
 - **0.9.1**: scoped ban message revocation, moderation/join/bulk-delete permission checks,
   finite restriction expiry, exact user/message/attempt faults, delayed responses and
   truthful execution/transport receipts. Owner-account behavior is unchanged.
-
 - **0.9.0**: owner accounts: `createOwnerClient`, a test stand-in for the GramJS `TelegramClient`
   subset an app uses on a user's own account (dialogs, folders, history, dialog filters), with owner
   controls, paging, delays and failures, and a calls ledger. The Bot API side is unchanged: existing
@@ -1338,9 +1330,21 @@ pnpm install
 pnpm test
 ```
 
+`npm run bench`, `node bench/reuse.mjs` and `node --expose-gc bench/scaling.mjs` measure the server.
+The scaling benchmark accepts `BENCH_HISTORY`, `BENCH_MESSAGES`, `BENCH_OBSERVERS` and
+`BENCH_ROUNDS` for larger runs; a small sample is not a throughput guarantee. The
+[measurements and regression record](https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/performance.md)
+has the commands, raw samples and observed costs.
+
 ## Status
 
 This is an early-stage project with a deliberately small scope, and the public API may still change.
+Pin an exact version:
+
+```sh
+pnpm add -D --save-exact telegram-bot-test-server@0.11.0
+# or: npm install --save-dev --save-exact telegram-bot-test-server@0.11.0
+```
 
 ## License
 

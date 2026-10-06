@@ -679,10 +679,6 @@ function inlineButtonAction(button) {
   );
 }
 
-function now() {
-  return Math.floor(Date.now() / 1000);
-}
-
 function fileUniqueId() {
   return `AgAD${randomBytes(6).toString("base64url")}`;
 }

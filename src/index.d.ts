@@ -19,7 +19,10 @@ export interface TelegramBotTestServerOptions {
   botToken: string;
   /** Default 0 (any free port). */
   port?: number;
-  /** Instance-owned manual time, in Unix milliseconds. Omit for real time. */
+  /**
+   * A manual clock starting at this Unix time in milliseconds, moved only by
+   * advanceTime. Omit for real time.
+   */
   clock?: { now: number };
   /** Default "127.0.0.1". */
   host?: string;
@@ -206,7 +209,7 @@ export interface FailureRule {
 export interface RecordedCall {
   seq: number;
   method: string;
-  /** A physical checkpoint or successful handler completion; reads/no-ops need not mutate. */
+  /** The call took effect, or, for a read or a call that changes nothing, succeeded. */
   applied: boolean;
   outcome:
     | "pending"
@@ -356,7 +359,10 @@ export interface TelegramBotTestServer {
   ): Promise<
     FakeMessageObservation | ChatMember | FakeJoinObservation | RecordedCall
   >;
-  /** Opaque, instance-owned handle; requires quiescence. Release when no longer used. */
+  /**
+   * An opaque handle only this server accepts; the server must be idle.
+   * Release it when no longer used.
+   */
   snapshot(): Promise<string>;
   restore(snapshot: string): Promise<{ restored: true; epoch: number }>;
   releaseSnapshot(snapshot: string): Promise<{ ok: true }>;
@@ -706,7 +712,10 @@ export interface TelegramBotTestServer {
   /** Every Bot API call received, and any unsupported methods called. */
   getCalls(): Promise<{
     calls: RecordedCall[];
-    /** Attempts rejected before parameter validation; kept separate for 0.9.x compatibility. */
+    /**
+     * Calls refused before their parameters were read: an unknown token or
+     * unreadable form data.
+     */
     rejected_requests: RecordedCall[];
     unimplemented: string[];
   }>;
