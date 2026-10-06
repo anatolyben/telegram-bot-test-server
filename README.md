@@ -245,8 +245,12 @@ The details a moderation bot depends on, each covered by a test:
   promoted or removed reaches that bot as `my_chat_member` and the chat's other bots as
   `chat_member`; only the bot that sent a message hears its buttons pressed. Users write privately
   only to the first bot, so no other bot can message them (403).
-- **Polls.** `sendPoll` needs a question and 2 to 12 options and keeps `is_anonymous`,
-  `allows_multiple_answers`, `description` and an attached photo; `stopPoll` closes a poll once.
+- **Polls.** `sendPoll` needs a question and 1 to 12 options of up to 100 characters each. It
+  keeps `is_anonymous`, `allows_multiple_answers`, `allows_revoting` (on by default for regular
+  polls, off for quizzes), `members_only` (channels only), `is_closed`, `description` and an
+  attached photo, and gives each option a `persistent_id`. A quiz needs `correct_option_ids` (or
+  the older `correct_option_id`), and the bot that sent it sees them in the poll. `stopPoll` closes
+  a poll once, and the bot then gets the closed poll as a `poll` update. Members do not vote.
 - **Forwards and copies.** A forward carries `forward_origin`; a copy does not. A bot cannot forward
   from a chat it is not in.
 - **Pins** ([unpinChatMessage](https://core.telegram.org/bots/api#unpinchatmessage)). Pinned
@@ -262,8 +266,12 @@ The details a moderation bot depends on, each covered by a test:
   An edit by the author reaches bots as `edited_message` (in a channel, `edited_channel_post`) with
   `edit_date`.
 - **Reactions.** A member's reaction reaches the chat's administrator bots as `message_reaction`,
-  only when they list it in `allowed_updates`, as on Telegram. A bot sets at most one reaction, and
-  removes a member's with `deleteMessageReaction` and `can_delete_messages`.
+  only when they list it in `allowed_updates`, as on Telegram. A bot sets at most one reaction,
+  and only an emoji from the [ReactionTypeEmoji](https://core.telegram.org/bots/api#reactiontypeemoji)
+  list (any other emoji fails with `REACTION_INVALID`, and a paid reaction is refused). A reaction
+  on an album lands on its first message that is not deleted. The bot removes a member's reaction
+  with `deleteMessageReaction` and `can_delete_messages`; `actor_chat_id` may stand in for
+  `user_id`, though members here never react as a chat.
 - **Administrators and chat settings.** `promoteChatMember` needs `can_promote_members` and grants
   only rights the bot holds; the bot can then edit and title the administrators it promoted.
   `setChatTitle`, `setChatDescription`, `setChatPhoto` and `deleteChatPhoto` need `can_change_info`,

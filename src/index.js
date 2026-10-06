@@ -118,6 +118,7 @@ const OBJECT_PARAMS = new Set([
   "scope",
   "ephemeral_message_parameters",
   "options",
+  "correct_option_ids",
   "entities",
   "caption_entities",
   "reaction",
@@ -165,6 +166,13 @@ const DICE = Object.freeze({
   "⚽": 5,
   "🎰": 64,
 });
+
+// The emoji a bot may react with: ReactionTypeEmoji's list, Bot API 10.3.
+const REACTION_EMOJI = new Set(
+  "❤ 👍 👎 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 🕊 🤡 🥱 🥴 😍 🐳 ❤‍🔥 🌚 🌭 💯 🤣 ⚡ 🍌 🏆 💔 🤨 😐 🍓 🍾 💋 🖕 😈 😴 😭 🤓 👻 👨‍💻 👀 🎃 🙈 😇 😨 🤝 ✍ 🤗 🫡 🎅 🎄 ☃ 💅 🤪 🗿 🆒 💘 🙉 🦄 😘 💊 🙊 😎 👾 🤷‍♂ 🤷 🤷‍♀ 😡".split(
+    " ",
+  ),
+);
 
 // What a member can post besides text and photos: the permission it needs,
 // the file's folder and extension, and whether it takes a caption.
@@ -345,6 +353,122 @@ function parseJsonObject(body) {
     );
   }
   return value;
+}
+
+/**
+ * A JSON-serialized list parameter, read as the Bot API server reads it: a
+ * string is decoded and null is an empty list. read returns each item, or
+ * throws an Error that says what is wrong with it.
+ */
+function jsonList(value, name, className, read) {
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      throw new TelegramError(
+        400,
+        `Bad Request: can't parse ${name} JSON object`,
+      );
+    }
+  }
+  if (value === null) return [];
+  if (!Array.isArray(value)) {
+    throw new TelegramError(
+      400,
+      `Bad Request: expected an Array of ${className}`,
+    );
+  }
+  return value.map((item) => {
+    try {
+      return read(item);
+    } catch (error) {
+      throw new TelegramError(
+        400,
+        `Bad Request: can't parse ${className}: ${error.message}`,
+      );
+    }
+  });
+}
+
+/** A required string field of a JSON object in a list parameter. */
+function requiredString(object, name) {
+  const value = object[name];
+  if (value === undefined) throw new Error(`Can't find field "${name}"`);
+  if (typeof value === "number") return String(value);
+  if (typeof value !== "string") {
+    throw new Error(`Field "${name}" must be of type String`);
+  }
+  return value;
+}
+
+/** A ReactionType: only emoji and custom_emoji, so never a paid reaction. */
+function reactionType(reaction) {
+  if (
+    reaction === null ||
+    typeof reaction !== "object" ||
+    Array.isArray(reaction)
+  ) {
+    throw new Error("expected an Object");
+  }
+  const type = requiredString(reaction, "type");
+  if (type === "emoji") {
+    return { type, emoji: requiredString(reaction, "emoji") };
+  }
+  if (type === "custom_emoji") return reaction;
+  throw new Error("invalid reaction type specified");
+}
+
+/** An InputPollOption's text: the option itself, or its text field. */
+function pollOptionText(option) {
+  if (typeof option === "string") return option;
+  if (option === null || typeof option !== "object" || Array.isArray(option)) {
+    throw new Error("Expected InputPollOption to be an Object");
+  }
+  return requiredString(option, "text");
+}
+
+/**
+ * A quiz's correct_option_ids, or else the older correct_option_id, read as
+ * the Bot API server reads them.
+ */
+function correctOptionIds(p) {
+  if (p.correct_option_ids === undefined) {
+    return p.correct_option_id === undefined
+      ? []
+      : [Number.parseInt(String(p.correct_option_id), 10) || 0];
+  }
+  let ids = p.correct_option_ids;
+  if (typeof ids === "string") {
+    try {
+      ids = JSON.parse(ids);
+    } catch {
+      throw new TelegramError(
+        400,
+        "Bad Request: can't parse correct option identifiers JSON object",
+      );
+    }
+  }
+  if (!Array.isArray(ids)) {
+    throw new TelegramError(
+      400,
+      "Bad Request: expected an Array of correct option identifiers",
+    );
+  }
+  return ids.map((id) => {
+    if (typeof id !== "number") {
+      throw new TelegramError(
+        400,
+        "Bad Request: correct option identifier must be of type Number",
+      );
+    }
+    if (!Number.isInteger(id) || id < -(2 ** 31) || id >= 2 ** 31) {
+      throw new TelegramError(
+        400,
+        "Bad Request: invalid correct option identifier specified",
+      );
+    }
+    return id;
+  });
 }
 
 async function readRequestParams(request, body) {
@@ -1989,29 +2113,64 @@ export async function startTestServer({
     },
     // A poll may carry a photo, uploaded with it as attach://<name>.
     sendPoll: (p, caller) => {
-      const options = (Array.isArray(p.options) ? p.options : []).map(
-        (option) => ({
-          text:
-            typeof option === "string" ? option : String(option?.text ?? ""),
-          voter_count: 0,
-        }),
+      const texts = jsonList(
+        p.options === undefined ? "" : p.options,
+        "options",
+        "InputPollOption",
+        pollOptionText,
       );
-      if (!p.question) {
+      const quiz = p.type === "quiz";
+      const correct = quiz ? correctOptionIds(p) : [];
+      const chat = botChat(p.chat_id);
+      if (!String(p.question ?? "").trim()) {
+        throw new TelegramError(400, "Bad Request: text must be non-empty");
+      }
+      if (texts.length === 0) {
         throw new TelegramError(
           400,
-          "Bad Request: poll question must be non-empty",
+          "Bad Request: poll must have at least one answer option",
         );
       }
-      if (options.length < 2) {
-        throw new TelegramError(
-          400,
-          "Bad Request: poll must have at least 2 option",
-        );
-      }
-      if (options.length > 12) {
+      if (texts.length > 12) {
         throw new TelegramError(
           400,
           "Bad Request: poll can't have more than 12 options",
+        );
+      }
+      for (const text of texts) {
+        if (!text.trim()) {
+          throw new TelegramError(400, "Bad Request: text must be non-empty");
+        }
+        if ([...text.trim()].length > 100) {
+          throw new TelegramError(
+            400,
+            "Bad Request: poll options length must not exceed 100",
+          );
+        }
+      }
+      if (quiz && correct.length === 0) {
+        throw new TelegramError(
+          400,
+          "Bad Request: correct quiz option list must be non-empty",
+        );
+      }
+      if (correct.some((id, index) => index > 0 && id <= correct[index - 1])) {
+        throw new TelegramError(
+          400,
+          "Bad Request: correct quiz option list must be increasing",
+        );
+      }
+      if (correct.some((id) => id < 0 || id >= texts.length)) {
+        throw new TelegramError(
+          400,
+          "Bad Request: wrong quiz correct_option_id",
+        );
+      }
+      const membersOnly = isTrue(p.members_only);
+      if (membersOnly && chat.type !== "channel") {
+        throw new TelegramError(
+          400,
+          "Bad Request: poll voters can be restricted only in channel chats",
         );
       }
       const attached =
@@ -2025,18 +2184,34 @@ export async function startTestServer({
         poll: {
           id: String(nextPollId),
           question: String(p.question),
-          options,
+          // persistent_id is the option's data. Telegram does not document
+          // its form; TDLib, when it chose it for a new poll, counted from "0".
+          options: texts.map((text, index) => ({
+            persistent_id: String.fromCharCode(48 + index),
+            text,
+            voter_count: 0,
+          })),
           total_voter_count: 0,
-          is_closed: false,
+          is_closed: isTrue(p.is_closed),
           is_anonymous: String(p.is_anonymous ?? "true") !== "false",
-          type: p.type === "quiz" ? "quiz" : "regular",
           allows_multiple_answers: isTrue(p.allows_multiple_answers),
+          allows_revoting:
+            p.allows_revoting === undefined
+              ? !quiz
+              : isTrue(p.allows_revoting),
+          members_only: membersOnly,
+          type: quiz ? "quiz" : "regular",
+          // The Bot API server still adds the single correct option as the
+          // older correct_option_id.
+          ...(correct.length === 1 ? { correct_option_id: correct[0] } : {}),
+          ...(quiz ? { correct_option_ids: correct } : {}),
           ...(p.description ? { description: String(p.description) } : {}),
           ...(photo ? { media: { photo: photoSizes(photo) } } : {}),
         },
       });
     },
-    stopPoll: (p, caller) => {
+    // The bot that stops its poll gets the closed poll as a poll update.
+    stopPoll: async (p, caller) => {
       const chat = botChat(p.chat_id);
       const entry = chat.messages.get(Number(p.message_id));
       if (!entry || entry.deleted || !entry.message.poll) {
@@ -2053,6 +2228,13 @@ export async function startTestServer({
         );
       }
       entry.message.poll.is_closed = true;
+      // Only a message's poll carries its description and media.
+      const {
+        description: _description,
+        media: _media,
+        ...state
+      } = entry.message.poll;
+      await emit("poll", structuredClone(state), { to: [caller] });
       return entry.message.poll;
     },
     forwardMessage: (p, caller) => {
@@ -2638,16 +2820,48 @@ export async function startTestServer({
       invite.creates_join_request = createsJoinRequest;
       return { ...invite };
     },
-    // A bot sets at most one reaction of its own on a message.
+    // A bot sets at most one reaction of its own on a message, an emoji from
+    // ReactionTypeEmoji's list; an album takes it on its first message.
     setMessageReaction: (p, caller) => {
+      const reactions =
+        p.reaction === undefined || p.reaction === ""
+          ? []
+          : jsonList(p.reaction, "reaction types", "ReactionType", reactionType);
       const chat = botChat(p.chat_id);
-      const entry = chat.messages.get(Number(p.message_id));
+      let entry = chat.messages.get(Number(p.message_id));
       if (!entry || entry.deleted) {
         throw new TelegramError(400, "Bad Request: MESSAGE_ID_INVALID");
       }
-      const reactions = Array.isArray(p.reaction) ? p.reaction : [];
+      const group = entry.message.media_group_id;
+      if (group) {
+        entry = [...chat.messages.values()].find(
+          (other) => !other.deleted && other.message.media_group_id === group,
+        );
+      }
+      // TDLib reads "" as no reaction, "$" as the paid one and "#…" as a
+      // custom emoji, so none of them is an emoji reaction.
+      if (
+        reactions.some(
+          ({ type, emoji }) =>
+            type === "emoji" &&
+            (emoji === "" || emoji === "$" || emoji.startsWith("#")),
+        )
+      ) {
+        throw new TelegramError(
+          400,
+          "Bad Request: invalid reaction type specified",
+        );
+      }
       if (reactions.length > 1) {
         throw new TelegramError(400, "Bad Request: REACTIONS_TOO_MANY");
+      }
+      if (
+        reactions.some(
+          (reaction) =>
+            reaction.type === "emoji" && !REACTION_EMOJI.has(reaction.emoji),
+        )
+      ) {
+        throw new TelegramError(400, "Bad Request: REACTION_INVALID");
       }
       entry.reactions ??= new Map();
       if (reactions.length) {
@@ -2658,7 +2872,8 @@ export async function startTestServer({
       } else entry.reactions.delete(caller.id);
       return true;
     },
-    // Removes a user's reaction; needs can_delete_messages.
+    // Removes a user's reaction, or a chat's (actor_chat_id) when no user_id
+    // is given; needs can_delete_messages.
     deleteMessageReaction: async (p, caller) => {
       const chat = requireChat(p.chat_id);
       if (!hasRight(chat, caller.id, "can_delete_messages")) {
@@ -2670,6 +2885,21 @@ export async function startTestServer({
       const entry = chat.messages.get(Number(p.message_id));
       if (!entry || entry.deleted) {
         throw new TelegramError(400, "Bad Request: MESSAGE_ID_INVALID");
+      }
+      if (p.user_id == null || p.user_id === "") {
+        const actor = String(p.actor_chat_id ?? "");
+        if (!actor) {
+          throw new TelegramError(400, "Bad Request: sender_chat_id is empty");
+        }
+        if (!/^-?\d+$/.test(actor)) {
+          throw new TelegramError(
+            400,
+            "Bad Request: sender_chat_id is not a valid Integer",
+          );
+        }
+        // Members react as themselves here, so no chat's reaction is ever
+        // there to remove.
+        return true;
       }
       const user = requireUser(p.user_id);
       if (entry.reactions?.has(user.id)) {

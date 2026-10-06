@@ -466,12 +466,19 @@ describe("polls, forwards and media", () => {
     });
     expect(poll.result.poll).toMatchObject({
       question: "Lunch?",
-      options: [{ text: "Pizza" }, { text: "Salad" }],
+      options: [
+        { persistent_id: expect.any(String), text: "Pizza", voter_count: 0 },
+        { persistent_id: expect.any(String), text: "Salad", voter_count: 0 },
+      ],
       is_anonymous: false,
       allows_multiple_answers: true,
+      allows_revoting: true,
+      members_only: false,
       description: "Vote by noon",
       is_closed: false,
     });
+    const [pizza, salad] = poll.result.poll.options;
+    expect(pizza.persistent_id).not.toBe(salad.persistent_id);
 
     const stop = () =>
       api("stopPoll", { chat_id: GROUP, message_id: poll.result.message_id });
@@ -482,14 +489,165 @@ describe("polls, forwards and media", () => {
     });
   });
 
-  it("refuses a poll with fewer than two options", async () => {
+  it("sends a poll with a single option, but not with none", async () => {
     const { api } = await setup();
     const poll = await api("sendPoll", {
       chat_id: GROUP,
       question: "Only one?",
       options: ["Yes"],
     });
-    expect(poll.status).toBe(400);
+    expect(poll.result.poll.options).toEqual([
+      { persistent_id: expect.any(String), text: "Yes", voter_count: 0 },
+    ]);
+    expect(
+      await api("sendPoll", { chat_id: GROUP, question: "None?", options: [] }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: poll must have at least one answer option",
+    });
+  });
+
+  it("checks the question and each option as Telegram does", async () => {
+    const { api } = await setup();
+    const send = (fields) =>
+      api("sendPoll", { chat_id: GROUP, question: "Which?", ...fields });
+    const refusal = (description) => ({ status: 400, description });
+
+    expect(await send({ options: undefined })).toMatchObject(
+      refusal("Bad Request: can't parse options JSON object"),
+    );
+    expect(await send({ options: [null, null] })).toMatchObject(
+      refusal(
+        "Bad Request: can't parse InputPollOption: Expected InputPollOption to be an Object",
+      ),
+    );
+    expect(await send({ options: [{}] })).toMatchObject(
+      refusal(
+        'Bad Request: can\'t parse InputPollOption: Can\'t find field "text"',
+      ),
+    );
+    expect(await send({ options: ["A", ""] })).toMatchObject(
+      refusal("Bad Request: text must be non-empty"),
+    );
+    expect(await send({ options: ["A", "x".repeat(101)] })).toMatchObject(
+      refusal("Bad Request: poll options length must not exceed 100"),
+    );
+    expect(await send({ question: "", options: ["A"] })).toMatchObject(
+      refusal("Bad Request: text must be non-empty"),
+    );
+    // The limit counts characters, not UTF-16 code units.
+    expect(await send({ options: ["🦄".repeat(100)] })).toMatchObject({
+      ok: true,
+    });
+  });
+
+  it("requires a quiz's correct options and returns them to the bot that sent it", async () => {
+    const { api } = await setup();
+    const quiz = (fields) =>
+      api("sendPoll", {
+        chat_id: GROUP,
+        question: "Primes?",
+        options: ["2", "4", "5"],
+        type: "quiz",
+        ...fields,
+      });
+
+    expect(await quiz({})).toMatchObject({
+      status: 400,
+      description: "Bad Request: correct quiz option list must be non-empty",
+    });
+    expect(await quiz({ correct_option_ids: [2, 0] })).toMatchObject({
+      status: 400,
+      description: "Bad Request: correct quiz option list must be increasing",
+    });
+    expect(await quiz({ correct_option_ids: [3] })).toMatchObject({
+      status: 400,
+      description: "Bad Request: wrong quiz correct_option_id",
+    });
+    for (const [ids, description] of [
+      ["[0", "can't parse correct option identifiers JSON object"],
+      [{}, "expected an Array of correct option identifiers"],
+      [["0"], "correct option identifier must be of type Number"],
+      [[0.5], "invalid correct option identifier specified"],
+    ]) {
+      expect(await quiz({ correct_option_ids: ids })).toMatchObject({
+        status: 400,
+        description: `Bad Request: ${description}`,
+      });
+    }
+
+    const sent = await quiz({
+      correct_option_ids: [0, 2],
+      allows_multiple_answers: true,
+    });
+    expect(sent.result.poll).toMatchObject({
+      type: "quiz",
+      allows_multiple_answers: true,
+      allows_revoting: false,
+      correct_option_ids: [0, 2],
+    });
+    expect(sent.result.poll.correct_option_id).toBeUndefined();
+    expect(
+      (await quiz({ correct_option_id: 1 })).result.poll,
+    ).toMatchObject({ correct_option_id: 1, correct_option_ids: [1] });
+  });
+
+  it("sends a poll already closed with is_closed", async () => {
+    const { api } = await setup();
+    const poll = await api("sendPoll", {
+      chat_id: GROUP,
+      question: "Preview?",
+      options: ["A", "B"],
+      is_closed: true,
+    });
+    expect(poll.result.poll.is_closed).toBe(true);
+    expect(
+      await api("stopPoll", {
+        chat_id: GROUP,
+        message_id: poll.result.message_id,
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: poll has already been closed",
+    });
+  });
+
+  it("limits voting to long-time members only in channels", async () => {
+    const { fake, api } = await setup();
+    const me = (await api("getMe")).result;
+    const channel = await fake.createChat({ type: "channel", ownerId: OWNER });
+    await fake.setBotMembership(channel, me.id, { status: "administrator" });
+    const send = (chatId) =>
+      api("sendPoll", {
+        chat_id: chatId,
+        question: "Members only?",
+        options: ["A", "B"],
+        members_only: true,
+      });
+
+    expect(await send(GROUP)).toMatchObject({
+      status: 400,
+      description:
+        "Bad Request: poll voters can be restricted only in channel chats",
+    });
+    expect((await send(channel)).result.poll.members_only).toBe(true);
+  });
+
+  it("sends the closed poll as a poll update to the bot that stopped it", async () => {
+    const { api } = await setup();
+    const hook = await startReceiver();
+    await api("setWebhook", { url: hook.url });
+    const sent = await api("sendPoll", {
+      chat_id: GROUP,
+      question: "Lunch?",
+      options: ["Pizza", "Salad"],
+      description: "Vote by noon",
+    });
+    await api("stopPoll", { chat_id: GROUP, message_id: sent.result.message_id });
+
+    await expect.poll(() => hook.ofType("poll").length).toBe(1);
+    const { description: _description, ...poll } = sent.result.poll;
+    expect(hook.ofType("poll")).toEqual([{ ...poll, is_closed: true }]);
   });
 
   it("forwards with the message's origin and copies without it", async () => {
@@ -966,6 +1124,7 @@ describe("polls and parsed options", () => {
     body.append("question", "Which?");
     body.append("options", JSON.stringify(["A", "B"]));
     body.append("type", "quiz");
+    body.append("correct_option_ids", JSON.stringify([1]));
     body.append(
       "media",
       JSON.stringify({ type: "photo", media: "attach://pic" }),
@@ -979,6 +1138,7 @@ describe("polls and parsed options", () => {
     ).json();
     expect(poll.result.poll).toMatchObject({
       type: "quiz",
+      correct_option_ids: [1],
       media: { photo: expect.any(Array) },
     });
 
