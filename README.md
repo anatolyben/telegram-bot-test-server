@@ -261,18 +261,30 @@ The details a moderation bot depends on, each covered by a test:
   message as it was). Tests see these messages in `getMessages`, with their receiver, and find one
   by `ephemeral_message_id` with `getEphemeralMessage`; `pressEphemeralButton` presses its buttons as
   the receiver. A `message` wait by author and exact text finds them too.
-- **Inline keyboards.** Every button needs an action: a button with only `text` (or an empty
-  `callback_data`) fails with Telegram's `Text buttons are not allowed in the inline keyboard`.
-  `callback_data` is limited to 64 bytes of UTF-8, not 64 characters; longer data fails with
-  `BUTTON_DATA_INVALID`. Sends, business sends and edits, ephemeral edits included, all check
-  this.
+- **Inline keyboards.** Every button needs `text` and an action: a button without `text` fails with
+  `can't parse InlineKeyboardButton: Can't find field "text"`, and one with only `text` (or an empty
+  `callback_data`) with Telegram's `Text buttons are not allowed in the inline keyboard`. A button
+  that sets several actions keeps only the first one Telegram reads (`url`, then `callback_data`,
+  then the others), so a button with both `url` and `callback_data` comes back with only its `url`
+  and cannot be pressed. A sent or edited message returns each button with only its `text`,
+  `icon_custom_emoji_id`, `style` and that one action. `callback_data` is limited to 64 bytes of
+  UTF-8, not 64 characters; longer data fails with `BUTTON_DATA_INVALID`. Buttons are checked when
+  the request is read, before the chat is looked up; the length of `callback_data` only after the
+  chat and message checks. Sends, business sends, edits, ephemeral edits and `stopPoll` all check
+  this, and a send checks `inline_keyboard` even when a reply `keyboard` sent with it wins.
+  `stopPoll` does not put its keyboard on the message here.
 - **Callback queries.** Answering a query that was never sent fails. Answer text is limited to 200
   characters; a longer answer fails with `MESSAGE_TOO_LONG` and the query stays open, so the bot can
   answer it again. `chat_instance` is an opaque number that is the same for every press in a chat;
   it is not the chat id.
 - **Command menus.** `setMyCommands`, `getMyCommands` and `deleteMyCommands` keep one list for each
   `scope` and `language_code`. `getMyCommands` returns only the list set for that exact scope and
-  language (an empty list if there is none), and `deleteMyCommands` removes only that list.
+  language (an empty list if there is none), and `deleteMyCommands` removes only that list. A scope
+  Telegram cannot read fails with its `can't parse BotCommandScope: …` error: one that is not an
+  object, an unknown `type`, an empty `chat_id`, or a `chat_member` scope without a positive
+  `user_id`. A chat scope's chat must be one the bot can see (`chat not found` otherwise); a private
+  chat takes only the `chat` scope, and a channel takes none. `language_code` must be empty or two
+  lower-case letters (`invalid language code specified`).
 - **Parameters.** A boolean is true when it reads `true`, `yes` or `1`, in any case. A
   JSON-serialized parameter (`reply_markup`, `reply_parameters`, `message_ids`, `media`, ...) may
   also come as a JSON string; one that cannot be read fails with Telegram's parse error, such as

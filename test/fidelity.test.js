@@ -369,19 +369,22 @@ describe("messages and buttons", () => {
     });
   });
 
-  it("refuses inline buttons without an action, and callback_data outside 1-64 bytes", async () => {
+  it("refuses inline buttons without text or an action, and callback_data outside 1-64 bytes", async () => {
     const { api } = await setup();
-    const send = (button) =>
+    const keyboard = (button) => ({ inline_keyboard: [[button]] });
+    const send = (button, chatId = GROUP) =>
       api("sendMessage", {
-        chat_id: GROUP,
+        chat_id: chatId,
         text: "Choose",
-        reply_markup: { inline_keyboard: [[{ text: "Go", ...button }]] },
+        reply_markup: keyboard({ text: "Go", ...button }),
       });
-    const textButton = {
+    const unparsable = (reason) => ({
       status: 400,
-      description:
-        "Bad Request: can't parse InlineKeyboardButton: Text buttons are not allowed in the inline keyboard",
-    };
+      description: `Bad Request: can't parse InlineKeyboardButton: ${reason}`,
+    });
+    const textButton = unparsable(
+      "Text buttons are not allowed in the inline keyboard",
+    );
     const badData = {
       status: 400,
       description: "Bad Request: BUTTON_DATA_INVALID",
@@ -389,6 +392,51 @@ describe("messages and buttons", () => {
 
     expect(await send({})).toMatchObject(textButton);
     expect(await send({ callback_data: "" })).toMatchObject(textButton);
+    // The text is read before the action.
+    expect(
+      await api("sendMessage", {
+        chat_id: GROUP,
+        text: "Choose",
+        reply_markup: keyboard({ callback_data: "a" }),
+      }),
+    ).toMatchObject(unparsable('Can\'t find field "text"'));
+    expect(await send({ text: true, callback_data: "a" })).toMatchObject(
+      unparsable('Field "text" must be of type String'),
+    );
+    // The keyboard is read with the request, before the chat; the data
+    // length is Telegram's servers' check, after it.
+    expect(await send({}, -1009999999999)).toMatchObject(textButton);
+    expect(
+      await send({ callback_data: "x".repeat(65) }, -1009999999999),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: chat not found",
+    });
+    // The inline rows are read even when a reply keyboard wins.
+    expect(
+      await api("sendMessage", {
+        chat_id: GROUP,
+        text: "Choose",
+        reply_markup: { keyboard: [["a"]], inline_keyboard: [[{ text: "t" }]] },
+      }),
+    ).toMatchObject(textButton);
+    const poll = (
+      await api("sendPoll", {
+        chat_id: GROUP,
+        question: "Ready?",
+        options: ["Yes", "No"],
+      })
+    ).result;
+    const stop = (button) =>
+      api("stopPoll", {
+        chat_id: GROUP,
+        message_id: poll.message_id,
+        reply_markup: keyboard({ text: "Go", ...button }),
+      });
+    expect(await stop({})).toMatchObject(textButton);
+    expect(await stop({ callback_data: "x".repeat(65) })).toMatchObject(
+      badData,
+    );
     expect(await send({ callback_data: "x".repeat(65) })).toMatchObject(
       badData,
     );
@@ -407,6 +455,40 @@ describe("messages and buttons", () => {
         },
       }),
     ).toMatchObject(badData);
+  });
+
+  it("keeps only the action Telegram reads from a button that sets several", async () => {
+    const { server, api, member } = await setup();
+    const ann = await member();
+    const data = "y".repeat(100);
+
+    const sent = (
+      await api("sendMessage", {
+        chat_id: GROUP,
+        text: "Read more",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "Site",
+                style: "primary",
+                url: "https://example.com",
+                callback_data: data,
+              },
+            ],
+          ],
+        },
+      })
+    ).result;
+
+    expect(sent.reply_markup).toEqual({
+      inline_keyboard: [
+        [{ text: "Site", style: "primary", url: "https://example.com" }],
+      ],
+    });
+    await expect(
+      server.pressButton(GROUP, sent.message_id, ann, data),
+    ).rejects.toThrow("no button");
   });
 
   it("edits text only in a text message and a caption only in a media message", async () => {
@@ -1287,6 +1369,67 @@ describe("Bot API details", () => {
     expect(await commands({ scope: chat, language_code: "ru" })).toEqual(
       russian,
     );
+  });
+
+  it("refuses a command scope or language_code Telegram cannot use", async () => {
+    const { server, api } = await setup();
+    const channel = await server.createChat({
+      type: "channel",
+      ownerId: OWNER,
+    });
+    await server.setBotMembership(channel, BOT, { status: "administrator" });
+    const commands = [{ command: "rules", description: "Show the rules" }];
+    const set = (params) => api("setMyCommands", { commands, ...params });
+    const refused = (description) => ({
+      status: 400,
+      description: `Bad Request: ${description}`,
+    });
+    const unparsable = (reason) =>
+      refused(`can't parse BotCommandScope: ${reason}`);
+    const member = (userId) => ({
+      scope: { type: "chat_member", chat_id: GROUP, user_id: userId },
+    });
+
+    expect(await api("getMyCommands", { scope: 5 })).toMatchObject(
+      unparsable("BotCommandScope must be an Object"),
+    );
+    expect(await set({ scope: { type: "bogus" } })).toMatchObject(
+      unparsable("Unsupported type specified"),
+    );
+    // The commands are read first.
+    expect(
+      await api("setMyCommands", { commands: 5, scope: { type: "bogus" } }),
+    ).toMatchObject(refused("expected an Array of BotCommand"));
+    expect(await set({ scope: { type: "chat", chat_id: "" } })).toMatchObject(
+      unparsable("Empty chat_id specified"),
+    );
+    expect(
+      await set({ scope: { type: "chat_member", chat_id: GROUP } }),
+    ).toMatchObject(unparsable('Can\'t find field "user_id"'));
+    expect(await set(member(true))).toMatchObject(
+      unparsable('Field "user_id" must be a Number'),
+    );
+    expect(await set(member("ann"))).toMatchObject(
+      unparsable('Field "user_id" must be a valid Number'),
+    );
+    expect(await set(member(0))).toMatchObject(
+      unparsable("Invalid user_id specified"),
+    );
+    expect(
+      await set({ scope: { type: "chat", chat_id: -1009999999999 } }),
+    ).toMatchObject(refused("chat not found"));
+    expect(
+      await set({ scope: { type: "chat_administrators", chat_id: OWNER } }),
+    ).toMatchObject(refused("can't use specified scope in private chats"));
+    expect(
+      await api("getMyCommands", { scope: { type: "chat", chat_id: channel } }),
+    ).toMatchObject(refused("can't change commands in channel chats"));
+    expect(
+      await api("deleteMyCommands", { language_code: "RU" }),
+    ).toMatchObject(refused("invalid language code specified"));
+    expect(
+      await set({ scope: { type: "chat", chat_id: OWNER } }),
+    ).toMatchObject({ ok: true });
   });
 
   it("returns media with the fields the Bot API requires, and files getFile can resolve", async () => {

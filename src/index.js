@@ -610,22 +610,6 @@ function numberParam(value, fallback) {
     : fallback;
 }
 
-/**
- * The command list a setMyCommands, getMyCommands or deleteMyCommands call
- * addresses: Telegram keeps one per scope and language_code. Only the chat
- * scopes name a chat, and only chat_member also names a user.
- */
-function commandsKey(p) {
-  const type = p.scope?.type ?? "default";
-  const inChat = ["chat", "chat_administrators", "chat_member"].includes(type);
-  return JSON.stringify([
-    type,
-    inChat ? String(p.scope.chat_id) : null,
-    type === "chat_member" ? String(p.scope.user_id) : null,
-    String(p.language_code ?? ""),
-  ]);
-}
-
 /** The field that gives an inline keyboard button its action, if any. */
 function inlineButtonAction(button) {
   const fields = Object(button);
@@ -1444,6 +1428,87 @@ export async function startTestServer({
     const user = users.get(Number(userId));
     if (!user) throw new TelegramError(400, "Bad Request: user not found");
     return user;
+  }
+
+  /**
+   * The command list a setMyCommands, getMyCommands or deleteMyCommands call
+   * addresses: Telegram keeps one per scope and language_code. The scope is
+   * read as Client::get_bot_command_scope reads it, and its chat checked as
+   * check_bot_command_scope checks it; then TDLib allows only the "chat"
+   * scope in a private chat and none in a channel
+   * (BotCommandScope::get_bot_command_scope), and a language_code that is
+   * empty or two lower-case letters (validate_bot_language_code).
+   */
+  function commandsKey(p, caller) {
+    const scope = jsonParam(p.scope, "BotCommandScope");
+    let type = "default";
+    let chatId = null;
+    let userId = null;
+    try {
+      if (scope !== undefined) {
+        if (!isObject(scope)) {
+          throw new Error("BotCommandScope must be an Object");
+        }
+        type = requiredString(scope, "type");
+      }
+      if (["chat", "chat_administrators", "chat_member"].includes(type)) {
+        chatId = requiredString(scope, "chat_id");
+        if (chatId === "") throw new Error("Empty chat_id specified");
+      } else if (
+        ![
+          "default",
+          "all_private_chats",
+          "all_group_chats",
+          "all_chat_administrators",
+        ].includes(type)
+      ) {
+        throw new Error("Unsupported type specified");
+      }
+      if (type === "chat_member") {
+        const value = scope.user_id;
+        if (value === undefined) throw new Error(`Can't find field "user_id"`);
+        if (!["number", "string"].includes(typeof value)) {
+          throw new Error(`Field "user_id" must be a Number`);
+        }
+        if (!/^-?\d+$/.test(String(value))) {
+          throw new Error(`Field "user_id" must be a valid Number`);
+        }
+        userId = Number(value);
+        if (userId <= 0) throw new Error("Invalid user_id specified");
+      }
+    } catch (error) {
+      throw new TelegramError(
+        400,
+        `Bad Request: can't parse BotCommandScope: ${error.message}`,
+      );
+    }
+    if (chatId !== null) {
+      chatId = Number(chatId);
+      const chat = chats.has(chatId) ? requireChat(chatId, caller) : null;
+      if (!chat && !users.has(chatId)) {
+        throw new TelegramError(400, "Bad Request: chat not found");
+      }
+      if (!chat && type !== "chat") {
+        throw new TelegramError(
+          400,
+          "Bad Request: can't use specified scope in private chats",
+        );
+      }
+      if (chat?.type === "channel") {
+        throw new TelegramError(
+          400,
+          "Bad Request: can't change commands in channel chats",
+        );
+      }
+    }
+    const language = String(p.language_code ?? "");
+    if (language !== "" && !/^[a-z]{2}$/.test(language)) {
+      throw new TelegramError(
+        400,
+        "Bad Request: invalid language code specified",
+      );
+    }
+    return JSON.stringify([type, chatId, userId, language]);
   }
 
   function chatObject(chat) {
@@ -3320,9 +3385,9 @@ export async function startTestServer({
       }
       return queue.slice(0, limit);
     },
+    // The commands are read before the scope (process_set_my_commands_query).
     setMyCommands: (p, caller) => {
-      caller.commands.set(
-        commandsKey(p),
+      const commands =
         p.commands === undefined || p.commands === ""
           ? []
           : jsonList(p.commands, "commands", "BotCommand", (command) => {
@@ -3330,16 +3395,17 @@ export async function startTestServer({
               requiredString(command, "command");
               requiredString(command, "description");
               return command;
-            }),
-      );
+            });
+      caller.commands.set(commandsKey(p, caller), commands);
       return true;
     },
     deleteMyCommands: (p, caller) => {
-      caller.commands.delete(commandsKey(p));
+      caller.commands.delete(commandsKey(p, caller));
       return true;
     },
     // Only the list set for exactly this scope and language, else none.
-    getMyCommands: (p, caller) => caller.commands.get(commandsKey(p)) ?? [],
+    getMyCommands: (p, caller) =>
+      caller.commands.get(commandsKey(p, caller)) ?? [],
     answerCallbackQuery: (p, caller) => {
       if (openQueries.get(String(p.callback_query_id)) !== caller.id) {
         throw new TelegramError(
@@ -3646,8 +3712,11 @@ export async function startTestServer({
     // (https://core.telegram.org/bots/api#update), so the bot that stops a
     // poll and the bot that sent it get the closed poll as a poll update. The
     // answer comes from TDLib's result, not after the update is delivered
-    // (telegram-bot-api TdOnStopPollCallback).
+    // (telegram-bot-api TdOnStopPollCallback). Its keyboard is checked as a
+    // send's: read with the request, its callback_data once the poll is
+    // found open (process_stop_poll_query, PollManager::stop_poll).
     stopPoll: (p, caller) => {
+      const markup = inlineMarkup(p.reply_markup);
       const chat = botChat(p.chat_id, caller);
       const entry = chat.messages.get(Number(p.message_id));
       if (!entry || entry.deleted || !entry.message.poll) {
@@ -3663,6 +3732,7 @@ export async function startTestServer({
           "Bad Request: poll has already been closed",
         );
       }
+      requireButtonData(markup);
       entry.message.poll.is_closed = true;
       // Only a message's poll carries its description and media.
       const {
@@ -4539,10 +4609,12 @@ export async function startTestServer({
   }
 
   /**
-   * reply_markup, checked as Client::get_reply_markup reads it, when it is an
-   * inline keyboard with at least one row; else undefined. Like the Bot API
-   * server, it refuses a button without an action while reading the request,
-   * before any chat or message check.
+   * reply_markup, checked as Client::get_reply_markup reads it, when it has
+   * an inline keyboard with at least one row; else undefined. Like the Bot API
+   * server, it refuses a button without text or an action while reading the
+   * request, before any chat or message check, and keeps of each button only
+   * its text, icon, style and the one action it reads, as
+   * JsonInlineKeyboardButton returns it.
    */
   function inlineMarkup(value) {
     const markup = jsonParam(value, "reply keyboard markup");
@@ -4562,19 +4634,34 @@ export async function startTestServer({
       }
     }
     if (!(markup.inline_keyboard?.length > 0)) return undefined;
-    for (const button of markup.inline_keyboard.flat()) {
-      if (
-        typeof button === "object" &&
-        button !== null &&
-        !inlineButtonAction(button)
-      ) {
+    const kept = (button) => {
+      if (typeof button !== "object" || button === null) return button;
+      try {
+        requiredString(button, "text");
+      } catch (error) {
+        throw new TelegramError(
+          400,
+          `Bad Request: can't parse InlineKeyboardButton: ${error.message}`,
+        );
+      }
+      const action = inlineButtonAction(button);
+      if (!action) {
         throw new TelegramError(
           400,
           "Bad Request: can't parse InlineKeyboardButton: Text buttons are not allowed in the inline keyboard",
         );
       }
-    }
-    return markup;
+      return Object.fromEntries(
+        ["text", "icon_custom_emoji_id", "style", action]
+          .filter((field) => Object.hasOwn(button, field))
+          .map((field) => [field, button[field]]),
+      );
+    };
+    return {
+      inline_keyboard: markup.inline_keyboard.map((row) =>
+        Array.isArray(row) ? row.map(kept) : row,
+      ),
+    };
   }
 
   /**
@@ -4609,9 +4696,11 @@ export async function startTestServer({
   function sendFrom(p, caller, fields, { counts = true } = {}) {
     const parameters = replyParameters(p);
     // Message.reply_markup only ever carries an inline keyboard; reply
-    // keyboards and ForceReply are shown to the user, not echoed back.
+    // keyboards and ForceReply are shown to the user, not echoed back. The
+    // inline rows are read even when a reply keyboard wins.
+    const inline = inlineMarkup(p.reply_markup);
     const keyboard = isReplyKeyboard(p.reply_markup);
-    const markup = keyboard ? undefined : inlineMarkup(p.reply_markup);
+    const markup = keyboard ? undefined : inline;
     const ephemeral = p.ephemeral_message_parameters;
     const chat = botChat(p.chat_id, caller, { send: true });
     requireCanSend(chat, caller);
