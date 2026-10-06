@@ -156,6 +156,118 @@ describe("bad input", () => {
     expect((await raw("/_fake/users", "null")).status).toBe(400);
   });
 
+  it("reads a JSON body's values as the text they are written as", async () => {
+    const { raw } = await setup();
+    const send = async (body) =>
+      (await raw(`/bot${TOKEN}/sendMessage`, body)).body;
+    const sent = async (value) =>
+      (await send(`{"chat_id": ${GROUP}, "text": ${value}}`)).result?.text;
+
+    expect(await sent("null")).toBe("null");
+    expect(await sent("1.50")).toBe("1.50");
+    expect(await sent(`{"a": 1}`)).toBe(`{"a": 1}`);
+    // A string keeps a raw control character, and an unknown escape gives
+    // the character escaped.
+    expect(await sent(`"it\\'s\\q"`)).toBe("it'sq");
+    expect(await sent(`"a\tb"`)).toBe("a b");
+    expect(
+      await send(`{"chat_id": ${GROUP}, "text": "hi", "parse_mode": null}`),
+    ).toMatchObject({
+      error_code: 400,
+      description: "Bad Request: unsupported parse_mode",
+    });
+  });
+
+  it("reads an integer parameter by its leading digits, so a JSON null is 0", async () => {
+    const { server, api } = await setup();
+    const ann = await server.createUser();
+    await server.join(GROUP, ann);
+    const forum = await server.createChat({
+      ownerId: 5000000001,
+      isForum: true,
+    });
+    await server.setBotMembership(forum, 123456, { status: "administrator" });
+
+    expect(
+      await api("sendMessage", {
+        chat_id: GROUP,
+        text: "no reply",
+        reply_to_message_id: null,
+      }),
+    ).toMatchObject({ ok: true, result: { text: "no reply" } });
+    const general = await api("sendMessage", {
+      chat_id: forum,
+      text: "general",
+      message_thread_id: null,
+    });
+    expect(general.ok).toBe(true);
+    expect(general.result.message_thread_id).toBeUndefined();
+    await api("restrictChatMember", {
+      chat_id: GROUP,
+      user_id: ann,
+      permissions: {},
+      until_date: null,
+    });
+    expect(
+      (await api("getChatMember", { chat_id: GROUP, user_id: ann })).result,
+    ).toMatchObject({ status: "restricted", until_date: 0 });
+  });
+
+  it("takes the first of repeated parameters, the query string before the body", async () => {
+    const { raw } = await setup();
+    const text = async (path, body, type) =>
+      (await raw(path, body, type)).body.result?.text;
+    const path = `/bot${TOKEN}/sendMessage`;
+
+    expect(
+      await text(
+        `${path}?text=query`,
+        JSON.stringify({ chat_id: GROUP, text: "body" }),
+      ),
+    ).toBe("query");
+    expect(
+      await text(
+        path,
+        `{"chat_id": ${GROUP}, "text": "first", "text": "second"}`,
+      ),
+    ).toBe("first");
+    expect(
+      await text(
+        path,
+        `chat_id=${GROUP}&text=first&text=second`,
+        "application/x-www-form-urlencoded",
+      ),
+    ).toBe("first");
+  });
+
+  it("reads coordinates by their leading number, and checks the map after the chat", async () => {
+    const { api } = await setup();
+    const location = async (latitude) =>
+      (await api("sendLocation", { chat_id: GROUP, latitude, longitude: "1" }))
+        .result?.location;
+
+    expect(await location("12abc")).toEqual({ latitude: 12, longitude: 1 });
+    expect(await location("abc")).toEqual({ latitude: 0, longitude: 1 });
+    // An exponent without digits leaves no number.
+    expect(await location("5e")).toEqual({ latitude: 0, longitude: 1 });
+    for (const [method, extra] of [
+      ["sendLocation", {}],
+      ["sendVenue", { title: "Office", address: "1 Main St" }],
+    ]) {
+      expect(
+        await api(method, {
+          chat_id: 42,
+          latitude: 100,
+          longitude: 0,
+          ...extra,
+        }),
+      ).toMatchObject({
+        error_code: 400,
+        description: "Bad Request: chat not found",
+      });
+    }
+  });
+
   it("answers malformed permissions with Telegram's parse errors", async () => {
     const { server, api } = await setup();
     const ann = await server.createUser();
@@ -164,6 +276,12 @@ describe("bad input", () => {
     for (const [permissions, description] of [
       [null, "Bad Request: object expected as permissions"],
       ["{", "Bad Request: can't parse permissions JSON object"],
+      // Given, even empty, permissions are read as JSON.
+      ["", "Bad Request: can't parse permissions JSON object"],
+      [
+        { can_send_messages: true, can_send_polls: "true" },
+        `Bad Request: can't parse chat permissions: Field "can_send_polls" must be of type Boolean`,
+      ],
     ]) {
       expect(
         await api("restrictChatMember", {
@@ -234,6 +352,14 @@ describe("bad input", () => {
         [{ type: "custom_emoji" }],
         `Bad Request: can't parse ReactionType: Can't find field "custom_emoji_id"`,
       ],
+      [
+        [{ type: "custom_emoji", custom_emoji_id: {} }],
+        `Bad Request: can't parse ReactionType: Field "custom_emoji_id" must be a Number`,
+      ],
+      [
+        [{ type: "custom_emoji", custom_emoji_id: "5368abc" }],
+        `Bad Request: can't parse ReactionType: Field "custom_emoji_id" must be a valid Number`,
+      ],
     ]) {
       expect(
         await api("setMessageReaction", {
@@ -273,6 +399,24 @@ describe("bad input", () => {
       [
         { link_preview_options: [] },
         "Bad Request: object expected as link preview options",
+      ],
+      // A flag inside these objects must be a JSON true or false.
+      [
+        {
+          reply_parameters: {
+            message_id: 999,
+            allow_sending_without_reply: "yes",
+          },
+        },
+        `Bad Request: field "allow_sending_without_reply" must be of type Boolean`,
+      ],
+      [
+        { link_preview_options: { is_disabled: "1" } },
+        `Bad Request: field "is_disabled" must be of type Boolean`,
+      ],
+      [
+        { reply_markup: { remove_keyboard: "yes" } },
+        `Bad Request: field "remove_keyboard" must be of type Boolean`,
       ],
     ]) {
       expect(
@@ -324,6 +468,12 @@ describe("bad input", () => {
         { chat_id: GROUP, user_id: -5 },
         "Bad Request: invalid user_id specified",
       ],
+      // An integer is an optional "-" and digits: no space or "+" first.
+      ...[` ${ann}`, `+${ann}`].map((userId) => [
+        "getChatMember",
+        { chat_id: GROUP, user_id: userId },
+        "Bad Request: invalid user_id specified",
+      ]),
       [
         "sendContact",
         { chat_id: GROUP, first_name: "Ann" },

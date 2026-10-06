@@ -195,8 +195,8 @@ export interface FailureRule {
    */
   description?: string;
   /**
-   * Sent as parameters.retry_after, as with a 429, which needs it and also
-   * carries it in the Retry-After header.
+   * A whole number of seconds, sent as parameters.retry_after, as with a 429,
+   * which needs it and also carries it in the Retry-After header.
    */
   retryAfter?: number;
   /** The call takes effect, but the connection closes before it answers. */
@@ -225,6 +225,10 @@ export interface RecordedCall {
   delay_ms?: number;
   /** The bot that made the call. */
   bot_id: number;
+  /**
+   * The parameters as Telegram's server reads them: text, with the
+   * JSON-serialized ones (reply_markup, media, ...) parsed.
+   */
   params: Record<string, unknown>;
   at: number;
   /** Rejected status, including actual permission/validation failures. */

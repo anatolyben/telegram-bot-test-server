@@ -26,6 +26,7 @@
  */
 import { createOwnerModel, OwnerError } from "./owner.js";
 import {
+  cleanInput,
   findEntities,
   formatText,
   FormattingError,
@@ -93,13 +94,44 @@ const NO_GIFTS = Object.freeze({
  * can_manage_topics and can_edit_tag follow can_pin_messages and
  * can_react_to_messages follows can_send_messages as passed; then, unless
  * use_independent_chat_permissions is set, the broader permissions imply the
- * narrower ones.
+ * narrower ones. Permissions that are given are read even when empty, and
+ * each field must be a JSON true or false, checked in the order Telegram
+ * reads them: the media ones only when one of them is given, else
+ * can_send_media_messages.
  */
 function normalizePermissions(input = {}, independent = false) {
+  if (input === "") {
+    throw new TelegramError(
+      400,
+      "Bad Request: can't parse permissions JSON object",
+    );
+  }
   if (!isObject(jsonParam(input, "permissions"))) {
     throw new TelegramError(400, "Bad Request: object expected as permissions");
   }
-  const given = (key) => input[key] === true || input[key] === "true";
+  const media = MEDIA_PERMISSIONS.slice(1);
+  const unreadable = nonBoolean(input, [
+    "can_send_messages",
+    "can_send_polls",
+    "can_send_other_messages",
+    "can_add_web_page_previews",
+    "can_change_info",
+    "can_invite_users",
+    "can_pin_messages",
+    "can_manage_topics",
+    ...(media.some((key) => key in input)
+      ? media
+      : ["can_send_media_messages"]),
+    "can_edit_tag",
+    "can_react_to_messages",
+  ]);
+  if (unreadable !== undefined) {
+    throw new TelegramError(
+      400,
+      `Bad Request: can't parse chat permissions: Field "${unreadable}" must be of type Boolean`,
+    );
+  }
+  const given = (key) => input[key] === true;
   const result = Object.fromEntries(
     PERMISSION_KEYS.map((key) => [key, given(key)]),
   );
@@ -608,6 +640,27 @@ function clampedInteger(value, fallback, min, max) {
   return Math.min(max, Math.max(min, number));
 }
 
+/**
+ * A number as td::to_double reads one through a C++ stream: the characters
+ * that can make a decimal number (a sign, digits with one point, then an
+ * exponent once there is a digit), which must make a whole one, else 0.
+ */
+function streamDouble(text) {
+  const [mantissa] = /^[+-]?\d*(?:\.\d*)?/.exec(text);
+  const [exponent = ""] = /\d/.test(mantissa)
+    ? (/^[eE][+-]?\d*/.exec(text.slice(mantissa.length)) ?? [])
+    : [];
+  const number = mantissa + exponent;
+  return /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(number)
+    ? Number(number)
+    : 0;
+}
+
+/** Text without the characters td::trim takes from its ends. */
+function trimSpaces(text) {
+  return text.replace(/^[ \t\r\n\0\v]+|[ \t\r\n\0\v]+$/g, "");
+}
+
 /** A request number, or the fallback when it is missing or not a number. */
 function numberParam(value, fallback) {
   const number = Number(value);
@@ -646,9 +699,14 @@ function userObject(user) {
   };
 }
 
+/**
+ * A request's parameters by name. As Telegram's Query::arg finds the first
+ * parameter of a name, a repeated one keeps its first value.
+ */
 function coerceParams(entries) {
   const params = {};
   for (const [key, value] of entries) {
+    if (Object.hasOwn(params, key)) continue;
     if (typeof value === "string" && OBJECT_PARAMS.has(key)) {
       try {
         params[key] = JSON.parse(value);
@@ -726,6 +784,54 @@ function requiredString(object, name) {
   return value;
 }
 
+/**
+ * A required 64-bit integer field of a JSON object in a list parameter, read
+ * as TDLib's JsonObject::get_required_long_field reads it: a number or a
+ * string whose text writes back unchanged as a 64-bit integer.
+ */
+function requiredLong(object, name) {
+  const value = object[name];
+  if (value === undefined) throw new Error(`Can't find field "${name}"`);
+  if (!["number", "string"].includes(typeof value)) {
+    throw new Error(`Field "${name}" must be a Number`);
+  }
+  const text = String(value);
+  if (
+    !/^-?\d+$/.test(text) ||
+    String(BigInt.asIntN(64, BigInt(text))) !== text
+  ) {
+    throw new Error(`Field "${name}" must be a valid Number`);
+  }
+  return text;
+}
+
+/**
+ * The first of the named fields of a JSON object parameter that is there but
+ * not a JSON true or false, which TDLib's
+ * JsonObject::get_optional_bool_field refuses.
+ */
+function nonBoolean(object, names) {
+  return names.find(
+    (name) => object[name] !== undefined && typeof object[name] !== "boolean",
+  );
+}
+
+/**
+ * Refuses a flag of reply_parameters, link_preview_options or reply_markup
+ * that is not a JSON Boolean, as the Bot API server does: a field inside a
+ * JSON object is not read as a top-level parameter is (Client.cpp
+ * get_reply_parameters, get_link_preview_options, get_reply_markup).
+ */
+function requireBooleans(object, names) {
+  const name = nonBoolean(object, names);
+  if (name !== undefined) {
+    throw new TelegramError(
+      400,
+      `Bad Request: field "${name}" must be of type Boolean`,
+    );
+  }
+}
+
 /** A ReactionType: only emoji and custom_emoji, so never a paid reaction. */
 function reactionType(reaction) {
   if (!isObject(reaction)) throw new Error("expected an Object");
@@ -734,9 +840,7 @@ function reactionType(reaction) {
     return { type, emoji: requiredString(reaction, "emoji") };
   }
   if (type === "custom_emoji") {
-    if (reaction.custom_emoji_id === undefined) {
-      throw new Error(`Can't find field "custom_emoji_id"`);
-    }
+    requiredLong(reaction, "custom_emoji_id");
     return reaction;
   }
   throw new Error("invalid reaction type specified");
@@ -836,7 +940,9 @@ function actorChatId(value) {
  * A JSON body's parameters as Telegram's HTTP reader takes them: the fields of
  * a top-level object up to the first malformed one, or a top-level string as
  * "content"; anything else gives none, and a parse error is no error
- * (tdnet HttpReader::parse_json_parameters, td::do_json_skip).
+ * (tdnet HttpReader::parse_json_parameters, td::do_json_skip). A string value
+ * is decoded; any other value is kept as the text it is written as, so null
+ * is "null" and 1.50 is "1.50", as a query string's values are text.
  */
 function jsonBodyEntries(text) {
   const entries = [];
@@ -844,18 +950,57 @@ function jsonBodyEntries(text) {
   const space = () => {
     while (at < text.length && " \t\r\n".includes(text[at])) at += 1;
   };
-  // The JSON string at `at`, decoded, or undefined when it is malformed.
+  // The JSON string at `at`, decoded as td::json_string_decode decodes it, or
+  // undefined when it is malformed: a raw control character stays, and an
+  // escape other than \b, \f, \n, \r, \t and \u gives the character escaped.
   const string = () => {
-    const pattern = /"(?:[^"\\]|\\.)*"/y;
-    pattern.lastIndex = at;
-    const match = pattern.exec(text);
-    if (!match) return undefined;
-    at += match[0].length;
-    try {
-      return JSON.parse(match[0]);
-    } catch {
-      return undefined;
+    if (text[at] !== '"') return undefined;
+    let index = at + 1;
+    let value = "";
+    // The four hex digits at `index`, or undefined.
+    const hex = () => {
+      const digits = text.slice(index, index + 4);
+      if (!/^[0-9a-fA-F]{4}$/.test(digits)) return undefined;
+      index += 4;
+      return Number.parseInt(digits, 16);
+    };
+    for (;;) {
+      if (index >= text.length) return undefined;
+      const char = text[index++];
+      if (char === '"') break;
+      if (char !== "\\") {
+        value += char;
+        continue;
+      }
+      if (index >= text.length) return undefined;
+      const escaped = text[index++];
+      if (escaped !== "u") {
+        value +=
+          { b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" }[escaped] ?? escaped;
+        continue;
+      }
+      let code = hex();
+      if (code === undefined) return undefined;
+      // A surrogate and a \u surrogate after it make one character.
+      if (
+        code >= 0xd800 &&
+        code < 0xe000 &&
+        index + 6 <= text.length &&
+        text.startsWith("\\u", index)
+      ) {
+        index += 2;
+        const next = hex();
+        if (next === undefined) return undefined;
+        if (next >= 0xd800 && next < 0xe000) {
+          code = (((code & 0x3ff) << 10) | (next & 0x3ff)) + 0x10000;
+        } else {
+          index -= 6;
+        }
+      }
+      value += String.fromCodePoint(code);
     }
+    at = index;
+    return value;
   };
   // Skips one value; false when it is malformed.
   const skip = () => {
@@ -916,11 +1061,7 @@ function jsonBodyEntries(text) {
       if (value === undefined) return entries;
     } else {
       if (!skip()) return entries;
-      try {
-        value = JSON.parse(text.slice(start, at));
-      } catch {
-        value = text.slice(start, at);
-      }
+      value = text.slice(start, at);
     }
     entries.push([key, value]);
     space();
@@ -936,17 +1077,18 @@ function jsonBodyEntries(text) {
  */
 async function readRequestParams(request, body) {
   const url = new URL(request.url, "http://localhost");
-  const params = coerceParams(url.searchParams.entries());
-  if (!body.length) return params;
+  const entries = [...url.searchParams.entries()];
+  if (!body.length) return coerceParams(entries);
   const type = String(request.headers["content-type"] ?? "");
   const lowerType = type.toLowerCase();
   if (
     !lowerType.includes("multipart/form-data") &&
     !lowerType.includes("application/x-www-form-urlencoded")
   ) {
-    return lowerType.includes("application/json")
-      ? { ...params, ...coerceParams(jsonBodyEntries(body.toString("utf8"))) }
-      : params;
+    if (lowerType.includes("application/json")) {
+      entries.push(...jsonBodyEntries(body.toString("utf8")));
+    }
+    return coerceParams(entries);
   }
   let form;
   try {
@@ -961,14 +1103,13 @@ async function readRequestParams(request, body) {
       "Bad Request: request body is not valid form data",
     );
   }
-  const entries = [];
   for (const [key, value] of form.entries()) {
     entries.push([
       key,
       typeof value === "string" ? value : await uploadedFile(value),
     ]);
   }
-  return { ...params, ...coerceParams(entries) };
+  return coerceParams(entries);
 }
 
 /** An uploaded part's bytes, carrying the file name and type it was sent with. */
@@ -1455,15 +1596,17 @@ export async function startTestServer({
   }
 
   /**
-   * user_id, or another user id parameter, as Client::get_user_id reads it:
-   * the integer its leading digits spell, which must be positive.
+   * user_id, or another user id parameter, as Client::get_user_id reads it
+   * with td::to_integer: an optional "-" and the digits after it, as a 64-bit
+   * integer, which must be positive. Nothing else may come first.
    */
   function userIdParam(value, field = "user_id") {
-    const id = parseInt(String(value ?? ""), 10);
-    if (!(id > 0)) {
+    const [, sign, digits] = /^(-?)(\d*)/.exec(String(value ?? ""));
+    const id = BigInt.asIntN(64, BigInt(sign + (digits || "0")));
+    if (id <= 0n) {
       throw new TelegramError(400, `Bad Request: invalid ${field} specified`);
     }
-    return id;
+    return Number(id);
   }
 
   function requireUser(userId) {
@@ -1765,6 +1908,14 @@ export async function startTestServer({
     }
   }
 
+  /**
+   * A send's message_thread_id as Client::get_forum_topic_id reads it: its
+   * leading digits, 0 (none) when it has none or is negative.
+   */
+  function topicParam(p) {
+    return clampedInteger(p.message_thread_id, 0, 0, 2 ** 31 - 1);
+  }
+
   /** A send into a forum names a topic that exists, or none (General). */
   function requireTopic(chat, threadId) {
     if (!threadId || !chat.topics) return;
@@ -1853,8 +2004,12 @@ export async function startTestServer({
     }
   }
 
+  /**
+   * until_date as Client::get_integer_arg reads it: its leading digits, then
+   * 0 (forever) unless it is 30 seconds to 366 days away.
+   */
   function restrictionUntil(value) {
-    const until = Number(value ?? 0);
+    const until = clampedInteger(value, 0, -(2 ** 31), 2 ** 31 - 1);
     const duration = until - Math.floor(clock.now() / 1000);
     return duration < 30 || duration > 366 * 86400 ? 0 : until;
   }
@@ -4191,7 +4346,7 @@ export async function startTestServer({
           : "Bad Request: invalid location specified",
       );
       return sendFrom(p, caller, () => ({
-        location: { ...location, ...liveLocation(p) },
+        location: { ...location(), ...liveLocation(p) },
       }));
     },
     sendVenue: (p, caller) => {
@@ -4207,9 +4362,16 @@ export async function startTestServer({
           "Bad Request: venue needs title and address",
         );
       }
-      return sendFrom(p, caller, {
-        venue: { location, title: String(p.title), address: String(p.address) },
-        location,
+      return sendFrom(p, caller, () => {
+        const point = location();
+        return {
+          venue: {
+            location: point,
+            title: String(p.title),
+            address: String(p.address),
+          },
+          location: point,
+        };
       });
     },
     sendContact: (p, caller) => {
@@ -4262,19 +4424,12 @@ export async function startTestServer({
           'Bad Request: parameter "media" is required',
         );
       }
+      // Every item is read before the chat (get_input_message_contents).
       const items = jsonList(p.media, "media", "InputMedia", (item) => {
-        if (!isObject(item)) throw new Error("expected an Object");
-        requiredString(item, "type");
+        inputMediaType(p, item, true);
         return item;
       });
       const types = items.map((item) => item.type);
-      if (
-        types.some(
-          (type) => !["photo", "video", "document", "audio"].includes(type),
-        )
-      ) {
-        throw new TelegramError(400, "Bad Request: unsupported media type");
-      }
       const chat = botChat(p.chat_id, caller, { send: true });
       if (items.length === 0) {
         throw new TelegramError(
@@ -4286,16 +4441,7 @@ export async function startTestServer({
       // Telegram parses every InputMedia caption before it checks the reply,
       // and sends none of the album if one fails; their lengths are checked
       // with the files.
-      const formatted = items.map((item) => {
-        const caption = captionFields(item);
-        if (namedFile(p, item.media) === null) {
-          throw new TelegramError(
-            400,
-            "Bad Request: can't parse InputMedia: media not found",
-          );
-        }
-        return caption;
-      });
+      const formatted = items.map((item) => captionFields(item));
       // One send of every item, each answering the same message, which is
       // checked (check_reply_parameters) before send_message_group reads
       // every file and counts the album.
@@ -4308,14 +4454,26 @@ export async function startTestServer({
         },
         caller,
         () => {
-          const media = items.map((item, index) => ({
-            // An album's documents go as plain files (Client.cpp
-            // get_input_media).
-            file: sentFile(p, item.media, item.type, caller, senderMeta(item), {
-              typeName: item.type === "document" ? "DocumentAsFile" : undefined,
-            }),
-            caption: formatted[index](),
-          }));
+          const media = items.map((item, index) => {
+            // A live photo names its still photo too, and an album's
+            // documents go as plain files (Client.cpp get_input_media).
+            const live = item.type === "live_photo";
+            return {
+              photo: live ? sentFile(p, item.photo, "photo", caller, {}) : null,
+              file: sentFile(
+                p,
+                item.media,
+                item.type,
+                caller,
+                live ? {} : senderMeta(item),
+                {
+                  typeName:
+                    item.type === "document" ? "DocumentAsFile" : undefined,
+                },
+              ),
+              caption: formatted[index](),
+            };
+          });
           if (items.length > 10) {
             throw new TelegramError(
               400,
@@ -4332,8 +4490,8 @@ export async function startTestServer({
           }
           const mediaGroupId =
             items.length > 1 ? String(nextMediaGroupId++) : undefined;
-          return media.map(({ file, caption }) => ({
-            ...mediaFields(file.kind, file),
+          return media.map(({ photo, file, caption }) => ({
+            ...mediaFields(photo ? "live_photo" : file.kind, file, photo),
             ...caption,
             ...(mediaGroupId ? { media_group_id: mediaGroupId } : {}),
           }));
@@ -4446,12 +4604,15 @@ export async function startTestServer({
       void memberChanged(chat, userId, member, caller);
       return true;
     },
-    // TDLib cleans the title and cuts it to 128 characters, and setting the
-    // current title again succeeds without a change (DialogManager.cpp
-    // set_dialog_title).
+    // TDLib cleans the title and cuts it to 128 characters, then makes each
+    // run of spaces, newlines and no-break spaces one space (clean_name), and
+    // setting the current title again succeeds without a change
+    // (DialogManager.cpp set_dialog_title).
     setChatTitle: (p, caller) => {
       const chat = requireChat(p.chat_id, caller);
-      const title = stripEmpty(p.title, 128).replace(/\s+/g, " ");
+      const title = trimSpaces(
+        stripEmpty(p.title, 128).replace(/[ \n\u00a0]+/g, " "),
+      );
       if (!title) {
         throw new TelegramError(400, "Bad Request: title must be non-empty");
       }
@@ -4741,7 +4902,8 @@ export async function startTestServer({
    * server, it refuses a button without text or an action while reading the
    * request, before any chat or message check, and keeps of each button only
    * its text, icon, style and the one action it reads, as
-   * JsonInlineKeyboardButton returns it.
+   * JsonInlineKeyboardButton returns it. After the keyboards it reads the
+   * flags, and a reply keyboard's own flags only with one.
    */
   function inlineMarkup(value) {
     const markup = jsonParam(value, "reply keyboard markup");
@@ -4760,7 +4922,6 @@ export async function startTestServer({
         );
       }
     }
-    if (!(markup.inline_keyboard?.length > 0)) return undefined;
     const kept = (button) => {
       if (typeof button !== "object" || button === null) return button;
       try {
@@ -4784,11 +4945,26 @@ export async function startTestServer({
           .map((field) => [field, button[field]]),
       );
     };
-    return {
-      inline_keyboard: markup.inline_keyboard.map((row) =>
-        Array.isArray(row) ? row.map(kept) : row,
-      ),
-    };
+    const inline =
+      markup.inline_keyboard?.length > 0
+        ? {
+            inline_keyboard: markup.inline_keyboard.map((row) =>
+              Array.isArray(row) ? row.map(kept) : row,
+            ),
+          }
+        : undefined;
+    requireBooleans(markup, [
+      "hide_keyboard",
+      "remove_keyboard",
+      "personal_keyboard",
+      "selective",
+      "force_reply_keyboard",
+      "force_reply",
+      ...(markup.keyboard?.length > 0
+        ? ["resize_keyboard", "one_time_keyboard", "is_persistent"]
+        : []),
+    ]);
+    return inline;
   }
 
   /**
@@ -4816,7 +4992,7 @@ export async function startTestServer({
     return (
       (Array.isArray(markup?.keyboard) && markup.keyboard.length > 0) ||
       (!inlineMarkup(markup) &&
-        (isTrue(markup?.remove_keyboard) || isTrue(markup?.force_reply)))
+        (markup?.remove_keyboard === true || markup?.force_reply === true))
     );
   }
 
@@ -4835,7 +5011,7 @@ export async function startTestServer({
     const ephemeral = p.ephemeral_message_parameters;
     const chat = botChat(p.chat_id, caller, { send: true });
     requireCanSend(chat, caller);
-    requireTopic(chat, p.message_thread_id);
+    requireTopic(chat, topicParam(p));
     const reply = replyFields(chat, p, caller, parameters);
     // Content given as a function is read only now, after the chat and reply
     // checks, as TDLib reads a file or live location only when it sends.
@@ -4854,11 +5030,8 @@ export async function startTestServer({
         ...item,
         ...reply,
         ...(markup ? { reply_markup: markup } : {}),
-        ...(p.message_thread_id && chat.topics
-          ? {
-              message_thread_id: Number(p.message_thread_id),
-              is_topic_message: true,
-            }
+        ...(topicParam(p) && chat.topics
+          ? { message_thread_id: topicParam(p), is_topic_message: true }
           : {}),
         ...(isTrue(p.protect_content) ? { has_protected_content: true } : {}),
       };
@@ -4986,14 +5159,20 @@ export async function startTestServer({
 
   /**
    * reply_parameters, or the older reply_to_message_id, as
-   * Client::get_reply_parameters reads them.
+   * Client::get_reply_parameters reads them; reply_to_message_id is read as
+   * get_message_id reads it, 0 (none) when it has no digits or is negative.
    */
   function replyParameters(p) {
     const given = jsonParam(p.reply_parameters, "reply parameters");
     if (given === undefined) {
       return p.reply_to_message_id != null
         ? {
-            message_id: p.reply_to_message_id,
+            message_id: clampedInteger(
+              p.reply_to_message_id,
+              0,
+              0,
+              2 ** 31 - 1,
+            ),
             allow_sending_without_reply: isTrue(p.allow_sending_without_reply),
           }
         : null;
@@ -5004,6 +5183,7 @@ export async function startTestServer({
         "Bad Request: object expected as reply parameters",
       );
     }
+    requireBooleans(given, ["allow_sending_without_reply"]);
     return given;
   }
 
@@ -5019,9 +5199,7 @@ export async function startTestServer({
   function replyFields(chat, p, caller, parameters) {
     if (parameters?.message_id == null || Number(parameters.message_id) <= 0) {
       const topic =
-        p.message_thread_id && chat.topics
-          ? chat.messages.get(Number(p.message_thread_id))
-          : null;
+        topicParam(p) && chat.topics ? chat.messages.get(topicParam(p)) : null;
       if (!topic) return {};
       const { reply_to_message: _nested, ...original } = topic.message;
       return { reply_to_message: original };
@@ -5048,7 +5226,7 @@ export async function startTestServer({
       entry.deleted ||
       (source.type === "group" && !isInChat(source, caller.id))
     ) {
-      if (isTrue(parameters.allow_sending_without_reply)) return {};
+      if (parameters.allow_sending_without_reply === true) return {};
       throw new TelegramError(
         400,
         "Bad Request: message to be replied not found",
@@ -5214,11 +5392,19 @@ export async function startTestServer({
    */
   function textFields(p, tooLong = "Bad Request: message is too long") {
     const preview = jsonParam(p.link_preview_options, "link preview options");
-    if (preview !== undefined && !isObject(preview)) {
-      throw new TelegramError(
-        400,
-        "Bad Request: object expected as link preview options",
-      );
+    if (preview !== undefined) {
+      if (!isObject(preview)) {
+        throw new TelegramError(
+          400,
+          "Bad Request: object expected as link preview options",
+        );
+      }
+      requireBooleans(preview, [
+        "is_disabled",
+        "prefer_small_media",
+        "prefer_large_media",
+        "show_above_text",
+      ]);
     }
     const text = String(p.text ?? "");
     if (!text) {
@@ -5254,18 +5440,18 @@ export async function startTestServer({
       p.link_preview_options ??
       (isTrue(p.disable_web_page_preview) ? { is_disabled: true } : null);
     if (given === null || typeof given !== "object") return null;
-    const disabled = isTrue(given.is_disabled);
+    const disabled = given.is_disabled === true;
     const url = disabled ? "" : String(given.url ?? "");
     const options = {
       ...(disabled && hasPreviewLink(formatted) ? { is_disabled: true } : {}),
       ...(url ? { url } : {}),
-      ...(url && isTrue(given.prefer_small_media)
+      ...(url && given.prefer_small_media === true
         ? { prefer_small_media: true }
         : {}),
-      ...(url && isTrue(given.prefer_large_media)
+      ...(url && given.prefer_large_media === true
         ? { prefer_large_media: true }
         : {}),
-      ...(isTrue(given.show_above_text) ? { show_above_text: true } : {}),
+      ...(given.show_above_text === true ? { show_above_text: true } : {}),
     };
     return Object.keys(options).length > 0 ? options : null;
   }
@@ -5453,35 +5639,41 @@ export async function startTestServer({
   }
 
   /**
-   * latitude and longitude as Client::get_location reads them; TDLib refuses
-   * a point off the map with `invalid` (Location.cpp, Venue.cpp).
+   * latitude and longitude as Client::get_location reads them: each must not
+   * be empty, and is read with td::to_double. The returned step is called
+   * after the chat checks, where TDLib refuses a point off the map with
+   * `invalid` (MessagesManager::send_message, Location.cpp, Venue.cpp).
    */
   function coordinates(p, invalid) {
-    for (const field of ["latitude", "longitude"]) {
-      if (String(p[field] ?? "").trim() === "") {
+    const [latitude, longitude] = ["latitude", "longitude"].map((field) => {
+      const text = String(p[field] ?? "").trim();
+      if (text === "") {
         throw new TelegramError(400, `Bad Request: ${field} is empty`);
       }
-    }
-    const latitude = Number(p.latitude);
-    const longitude = Number(p.longitude);
-    if (
-      !Number.isFinite(latitude) ||
-      !Number.isFinite(longitude) ||
-      Math.abs(latitude) > 90 ||
-      Math.abs(longitude) > 180
-    ) {
-      throw new TelegramError(400, invalid);
-    }
-    return { latitude, longitude };
+      return streamDouble(text);
+    });
+    return () => {
+      if (!(Math.abs(latitude) <= 90 && Math.abs(longitude) <= 180)) {
+        throw new TelegramError(400, invalid);
+      }
+      return { latitude, longitude };
+    };
   }
 
   /**
-   * Text as TDLib's strip_empty_characters leaves it: trimmed, cut to `max`
-   * characters, and empty when only invisible characters remain (misc.cpp).
+   * A chat's title or description as TDLib cleans it: clean_input_string
+   * (Requests.cpp CLEAN_INPUT_STRING), then strip_empty_characters
+   * (misc.cpp), which turns its blank characters into spaces, trims the text,
+   * cuts it to `max` characters, trims it again, and leaves nothing when only
+   * blank or invisible characters remain.
    */
   function stripEmpty(value, max) {
-    const text = [...String(value ?? "").trim()].slice(0, max).join("").trim();
-    return /[^\s\u200b-\u200f\u202e\ufeff]/u.test(text) ? text : "";
+    const spaced = cleanInput(String(value ?? "")).replace(
+      /[\u1680\u180e\u2000-\u200a\u202f\u205f\u2800\u3000\ufffc\u{e0000}-\u{e007f}]/gu,
+      " ",
+    );
+    const text = trimSpaces([...trimSpaces(spaced)].slice(0, max).join(""));
+    return isEmptyText(text) ? "" : text;
   }
 
   /** Changing a chat's title, description or photo needs can_change_info. */
@@ -6088,13 +6280,46 @@ export async function startTestServer({
   }
 
   /**
+   * The type of an InputMedia, read as Client::get_input_media reads it: the
+   * caption's markup (TDLib checks its entities and length later), the type,
+   * the file, a live photo's still photo, then whether the type can be sent
+   * this way; an album takes no animation. A problem throws an Error with the
+   * reason Telegram gives after "can't parse InputMedia: ".
+   */
+  function inputMediaType(p, input, album = false) {
+    if (!isObject(input)) throw new Error("expected an Object");
+    if (input.caption != null && input.caption !== "") {
+      try {
+        formatOrFail(String(input.caption), input.parse_mode);
+      } catch (error) {
+        if (!(error instanceof TelegramError)) throw error;
+        const reason = error.message.replace(/^Bad Request: /, "");
+        throw new Error(reason[0].toUpperCase() + reason.slice(1));
+      }
+    }
+    const type = requiredString(input, "type");
+    const reason =
+      namedFile(p, input.media) === null
+        ? "media not found"
+        : type === "live_photo" && namedFile(p, input.photo) === null
+          ? "Photo not found"
+          : type === "animation" && album
+            ? `type "${type}" can't be used in sendMediaGroup`
+            : type === "voice_note"
+              ? `type "${type}" is not allowed`
+              : !MEDIA_KINDS.includes(type)
+                ? `type "${type}" is unsupported`
+                : null;
+    if (reason) throw new Error(reason);
+    return type;
+  }
+
+  /**
    * The media edit of editMessageMedia and editEphemeralMessageMedia. The new
    * media is an upload attached as attach://<name>, a file_id the bot was
    * given or an HTTP URL; a live photo names its still photo too. The Bot API
-   * reads it before the message, in get_input_media's order (Client.cpp): the
-   * caption's markup, the type, the file, a live photo's still photo, then
-   * whether an edit takes the type. TDLib reads the files and checks the
-   * caption's length once it has the message (MessageContent.cpp
+   * reads it before the message (inputMediaType). TDLib reads the files and
+   * checks the caption's length once it has the message (MessageContent.cpp
    * get_input_message_content). In an album the media may change only to a
    * kind the album allows (MessagesManager::edit_message_media).
    */
@@ -6112,36 +6337,15 @@ export async function startTestServer({
       );
     }
     const input = p.media;
-    const unreadable = (reason) =>
-      new TelegramError(400, `Bad Request: can't parse InputMedia: ${reason}`);
-    if (!isObject(input)) throw unreadable("expected an Object");
-    if (input.caption != null && input.caption !== "") {
-      try {
-        // The markup only; TDLib checks entities and length later.
-        formatOrFail(String(input.caption), input.parse_mode);
-      } catch (error) {
-        if (!(error instanceof TelegramError)) throw error;
-        const reason = error.message.replace(/^Bad Request: /, "");
-        throw unreadable(reason[0].toUpperCase() + reason.slice(1));
-      }
-    }
     let type;
     try {
-      type = requiredString(input, "type");
+      type = inputMediaType(p, input);
     } catch (error) {
-      throw unreadable(error.message);
+      throw new TelegramError(
+        400,
+        `Bad Request: can't parse InputMedia: ${error.message}`,
+      );
     }
-    const reason =
-      namedFile(p, input.media) === null
-        ? "media not found"
-        : type === "live_photo" && namedFile(p, input.photo) === null
-          ? "Photo not found"
-          : type === "voice_note"
-            ? `type "${type}" is not allowed`
-            : !MEDIA_KINDS.includes(type)
-              ? `type "${type}" is unsupported`
-              : null;
-    if (reason) throw unreadable(reason);
     // Only a send turns Telegram's MEDIA_EMPTY into the Bot API's text
     // (MessagesManager.cpp process_send_message_fail_error); an edit gets it
     // as it is (EditMessageQuery::on_error).
@@ -6813,7 +7017,9 @@ export async function startTestServer({
           "a failure needs the method it applies to",
         );
       }
-      for (const field of ["attempt", "times", "delay_ms"]) {
+      // Each is a whole number, retry_after too, as Telegram gives it
+      // (Query::set_retry_after_error takes an int).
+      for (const field of ["attempt", "times", "delay_ms", "retry_after"]) {
         if (
           body[field] != null &&
           (!Number.isInteger(Number(body[field])) ||

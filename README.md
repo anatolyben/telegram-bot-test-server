@@ -191,7 +191,9 @@ goal is not full coverage of the Bot API.
 Method names are case-insensitive. Parameters come as a query string, JSON, or URL-encoded or
 multipart form data, read as Telegram's server reads them: a body of any other type is ignored, a
 JSON body keeps the fields read before anything malformed, and only form data that cannot be read
-is refused, with an empty 400.
+is refused, with an empty 400. A JSON body's values are text, as a query string's are: `null` is
+the text `null`, `1.50` stays `1.50`, and a string may hold raw control characters. A parameter
+given twice keeps its first value, and the query string comes before the body.
 
 ## Behaves like Telegram
 
@@ -201,6 +203,9 @@ The details a moderation bot depends on, each covered by a test:
   `can_edit_tag` follow `can_pin_messages`, and `can_react_to_messages` follows `can_send_messages`
   as passed. Then, unless `use_independent_chat_permissions` is set, broader permissions imply
   narrower ones (`can_send_other_messages` implies media and text, `can_send_polls` implies text).
+  Each permission must be a JSON `true` or `false`
+  (`can't parse chat permissions: Field "can_send_polls" must be of type Boolean` otherwise), and
+  `permissions` given empty fail with `can't parse permissions JSON object`.
   A member needs both their own permission and the chat's default from `setChatPermissions` to post;
   a photo needs `can_send_photos`, not only `can_send_messages`. `getChat` returns the default
   `permissions` for groups and supergroups, not for channels.
@@ -292,7 +297,12 @@ The details a moderation bot depends on, each covered by a test:
   `command description must be non-empty`, and one over 32 or 256 characters with
   `command length must not exceed 32` or `command description length must not exceed 256`. The
   characters a command may use are not checked here.
-- **Parameters.** A boolean is true when it reads `true`, `yes` or `1`, in any case. A
+- **Parameters.** A boolean parameter is true when it reads `true`, `yes` or `1`, in any case. A
+  flag inside `reply_parameters`, `link_preview_options`, `reply_markup` or `permissions` must be a
+  JSON `true` or `false`, or the call fails, for example with
+  `field "remove_keyboard" must be of type Boolean`. A user id is an optional `-` and the digits
+  after it (`12abc` is 12; a leading space or `+` makes it invalid), and `reply_to_message_id`,
+  `message_thread_id` and `until_date` are read by their leading digits too, so `null` is 0. A
   JSON-serialized parameter (`reply_markup`, `reply_parameters`, `message_ids`, `media`, ...) may
   also come as a JSON string; one that cannot be read fails with Telegram's parse error, such as
   `can't parse reply keyboard markup JSON object`. A missing required parameter fails with
@@ -331,9 +341,14 @@ The details a moderation bot depends on, each covered by a test:
   the header cannot be read. Telegram also lists smaller sizes. A contact keeps its `vcard`. A
   location with `live_period` is a live location with its `heading` and `proximity_alert_radius`,
   refused out of Telegram's ranges, and off the map with `invalid live location specified`.
+  Coordinates are read by their leading number (`12abc` is 12, and text without one is 0), and a
+  point off the map is refused only after the chat is checked.
   `sendMediaGroup` sends up to 10 items as one album; a single item is sent as an ordinary
-  message, as TDLib does. As in Telegram's Bot API server, it reads `reply_parameters` before
-  `media`, and checks the replied message before it reads any file or counts the album.
+  message, as TDLib does. Photos, live photos and videos can share an album. As in Telegram's Bot
+  API server, it reads `reply_parameters` before `media`, reads every item before the chat, failing
+  with `can't parse InputMedia: …` (such as `type "animation" can't be used in sendMediaGroup` or
+  `type "sticker" is unsupported`), and checks the replied message before it reads any file or
+  counts the album.
 - **Files** ([sending files](https://core.telegram.org/bots/api#sending-files)). Each bot gets its
   own opaque `file_id` for a file, and `file_unique_id` is the same for every bot. A bot can send
   again, `getFile` and download (with its own token) only the file_ids it was given. `getFile` on
@@ -434,13 +449,13 @@ The details a moderation bot depends on, each covered by a test:
   only when they list it in `allowed_updates`, as on Telegram. A bot sets at most one reaction,
   and only an emoji from the [ReactionTypeEmoji](https://core.telegram.org/bots/api#reactiontypeemoji)
   list (any other emoji fails with `REACTION_INVALID`, and a paid reaction is refused) or a custom
-  emoji. A custom emoji is accepted without checking that it is already on the message or allowed
-  by the chat's administrators. A reaction on an album lands on its first message that is not
-  deleted. The bot removes a member's reaction with `deleteMessageReaction` and
-  `can_delete_messages`; `actor_chat_id` may stand in for `user_id`, though members here never
-  react as a chat. A user's id there removes that user's reaction, and a chat this server does not
-  know fails with `reaction sender not found`. The ids and the message are checked before the
-  bot's rights.
+  emoji, whose `custom_emoji_id` must be an integer. A custom emoji is accepted without checking
+  that it is already on the message or allowed by the chat's administrators. A reaction on an
+  album lands on its first message that is not deleted. The bot removes a member's reaction with
+  `deleteMessageReaction` and `can_delete_messages`; `actor_chat_id` may stand in for `user_id`,
+  though members here never react as a chat. A user's id there removes that user's reaction, and
+  a chat this server does not know fails with `reaction sender not found`. The ids and the message
+  are checked before the bot's rights.
 - **Administrators and chat settings.** `promoteChatMember` needs `can_promote_members` and grants
   only rights the bot holds. Rights the kind of chat does not have (below) are dropped first, as
   TDLib drops them; any one right left makes an administrator, `can_send_welcome_messages`,
@@ -452,9 +467,11 @@ The details a moderation bot depends on, each covered by a test:
   `can_manage_tags` in groups, and `can_manage_topics` in supergroups.
   `setChatTitle`, `setChatDescription`, `setChatPhoto` and `deleteChatPhoto` need `can_change_info`
   and post Telegram's service messages to every bot in the chat, the bot that made the change
-  included. A title is cut to 128 characters and a description to 255; the current title set again
-  succeeds without a service message, while an unchanged description or a missing photo is
-  refused.
+  included. A title is cut to 128 characters and a description to 255, after TDLib's cleaning:
+  blank characters such as U+2800 become spaces, U+2028 to U+202E are dropped, only ASCII spaces
+  are trimmed, and in a title each run of spaces, newlines and no-break spaces becomes one space.
+  A title left empty fails with `title must be non-empty`. The current title set again succeeds
+  without a service message, while an unchanged description or a missing photo is refused.
 - **Join request queries (Bot API 10.x).** A guard bot (`supportsJoinRequestQueries`) with
   `can_invite_users` gets each join request with a `query_id`, which it answers with
   `answerChatJoinRequestQuery` (`chat_join_request_query_id`, `result`: `approve`, `decline` or
@@ -1020,11 +1037,15 @@ consume the rule. `delayMs` alone executes normally and delays only the response
 Adding `errorCode` rejects before execution; `dropAfterApply` executes once then drops
 the connection. Delays are bounded to 30 seconds and cancelled on server stop.
 Without `description`, an injected error reads as Telegram's does for its code
-(`Bad Request`, `Forbidden`, `Conflict`, ...). A 429 needs `retryAfter`: it reads
-`Too Many Requests: retry after N` and carries the `Retry-After` header, as on Telegram.
+(`Bad Request`, `Forbidden`, `Conflict`, ...). A 429 needs `retryAfter`, a whole number of
+seconds: it reads `Too Many Requests: retry after N` and carries the `Retry-After` header, as on
+Telegram.
 
 `getCalls()` / `GET /_fake/calls` retain append-only receipts with `seq`, `outcome`,
 `applied`, `status`, `completed_at`, and matching `fault_id` / `attempt` / `delay_ms`.
+Each receipt's `params` are the parameters as Telegram's server reads them: text, with the
+JSON-serialized ones (`reply_markup`, `media`, `permissions`, ...) parsed, so a call wait that
+narrows by `params` gives `chat_id` as text, such as `"-100123"`.
 `applied` means the handler succeeded, including reads/no-ops, rather than claiming a
 state change. Actual permission rejection records `failed` as well as injected
 rejection. A failed handler never records a successful response loss. Compare these

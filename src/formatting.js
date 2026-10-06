@@ -875,6 +875,16 @@ export const isEmptyText = (text) =>
   );
 
 /**
+ * Text as TDLib's clean_input_string leaves it, as cleanAndTrim below cleans
+ * it when there are no entities to move.
+ */
+export const cleanInput = (text) =>
+  text
+    .replace(/[\r\u2028-\u202e\u030a\u0333\u033f]/g, "")
+    .replace(/[\0-\t\v-\x1f]/g, " ")
+    .replace(/[\u200e\u200f](?=[\u200e\u200f])/g, "\u200c");
+
+/**
  * TDLib fix_formatted_text for a message being sent. clean_input_string turns
  * control characters other than \n into spaces and drops \r, U+2028 to U+202E
  * and the combining marks U+030A, U+0333 and U+033F; in a run of

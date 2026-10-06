@@ -764,7 +764,11 @@ it("keeps the deleted message author as a stable call selector without rewriting
     stage: "response_sent",
   });
   expect(call.target_user_id).toBe(user);
-  expect(call.params).toEqual({ chat_id: CHAT, message_id: messageId });
+  // Parameters are recorded as Telegram's server reads them: as text.
+  expect(call.params).toEqual({
+    chat_id: String(CHAT),
+    message_id: String(messageId),
+  });
 });
 
 it("allocates valid stored message IDs for configured and created chats when manual time starts at zero", async () => {

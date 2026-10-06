@@ -1608,6 +1608,9 @@ describe("failures a test asks for", () => {
     await expect(
       fake.failNext({ method: "getMe", errorCode: 429 }),
     ).rejects.toThrow("retry_after");
+    await expect(
+      fake.failNext({ method: "getMe", errorCode: 429, retryAfter: 2.5 }),
+    ).rejects.toThrow("retry_after");
   });
 
   it("applies a call whose answer it then drops, as a lost connection would", async () => {

@@ -586,6 +586,67 @@ describe("more send methods", () => {
     expect(single.result[0].media_group_id).toBeUndefined();
   });
 
+  it("refuses album items with the Bot API's InputMedia errors before it looks at the chat", async () => {
+    const { upload } = await setup();
+    const unreadable = (reason) => ({
+      status: 400,
+      description: `Bad Request: can't parse InputMedia: ${reason}`,
+    });
+    const photo = { type: "photo", media: "attach://one" };
+    const album = (chatId, item) =>
+      upload("sendMediaGroup", {
+        chat_id: String(chatId),
+        media: [photo, item],
+        one: BYTES,
+      });
+
+    for (const [item, reason] of [
+      [
+        { type: "sticker", media: "attach://one" },
+        'type "sticker" is unsupported',
+      ],
+      [
+        { type: "animation", media: "attach://one" },
+        `type "animation" can't be used in sendMediaGroup`,
+      ],
+      [
+        { type: "voice_note", media: "attach://one" },
+        'type "voice_note" is not allowed',
+      ],
+      [{ type: "live_photo", media: "attach://one" }, "Photo not found"],
+      [{ type: "sticker", media: "attach://missing" }, "media not found"],
+    ]) {
+      expect(await album(GROUP, item)).toMatchObject(unreadable(reason));
+      expect(await album(42, item)).toMatchObject(unreadable(reason));
+    }
+  });
+
+  it("sends a live photo in an album", async () => {
+    const { upload } = await setup();
+    const sent = await upload("sendMediaGroup", {
+      chat_id: String(GROUP),
+      media: [
+        {
+          type: "live_photo",
+          media: "attach://motion",
+          photo: "attach://still",
+        },
+        { type: "photo", media: "attach://still" },
+      ],
+      motion: BYTES,
+      still: BYTES,
+    });
+
+    expect(sent.result).toHaveLength(2);
+    const [live, photo] = sent.result;
+    expect(live.media_group_id).toBe(photo.media_group_id);
+    expect(live.live_photo).toMatchObject({
+      photo: live.photo,
+      file_id: expect.any(String),
+    });
+    expect(photo.photo).toEqual(expect.any(Array));
+  });
+
   it("sends an album as a reply, read before its media and checked before its files", async () => {
     const { fake, api, upload, member } = await setup();
     const asked = await fake.post(GROUP, member, "send the photos");
@@ -840,6 +901,27 @@ describe("administrators and chat settings", () => {
       status: 400,
       description: "Bad Request: chat description is not modified",
     });
+  });
+
+  it("cleans a title and description as TDLib does, and refuses a title of blank characters", async () => {
+    const { api } = await setup();
+    const chat = async () => (await api("getChat", { chat_id: GROUP })).result;
+
+    expect(
+      await api("setChatTitle", { chat_id: GROUP, title: "\u2800\u3000" }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: title must be non-empty",
+    });
+    // A blank such as U+2800 becomes a space; U+2028 is dropped.
+    await api("setChatTitle", { chat_id: GROUP, title: "a\u2800b\u2028c" });
+    expect((await chat()).title).toBe("a bc");
+    // Only ASCII spaces are trimmed from a description.
+    await api("setChatDescription", {
+      chat_id: GROUP,
+      description: " a\u2003b\u00a0",
+    });
+    expect((await chat()).description).toBe("a b\u00a0");
   });
 
   it("changes a chat's title, description and photo with can_change_info", async () => {
