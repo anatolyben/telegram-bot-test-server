@@ -199,7 +199,17 @@ The details a moderation bot depends on, each covered by a test:
   with `receiver_user` and `ephemeral_message_id`. Unlike Telegram, which gives it `message_id` 0, it
   keeps an ordinary message id, so tests can find it in the chat and press its buttons. The
   `editEphemeralMessage…` and `deleteEphemeralMessage` methods are not modelled.
-- **Callback queries.** Answering a query that was never sent fails.
+- **Inline keyboards.** Every button needs an action: a button with only `text` (or an empty
+  `callback_data`) fails with Telegram's `Text buttons are not allowed in the inline keyboard`.
+  `callback_data` is limited to 64 bytes of UTF-8, not 64 characters; longer data fails with
+  `BUTTON_DATA_INVALID`. Sends, business sends and edits all check this.
+- **Callback queries.** Answering a query that was never sent fails. Answer text is limited to 200
+  characters; a longer answer fails with `MESSAGE_TOO_LONG` and the query stays open, so the bot can
+  answer it again. `chat_instance` is an opaque number that is the same for every press in a chat;
+  it is not the chat id.
+- **Command menus.** `setMyCommands`, `getMyCommands` and `deleteMyCommands` keep one list for each
+  `scope` and `language_code`. `getMyCommands` returns only the list set for that exact scope and
+  language (an empty list if there is none), and `deleteMyCommands` removes only that list.
 - **Invite links.** Exporting a new primary link revokes the previous one; joining through a
   revoked link fails.
 - **Entities.** Member messages and captions carry `bot_command`, `mention`, `email` and `url`

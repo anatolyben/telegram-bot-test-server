@@ -35,7 +35,18 @@ async function setup(options = {}) {
     await server.join(GROUP, id);
     return id;
   }
-  return { server, api, member };
+  // The next callback query from getUpdates, confirming the updates before it.
+  let offset = 0;
+  async function nextCallbackQuery() {
+    for (;;) {
+      const { result } = await api("getUpdates", { offset, timeout: 5 });
+      for (const update of result) {
+        offset = update.update_id + 1;
+        if (update.callback_query) return update.callback_query;
+      }
+    }
+  }
+  return { server, api, member, nextCallbackQuery };
 }
 
 describe("moderation", () => {
@@ -326,11 +337,125 @@ describe("messages and buttons", () => {
     });
   });
 
+  it("refuses inline buttons without an action, and callback_data outside 1-64 bytes", async () => {
+    const { api } = await setup();
+    const send = (button) =>
+      api("sendMessage", {
+        chat_id: GROUP,
+        text: "Choose",
+        reply_markup: { inline_keyboard: [[{ text: "Go", ...button }]] },
+      });
+    const textButton = {
+      status: 400,
+      description:
+        "Bad Request: can't parse InlineKeyboardButton: Text buttons are not allowed in the inline keyboard",
+    };
+    const badData = {
+      status: 400,
+      description: "Bad Request: BUTTON_DATA_INVALID",
+    };
+
+    expect(await send({})).toMatchObject(textButton);
+    expect(await send({ callback_data: "" })).toMatchObject(textButton);
+    expect(await send({ callback_data: "x".repeat(65) })).toMatchObject(
+      badData,
+    );
+    // The limit is in UTF-8 bytes: 33 "é" are 66 bytes.
+    expect(await send({ callback_data: "é".repeat(33) })).toMatchObject(
+      badData,
+    );
+    const sent = await send({ callback_data: "é".repeat(32) });
+    expect(sent).toMatchObject({ ok: true });
+    expect(
+      await api("editMessageReplyMarkup", {
+        chat_id: GROUP,
+        message_id: sent.result.message_id,
+        reply_markup: {
+          inline_keyboard: [[{ text: "Go", callback_data: "x".repeat(65) }]],
+        },
+      }),
+    ).toMatchObject(badData);
+  });
+
   it("refuses to answer a callback query that was never sent", async () => {
     const { api } = await setup();
     expect(
       await api("answerCallbackQuery", { callback_query_id: "12345" }),
     ).toMatchObject({ status: 400, ok: false });
+  });
+
+  it("refuses a callback answer over 200 characters and keeps the query open", async () => {
+    const { server, api, member, nextCallbackQuery } = await setup();
+    const ann = await member();
+    const sent = (
+      await api("sendMessage", {
+        chat_id: GROUP,
+        text: "Verify",
+        reply_markup: {
+          inline_keyboard: [[{ text: "OK", callback_data: "ok" }]],
+        },
+      })
+    ).result;
+    const press = server.pressButton(GROUP, sent.message_id, ann, "ok");
+    const query = await nextCallbackQuery();
+
+    expect(
+      await api("answerCallbackQuery", {
+        callback_query_id: query.id,
+        text: "x".repeat(201),
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: MESSAGE_TOO_LONG",
+    });
+    expect(
+      await api("answerCallbackQuery", {
+        callback_query_id: query.id,
+        text: "x".repeat(200),
+      }),
+    ).toMatchObject({ ok: true });
+    expect(await press).toMatchObject({
+      answered: true,
+      text: "x".repeat(200),
+    });
+  });
+
+  it("gives callback queries an opaque chat_instance, the same for every press in a chat", async () => {
+    const { server, api, member, nextCallbackQuery } = await setup();
+    const ann = await member();
+    await server.sendDirectMessage(ann, "/start");
+    const send = async (chatId) =>
+      (
+        await api("sendMessage", {
+          chat_id: chatId,
+          text: "Verify",
+          reply_markup: {
+            inline_keyboard: [[{ text: "OK", callback_data: "ok" }]],
+          },
+        })
+      ).result.message_id;
+    const instance = async (press) => {
+      const query = await nextCallbackQuery();
+      await api("answerCallbackQuery", { callback_query_id: query.id });
+      await press;
+      return query.chat_instance;
+    };
+
+    const group = await instance(
+      server.pressButton(GROUP, await send(GROUP), ann, "ok"),
+    );
+    const groupAgain = await instance(
+      server.pressButton(GROUP, await send(GROUP), ann, "ok"),
+    );
+    const direct = await instance(
+      server.pressDirectButton(ann, await send(ann), "ok"),
+    );
+
+    expect(group).toMatch(/^-?\d+$/);
+    expect(group).not.toBe(String(GROUP));
+    expect(groupAgain).toBe(group);
+    expect(direct).not.toBe(String(ann));
+    expect(direct).not.toBe(group);
   });
 
   it("lets the bot message a user privately only after the user has written to it", async () => {
@@ -411,6 +536,44 @@ describe("Bot API details", () => {
     await api("SETMYCOMMANDS", { commands });
 
     expect((await api("getmycommands")).result).toEqual(commands);
+  });
+
+  it("keeps one command list per scope and language, and deletes only the one addressed", async () => {
+    const { api } = await setup();
+    const members = [{ command: "rules", description: "Show the rules" }];
+    const admins = [{ command: "ban", description: "Ban a member" }];
+    const russian = [{ command: "pravila", description: "Правила" }];
+    const chat = { type: "chat", chat_id: GROUP };
+    const chatAdmins = { type: "chat_administrators", chat_id: GROUP };
+    const commands = async (params) =>
+      (await api("getMyCommands", params)).result;
+
+    await api("setMyCommands", { commands: members, scope: chat });
+    await api("setMyCommands", { commands: admins, scope: chatAdmins });
+    await api("setMyCommands", {
+      commands: russian,
+      scope: chat,
+      language_code: "ru",
+    });
+
+    expect(await commands({})).toEqual([]);
+    expect(await commands({ scope: { type: "default" } })).toEqual([]);
+    expect(await commands({ scope: chat })).toEqual(members);
+    expect(
+      await commands({ scope: { type: "chat", chat_id: String(GROUP) } }),
+    ).toEqual(members);
+    expect(await commands({ scope: chatAdmins })).toEqual(admins);
+    expect(await commands({ scope: chat, language_code: "ru" })).toEqual(
+      russian,
+    );
+
+    await api("deleteMyCommands", { scope: chatAdmins });
+
+    expect(await commands({ scope: chatAdmins })).toEqual([]);
+    expect(await commands({ scope: chat })).toEqual(members);
+    expect(await commands({ scope: chat, language_code: "ru" })).toEqual(
+      russian,
+    );
   });
 
   it("returns media with the fields the Bot API requires, and files getFile can resolve", async () => {
