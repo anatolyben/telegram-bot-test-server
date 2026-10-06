@@ -133,8 +133,11 @@ export function createWaits() {
         timer = setTimeout(
           () =>
             waiter.fail(
-              new Error(
-                `Fake wait deadline ${timeoutMs}ms exceeded: ${describe()}`,
+              Object.assign(
+                new Error(
+                  `Fake wait deadline ${timeoutMs}ms exceeded: ${describe()}`,
+                ),
+                { timedOut: true },
               ),
             ),
           timeoutMs,

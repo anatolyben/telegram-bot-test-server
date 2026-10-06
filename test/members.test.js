@@ -333,7 +333,7 @@ describe("more send methods", () => {
     });
   });
 
-  it("sends an album of 2 to 10 items, and never documents mixed with photos", async () => {
+  it("sends an album of up to 10 items, and never documents or audio mixed with others", async () => {
     const { upload } = await setup();
     const sent = await upload("sendMediaGroup", {
       chat_id: String(GROUP),
@@ -351,22 +351,40 @@ describe("more send methods", () => {
       photo: expect.any(Array),
     });
 
-    const mixed = await upload("sendMediaGroup", {
-      chat_id: String(GROUP),
-      media: [
-        { type: "photo", media: "attach://one" },
-        { type: "document", media: "attach://two" },
+    const photo = { type: "photo", media: "attach://one" };
+    for (const [media, description] of [
+      [undefined, 'Bad Request: parameter "media" is required'],
+      [[], "Bad Request: there are no messages to send"],
+      [
+        Array.from({ length: 11 }, () => photo),
+        "Bad Request: too many messages to send as an album",
       ],
-      one: BYTES,
-      two: BYTES,
-    });
-    expect(mixed.status).toBe(400);
+      [
+        [photo, { type: "document", media: "attach://one" }],
+        "Bad Request: document can't be mixed with other media types",
+      ],
+      [
+        [{ type: "audio", media: "attach://one" }, photo],
+        "Bad Request: audio can't be mixed with other media types",
+      ],
+    ]) {
+      expect(
+        await upload("sendMediaGroup", {
+          chat_id: String(GROUP),
+          ...(media ? { media } : {}),
+          one: BYTES,
+        }),
+      ).toMatchObject({ status: 400, description });
+    }
+    // One item is sent as an ordinary message, outside any album.
     const single = await upload("sendMediaGroup", {
       chat_id: String(GROUP),
-      media: [{ type: "photo", media: "attach://one" }],
+      media: [photo],
       one: BYTES,
     });
-    expect(single.status).toBe(400);
+    expect(single.result).toHaveLength(1);
+    expect(single.result[0].photo).toEqual(expect.any(Array));
+    expect(single.result[0].media_group_id).toBeUndefined();
   });
 
   it("sends an album as a reply", async () => {
@@ -528,6 +546,47 @@ describe("administrators and chat settings", () => {
     );
   });
 
+  it("cuts a long title or description instead of refusing it, and refuses an empty title", async () => {
+    const { api } = await setup();
+
+    for (const title of ["", "   "]) {
+      expect(
+        await api("setChatTitle", { chat_id: GROUP, title }),
+      ).toMatchObject({
+        status: 400,
+        description: "Bad Request: title must be non-empty",
+      });
+    }
+    expect(
+      (
+        await api("setChatTitle", {
+          chat_id: GROUP,
+          title: "  a  b " + "t".repeat(200),
+        })
+      ).result,
+    ).toBe(true);
+    expect(
+      (
+        await api("setChatDescription", {
+          chat_id: GROUP,
+          description: "d".repeat(300),
+        })
+      ).result,
+    ).toBe(true);
+    const chat = (await api("getChat", { chat_id: GROUP })).result;
+    expect(chat.title).toBe("a b " + "t".repeat(123));
+    expect(chat.description).toBe("d".repeat(255));
+    expect(
+      await api("setChatDescription", {
+        chat_id: GROUP,
+        description: "d".repeat(256),
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: chat description is not modified",
+    });
+  });
+
   it("changes a chat's title, description and photo with can_change_info", async () => {
     const { fake, api, upload, me } = await setup();
     const hook = await startReceiver();
@@ -541,9 +600,10 @@ describe("administrators and chat settings", () => {
     expect(
       (await api("setChatTitle", { chat_id: GROUP, title: "New Name" })).result,
     ).toBe(true);
+    // The same title again succeeds without a second service message.
     expect(
-      await api("setChatTitle", { chat_id: GROUP, title: "New Name" }),
-    ).toMatchObject({ description: "Bad Request: chat title is not modified" });
+      (await api("setChatTitle", { chat_id: GROUP, title: "New Name" })).result,
+    ).toBe(true);
     await api("setChatDescription", { chat_id: GROUP, description: "Rules" });
     await upload("setChatPhoto", { chat_id: String(GROUP), photo: BYTES });
 

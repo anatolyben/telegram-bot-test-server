@@ -85,11 +85,8 @@ const NO_GIFTS = Object.freeze({
  * narrower ones.
  */
 function normalizePermissions(input = {}, independent = false) {
-  if (input === null || typeof input !== "object" || Array.isArray(input)) {
-    throw new TelegramError(
-      400,
-      "Bad Request: can't parse permissions JSON object",
-    );
+  if (!isObject(jsonParam(input, "permissions"))) {
+    throw new TelegramError(400, "Bad Request: object expected as permissions");
   }
   const given = (key) => input[key] === true || input[key] === "true";
   const result = Object.fromEntries(
@@ -102,7 +99,7 @@ function normalizePermissions(input = {}, independent = false) {
   if (!("can_react_to_messages" in input)) {
     result.can_react_to_messages = result.can_send_messages;
   }
-  if (!(independent === true || independent === "true")) {
+  if (!isTrue(independent)) {
     if (result.can_send_other_messages || result.can_add_web_page_previews) {
       for (const key of MEDIA_PERMISSIONS) result[key] = true;
     }
@@ -305,6 +302,46 @@ function contentType(message) {
   return CONTENT_FIELDS.find((field) => message[field] !== undefined) ?? null;
 }
 
+// Bot API 10.3 methods documented to return True on success, plus the older
+// names (kickChatMember, setStickerSetThumb) Telegram still routes to them.
+// unimplemented: "ok" answers true only for these.
+const TRUE_METHODS = new Set(
+  `logOut close setWebhook deleteWebhook sendMessageDraft sendChatAction
+  setMessageReaction setUserEmojiStatus banChatMember kickChatMember
+  unbanChatMember restrictChatMember promoteChatMember
+  setChatAdministratorCustomTitle setChatMemberTag banChatSenderChat
+  unbanChatSenderChat setChatPermissions approveChatJoinRequest
+  declineChatJoinRequest answerChatJoinRequestQuery sendChatJoinRequestWebApp
+  setChatPhoto deleteChatPhoto setChatTitle setChatDescription pinChatMessage
+  unpinChatMessage unpinAllChatMessages leaveChat setChatStickerSet
+  deleteChatStickerSet editForumTopic closeForumTopic reopenForumTopic
+  deleteForumTopic unpinAllForumTopicMessages editGeneralForumTopic
+  closeGeneralForumTopic reopenGeneralForumTopic hideGeneralForumTopic
+  unhideGeneralForumTopic unpinAllGeneralForumTopicMessages answerCallbackQuery
+  setManagedBotAccessSettings setMyCommands deleteMyCommands setMyName
+  setMyDescription setMyShortDescription setMyProfilePhoto removeMyProfilePhoto
+  setChatMenuButton setMyDefaultAdministratorRights sendGift
+  giftPremiumSubscription verifyUser verifyChat removeUserVerification
+  removeChatVerification readBusinessMessage deleteBusinessMessages
+  setBusinessAccountName setBusinessAccountUsername setBusinessAccountBio
+  setBusinessAccountProfilePhoto removeBusinessAccountProfilePhoto
+  setBusinessAccountGiftSettings transferBusinessAccountStars
+  convertGiftToStars upgradeGift transferGift deleteStory
+  editEphemeralMessageText editEphemeralMessageMedia
+  editEphemeralMessageCaption editEphemeralMessageReplyMarkup
+  approveSuggestedPost declineSuggestedPost deleteMessage deleteMessages
+  deleteEphemeralMessage deleteMessageReaction deleteAllMessageReactions
+  createNewStickerSet addStickerToSet setStickerPositionInSet
+  deleteStickerFromSet replaceStickerInSet setStickerEmojiList
+  setStickerKeywords setStickerMaskPosition setStickerSetTitle
+  setStickerSetThumbnail setStickerSetThumb setCustomEmojiStickerSetThumbnail
+  deleteStickerSet sendRichMessageDraft answerInlineQuery answerShippingQuery
+  answerPreCheckoutQuery refundStarPayment editUserStarSubscription
+  setPassportDataErrors`
+    .split(/\s+/)
+    .map((name) => name.toLowerCase()),
+);
+
 class TelegramError extends Error {
   constructor(code, description, parameters = null) {
     super(description);
@@ -312,6 +349,67 @@ class TelegramError extends Error {
     // The Bot API's ResponseParameters, when Telegram sends any.
     this.parameters = parameters;
   }
+}
+
+/**
+ * A boolean parameter as Client::to_bool reads it: "true", "yes" or "1", in
+ * any case and around spaces.
+ */
+function isTrue(value) {
+  return ["true", "yes", "1"].includes(String(value).trim().toLowerCase());
+}
+
+function isObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * A JSON-serialized parameter, undefined when it is absent or empty. Text
+ * that is not JSON is still a string here, which Telegram refuses with
+ * "can't parse <name> JSON object".
+ */
+function jsonParam(value, name) {
+  if (value === undefined || value === "") return undefined;
+  if (typeof value === "string") {
+    throw new TelegramError(
+      400,
+      `Bad Request: can't parse ${name} JSON object`,
+    );
+  }
+  return value;
+}
+
+/**
+ * A JSON array as Client::get_array reads it: null is empty, and `problem`
+ * says why an item cannot be read, if it cannot.
+ */
+function jsonArray(value, className, problem = () => undefined) {
+  if (value === null) return [];
+  if (!Array.isArray(value)) {
+    throw new TelegramError(
+      400,
+      `Bad Request: expected an Array of ${className}`,
+    );
+  }
+  for (const item of value) {
+    const reason = problem(item);
+    if (reason) {
+      throw new TelegramError(
+        400,
+        `Bad Request: can't parse ${className}: ${reason}`,
+      );
+    }
+  }
+  return value;
+}
+
+/** Why a JSON object has no usable string field, as td::JsonObject says. */
+function missingString(object, field) {
+  if (!(field in object)) return `Can't find field "${field}"`;
+  if (!["string", "number"].includes(typeof object[field])) {
+    return `Field "${field}" must be of type String`;
+  }
+  return undefined;
 }
 
 /** A request number, or the fallback when it is missing or not a number. */
@@ -517,22 +615,121 @@ function correctOptionIds(p) {
   });
 }
 
+/**
+ * A JSON body's parameters as Telegram's HTTP reader takes them: the fields of
+ * a top-level object up to the first malformed one, or a top-level string as
+ * "content"; anything else gives none, and a parse error is no error
+ * (tdnet HttpReader::parse_json_parameters, td::do_json_skip).
+ */
+function jsonBodyEntries(text) {
+  const entries = [];
+  let at = 0;
+  const space = () => {
+    while (at < text.length && " \t\r\n".includes(text[at])) at += 1;
+  };
+  // The JSON string at `at`, decoded, or undefined when it is malformed.
+  const string = () => {
+    const pattern = /"(?:[^"\\]|\\.)*"/y;
+    pattern.lastIndex = at;
+    const match = pattern.exec(text);
+    if (!match) return undefined;
+    at += match[0].length;
+    try {
+      return JSON.parse(match[0]);
+    } catch {
+      return undefined;
+    }
+  };
+  // Skips one value; false when it is malformed.
+  const skip = () => {
+    space();
+    const open = text[at];
+    if (open === '"') return string() !== undefined;
+    if (open === "{" || open === "[") {
+      const close = open === "{" ? "}" : "]";
+      at += 1;
+      space();
+      if (text[at] !== close) {
+        for (;;) {
+          if (at >= text.length) return false;
+          if (close === "}") {
+            if (string() === undefined) return false;
+            space();
+            if (text[at] !== ":") return false;
+            at += 1;
+          }
+          if (!skip()) return false;
+          space();
+          if (text[at] === close) break;
+          if (text[at] !== ",") return false;
+          at += 1;
+          space();
+        }
+      }
+      at += 1;
+      return true;
+    }
+    const literal = /true|false|null|[-+.0-9][-+.0-9eE]*/y;
+    literal.lastIndex = at;
+    const match = literal.exec(text);
+    if (match) at += match[0].length;
+    return match !== null;
+  };
+  space();
+  if (text[at] === '"') {
+    const content = string();
+    return content !== undefined && at === text.length
+      ? [["content", content]]
+      : [];
+  }
+  if (text[at] !== "{") return entries;
+  at += 1;
+  for (;;) {
+    space();
+    if (at >= text.length || text[at] === "}") return entries;
+    const key = string();
+    space();
+    if (key === undefined || text[at] !== ":") return entries;
+    at += 1;
+    space();
+    const start = at;
+    let value;
+    if (text[at] === '"') {
+      value = string();
+      if (value === undefined) return entries;
+    } else {
+      if (!skip()) return entries;
+      try {
+        value = JSON.parse(text.slice(start, at));
+      } catch {
+        value = text.slice(start, at);
+      }
+    }
+    entries.push([key, value]);
+    space();
+    if (text[at] === ",") at += 1;
+    else if (text[at] !== "}") return entries;
+  }
+}
+
+/**
+ * A Bot API request's parameters: the query string, then a form or JSON body.
+ * As on Telegram, a body of another type is ignored, and only form data that
+ * cannot be read is refused (tdnet HttpReader).
+ */
 async function readRequestParams(request, body) {
   const url = new URL(request.url, "http://localhost");
   const params = coerceParams(url.searchParams.entries());
   if (!body.length) return params;
   const type = String(request.headers["content-type"] ?? "");
-  if (type.includes("application/json")) {
-    return { ...params, ...parseJsonObject(body) };
-  }
+  const lowerType = type.toLowerCase();
   if (
-    !type.includes("multipart/form-data") &&
-    !type.includes("application/x-www-form-urlencoded")
+    !lowerType.includes("multipart/form-data") &&
+    !lowerType.includes("application/x-www-form-urlencoded")
   ) {
-    throw new TelegramError(
-      400,
-      "Bad Request: send parameters as a query string, JSON, or form data",
-    );
+    return lowerType.includes("application/json")
+      ? { ...params, ...coerceParams(jsonBodyEntries(body.toString("utf8"))) }
+      : params;
   }
   let form;
   try {
@@ -797,7 +994,15 @@ export async function startTestServer({
     });
   }
 
+  /** Client::check_chat's first check: chat_id must be given. */
+  function requireChatId(chatId) {
+    if (chatId == null || chatId === "") {
+      throw new TelegramError(400, "Bad Request: chat_id is empty");
+    }
+  }
+
   function requireChat(chatId) {
+    requireChatId(chatId);
     const chat = chats.get(Number(chatId));
     if (!chat) throw new TelegramError(400, "Bad Request: chat not found");
     return chat;
@@ -832,6 +1037,7 @@ export async function startTestServer({
    * for a send (`sender`), to someone whose join request it may answer.
    */
   function botChat(chatId, sender = null) {
+    requireChatId(chatId);
     const id = Number(chatId);
     if (chats.has(id)) return chats.get(id);
     if (privateChats.has(id)) return privateChats.get(id);
@@ -864,6 +1070,18 @@ export async function startTestServer({
         receives(chat, record, "chat_join_request")
       );
     });
+  }
+
+  /**
+   * user_id as Client::get_user_id reads it: the integer its leading digits
+   * spell, which must be positive.
+   */
+  function userIdParam(value) {
+    const id = parseInt(String(value ?? ""), 10);
+    if (!(id > 0)) {
+      throw new TelegramError(400, "Bad Request: invalid user_id specified");
+    }
+    return id;
   }
 
   function requireUser(userId) {
@@ -1775,7 +1993,7 @@ export async function startTestServer({
   // the control API read any file on the host through the file download URL.
   function registerFile(bytes, folder, extension) {
     const data = bytes;
-    const fileId = `AgACAgQAAx0Cfake${randomBytes(9).toString("base64url")}`;
+    const fileId = `AgACAgQAAx0C${randomBytes(12).toString("base64url")}`;
     const uniqueId = fileUniqueId();
     const fileName = bytes.fileName;
     const mimeType =
@@ -1976,7 +2194,15 @@ export async function startTestServer({
     setMyCommands: (p, caller) => {
       caller.commands.set(
         commandsKey(p),
-        Array.isArray(p.commands) ? p.commands : [],
+        jsonArray(
+          jsonParam(p.commands, "commands") ?? [],
+          "BotCommand",
+          (command) =>
+            isObject(command)
+              ? (missingString(command, "command") ??
+                missingString(command, "description"))
+              : "expected an Object",
+        ),
       );
       return true;
     },
@@ -2001,12 +2227,13 @@ export async function startTestServer({
       openQueries.delete(String(p.callback_query_id));
       callbackAnswers.set(String(p.callback_query_id), {
         text: p.text ?? "",
-        show_alert: String(p.show_alert) === "true",
+        show_alert: isTrue(p.show_alert),
       });
       waits.notify();
       return true;
     },
     getChat: (p, caller) => {
+      requireChatId(p.chat_id);
       if (String(p.chat_id).startsWith("@")) {
         const entry = publicByUsername.get(
           String(p.chat_id).slice(1).toLowerCase(),
@@ -2095,8 +2322,10 @@ export async function startTestServer({
         accepted_gift_types: { ...NO_GIFTS },
       };
     },
-    getChatMember: (p, caller) =>
-      chatMemberObject(requireChat(p.chat_id), p.user_id, caller),
+    getChatMember: (p, caller) => {
+      const userId = userIdParam(p.user_id);
+      return chatMemberObject(requireChat(p.chat_id), userId, caller);
+    },
     // Other bots are left out unless return_bots is set.
     getChatAdministrators: (p, caller) => {
       const chat = requireChat(p.chat_id);
@@ -2113,7 +2342,7 @@ export async function startTestServer({
       return [...chat.members.keys()].filter((id) => isInChat(chat, id)).length;
     },
     getUserProfilePhotos: (p) => {
-      const user = requireUser(p.user_id);
+      const user = requireUser(userIdParam(p.user_id));
       const offset = Math.max(0, numberParam(p.offset, 0));
       const limit = Math.min(100, Math.max(1, numberParam(p.limit, 100)));
       const photos = (user.photos ?? []).slice(offset, offset + limit);
@@ -2315,7 +2544,7 @@ export async function startTestServer({
           })),
           total_voter_count: 0,
           is_closed: isTrue(p.is_closed),
-          is_anonymous: String(p.is_anonymous ?? "true") !== "false",
+          is_anonymous: p.is_anonymous === undefined || isTrue(p.is_anonymous),
           allows_multiple_answers: isTrue(p.allows_multiple_answers),
           allows_revoting:
             p.allows_revoting === undefined
@@ -2485,21 +2714,10 @@ export async function startTestServer({
       return true;
     },
     deleteMessages: (p, caller) => {
+      const ids = messageIds(p.message_ids);
       const chat = botChat(p.chat_id);
-      if (!Array.isArray(p.message_ids)) {
-        throw new TelegramError(
-          400,
-          "Bad Request: message_ids must be a JSON array",
-        );
-      }
-      if (p.message_ids.length < 1 || p.message_ids.length > 100) {
-        throw new TelegramError(
-          400,
-          "Bad Request: message_ids must contain 1-100 identifiers",
-        );
-      }
-      const entries = p.message_ids
-        .map((id) => chat.messages.get(Number(id)))
+      const entries = ids
+        .map((id) => chat.messages.get(id))
         .filter((entry) => entry && !entry.deleted);
       for (const entry of entries) requireDeleteRights(chat, entry, caller);
       for (const entry of entries) entry.deleted = true;
@@ -2508,6 +2726,7 @@ export async function startTestServer({
       return true;
     },
     restrictChatMember: (p, caller) => {
+      const userId = userIdParam(p.user_id);
       const chat = requireChat(p.chat_id);
       if (chat.type !== "supergroup") {
         throw new TelegramError(
@@ -2515,7 +2734,6 @@ export async function startTestServer({
           "Bad Request: method is available only in supergroups",
         );
       }
-      const userId = Number(p.user_id);
       requireUser(userId);
       assertCanModerate(chat, userId, { self: "can't restrict self", caller });
       const before = memberStatus(chat, userId);
@@ -2541,8 +2759,8 @@ export async function startTestServer({
       return true;
     },
     banChatMember: (p, caller) => {
+      const userId = userIdParam(p.user_id);
       const chat = requireChat(p.chat_id);
-      const userId = Number(p.user_id);
       requireUser(userId);
       assertCanModerate(chat, userId, { caller });
       const before = memberStatus(chat, userId);
@@ -2571,6 +2789,7 @@ export async function startTestServer({
       return true;
     },
     unbanChatMember: (p, caller) => {
+      const userId = userIdParam(p.user_id);
       const chat = requireChat(p.chat_id);
       requireSupergroupOrChannel(chat);
       requireRight(
@@ -2579,7 +2798,6 @@ export async function startTestServer({
         "can_restrict_members",
         "not enough rights to restrict/unrestrict chat member",
       );
-      const userId = Number(p.user_id);
       requireUser(userId);
       const before = memberStatus(chat, userId);
       if (before.status === "kicked") {
@@ -2600,6 +2818,7 @@ export async function startTestServer({
       return true;
     },
     approveChatJoinRequest: (p, caller) => {
+      const userId = userIdParam(p.user_id);
       const chat = requireChat(p.chat_id);
       requireRight(
         chat,
@@ -2607,7 +2826,6 @@ export async function startTestServer({
         "can_invite_users",
         "not enough rights to manage chat join requests",
       );
-      const userId = Number(p.user_id);
       if (!chat.joinRequests.has(userId)) {
         throw new TelegramError(400, "Bad Request: HIDE_REQUESTER_MISSING");
       }
@@ -2634,6 +2852,7 @@ export async function startTestServer({
       return true;
     },
     declineChatJoinRequest: (p, caller) => {
+      const userId = userIdParam(p.user_id);
       const chat = requireChat(p.chat_id);
       requireRight(
         chat,
@@ -2641,7 +2860,6 @@ export async function startTestServer({
         "can_invite_users",
         "not enough rights to manage chat join requests",
       );
-      const userId = Number(p.user_id);
       if (!chat.joinRequests.delete(userId)) {
         throw new TelegramError(400, "Bad Request: HIDE_REQUESTER_MISSING");
       }
@@ -2683,26 +2901,35 @@ export async function startTestServer({
     sendAudio: (p, caller) => sendMedia(p, caller, "audio"),
     sendVideoNote: (p, caller) => sendMedia(p, caller, "video_note"),
     sendLocation: (p, caller) =>
-      sendFrom(p, caller, { location: coordinates(p) }),
+      sendFrom(p, caller, {
+        location: coordinates(p, "Bad Request: invalid location specified"),
+      }),
     sendVenue: (p, caller) => {
+      const location = coordinates(
+        p,
+        "Bad Request: wrong venue location specified",
+      );
+      // UNVERIFIED: Telegram's Bot API and TDLib do not check these; the
+      // answer for an empty title or address is not documented.
       if (!p.title || !p.address) {
         throw new TelegramError(
           400,
           "Bad Request: venue needs title and address",
         );
       }
-      const location = coordinates(p);
       return sendFrom(p, caller, {
         venue: { location, title: String(p.title), address: String(p.address) },
         location,
       });
     },
     sendContact: (p, caller) => {
-      if (!p.phone_number || !p.first_name) {
-        throw new TelegramError(
-          400,
-          "Bad Request: contact needs phone_number and first_name",
-        );
+      for (const field of ["phone_number", "first_name"]) {
+        if (p[field] === undefined || p[field] === "") {
+          throw new TelegramError(
+            400,
+            `Bad Request: parameter "${field}" is required`,
+          );
+        }
       }
       return sendFrom(p, caller, {
         contact: {
@@ -2732,16 +2959,23 @@ export async function startTestServer({
       requireCanSend(chat, caller);
       return true;
     },
-    // An album of 2 to 10 photos and videos, or of documents or audios alone.
+    // An album of up to 10 photos and videos, or of documents or audios
+    // alone; one item is sent as an ordinary message (TDLib
+    // MessagesManager::send_message_group, check_message_group_message_contents).
     sendMediaGroup: (p, caller) => {
-      const items = Array.isArray(p.media) ? p.media : [];
-      if (items.length < 2 || items.length > 10) {
+      if (p.media === undefined || p.media === "") {
         throw new TelegramError(
           400,
-          "Bad Request: media group must include 2-10 items",
+          'Bad Request: parameter "media" is required',
         );
       }
-      const types = items.map((item) => item?.type);
+      const items = jsonArray(
+        jsonParam(p.media, "media"),
+        "InputMedia",
+        (item) =>
+          isObject(item) ? missingString(item, "type") : "expected an Object",
+      );
+      const types = items.map((item) => item.type);
       if (
         types.some(
           (type) => !["photo", "video", "document", "audio"].includes(type),
@@ -2749,15 +2983,13 @@ export async function startTestServer({
       ) {
         throw new TelegramError(400, "Bad Request: unsupported media type");
       }
-      for (const alone of ["document", "audio"]) {
-        if (types.includes(alone) && types.some((type) => type !== alone)) {
-          throw new TelegramError(
-            400,
-            `Bad Request: ${alone}s can't be mixed with other media types`,
-          );
-        }
-      }
       const chat = botChat(p.chat_id, caller);
+      if (items.length === 0) {
+        throw new TelegramError(
+          400,
+          "Bad Request: there are no messages to send",
+        );
+      }
       requireCanSend(chat, caller);
       // Telegram parses every InputMedia caption before issuing an album send.
       const prepared = items.map((item) => {
@@ -2777,7 +3009,22 @@ export async function startTestServer({
         }
         return { item, formatted, reference };
       });
-      const mediaGroupId = String(nextMediaGroupId++);
+      if (items.length > 10) {
+        throw new TelegramError(
+          400,
+          "Bad Request: too many messages to send as an album",
+        );
+      }
+      for (const alone of ["document", "audio"]) {
+        if (types.includes(alone) && types.some((type) => type !== alone)) {
+          throw new TelegramError(
+            400,
+            `Bad Request: ${alone} can't be mixed with other media types`,
+          );
+        }
+      }
+      const mediaGroupId =
+        items.length > 1 ? String(nextMediaGroupId++) : undefined;
       return prepared.map(({ item, formatted, reference }, index) => {
         const file =
           typeof reference === "string" && files.has(reference)
@@ -2807,7 +3054,7 @@ export async function startTestServer({
           {
             ...mediaFields(item.type, file, {}),
             ...formatted,
-            media_group_id: mediaGroupId,
+            ...(mediaGroupId ? { media_group_id: mediaGroupId } : {}),
           },
           // Flood control counts the album as one send.
           { counts: index === 0 },
@@ -2815,9 +3062,9 @@ export async function startTestServer({
       });
     },
     promoteChatMember: async (p, caller) => {
+      const userId = userIdParam(p.user_id);
       const chat = requireChat(p.chat_id);
       requireSupergroupOrChannel(chat);
-      const userId = Number(p.user_id);
       requireUser(userId);
       if (!hasRight(chat, caller.id, "can_promote_members")) {
         throw new TelegramError(400, "Bad Request: not enough rights");
@@ -2871,6 +3118,7 @@ export async function startTestServer({
       return true;
     },
     setChatAdministratorCustomTitle: async (p, caller) => {
+      const userId = userIdParam(p.user_id);
       const chat = requireChat(p.chat_id);
       if (chat.type === "channel") {
         throw new TelegramError(
@@ -2878,7 +3126,6 @@ export async function startTestServer({
           "Bad Request: method is available only in groups and supergroups",
         );
       }
-      const userId = Number(p.user_id);
       const member = memberStatus(chat, userId);
       if (member.status === "creator") {
         throw new TelegramError(
@@ -2913,16 +3160,17 @@ export async function startTestServer({
       await memberChanged(chat, userId, member, caller);
       return true;
     },
+    // TDLib cleans the title and cuts it to 128 characters, and setting the
+    // current title again succeeds without a change (DialogManager.cpp
+    // set_dialog_title).
     setChatTitle: (p, caller) => {
       const chat = requireChat(p.chat_id);
+      const title = stripEmpty(p.title, 128).replace(/\s+/g, " ");
+      if (!title) {
+        throw new TelegramError(400, "Bad Request: title must be non-empty");
+      }
       requireInfoRight(chat, caller, "change chat title");
-      const title = String(p.title ?? "").trim();
-      if (!title || title.length > 128) {
-        throw new TelegramError(400, "Bad Request: chat title can't be empty");
-      }
-      if (title === chat.title) {
-        throw new TelegramError(400, "Bad Request: chat title is not modified");
-      }
+      if (title === chat.title) return true;
       chat.title = title;
       // The Bot API delivers the service message to the bot that made the
       // change too (need_skip_update_message keeps outgoing title, photo and
@@ -2930,16 +3178,12 @@ export async function startTestServer({
       emit("message", addMessage(chat, caller, { new_chat_title: title }));
       return true;
     },
+    // The description is cut to 255 characters (ChatManager.cpp
+    // set_channel_description).
     setChatDescription: (p, caller) => {
       const chat = requireChat(p.chat_id);
       requireInfoRight(chat, caller, "set chat description");
-      const description = String(p.description ?? "");
-      if (description.length > 255) {
-        throw new TelegramError(
-          400,
-          "Bad Request: chat description is too long",
-        );
-      }
+      const description = stripEmpty(p.description, 255);
       if (description === (chat.description ?? "")) {
         throw new TelegramError(
           400,
@@ -3090,7 +3334,7 @@ export async function startTestServer({
         // there to remove.
         return true;
       }
-      const user = requireUser(p.user_id);
+      const user = requireUser(userIdParam(p.user_id));
       if (entry.reactions?.has(user.id)) {
         await changeReaction(chat, entry, user, []);
       }
@@ -3158,22 +3402,73 @@ export async function startTestServer({
     ]),
   );
 
-  function isTrue(value) {
-    return value === true || value === "true";
+  /** deleteMessages' message_ids, checked as Client::get_message_ids does. */
+  function messageIds(value) {
+    if (value === undefined || value === "") {
+      throw new TelegramError(
+        400,
+        "Bad Request: message identifiers are not specified",
+      );
+    }
+    if (!Array.isArray(jsonParam(value, "message_ids"))) {
+      throw new TelegramError(
+        400,
+        "Bad Request: expected an Array of message identifiers",
+      );
+    }
+    if (value.length > 100) {
+      throw new TelegramError(
+        400,
+        "Bad Request: too many message identifiers specified",
+      );
+    }
+    return value.map((id) => {
+      if (!["number", "string"].includes(typeof id)) {
+        throw new TelegramError(
+          400,
+          "Bad Request: message identifier must be a Number",
+        );
+      }
+      if (!/^-?\d+$/.test(String(id)) || Math.abs(Number(id)) >= 2 ** 31) {
+        throw new TelegramError(
+          400,
+          "Bad Request: can't parse message identifier as a Number",
+        );
+      }
+      if (Number(id) <= 0) {
+        throw new TelegramError(
+          400,
+          "Bad Request: invalid message identifier specified",
+        );
+      }
+      return Number(id);
+    });
   }
 
   /**
-   * An inline keyboard with at least one row, or undefined. Like the Bot API
+   * reply_markup, checked as Client::get_reply_markup reads it, when it is an
+   * inline keyboard with at least one row; else undefined. Like the Bot API
    * server, it refuses a button without an action while reading the request,
    * before any chat or message check.
    */
-  function inlineMarkup(markup) {
-    if (
-      !Array.isArray(markup?.inline_keyboard) ||
-      markup.inline_keyboard.length === 0
-    ) {
-      return undefined;
+  function inlineMarkup(value) {
+    const markup = jsonParam(value, "reply keyboard markup");
+    if (markup === undefined) return undefined;
+    if (!isObject(markup)) {
+      throw new TelegramError(
+        400,
+        "Bad Request: object expected as reply markup",
+      );
     }
+    for (const field of ["keyboard", "inline_keyboard"]) {
+      if (field in markup && !Array.isArray(markup[field])) {
+        throw new TelegramError(
+          400,
+          `Bad Request: field "${field}" must be of type Array`,
+        );
+      }
+    }
+    if (!(markup.inline_keyboard?.length > 0)) return undefined;
     for (const button of markup.inline_keyboard.flat()) {
       if (
         typeof button === "object" &&
@@ -3219,6 +3514,7 @@ export async function startTestServer({
   }
 
   function sendFrom(p, caller, fields, { counts = true } = {}) {
+    const parameters = replyParameters(p);
     // Message.reply_markup only ever carries an inline keyboard; reply
     // keyboards and ForceReply are shown to the user, not echoed back.
     const keyboard = isReplyKeyboard(p.reply_markup);
@@ -3231,7 +3527,7 @@ export async function startTestServer({
       ephemeral?.receiver_user_id != null
         ? ephemeralReceiver(chat, caller, ephemeral)
         : null;
-    const reply = replyFields(chat, p, caller);
+    const reply = replyFields(chat, p, caller, parameters);
     requireButtonData(markup);
     if (counts) countSend(chat, caller);
     const content = {
@@ -3337,22 +3633,37 @@ export async function startTestServer({
   }
 
   /**
-   * The reply fields of a bot send. reply_parameters (or the older
-   * reply_to_message_id) answer a message in this chat with reply_to_message,
-   * or, with chat_id, one in another chat the bot can read with
-   * external_reply; a quote must be found in the message it answers. Else, in
-   * a forum topic, the send answers the topic's creation message.
-   * https://core.telegram.org/bots/api#replyparameters
+   * reply_parameters, or the older reply_to_message_id, as
+   * Client::get_reply_parameters reads them.
    */
-  function replyFields(chat, p, caller) {
-    const parameters =
-      p.reply_parameters ??
-      (p.reply_to_message_id != null
+  function replyParameters(p) {
+    const given = jsonParam(p.reply_parameters, "reply parameters");
+    if (given === undefined) {
+      return p.reply_to_message_id != null
         ? {
             message_id: p.reply_to_message_id,
-            allow_sending_without_reply: p.allow_sending_without_reply,
+            allow_sending_without_reply: isTrue(p.allow_sending_without_reply),
           }
-        : null);
+        : null;
+    }
+    if (!isObject(given)) {
+      throw new TelegramError(
+        400,
+        "Bad Request: object expected as reply parameters",
+      );
+    }
+    return given;
+  }
+
+  /**
+   * The reply fields of a bot send. Its reply parameters answer a message in
+   * this chat with reply_to_message, or, with chat_id, one in another chat the
+   * bot can read with external_reply; a quote must be found in the message it
+   * answers. Else, in a forum topic, the send answers the topic's creation
+   * message.
+   * https://core.telegram.org/bots/api#replyparameters
+   */
+  function replyFields(chat, p, caller, parameters) {
     if (parameters?.message_id == null) {
       const topic =
         p.message_thread_id && chat.topics
@@ -3546,6 +3857,13 @@ export async function startTestServer({
    * with MESSAGE_TOO_LONG.
    */
   function textFields(p, tooLong = "Bad Request: message is too long") {
+    const preview = jsonParam(p.link_preview_options, "link preview options");
+    if (preview !== undefined && !isObject(preview)) {
+      throw new TelegramError(
+        400,
+        "Bad Request: object expected as link preview options",
+      );
+    }
     const text = String(p.text ?? "");
     if (!text) {
       throw new TelegramError(400, "Bad Request: message text is empty");
@@ -3693,7 +4011,16 @@ export async function startTestServer({
     });
   }
 
-  function coordinates(p) {
+  /**
+   * latitude and longitude as Client::get_location reads them; TDLib refuses
+   * a point off the map with `invalid` (Location.cpp, Venue.cpp).
+   */
+  function coordinates(p, invalid) {
+    for (const field of ["latitude", "longitude"]) {
+      if (String(p[field] ?? "").trim() === "") {
+        throw new TelegramError(400, `Bad Request: ${field} is empty`);
+      }
+    }
     const latitude = Number(p.latitude);
     const longitude = Number(p.longitude);
     if (
@@ -3702,9 +4029,18 @@ export async function startTestServer({
       Math.abs(latitude) > 90 ||
       Math.abs(longitude) > 180
     ) {
-      throw new TelegramError(400, "Bad Request: wrong latitude or longitude");
+      throw new TelegramError(400, invalid);
     }
     return { latitude, longitude };
+  }
+
+  /**
+   * Text as TDLib's strip_empty_characters leaves it: trimmed, cut to `max`
+   * characters, and empty when only invisible characters remain (misc.cpp).
+   */
+  function stripEmpty(value, max) {
+    const text = [...String(value ?? "").trim()].slice(0, max).join("").trim();
+    return /[^\s\u200b-\u200f\u202e\ufeff]/u.test(text) ? text : "";
   }
 
   /** Changing a chat's title, description or photo needs can_change_info. */
@@ -3731,18 +4067,33 @@ export async function startTestServer({
   }
 
   /**
-   * The caller's connection with that id. Telegram names an unknown one
-   * BUSINESS_CONNECTION_INVALID (400) at the MTProto layer; the Bot API's
-   * exact wording is UNVERIFIED.
-   * https://core.telegram.org/method/messages.sendMessage
-   * https://core.telegram.org/api/bots/connected-business-bots
+   * The caller's connection with that id. The Bot API answers any failure
+   * to find one with "business connection not found" (telegram-bot-api
+   * TdOnCheckBusinessConnectionCallback).
    */
   function requireBusinessConnection(id, caller) {
     const connection = businessConnections.get(String(id ?? ""));
     if (!connection || connection.botId !== caller.id) {
-      throw new TelegramError(400, "Bad Request: BUSINESS_CONNECTION_INVALID");
+      throw new TelegramError(
+        400,
+        "Bad Request: business connection not found",
+      );
     }
     return connection;
+  }
+
+  /** A business send's chat_id, as Client::get_business_connection_chat_id reads it. */
+  function businessChatId(value) {
+    if (value == null || value === "") {
+      throw new TelegramError(400, "Bad Request: chat identifier is empty");
+    }
+    if (!/^-?\d+$/.test(String(value))) {
+      throw new TelegramError(
+        400,
+        "Bad Request: chat identifier must be a valid Integer",
+      );
+    }
+    return Number(value);
   }
 
   function businessChat(connection, userId) {
@@ -3796,6 +4147,7 @@ export async function startTestServer({
    * (https://core.telegram.org/method/messages.sendMessage).
    */
   function businessReplyChat(p, caller) {
+    const userId = businessChatId(p.chat_id);
     const connection = requireBusinessConnection(
       p.business_connection_id,
       caller,
@@ -3807,11 +4159,11 @@ export async function startTestServer({
     }
     // BOT_ACCESS_FORBIDDEN is Telegram's error for an operation a business
     // connection does not allow (connected-business-bots page); that a missing
-    // can_reply right produces it, with 403, is UNVERIFIED.
+    // can_reply right produces it is UNVERIFIED. The Bot API answers an
+    // upper-case 403 server error as a 400 (Client::fail_query_with_error).
     if (connection.rights.can_reply !== true) {
-      throw new TelegramError(403, "Forbidden: BOT_ACCESS_FORBIDDEN");
+      throw new TelegramError(400, "Bad Request: BOT_ACCESS_FORBIDDEN");
     }
-    const userId = Number(p.chat_id);
     requireUser(userId);
     const chat = businessChat(connection, userId);
     if (
@@ -3825,6 +4177,7 @@ export async function startTestServer({
 
   /** The bot answers in a business chat, as the owner. */
   function sendBusinessMessage(p, caller) {
+    const text = textFields(p);
     const markup = inlineMarkup(p.reply_markup);
     const { connection, userId } = businessReplyChat(p, caller);
     requireButtonData(markup);
@@ -3834,7 +4187,7 @@ export async function startTestServer({
       "bot",
       requireUser(connection.ownerId),
       {
-        ...textFields(p),
+        ...text,
         sender_business_bot: userObject(caller),
       },
     );
@@ -3902,9 +4255,7 @@ export async function startTestServer({
           ? requireBot(existing.botId)
           : bot;
     const connection = existing ?? {
-      id: String(
-        body.id ?? `fake-business-${randomBytes(9).toString("base64url")}`,
-      ),
+      id: String(body.id ?? randomBytes(12).toString("base64url")),
       ownerId,
       botId: record.id,
       date: now(),
@@ -4755,10 +5106,25 @@ export async function startTestServer({
     }
   }
 
+  /**
+   * A failed wait, drain or clock advance over HTTP is a normal control
+   * answer, not a server failure: bad input (400), a deadline (408), or work
+   * that was cancelled or is not allowed (409).
+   */
+  function controlFailure(error) {
+    if (error instanceof TelegramError) throw error;
+    throw new TelegramError(
+      error instanceof TypeError ? 400 : error.timedOut ? 408 : 409,
+      error.message,
+    );
+  }
+
   async function controlInner(method, parts, body) {
     const [resource, id, sub, subId] = parts;
     if (resource === "wait" && method === "POST")
-      return waitFor(body.condition, { timeoutMs: body.timeoutMs });
+      return waitFor(body.condition, { timeoutMs: body.timeoutMs }).catch(
+        controlFailure,
+      );
     if (resource === "snapshots" && method === "POST") return snapshot();
     if (resource === "snapshots" && id && method === "DELETE") {
       if (!snapshots.delete(id))
@@ -4769,14 +5135,14 @@ export async function startTestServer({
       return restore(body.snapshot);
     if (resource === "clock" && method === "GET") return clock.state();
     if (resource === "clock" && method === "POST") {
-      const state = await clock.advance(body.ms);
+      const state = await clock.advance(body.ms).catch(controlFailure);
       waits.notify();
       return state;
     }
     if (resource === "deliveries" && method === "GET")
       return structuredClone(deliveryJournal);
     if (resource === "deliveries" && method === "POST")
-      return drainDeliveries(body);
+      return drainDeliveries(body).catch(controlFailure);
     if (resource === "owners") {
       try {
         return ownerModel.control(method, parts.slice(1), body);
@@ -4874,6 +5240,13 @@ export async function startTestServer({
       }
       if (Number(body.delay_ms) > 30000)
         throw new TelegramError(400, "failure delay_ms must be at most 30000");
+      const errorCode = numberParam(body.error_code, 400);
+      const retryAfter =
+        body.retry_after == null ? null : numberParam(body.retry_after, 1);
+      // Telegram's 429 always carries retry_after (Query::set_retry_after_error).
+      if (errorCode === 429 && !(retryAfter > 0)) {
+        throw new TelegramError(400, "a 429 failure needs a retry_after");
+      }
       const rule = {
         id: randomBytes(9).toString("hex"),
         method: body.method,
@@ -4885,10 +5258,17 @@ export async function startTestServer({
         chat_id: body.chat_id == null ? null : String(body.chat_id),
         bot_id: body.bot_id == null ? null : Number(body.bot_id),
         remaining: Math.max(1, numberParam(body.times, 1)),
-        error_code: numberParam(body.error_code, 400),
-        description: String(body.description ?? "Bad Request"),
-        retry_after:
-          body.retry_after == null ? null : numberParam(body.retry_after, 1),
+        error_code: errorCode,
+        // By default the description Telegram gives the code: "Too Many
+        // Requests: retry after N" for 429, else its prefix ("Forbidden",
+        // "Conflict", ...), which is the HTTP reason phrase.
+        description: String(
+          body.description ??
+            (errorCode === 429
+              ? `Too Many Requests: retry after ${retryAfter}`
+              : (http.STATUS_CODES[errorCode] ?? "Bad Request")),
+        ),
+        retry_after: retryAfter,
         drop_after_apply: body.drop_after_apply === true,
         delay_only:
           body.delay_ms != null &&
@@ -5595,7 +5975,14 @@ export async function startTestServer({
     }
     const fields = {};
     if (type) {
-      const bytes = Buffer.from(photoBase64 ?? media.base64 ?? "", "base64");
+      const base64 = photoBase64 ?? media.base64 ?? "";
+      if (typeof base64 !== "string") {
+        throw new TelegramError(
+          400,
+          `${photoBase64 != null ? "photo_base64" : "media.base64"} must be a base64 string`,
+        );
+      }
+      const bytes = Buffer.from(base64, "base64");
       const file =
         type === "photo"
           ? registerPhoto(bytes)
@@ -5658,7 +6045,7 @@ export async function startTestServer({
   function requireLoginKey() {
     return (loginKey ??= generateKeyPairSync("rsa", { modulusLength: 2048 }));
   }
-  const loginKid = `fake-${randomBytes(6).toString("hex")}`;
+  const loginKid = randomBytes(8).toString("hex");
   const loginCodes = new Map();
   // `sub` is an opaque id, not the Telegram id (the documented example has a
   // different sub and id); it is stable for a user ("public" subject type).
@@ -6021,8 +6408,11 @@ ${buttons}
     return true;
   }
 
-  function send(response, status, payload) {
-    response.writeHead(status, { "Content-Type": "application/json" });
+  function send(response, status, payload, headers = {}) {
+    response.writeHead(status, {
+      "Content-Type": "application/json",
+      ...headers,
+    });
     response.end(JSON.stringify(payload));
   }
 
@@ -6156,11 +6546,9 @@ ${buttons}
           response,
           rejectedRequests,
         );
-        send(response, error.code, {
-          ok: false,
-          error_code: error.code,
-          description: error.message,
-        });
+        // Telegram's HTTP reader answers a body it cannot read with the bare
+        // status and closes the connection (td::HttpConnectionBase).
+        response.writeHead(error.code, { Connection: "close" }).end();
         return;
       }
       // Bot API method names are case-insensitive.
@@ -6235,36 +6623,46 @@ ${buttons}
         });
         waits.notify();
         if (failure.delay_ms) await delayResponse(failure.delay_ms);
-        send(response, failure.error_code, {
-          ok: false,
-          error_code: failure.error_code,
-          description: failure.description,
-          ...(failure.retry_after != null
-            ? { parameters: { retry_after: failure.retry_after } }
-            : {}),
-        });
+        send(
+          response,
+          failure.error_code,
+          {
+            ok: false,
+            error_code: failure.error_code,
+            description: failure.description,
+            ...(failure.retry_after != null
+              ? { parameters: { retry_after: failure.retry_after } }
+              : {}),
+          },
+          // HttpConnection::send_response adds Retry-After to every 429.
+          failure.error_code === 429
+            ? { "Retry-After": String(failure.retry_after) }
+            : {},
+        );
         return;
       }
       if (!handler) {
+        const answerTrue =
+          unimplementedMode === "ok" && TRUE_METHODS.has(method.toLowerCase());
         Object.assign(receipt, {
-          outcome: unimplementedMode === "ok" ? "unimplemented_ok" : "rejected",
-          status: unimplementedMode === "ok" ? 200 : 404,
+          outcome: answerTrue ? "unimplemented_ok" : "rejected",
+          status: answerTrue ? 200 : 404,
           completed_at: clock.now(),
         });
-        if (unimplementedMode !== "ok") receipt.failed = 404;
+        if (!answerTrue) receipt.failed = 404;
         if (!unimplemented.has(method)) {
           unimplemented.add(method);
           log(`unimplemented Bot API method ${method}`);
         }
-        if (unimplementedMode === "ok") {
+        if (answerTrue) {
           send(response, 200, { ok: true, result: true });
         } else {
-          // Real Telegram's answer to a method it does not know, with a
-          // description that says this fake is the one missing it.
+          // Telegram's answer to a method it does not know; which methods this
+          // server lacks is reported by GET /_fake/calls and the log.
           send(response, 404, {
             ok: false,
             error_code: 404,
-            description: `Not Found: method ${method} is not implemented by telegram-bot-test-server`,
+            description: "Not Found: method not found",
           });
         }
         return;
@@ -6324,11 +6722,13 @@ ${buttons}
         });
       }
     } catch (error) {
+      // A failure of this server itself: Telegram's bare 500, with the cause
+      // only in the log.
       log(`internal error: ${error.stack ?? error.message}`);
       send(response, 500, {
         ok: false,
         error_code: 500,
-        description: error.message,
+        description: "Internal Server Error",
       });
     }
   });

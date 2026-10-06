@@ -935,6 +935,45 @@ describe("failures a test asks for", () => {
     expect(texts).toEqual(["c"]);
   });
 
+  it("describes an injected error by its code, and sends Retry-After with a 429", async () => {
+    const { fake } = await setup();
+    async function getMe() {
+      const response = await fetch(`${fake.origin}/bot${TOKEN}/getMe`);
+      return {
+        retryAfter: response.headers.get("retry-after"),
+        ...(await response.json()),
+      };
+    }
+
+    await fake.failNext({ method: "getMe", errorCode: 429, retryAfter: 5 });
+    expect(await getMe()).toEqual({
+      retryAfter: "5",
+      ok: false,
+      error_code: 429,
+      description: "Too Many Requests: retry after 5",
+      parameters: { retry_after: 5 },
+    });
+    for (const [errorCode, description] of [
+      [400, "Bad Request"],
+      [401, "Unauthorized"],
+      [403, "Forbidden"],
+      [409, "Conflict"],
+      [500, "Internal Server Error"],
+    ]) {
+      await fake.failNext({ method: "getMe", errorCode });
+      expect(await getMe()).toEqual({
+        retryAfter: null,
+        ok: false,
+        error_code: errorCode,
+        description,
+      });
+    }
+    // Telegram's 429 always says how long to wait.
+    await expect(
+      fake.failNext({ method: "getMe", errorCode: 429 }),
+    ).rejects.toThrow("retry_after");
+  });
+
   it("applies a call whose answer it then drops, as a lost connection would", async () => {
     const { fake } = await setup();
     await fake.failNext({ method: "sendMessage", dropAfterApply: true });

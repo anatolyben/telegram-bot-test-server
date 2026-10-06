@@ -42,8 +42,9 @@ export interface TelegramBotTestServerOptions {
   /** Channels, groups and bots that getChat("@username") resolves. */
   publicChats?: PublicChat[];
   /**
-   * What an unimplemented Bot API method returns: an error naming the method
-   * ("error", default), or `true` ("ok").
+   * What an unimplemented Bot API method returns: Telegram's 404 "Not Found:
+   * method not found" ("error", default), or `true` when Telegram documents
+   * the method as returning True ("ok"; any other method still gets the 404).
    */
   unimplemented?: "error" | "ok";
   /**
@@ -183,9 +184,15 @@ export interface FailureRule {
   times?: number;
   /** Default 400. */
   errorCode?: number;
-  /** Default "Bad Request". */
+  /**
+   * Default: Telegram's description for the code, such as "Forbidden", or
+   * "Too Many Requests: retry after N" for 429.
+   */
   description?: string;
-  /** Sent as parameters.retry_after, as with a 429. */
+  /**
+   * Sent as parameters.retry_after, as with a 429, which needs it and also
+   * carries it in the Retry-After header.
+   */
   retryAfter?: number;
   /** The call takes effect, but the connection closes before it answers. */
   dropAfterApply?: boolean;

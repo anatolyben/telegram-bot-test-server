@@ -124,13 +124,13 @@ response happens after that, so wait for the outcome rather than checking it imm
 npx telegram-bot-test-server --token 123456:TEST --port 8081 --config chats.json
 ```
 
-| Flag                 | Default         | Meaning                                                   |
-| -------------------- | --------------- | --------------------------------------------------------- |
-| `--token`            | required        | The bot's token.                                          |
-| `--port`, `--host`   | 8081, 127.0.0.1 | Where to listen.                                          |
-| `--username`         | `fake_test_bot` | The bot's username.                                       |
-| `--config`           | none            | A JSON file with `chats` and `publicChats`.               |
-| `--unimplemented-ok` | off             | Answer `true` to unsupported methods instead of an error. |
+| Flag                 | Default         | Meaning                                                |
+| -------------------- | --------------- | ------------------------------------------------------ |
+| `--token`            | required        | The bot's token.                                       |
+| `--port`, `--host`   | 8081, 127.0.0.1 | Where to listen.                                       |
+| `--username`         | `fake_test_bot` | The bot's username.                                    |
+| `--config`           | none            | A JSON file with `chats` and `publicChats`.            |
+| `--unimplemented-ok` | off             | Answer `true` to unsupported methods that return True. |
 
 `chats.json` holds `{ "chats": [...], "publicChats": [...] }` in the same shape as the options
 below. Point your bot's Bot API base URL at `http://127.0.0.1:8081` and drive the same test actions
@@ -148,7 +148,7 @@ over HTTP through the control API described below, from Python, Go or anything e
 | `loginClientSecret`          | random           | The first bot's Telegram Login client secret.                                                |
 | `chats`                      | `[]`             | Supergroups `{ id, title, ownerId, ownerName? }`. The bot is an administrator.               |
 | `publicChats`                | `[]`             | Channels, groups and bots `{ username, type, title? }` resolvable by `getChat("@username")`. |
-| `unimplemented`              | `"error"`        | What an unsupported method returns: a 404 error naming it, or `"ok"` for `true`.             |
+| `unimplemented`              | `"error"`        | Telegram's 404 for an unsupported method, or `"ok"`: `true` for one that returns True.       |
 | `floodControl`               | `false`          | Answer sends over Telegram's published limits with 429 ([Flood control](#flood-control)).    |
 | `log`                        | none             | Receives one line per notable event (unsupported methods, webhook failures).                 |
 
@@ -174,14 +174,20 @@ These read or change the server's state:
 `editMessageText` and `editMessageReplyMarkup` with `business_connection_id`.
 
 These are not modelled: `setMyDescription`, `setMyShortDescription`,
-`setChatMenuButton`, `setMyDefaultAdministratorRights`. In strict mode they return
-an explicit unsupported-method error.
+`setChatMenuButton`, `setMyDefaultAdministratorRights`.
 
-Any other method returns a 404 error that names it, so a test cannot pass against behaviour the
-server does not have; so do `editMessageCaption` and `editMessageMedia` with
-`business_connection_id`. Methods are added when a real bot needs them; the goal is not full
-coverage of the Bot API. Method names are case-insensitive, and parameters are accepted as a query
-string, JSON or multipart form data, as with Telegram.
+They and any other method not listed get Telegram's answer to a method it does not know: 404
+`Not Found: method not found`, so a test cannot pass against behaviour the server does not have;
+`editMessageCaption` and `editMessageMedia` with `business_connection_id` get a 404 too.
+`getCalls()` (`GET /_fake/calls`) lists the unsupported methods called, and `log` reports each
+once. With `unimplemented: "ok"`, an unsupported method that Telegram documents as returning
+`True` answers `true` instead; any other still gets the 404. Methods are added when a real bot
+needs them; the goal is not full coverage of the Bot API.
+
+Method names are case-insensitive. Parameters come as a query string, JSON, or URL-encoded or
+multipart form data, read as Telegram's server reads them: a body of any other type is ignored, a
+JSON body keeps the fields read before anything malformed, and only form data that cannot be read
+is refused, with an empty 400.
 
 ## Behaves like Telegram
 
@@ -251,6 +257,12 @@ The details a moderation bot depends on, each covered by a test:
 - **Command menus.** `setMyCommands`, `getMyCommands` and `deleteMyCommands` keep one list for each
   `scope` and `language_code`. `getMyCommands` returns only the list set for that exact scope and
   language (an empty list if there is none), and `deleteMyCommands` removes only that list.
+- **Parameters.** A boolean is true when it reads `true`, `yes` or `1`, in any case. A
+  JSON-serialized parameter (`reply_markup`, `reply_parameters`, `message_ids`, `media`, ...) may
+  also come as a JSON string; one that cannot be read fails with Telegram's parse error, such as
+  `can't parse reply keyboard markup JSON object`. A missing required parameter fails with
+  Telegram's text, such as `chat_id is empty` or `invalid user_id specified`. If this server itself
+  fails, the bot gets Telegram's bare `500 Internal Server Error`, and the cause goes to `log`.
 - **Invite links.** Creating, exporting, editing and revoking links needs `can_invite_users`
   (`not enough rights to manage chat invite link` otherwise). Each administrator has its own
   primary link: `exportChatInviteLink` replaces only the calling bot's, `getChat` returns it as
@@ -271,7 +283,8 @@ The details a moderation bot depends on, each covered by a test:
   link and `package.json` is not. Phone numbers are not marked.
 - **Media.** Sent photos, documents, videos, animations and stickers carry the fields the Bot API
   requires and resolve through `getFile`. `editMessageMedia` replaces a message's media with an
-  upload (`attach://`) or a held `file_id`.
+  upload (`attach://`) or a held `file_id`. `sendMediaGroup` sends up to 10 items as one album; a
+  single item is sent as an ordinary message, as TDLib does.
 - **More than one bot.** Each bot has its own webhook or update queue and its own membership and
   rights in each chat. A bot posts only where it is a member (a channel needs `can_post_messages`),
   edits and stops only its own messages and polls (in a channel, others' too with
@@ -333,9 +346,11 @@ The details a moderation bot depends on, each covered by a test:
   Telegram writes them: `can_post_messages`, `can_edit_messages` and `can_manage_direct_messages`
   in channels, `can_pin_messages` and `can_manage_tags` in groups, and `can_manage_topics` in
   supergroups.
-  `setChatTitle`, `setChatDescription`, `setChatPhoto` and `deleteChatPhoto` need `can_change_info`,
-  refuse a change that changes nothing, and post Telegram's service messages to every bot in the
-  chat, the bot that made the change included.
+  `setChatTitle`, `setChatDescription`, `setChatPhoto` and `deleteChatPhoto` need `can_change_info`
+  and post Telegram's service messages to every bot in the chat, the bot that made the change
+  included. A title is cut to 128 characters and a description to 255; the current title set again
+  succeeds without a service message, while an unchanged description or a missing photo is
+  refused.
 - **Join request queries (Bot API 10.x).** A guard bot (`supportsJoinRequestQueries`) with
   `can_invite_users` gets each join request with a `query_id`, which it answers with
   `answerChatJoinRequestQuery` (`chat_join_request_query_id`, `result`: `approve`, `decline` or
@@ -348,14 +363,15 @@ The details a moderation bot depends on, each covered by a test:
   answers as the owner, with `sender_business_bot` set. It needs an enabled connection, `can_reply`,
   and a message from the person in the last 24 hours (`BUSINESS_PEER_USAGE_MISSING` otherwise, as
   [documented](https://core.telegram.org/method/messages.sendMessage)). An unknown connection is
-  `BUSINESS_CONNECTION_INVALID`. Unverified: the error for a disabled connection (treated as
-  invalid) and for a missing `can_reply` (`403 BOT_ACCESS_FORBIDDEN`). `editMessageText` and
-  `editMessageReplyMarkup` with `business_connection_id` edit the bot's and the owner's messages in
-  a business chat, under the same rules as sending; the owner's own messages without an inline
-  keyboard only within 48 hours, as documented. Unverified: the errors, taken from
-  [messages.editMessage](https://core.telegram.org/method/messages.editMessage), for the person's
-  message (`MESSAGE_AUTHOR_REQUIRED`), an unknown one (`MESSAGE_ID_INVALID`) and the 48 hours
-  (`MESSAGE_EDIT_TIME_EXPIRED`). The connected bot may also message the owner's private chat
+  `business connection not found`, as the Bot API says. Unverified: the error for a disabled
+  connection (`BUSINESS_CONNECTION_INVALID`) and for a missing `can_reply`
+  (`400 BOT_ACCESS_FORBIDDEN`; the Bot API never answers such an error with 403).
+  `editMessageText` and `editMessageReplyMarkup` with `business_connection_id` edit the bot's and
+  the owner's messages in a business chat, under the same rules as sending; the owner's own
+  messages without an inline keyboard only within 48 hours, as documented. Unverified: the errors,
+  taken from [messages.editMessage](https://core.telegram.org/method/messages.editMessage), for the
+  person's message (`MESSAGE_AUTHOR_REQUIRED`), an unknown one (`MESSAGE_ID_INVALID`) and the 48
+  hours (`MESSAGE_EDIT_TIME_EXPIRED`). The connected bot may also message the owner's private chat
   (`user_chat_id`). `getMe` reports `can_connect_to_business`.
 - **Redelivery.** A test can have Telegram deliver any update again, byte for byte, as it does when a
   webhook does not confirm one.
@@ -802,6 +818,9 @@ selectors. `userId` identifies the method target, ephemeral recipient, or
 consume the rule. `delayMs` alone executes normally and delays only the response.
 Adding `errorCode` rejects before execution; `dropAfterApply` executes once then drops
 the connection. Delays are bounded to 30 seconds and cancelled on server stop.
+Without `description`, an injected error reads as Telegram's does for its code
+(`Bad Request`, `Forbidden`, `Conflict`, ...). A 429 needs `retryAfter`: it reads
+`Too Many Requests: retry after N` and carries the `Retry-After` header, as on Telegram.
 
 `getCalls()` / `GET /_fake/calls` retain append-only receipts with `seq`, `outcome`,
 `applied`, `status`, `completed_at`, and matching `fault_id` / `attempt` / `delay_ms`.
@@ -946,6 +965,9 @@ The HTTP equivalents use camel-case control fields:
 | `GET /_fake/deliveries`           | delivery journal                                     |
 | `POST /_fake/deliveries`          | `{ botId?, timeoutMs? }` → drain fake deliveries     |
 
+A wait, drain or clock advance that fails answers `{ error }`: 400 for bad input, 408
+when the deadline passes, and 409 when the wait is cancelled or the clock is not manual.
+
 ### Request timelines and compatibility
 
 Each Bot API receipt has an instance/epoch/sequence `request_id` and a bounded
@@ -972,13 +994,13 @@ Matching attempts before fault injection starts now retain
 
 `getCalls()` is now detached: mutating its result cannot rewrite evidence.
 Existing `calls` retains its authenticated, parsed-request scope. New
-`rejected_requests` records unauthorized/malformed attempts separately, preserving
-0.9.x call counts. Call waits use `calls` by default; set
+`rejected_requests` records unauthorized attempts and form data that cannot be read
+separately, preserving 0.9.x call counts. Call waits use `calls` by default; set
 `includeRejectedRequests: true` to observe the early-rejection journal too. Its
 `bot_id` is the attempted numeric token prefix, not authenticated identity.
 `afterSeq` is local to each journal; `requestId` is unique across both. A call
 wait without an outcome/stage can resolve at receipt, before execution.
-Unauthorized URL tokens are not journaled; malformed bodies
+Unauthorized URL tokens are not journaled; unreadable bodies
 are retained as `raw_body` and suppressed in diagnostics. Calls refused for chat
 access (including an upgraded basic group) receive the same identity/timeline as
 other parsed calls. Owner RPCs retain their
@@ -993,8 +1015,9 @@ restored journals are copied without exceeding JavaScript function argument limi
 Four former no-op setters (`setMyDescription`, `setMyShortDescription`,
 `setChatMenuButton`, `setMyDefaultAdministratorRights`) now report unsupported in
 strict mode instead of claiming to store state. This is an intentional compatibility
-change. The explicitly selected legacy `unimplemented: "ok"` mode remains for
-existing consumers and is not an accuracy mode; strict `"error"` is the default.
+change. The explicitly selected `unimplemented: "ok"` mode remains for existing
+consumers: it answers `true` only where Telegram's result is `True`, and stores
+nothing. Strict `"error"` is the default.
 `setChatPermissions` now requires a group/supergroup and the caller’s
 `can_restrict_members` right; an unauthorized call cannot change default
 permissions. Consumers whose fixtures depended on unauthorized success must
