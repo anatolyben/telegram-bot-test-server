@@ -412,6 +412,7 @@ describe("editing in a business chat", () => {
       status: 400,
       description: "Bad Request: MESSAGE_ID_INVALID",
     });
+    // Not modelled: Telegram's answer to a method it lacks, and the journal.
     expect(
       await api("editMessageCaption", {
         business_connection_id: connection.id,
@@ -419,7 +420,13 @@ describe("editing in a business chat", () => {
         message_id: sent.message_id,
         caption: "x",
       }),
-    ).toMatchObject({ status: 404 });
+    ).toMatchObject({
+      status: 404,
+      description: "Not Found: method not found",
+    });
+    expect((await fake.getCalls()).unimplemented).toEqual([
+      "editMessageCaption with business_connection_id",
+    ]);
   });
 
   it("edits the owner's own messages for 48 hours, in a chat with a message from the last 24", async () => {

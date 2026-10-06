@@ -951,6 +951,12 @@ export async function startTestServer({
   const rejectedRequestIndex = new Map();
   let requestSequence = 0;
   const unimplemented = new Set();
+  /** Reports, once, a method (or a mode of one) this server does not have. */
+  function reportUnimplemented(name) {
+    if (unimplemented.has(name)) return;
+    unimplemented.add(name);
+    log(`unimplemented Bot API method ${name}`);
+  }
   // Calls a test asked to fail: the next `times` calls of a method (to one
   // chat, from one bot, when named) answer the error, or take effect and never
   // answer.
@@ -4205,12 +4211,12 @@ export async function startTestServer({
    */
   function businessEditEntry(p, caller, kind) {
     if (kind === "caption" || kind === "media") {
+      // Not modelled: Telegram's answer to a method it does not know, with
+      // the gap reported by GET /_fake/calls and the log.
       const method =
         kind === "caption" ? "editMessageCaption" : "editMessageMedia";
-      throw new TelegramError(
-        404,
-        `Not Found: method ${method} with business_connection_id is not implemented by telegram-bot-test-server`,
-      );
+      reportUnimplemented(`${method} with business_connection_id`);
+      throw new TelegramError(404, "Not Found: method not found");
     }
     const { chat } = businessReplyChat(p, caller);
     const entry = chat.entries.find(
@@ -6650,10 +6656,7 @@ ${buttons}
           completed_at: clock.now(),
         });
         if (!answerTrue) receipt.failed = 404;
-        if (!unimplemented.has(method)) {
-          unimplemented.add(method);
-          log(`unimplemented Bot API method ${method}`);
-        }
+        reportUnimplemented(method);
         if (answerTrue) {
           send(response, 200, { ok: true, result: true });
         } else {
