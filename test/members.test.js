@@ -643,6 +643,40 @@ describe("administrators and chat settings", () => {
     }
   });
 
+  it("drops rights the kind of chat does not have before checking and granting them", async () => {
+    const { fake, api, member, me } = await setup();
+    const channel = await fake.createChat({ type: "channel", ownerId: OWNER });
+    for (const chat of [GROUP, channel]) {
+      await fake.setBotMembership(chat, me.id, {
+        status: "administrator",
+        rights: { can_promote_members: true },
+      });
+    }
+    const reader = await fake.createUser();
+    await fake.join(channel, reader);
+
+    expect(
+      await api("promoteChatMember", {
+        chat_id: GROUP,
+        user_id: member,
+        can_manage_direct_messages: true,
+      }),
+    ).toMatchObject({ ok: true });
+    expect((await fake.getMember(GROUP, member)).status).toBe("member");
+    // The channel default can_restrict_members still follows the request.
+    expect(
+      await api("promoteChatMember", {
+        chat_id: channel,
+        user_id: reader,
+        can_manage_tags: true,
+      }),
+    ).toMatchObject({ ok: true });
+    expect(await fake.getMember(channel, reader)).toMatchObject({
+      status: "administrator",
+      can_restrict_members: true,
+    });
+  });
+
   it("gives each kind of chat its own administrator rights, and channel admins can_restrict_members by default", async () => {
     const { fake, api, me } = await setup();
     const channel = await fake.createChat({ type: "channel", ownerId: OWNER });
@@ -1109,6 +1143,18 @@ describe("reactions and join request queries", () => {
     await fake.advanceTime(1_000);
     expect(await write(bob)).toMatchObject(refused);
     expect(await fake.getDirectMessages(bob)).toHaveLength(1);
+
+    const carol = await fake.createUser();
+    await fake.joinByLink(link, carol);
+    expect(
+      (
+        await api("sendPoll", {
+          chat_id: carol,
+          question: "Why do you want to join?",
+          options: [{ text: "To learn" }, { text: "To help" }],
+        })
+      ).ok,
+    ).toBe(true);
   });
 
   it("reads a join request query's result trimmed and in any case, and checks it first", async () => {

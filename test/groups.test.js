@@ -360,6 +360,31 @@ describe("basic groups and the upgrade to a supergroup", () => {
       parameters: { migrate_to_chat_id: supergroup },
     });
   });
+
+  it("forwards, copies and replies from the old id without the upgrade error", async () => {
+    const { fake, api, me } = await setup();
+    const group = await fake.createChat({ type: "group", ownerId: OWNER });
+    await fake.setBotMembership(group, me.id, { status: "administrator" });
+    const message = await fake.post(group, OWNER, "old history");
+    const supergroup = await fake.migrateToSupergroup(group, { by: OWNER });
+    const from = { from_chat_id: group, message_id: message };
+
+    for (const [method, params] of [
+      ["forwardMessage", from],
+      ["copyMessage", from],
+      [
+        "sendMessage",
+        {
+          text: "re",
+          reply_parameters: { chat_id: group, message_id: message },
+        },
+      ],
+    ]) {
+      expect((await api(method, { chat_id: supergroup, ...params })).ok).toBe(
+        true,
+      );
+    }
+  });
 });
 
 describe("people changing the chat", () => {

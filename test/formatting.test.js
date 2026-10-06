@@ -645,7 +645,7 @@ describe("bot sends", () => {
       }),
     ).toMatchObject({
       status: 400,
-      description: "Bad Request: message to be replied not found",
+      description: "Bad Request: chat not found",
     });
     expect(
       await api("sendMessage", {

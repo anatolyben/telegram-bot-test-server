@@ -1649,18 +1649,30 @@ describe("bot membership", () => {
     });
   });
 
-  it("lets a bot removed from a basic group read the chat and its own status, but nothing else", async () => {
+  it("lets a bot removed from a basic group read the chat and its own status and delete its ephemeral messages, but nothing else", async () => {
     const { fake, api, second } = await setup();
     const group = await fake.createChat({ type: "group", ownerId: OWNER });
-    await fake.setBotMembership(group, second.id, { status: "member" });
+    await fake.setBotMembership(group, second.id, { status: "administrator" });
     const call = (method, params = {}) =>
       api(method, { chat_id: group, ...params }, SECOND_TOKEN);
+    const ephemeral = (
+      await call("sendMessage", {
+        text: "only you",
+        ephemeral_message_parameters: { receiver_user_id: OWNER },
+      })
+    ).result;
 
     await fake.setBotMembership(group, second.id, { status: "left" });
     expect((await call("getChat")).result).toMatchObject({ type: "group" });
     expect(
       (await call("getChatMember", { user_id: second.id })).result.status,
     ).toBe("left");
+    expect(
+      await call("deleteEphemeralMessage", {
+        receiver_user_id: OWNER,
+        ephemeral_message_id: ephemeral.ephemeral_message_id,
+      }),
+    ).toMatchObject({ ok: true });
     for (const [method, params] of [
       ["getChatMemberCount", {}],
       ["getChatMember", { user_id: OWNER }],
@@ -1692,6 +1704,78 @@ describe("bot membership", () => {
         description: "Bad Request: chat not found",
       });
     }
+  });
+
+  it("reads a call's arguments, and a forward's source chat, before the chat it addresses", async () => {
+    const { fake, api, second } = await setup();
+    const hidden = await fake.createChat({ ownerId: OWNER });
+    await fake.setBotMembership(GROUP, second.id, { status: "kicked" });
+    const call = (method, params) =>
+      api(method, { chat_id: GROUP, ...params }, SECOND_TOKEN);
+
+    expect(await call("sendMessage", { text: "" })).toMatchObject({
+      status: 400,
+      description: "Bad Request: message text is empty",
+    });
+    for (const method of [
+      "banChatMember",
+      "getChatMember",
+      "deleteMessageReaction",
+    ]) {
+      expect(
+        await call(method, { user_id: "abc", message_id: 1 }),
+      ).toMatchObject({
+        status: 400,
+        description: "Bad Request: invalid user_id specified",
+      });
+    }
+    for (const method of ["restrictChatMember", "setChatPermissions"]) {
+      expect(
+        await call(method, { user_id: OWNER, permissions: "none" }),
+      ).toMatchObject({
+        status: 400,
+        description: "Bad Request: can't parse permissions JSON object",
+      });
+    }
+    expect(await call("sendChatAction", { action: "dancing" })).toMatchObject({
+      status: 400,
+      description: "Bad Request: wrong parameter action in request",
+    });
+    expect(
+      await call("forwardMessage", { from_chat_id: hidden, message_id: 1 }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: chat not found",
+    });
+  });
+
+  it("checks the bot's access to the chat of the message it replies to", async () => {
+    const { fake, api, second } = await setup();
+    const other = await fake.createChat({ ownerId: OWNER });
+    await fake.setBotMembership(GROUP, second.id, { status: "member" });
+    await fake.setBotMembership(other, second.id, { status: "member" });
+    const message = await fake.post(other, OWNER, "elsewhere");
+    const reply = (chat) =>
+      api(
+        "sendMessage",
+        {
+          chat_id: GROUP,
+          text: "re",
+          reply_parameters: { chat_id: chat, message_id: message },
+        },
+        SECOND_TOKEN,
+      );
+
+    await fake.setBotMembership(other, second.id, { status: "kicked" });
+    expect(await reply(other)).toMatchObject({
+      status: 403,
+      description: "Forbidden: bot was kicked from the supergroup chat",
+    });
+    await fake.setBotMembership(other, second.id, { status: "left" });
+    expect(await reply(other)).toMatchObject({
+      status: 403,
+      description: "Forbidden: bot is not a member of the supergroup chat",
+    });
   });
 
   it("says can_be_edited only to the bot that promoted the administrator", async () => {

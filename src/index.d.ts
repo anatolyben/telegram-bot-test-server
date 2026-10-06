@@ -28,8 +28,9 @@ export interface TelegramBotTestServerOptions {
   /** Default "Fake Test Bot". */
   botName?: string;
   /**
-   * The bot is a guard bot: join requests reach it as queries it answers with
-   * answerChatJoinRequestQuery. Default false.
+   * The bot is a guard bot: in a chat where it has can_invite_users, join
+   * requests reach it as queries it answers with answerChatJoinRequestQuery.
+   * Default false.
    */
   supportsJoinRequestQueries?: boolean;
   /**
@@ -372,7 +373,10 @@ export interface TelegramBotTestServer {
     token: string;
     username: string;
     firstName?: string;
-    /** A guard bot that gets join requests as queries. */
+    /**
+     * A guard bot: in a chat where it has can_invite_users, it gets join
+     * requests as queries.
+     */
     supportsJoinRequestQueries?: boolean;
     /** Its Telegram Login client secret; default random. */
     loginClientSecret?: string;

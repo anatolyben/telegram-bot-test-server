@@ -1491,7 +1491,7 @@ describe("moderation physical state", () => {
 });
 
 describe("documented moderation boundaries", () => {
-  it("keeps messages after a form-encoded revocation in a basic group and ignores its ban deadline", async () => {
+  it("keeps messages after a form-encoded revocation in a basic group and leaves the user removed, not banned", async () => {
     const { server } = await setup();
     const group = await server.createChat({ type: "group", ownerId: OWNER });
     await server.setBotMembership(group, BOT, { status: "administrator" });
@@ -1511,10 +1511,9 @@ describe("documented moderation boundaries", () => {
     expect(await server.getMessage(group, message)).toMatchObject({
       deleted: false,
     });
-    expect(await server.getMember(group, ann)).toMatchObject({
-      status: "kicked",
-      until_date: 0,
-    });
+    const removed = await server.getMember(group, ann);
+    expect(removed.status).toBe("left");
+    expect(removed).not.toHaveProperty("until_date");
   });
 
   it("rejects deletion at 48 hours while allowing it just before that boundary", async () => {
