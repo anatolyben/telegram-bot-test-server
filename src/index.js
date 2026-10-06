@@ -379,39 +379,6 @@ function jsonParam(value, name) {
   return value;
 }
 
-/**
- * A JSON array as Client::get_array reads it: null is empty, and `problem`
- * says why an item cannot be read, if it cannot.
- */
-function jsonArray(value, className, problem = () => undefined) {
-  if (value === null) return [];
-  if (!Array.isArray(value)) {
-    throw new TelegramError(
-      400,
-      `Bad Request: expected an Array of ${className}`,
-    );
-  }
-  for (const item of value) {
-    const reason = problem(item);
-    if (reason) {
-      throw new TelegramError(
-        400,
-        `Bad Request: can't parse ${className}: ${reason}`,
-      );
-    }
-  }
-  return value;
-}
-
-/** Why a JSON object has no usable string field, as td::JsonObject says. */
-function missingString(object, field) {
-  if (!(field in object)) return `Can't find field "${field}"`;
-  if (!["string", "number"].includes(typeof object[field])) {
-    return `Field "${field}" must be of type String`;
-  }
-  return undefined;
-}
-
 /** A request number, or the fallback when it is missing or not a number. */
 function numberParam(value, fallback) {
   const number = Number(value);
@@ -500,14 +467,15 @@ function parseJsonObject(body) {
 }
 
 /**
- * A JSON-serialized list parameter, read as the Bot API server reads it: a
- * string is decoded and null is an empty list. read returns each item, or
- * throws an Error that says what is wrong with it.
+ * A JSON-serialized list parameter, read as Client::get_array reads it: null
+ * is an empty list. A string here is text that was not JSON or, when it reads
+ * as JSON, a JSON string, which is no list. read returns each item, or throws
+ * an Error that says what is wrong with it.
  */
 function jsonList(value, name, className, read) {
   if (typeof value === "string") {
     try {
-      value = JSON.parse(value);
+      JSON.parse(value);
     } catch {
       throw new TelegramError(
         400,
@@ -547,13 +515,7 @@ function requiredString(object, name) {
 
 /** A ReactionType: only emoji and custom_emoji, so never a paid reaction. */
 function reactionType(reaction) {
-  if (
-    reaction === null ||
-    typeof reaction !== "object" ||
-    Array.isArray(reaction)
-  ) {
-    throw new Error("expected an Object");
-  }
+  if (!isObject(reaction)) throw new Error("expected an Object");
   const type = requiredString(reaction, "type");
   if (type === "emoji") {
     return { type, emoji: requiredString(reaction, "emoji") };
@@ -570,7 +532,7 @@ function reactionType(reaction) {
 /** An InputPollOption's text: the option itself, or its text field. */
 function pollOptionText(option) {
   if (typeof option === "string") return option;
-  if (option === null || typeof option !== "object" || Array.isArray(option)) {
+  if (!isObject(option)) {
     throw new Error("Expected InputPollOption to be an Object");
   }
   return requiredString(option, "text");
@@ -586,10 +548,11 @@ function correctOptionIds(p) {
       ? []
       : [Number.parseInt(String(p.correct_option_id), 10) || 0];
   }
-  let ids = p.correct_option_ids;
+  const ids = p.correct_option_ids;
+  // As in jsonList, a string that reads as JSON was a JSON string.
   if (typeof ids === "string") {
     try {
-      ids = JSON.parse(ids);
+      JSON.parse(ids);
     } catch {
       throw new TelegramError(
         400,
@@ -2205,15 +2168,14 @@ export async function startTestServer({
     setMyCommands: (p, caller) => {
       caller.commands.set(
         commandsKey(p),
-        jsonArray(
-          jsonParam(p.commands, "commands") ?? [],
-          "BotCommand",
-          (command) =>
-            isObject(command)
-              ? (missingString(command, "command") ??
-                missingString(command, "description"))
-              : "expected an Object",
-        ),
+        p.commands === undefined || p.commands === ""
+          ? []
+          : jsonList(p.commands, "commands", "BotCommand", (command) => {
+              if (!isObject(command)) throw new Error("expected an Object");
+              requiredString(command, "command");
+              requiredString(command, "description");
+              return command;
+            }),
       );
       return true;
     },
@@ -2980,12 +2942,11 @@ export async function startTestServer({
           'Bad Request: parameter "media" is required',
         );
       }
-      const items = jsonArray(
-        jsonParam(p.media, "media"),
-        "InputMedia",
-        (item) =>
-          isObject(item) ? missingString(item, "type") : "expected an Object",
-      );
+      const items = jsonList(p.media, "media", "InputMedia", (item) => {
+        if (!isObject(item)) throw new Error("expected an Object");
+        requiredString(item, "type");
+        return item;
+      });
       const types = items.map((item) => item.type);
       if (
         types.some(

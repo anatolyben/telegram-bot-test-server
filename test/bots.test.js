@@ -530,6 +530,12 @@ describe("polls, forwards and media", () => {
     expect(await send({ options: undefined })).toMatchObject(
       refusal("Bad Request: can't parse options JSON object"),
     );
+    // A JSON string is no list, even one whose text is a list.
+    for (const options of [{}, JSON.stringify(JSON.stringify(["A", "B"]))]) {
+      expect(await send({ options })).toMatchObject(
+        refusal("Bad Request: expected an Array of InputPollOption"),
+      );
+    }
     expect(await send({ options: [null, null] })).toMatchObject(
       refusal(
         "Bad Request: can't parse InputPollOption: Expected InputPollOption to be an Object",
@@ -581,6 +587,10 @@ describe("polls, forwards and media", () => {
     for (const [ids, description] of [
       ["[0", "can't parse correct option identifiers JSON object"],
       [{}, "expected an Array of correct option identifiers"],
+      [
+        JSON.stringify("[0]"),
+        "expected an Array of correct option identifiers",
+      ],
       [["0"], "correct option identifier must be of type Number"],
       [[0.5], "invalid correct option identifier specified"],
     ]) {
