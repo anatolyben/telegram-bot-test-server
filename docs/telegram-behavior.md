@@ -312,8 +312,9 @@ other blank characters) fails with `MESSAGE_EMPTY`; such a caption is dropped.
 Member messages and captions carry the entities Telegram finds by itself, found the way TDLib finds
 them: `mention`, `bot_command` (anywhere it does not touch a letter, digit, `_`, `/`, `<` or `>`),
 `hashtag`, `cashtag`, `url` and `email`, with UTF-16 offsets, in groups and in private chats. A link
-without a protocol needs a common top-level domain, so `example.com` is a link and `package.json` is
-not. Phone numbers are not marked.
+without a protocol needs a common top-level domain, so `example.com` and `shop.xyz` are links and
+`package.json`, `spam.test` and `evil.local` are not; with a protocol, as in
+`http://spam.invalid/x`, any domain is. Phone numbers are not marked.
 
 ### Deleting messages
 
@@ -486,18 +487,21 @@ id.
 
 ### Ephemeral messages
 
-A send with `ephemeral_message_parameters` is shown to one member. It returns `message_id` 0,
-`receiver_user` and an `ephemeral_message_id` of its own, and takes no message id from the chat. A
-poll, a dice or a live location cannot be sent this way (`unallowed message content specified`). The
-regular edit and delete methods cannot reach it; only the bot that sent it changes it, with the
-`editEphemeralMessage…` methods and `deleteEphemeralMessage`, which return `true`.
+A send with `ephemeral_message_parameters: { receiver_user_id }` is shown to one member. It
+returns `message_id` 0, `receiver_user` and an `ephemeral_message_id` of its own, and takes no
+message id from the chat; a press on its button carries the same message in
+`callback_query.message`. A poll, a dice or a live location cannot be sent this way
+(`unallowed message content specified`). The regular edit and delete methods cannot reach it; only
+the bot that sent it changes it, with the `editEphemeralMessage…` methods and
+`deleteEphemeralMessage`, which take `chat_id`, `receiver_user_id` and `ephemeral_message_id` and
+return `true`.
 `editEphemeralMessageText` and `editEphemeralMessageCaption` reach Telegram as the same request, so
 either one changes a text message's text or a media message's caption. The receiver must be a
 member of the group or supergroup and not a bot. A bot that administers the chat may send one at any
-time; any other bot needs the `callback_query_id` of a button press it received from the receiver,
-at most 15 seconds old. Who may get the message is checked after the chat, the reply and the
-content. Members cannot send ephemeral commands here, so `reply_parameters.ephemeral_message_id`
-never qualifies.
+time; any other bot needs to pass, as `ephemeral_message_parameters.callback_query_id`, the id of a
+button press it received from the receiver, at most 15 seconds old. Who may get the message is
+checked after the chat, the reply and the content. Members cannot send ephemeral commands here, so
+`reply_parameters.ephemeral_message_id` never qualifies.
 
 Unverified: Telegram does not document the errors (`PEER_ID_INVALID` outside groups,
 `USER_IS_BOT`, `USER_NOT_PARTICIPANT`, `CHAT_ADMIN_REQUIRED` without an eligible action, and
@@ -639,12 +643,13 @@ seconds.
   holds a user name and password, `X-Telegram-Bot-Api-Secret-Token` when a secret was set,
   `Content-Type: application/json`, `Content-Length`, `Connection: keep-alive` and
   `Accept-Encoding: gzip, deflate`.
-- **Order.** Updates wait in queues keyed as Telegram keys them: messages and `my_chat_member` by
-  chat, `chat_member`, join requests and button presses by user, reactions by chat. A queue's
-  updates arrive one at a time, in order; different queues are delivered at once, up to
-  `max_connections` requests (1 to 100, default 40). When more queues are ready than connections
-  are free, the queue ready longest goes first, then the one with the lowest queue id, as on
-  Telegram. Updates pending when the webhook is set are ready together; an update the webhook
+- **Order.** Updates wait in queues keyed as Telegram keys them: a chat's messages, its
+  `my_chat_member` updates and its reactions in three queues of the chat; a user's `chat_member`
+  updates and join requests in one queue of the user, and their button presses in another. A
+  queue's updates reach the webhook one at a time, in order; different queues are delivered at
+  once, up to `max_connections` requests (1 to 100, default 40). When more queues are ready than
+  connections are free, the queue ready longest goes first, then the one with the lowest queue id,
+  as on Telegram. Updates pending when the webhook is set are ready together; an update the webhook
   refused is ready again only when its retry is due, behind the queues already waiting. Telegram
   also opens its connections gradually and loads at most twice `max_connections` updates at a
   time; this server does neither.

@@ -53,7 +53,8 @@ bot.on("message:text", async (ctx) => {
     await ctx.banChatMember(ctx.from.id);
   }
 });
-bot.start();
+// Resolve once the bot is polling.
+await new Promise((resolve) => bot.start({ onStart: resolve }));
 
 // Telegram's side, played by the test.
 const ann = await server.createUser({ first_name: "Ann" });
@@ -78,6 +79,10 @@ await bot.stop();
 await server.stop();
 ```
 
+With `grammy` installed, save it as `quickstart.mjs` and run `node quickstart.mjs`. It exits 0
+once the bot has deleted the message and banned Ann. Like every example here, it is an ES module:
+use `.mjs`, or `"type": "module"` in your `package.json`.
+
 The same works with other libraries; only the base URL option differs:
 
 | Library       | Point it at the server                                                  |
@@ -87,8 +92,8 @@ The same works with other libraries; only the base URL option differs:
 | Anything else | Replace `https://api.telegram.org` with `server.origin` in its settings |
 
 Both grammY and Telegraf are tested against the server, with polling and with a webhook. A bot
-written in another language points at the server the same way; its tests drive the server over
-HTTP ([Other languages](#other-languages-command-line-and-http)).
+written in another language, such as Python, points at the server the same way; its tests drive
+the server over HTTP ([Other languages](#other-languages-command-line-and-http)).
 
 ## How it works
 
@@ -163,7 +168,8 @@ What each part does:
   receipts name a bot by it (`botId`).
 - `createUser` returns a new user's id; `join` makes them a member.
 - `waitFor` resolves as soon as the condition holds and fails after a second by default, so a test
-  never sleeps ([Check what the bot did](#check-what-the-bot-did)).
+  never sleeps. [Check what the bot did](#check-what-the-bot-did) also shows how to check that the
+  bot did nothing.
 - A fresh server per test keeps tests apart. To share one, restore a [snapshot](#snapshots) between
   tests instead.
 
@@ -174,7 +180,8 @@ The rest of this guide shows parts of tests like this one, with `server`, `bot`,
 
 Test actions play people on Telegram. Each one resolves once the update it causes has been handed
 to the bot: its first webhook attempt has finished (with any call the webhook answered with), it
-waits behind an update the webhook refused, or it is queued for `getUpdates`. What the bot does in
+waits behind an update the webhook refused, or it is queued for `getUpdates`. A webhook gets a
+minute to answer, so one that never answers holds the action for a minute. What the bot does in
 response happens after that, so wait for the outcome rather than checking it immediately. An action
 fails where Telegram would refuse the person: `post` fails if the user is not allowed to post, for
 example.
@@ -204,6 +211,12 @@ const { message } = await server.waitFor({
 const answer = await server.pressButton(GROUP, message.message_id, ann, "rules");
 expect(answer).toMatchObject({ answered: true, text: "Thanks!" });
 ```
+
+The last argument is the button's `callback_data`, not its label; the press fails at once if the
+message has no button with that data. If the bot does not answer within 10 seconds, the press
+resolves `{ answered: false }`. Vitest and Jest stop a test after 5 seconds by default, so give a
+test that may see no answer a longer timeout. Or start the press without awaiting it, then wait for
+the bot's `answerCallbackQuery` call with `waitFor`, which fails after a second.
 
 The test can also call the Bot API as the bot, for example to make an invite link, and then have
 a user open it:
@@ -254,8 +267,12 @@ expect(ban.params.user_id).toBe(String(ann));
 
 A wait fails after 1000 ms by default; `{ timeoutMs }` sets 1 to 30000 ms of wall time. Its error
 names the exact expectation, what was observed (or up to eight matching requests) and the work
-still outstanding, in at most 8000 characters with credentials redacted.
-[Wait conditions](#wait-conditions) lists every condition.
+still outstanding, in at most 8000 characters with credentials redacted. The outstanding work
+counts what is in progress: `controls` (test actions), `http` (open HTTP requests to the server),
+`owners` (owner client calls), `deliveries` (webhook attempts queued or running), `polls` (open
+long polls), `delayedOrNetworkRequests` (webhook connections and response delays) and `waits`
+(waits, this one included). A polling bot always has a long poll open, so `http: 1` and `polls: 1`
+are normal. [Wait conditions](#wait-conditions) lists every condition.
 
 Once the outcome is there, read the state directly:
 
@@ -272,6 +289,26 @@ Messages are kept the way Telegram returns them: `parse_mode` formatting becomes
 `pinned_message` for each pin.
 `getCalls()` keeps requests as they came, fixture secrets included, so do not dump it
 indiscriminately.
+
+To show that the bot did **not** act, without sleeping, give it something it does act on
+afterwards, in the same chat, and wait for that:
+
+```js
+// Your bot deletes links, as in the quick start.
+const ann = await server.createUser({ first_name: "Ann" });
+await server.join(GROUP, ann);
+const hello = await server.post(GROUP, ann, "Hello, no links here");
+// A later message the bot acts on marks the point where it has handled the first.
+const marker = await server.post(GROUP, ann, "see example.com");
+await server.waitFor({ kind: "message", chatId: GROUP, messageId: marker, deleted: true });
+expect((await server.getMessage(GROUP, hello)).deleted).toBe(false);
+```
+
+One chat's messages reach the bot in order, so this holds for a bot that handles them one at a
+time: grammY's `bot.start()`, or any webhook that answers after its handler has run, as grammY's
+and Telegraf's do. Telegraf's polling handles each batch of updates at once, so there the marker
+is not enough. A webhook bot can instead `await server.drainDeliveries()`, which returns once the
+webhook has answered every update sent so far.
 
 ### Webhooks and polling
 
@@ -317,11 +354,14 @@ Updates reach the bot as Telegram sends them:
 - Each bot has its own update queue. An update stays pending until the bot confirms it, with a
   `getUpdates` offset or by answering its webhook with a 2XX status. It expires a day after it
   happened, and a button press after 150 seconds.
-- A webhook that does not answer 2XX gets the update again: at once, then after 2, 4, 8 ...
-  seconds up to a random 60 to 120, or after its `Retry-After`. `getWebhookInfo` reports the
-  pending count and the last error.
-- One chat's updates arrive one at a time, in order; different chats' updates go out at once, up
-  to `max_connections` (default 40).
+- A webhook that does not answer 2XX within a minute gets the update again: at once, then after 2,
+  4, 8 ... seconds up to a random 60 to 120, or after its `Retry-After`. `getWebhookInfo` reports
+  the pending count and the last error. Make your webhook answer even when a handler throws.
+- Updates wait in queues keyed as Telegram keys them: messages by chat; `chat_member` updates,
+  join requests and button presses by user; `my_chat_member` updates and reactions by chat, apart
+  from the messages. A queue's updates reach a webhook one at a time, in order; different queues go
+  out at once, up to `max_connections` (default 40). So a join's `chat_member` update can arrive
+  while the chat's messages are still on their way. `getUpdates` returns all of them in order.
 - A webhook may answer an update with a Bot API call, as Telegraf does by default; the call runs.
 - Without `allowed_updates`, a bot gets every update but `chat_member`, `message_reaction` and
   `message_reaction_count`. `chat_member` and `message_reaction` reach only administrator bots,
@@ -338,9 +378,10 @@ or wait for what the bot does after answering. `getDeliveries()` lists each atte
 and bot id, attempt number (each retry is one), `epoch` (the number of restores before it), when it
 was queued, started and completed, its status and outcome. Sent updates and this list are kept
 until a restore. `redeliverUpdate(updateId, { botId })` has Telegram deliver an update again, byte
-for byte, callback queries included, as it does when a webhook does not confirm one; name the bot
-when two bots got that `update_id`. It sends the saved update, so do not restore an earlier
-snapshot between the steps of a replay.
+for byte, callback queries included, as it does when a webhook does not confirm one. Each bot
+numbers its own updates, and bots added in the same second start at the same number, so with more
+than one bot always pass `botId`. It sends the saved update, so do not restore an earlier snapshot
+between the steps of a replay.
 
 ### More than one bot
 
@@ -430,8 +471,9 @@ after the rule is added, and `times` (default 1) is how many matching calls in a
 
 - With `errorCode`, the call fails before it runs. Without `description`, the error reads as
   Telegram's does for its code (`Bad Request`, `Forbidden`, `Conflict`, ...). A 429 needs
-  `retryAfter`, a whole number of seconds: it reads `Too Many Requests: retry after N` and carries
-  the `Retry-After` header, as on Telegram.
+  `retryAfter`, a whole number of seconds, and `failNext` rejects a 429 rule without it. The call
+  then reads `Too Many Requests: retry after N` and carries the `Retry-After` header, as on
+  Telegram.
 - With `dropAfterApply`, the call takes effect once, then the connection closes without an answer.
 - `delayMs` (at most 30 seconds) delays the answer; on its own, the call runs normally. Delays end
   when the server stops.
@@ -717,19 +759,30 @@ Tests in Python, Go or any other language run the server from the command line a
 HTTP:
 
 ```sh
-npx telegram-bot-test-server --token 123456:TEST --port 8081 --config chats.json
+npx telegram-bot-test-server --token 123456:TEST --port 0 --config chats.json
 ```
+
+Once it listens, it prints its origin as its first line, then any log lines:
+
+```text
+[telegram-bot-test-server] listening at http://127.0.0.1:52428
+```
+
+Read the origin from that line. SIGTERM or Ctrl-C stops the server.
 
 | Flag                 | Default         | Meaning                                                |
 | -------------------- | --------------- | ------------------------------------------------------ |
 | `--token`            | required        | The bot's token.                                       |
-| `--port`, `--host`   | 8081, 127.0.0.1 | Where to listen.                                       |
+| `--port`, `--host`   | 8081, 127.0.0.1 | Where to listen. `--port 0` picks a free port.         |
 | `--username`         | `example_bot`   | The bot's username.                                    |
 | `--config`           | none            | A JSON file with `chats` and `publicChats`.            |
 | `--unimplemented-ok` | off             | Answer `true` to unsupported methods that return True. |
 
+These are all the flags; there is no `--help`. Without `--token` it prints its usage line, and an
+unknown flag stops it with an error.
+
 `chats.json` holds `{ "chats": [...], "publicChats": [...] }` in the shape of the
-[options](#options):
+[options](#options), with their camelCase keys:
 
 ```json
 {
@@ -737,45 +790,78 @@ npx telegram-bot-test-server --token 123456:TEST --port 8081 --config chats.json
 }
 ```
 
-Point your bot's Bot API base URL at `http://127.0.0.1:8081` and drive the test actions through the
-[control API](#control-api): JSON routes under `/_fake/`. This Python test, using only the standard
-library, plays the quick start's user while the bot under test runs against the server:
+Your bot sends its Bot API calls to `<origin>/bot<token>/<method>`, such as
+`http://127.0.0.1:8081/bot123456:TEST/getUpdates`, and downloads files from
+`<origin>/file/bot<token>/<file_path>`, as it would from `https://api.telegram.org`. With
+python-telegram-bot, call `.base_url(f"{origin}/bot")` and `.base_file_url(f"{origin}/file/bot")`
+on `Application.builder()`; with aiogram, give the bot
+`session=AiohttpSession(api=TelegramAPIServer.from_base(origin))`.
+
+The test drives the test actions through the [control API](#control-api): JSON routes under
+`/_fake/`, a prefix no Bot API path uses. This pytest test starts the server on a free port and the
+bot under test (here `bot.py`, which takes the origin as its argument), then plays the quick
+start's user:
 
 ```python
+# test_moderation.py: run with pytest, with chats.json and your bot.py beside it.
 import json
+import subprocess
+import sys
+import threading
 import urllib.request
+
+import pytest
 
 GROUP = -1001000000001
 
 
-def control(method, path, body=None):
-    request = urllib.request.Request(
-        f"http://127.0.0.1:8081/_fake/{path}",
-        method=method,
-        data=None if body is None else json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
+@pytest.fixture
+def control():
+    # The server picks a free port and prints its origin on its first line.
+    server = subprocess.Popen(
+        ["npx", "telegram-bot-test-server", "--token", "123456:TEST",
+         "--port", "0", "--config", "chats.json"],
+        stdout=subprocess.PIPE, text=True,
     )
-    with urllib.request.urlopen(request) as response:
-        return json.load(response)
+    origin = server.stdout.readline().split(" listening at ")[1].strip()
+    threading.Thread(target=server.stdout.read, daemon=True).start()
+    # The bot under test, with the origin as its Bot API base URL.
+    bot = subprocess.Popen([sys.executable, "bot.py", origin])
+
+    def control(method, path, body=None):
+        request = urllib.request.Request(
+            f"{origin}/_fake/{path}",
+            method=method,
+            data=None if body is None else json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request) as response:
+            return json.load(response)
+
+    yield control
+    for process in (bot, server):
+        process.terminate()
+        process.wait()
 
 
-def wait_for(condition):
-    return control("POST", "wait", {"condition": condition, "timeoutMs": 2000})
+def test_bans_whoever_posts_a_link(control):
+    def wait_for(condition):
+        return control("POST", "wait", {"condition": condition, "timeoutMs": 2000})
 
+    ann = control("POST", "users", {"first_name": "Ann"})["id"]
+    control("POST", f"chats/{GROUP}/join", {"user_id": ann})
+    spam = control("POST", f"chats/{GROUP}/messages",
+                   {"user_id": ann, "text": "cheap followers at example.com"})
 
-ann = control("POST", "users", {"first_name": "Ann"})["id"]
-control("POST", f"chats/{GROUP}/join", {"user_id": ann})
-spam = control("POST", f"chats/{GROUP}/messages",
-               {"user_id": ann, "text": "cheap followers at example.com"})
-
-wait_for({"kind": "message", "chatId": GROUP,
-          "messageId": spam["message_id"], "deleted": True})
-wait_for({"kind": "member", "chatId": GROUP, "userId": ann, "status": "kicked"})
-assert control("GET", f"chats/{GROUP}/members/{ann}")["status"] == "kicked"
+    wait_for({"kind": "message", "chatId": GROUP,
+              "messageId": spam["message_id"], "deleted": True})
+    wait_for({"kind": "member", "chatId": GROUP, "userId": ann, "status": "kicked"})
+    assert control("GET", f"chats/{GROUP}/members/{ann}")["status"] == "kicked"
 ```
 
-A wait that times out raises `urllib.error.HTTPError` with status 408, and its `{ error }` body
-says what was expected and what was observed.
+The thread keeps reading the server's output, so its log never fills the pipe. A wait that times
+out raises `urllib.error.HTTPError` with status 408, and its `{ error }` body says what was
+expected and what was observed.
 
 The control API takes snake_case fields, like the Bot API; the waits, snapshots, clock and
 deliveries routes take camelCase fields, like their JavaScript methods.
@@ -819,7 +905,9 @@ the bot's Bot API root. Each action resolves once the update it causes has been 
 **Users**
 
 - `createUser({ first_name, last_name, username, language_code, bio, is_bot, is_premium })`: a new
-  Telegram user; returns their id. All fields optional.
+  Telegram user; returns their id. All fields are optional: `first_name` defaults to
+  `"Test Member"` and `language_code` to `"en"`; the user has no last name, username or bio, and
+  is neither a bot nor premium.
 - `updateProfile(userId, fields)`: the user changes their name, username or bio.
 - `addProfilePhoto(userId, bytes)`: the user adds a profile photo.
 
@@ -859,10 +947,13 @@ the bot's Bot API root. Each action resolves once the update it causes has been 
 
 **Buttons**
 
-- `pressButton(chatId, messageId, userId, data)`: the user presses an inline button; resolves with
-  the bot's `answerCallbackQuery` answer, `{ answered, text, show_alert }`. It waits up to 10
-  seconds for the answer; an answer Telegram refuses, such as text over 200 characters, does not
-  count. The bot that put the keyboard on the message gets the press.
+- `pressButton(chatId, messageId, userId, data)`: the user presses the inline button whose
+  `callback_data` is `data` (not its label); resolves with the bot's `answerCallbackQuery` answer,
+  `{ answered, text, show_alert }`. It fails at once if the message has no button with that data.
+  Once the press has reached the bot (for a webhook, once it answered, within a minute), it waits
+  up to 10 seconds for the answer, and resolves `{ answered: false }` if none came. An answer
+  Telegram refuses, such as text over 200 characters, does not count. The bot that put the
+  keyboard on the message gets the press.
 - `pressEphemeralButton(chatId, ephemeralMessageId, userId, data)`: the receiver presses an inline
   button on an ephemeral message; resolves like `pressButton`.
 - `pressDirectButton(userId, messageId, data)`: the user presses a button in their private chat
@@ -872,13 +963,14 @@ the bot's Bot API root. Each action resolves once the update it causes has been 
 
 - `sendDirectMessage(userId, text)`: the user messages the bot privately; returns the
   `message_id`. Empty text fails with `MESSAGE_EMPTY`.
-- `getDirectMessages(userId)`: the private chat between the user and the bot, newest first.
+- `getDirectMessages(userId)`: an array of the messages in the private chat between the user and
+  the bot, newest first.
 
 **Reading state**
 
-- `getMessages(chatId)`: the chat's messages not deleted, newest first, ephemeral ones
-  (`message_id` 0, with `receiver_user`) included in the order they were sent. Their file_ids are
-  the first bot's.
+- `getMessages(chatId)`: an array of the chat's messages not deleted, newest first. Ephemeral
+  messages are included in their place, with `receiver_user`; all of them have `message_id` 0, so
+  tell them apart by `ephemeral_message_id`. File ids are the first bot's.
 - `getMessage(chatId, id)`: a regular message by `message_id`, as
   `{ exists, deleted, message }`.
 - `getEphemeralMessage(chatId, ephemeralMessageId)`: an ephemeral message by its
@@ -940,7 +1032,8 @@ the bot's Bot API root. Each action resolves once the update it causes has been 
   (`dropAfterApply`) take effect and never answer ([Injected failures](#injected-failures)).
 - `clearFailures()`: drop failure rules not used up.
 - `redeliverUpdate(updateId, { botId })`: Telegram delivers that update again, byte for byte, to the
-  same bot's webhook; `botId` names the bot when two bots got that `update_id`.
+  same bot's webhook. `botId` names the bot; with more than one bot, always pass it, since two bots
+  can get the same `update_id`.
 - `drainDeliveries({ botId, timeoutMs })`, `getDeliveries()`: wait for webhook attempts to settle;
   list them ([Webhooks and polling](#webhooks-and-polling)).
 
@@ -966,8 +1059,10 @@ same):
 - `{ kind: "message", chatId, ... }` needs `messageId`, or an author (`userId` or `botId`) plus
   exact `text` or `caption`. `deleted` checks whether it was deleted, and author, text and caption
   can also narrow a `messageId`. `userId` or `botId` identifies the author also in a channel, where
-  the message itself names only the channel. It resolves with `{ exists, deleted, message }`, and
-  finds ephemeral messages by author and text too.
+  the message itself names only the channel. It resolves with
+  `{ exists, deleted, message, author }`, where `author` is the author's user id, and finds
+  ephemeral messages by author and text too. To tell apart the same ephemeral text sent to two
+  members, read each one with `getEphemeralMessage`.
 - `{ kind: "member", chatId, userId, status }` reads the member's status in the chat, which every
   bot in it shares. `permissions` compares the returned `ChatMember`'s permission fields. It
   resolves with the `ChatMember`.
@@ -983,8 +1078,8 @@ same):
 ### Control API
 
 The test actions, over HTTP, for tests written in other languages. All routes live under
-`/_fake/`, take and return JSON and use snake_case fields. A route that fails answers `{ error }`
-with an HTTP status.
+`/_fake/`, a prefix no Bot API path uses, take and return JSON and use snake_case fields. A route
+that fails answers `{ error }` with an HTTP status.
 
 **Users**
 
@@ -1024,8 +1119,8 @@ with an HTTP status.
   `{ message_id }`.
 - `POST chats/:id/guest-bot-reply`: a guest bot answers the user
   `{ caller_user_id, bot_username, text }` in the group; returns `{ message_id }`.
-- `GET chats/:id/messages`: messages not deleted, newest first, ephemeral ones (`message_id` 0,
-  with `receiver_user`) included in the order they were sent.
+- `GET chats/:id/messages`: an array of the messages not deleted, newest first, as
+  `getMessages` returns it.
 - `GET chats/:id/messages/:messageId`: `{ exists, deleted, message, reactions }`, reactions by user
   id.
 - `GET chats/:id/ephemeral-messages/:eid`: `{ exists, deleted, message }` for the ephemeral message
@@ -1041,14 +1136,16 @@ with an HTTP status.
 - `POST users/:id/dm/:messageId/callback`: the user presses a button in the private chat
   `{ data }`.
 
-A button press waits up to 10 seconds for the bot to call `answerCallbackQuery` and returns
-`{ answered, text, show_alert }`. An answer Telegram refuses, such as text over 200 characters,
-does not count.
+`data` is the button's `callback_data`; a message with no button with that data answers 400 at
+once. A press waits as `pressButton` does, up to 10 seconds once it has reached the bot, for the
+bot to call `answerCallbackQuery`, and returns `{ answered, text, show_alert }`, or
+`{ answered: false }`. An answer Telegram refuses, such as text over 200 characters, does not
+count.
 
 **Private chats**
 
 - `POST users/:id/dm`: the user sends the bot a direct message `{ text }`.
-- `GET users/:id/dm`: the private chat's messages, newest first.
+- `GET users/:id/dm`: an array of the private chat's messages, newest first.
 
 **Bots and chats**
 
@@ -1241,6 +1338,8 @@ messages, text formatting and replies, and request parsing and update delivery.
   cannot be closed or deleted.
 - Updates when a restriction or ban runs out: the member's status changes on time, and no update is
   sent.
+- Privacy mode. Every bot in a group gets all its messages, as a bot with privacy mode off does,
+  and `getMe` says `can_read_all_group_messages: true`.
 - In Telegram Login: the `phone` scope's `phone_number` (test users have no phone numbers), the
   ES256, EdDSA and ES256K signing options (only the default RS256), the redirect URLs registered
   with BotFather (any `redirect_uri` is accepted), the `telegram-login.js` popup and native SDKs,
@@ -1258,6 +1357,12 @@ messages, text formatting and replies, and request parsing and update delivery.
 0.11.0 answers as Telegram does in many places where 0.10.0 did not, so a test that relied on the
 old behavior can fail. Each item says what changed and how to adapt the test.
 
+One rule covers many of them: compare the fields you need (with `toMatchObject`, for example), not
+whole objects. Several objects gained fields: `getChat` has `invite_link` when the bot has
+`can_invite_users`, the bot's `ChatMemberAdministrator` has `can_manage_tags`, a `Poll` has
+`allows_revoting` and `members_only` and its options `persistent_id`, and `getWebhookInfo` has the
+fields below.
+
 - **The default bot is `example_bot`, named "Example Bot"** (was `fake_test_bot`, "Fake Test
   Bot"). Update expected usernames and commands such as `/start@example_bot`, or pass `botUsername`
   and `botName` (`--username` on the command line).
@@ -1265,30 +1370,62 @@ old behavior can fail. Each item says what changed and how to adapt the test.
   description that named this server. See which methods your bot called in
   `getCalls().unimplemented`. With `unimplemented: "ok"`, only a method documented to return `True`
   answers `true`.
-- **Error descriptions are Telegram's.** Update assertions that matched 0.10.0's texts.
-- **Ephemeral messages have `message_id` 0** and an `ephemeral_message_id` of their own. Find them
-  with `getEphemeralMessage(chatId, ephemeralMessageId)`, or a `message` wait by author and text,
-  instead of `getMessage`; press their buttons with `pressEphemeralButton` instead of `pressButton`.
-  The bot edits and deletes them with the `editEphemeralMessage…` methods and
-  `deleteEphemeralMessage`; the regular methods no longer reach them.
+- **Error descriptions are Telegram's.** Update assertions that matched 0.10.0's texts. These are
+  the ones tests most often assert; each is `400 Bad Request: ...` unless it says otherwise:
+  - A bot never added to the chat: 403 `Forbidden: bot is not a member of the supergroup chat` is
+    now `chat not found`, also for reads such as `getChat` and for `leaveChat`.
+  - Banning, restricting or unbanning without `can_restrict_members`: `not enough rights` is now
+    `not enough rights to restrict/unrestrict chat member`. `setChatPermissions` without it:
+    `not enough rights to change chat permissions`.
+  - A missing `chat_id`: `chat not found` is now `chat_id is empty`. A missing `user_id`:
+    `user not found` is now `invalid user_id specified`.
+  - `restrictChatMember` in a basic group: `restrictChatMember requires a supergroup` is now
+    `method is available only in supergroups`.
+  - `deleteMessages`: `message_ids must be a JSON array` is now
+    `expected an Array of message identifiers`, and `message_ids must contain 1-100 identifiers`
+    is now `too many message identifiers specified`.
+  - `sendMediaGroup` with more than 10 items: `media group must include 2-10 items` is now
+    `too many messages to send as an album`.
+  - An empty poll question or chat title: `poll question must be non-empty` and
+    `chat title can't be empty` are now `text must be non-empty` and `title must be non-empty`.
+  - `sendContact` without a phone number: `contact needs phone_number and first_name` is now
+    `parameter "phone_number" is required`. `sendLocation` with a bad position:
+    `wrong latitude or longitude` is now `invalid location specified`.
+- **Ephemeral messages have `message_id` 0** and an `ephemeral_message_id` of their own. A bot
+  sends one with `ephemeral_message_parameters: { receiver_user_id }`. It edits or deletes one only
+  with the `editEphemeralMessage…` methods and `deleteEphemeralMessage`, which take `chat_id`,
+  `receiver_user_id` and `ephemeral_message_id`; the regular methods no longer reach it. A press on
+  its button carries `ephemeral_message_id` in `callback_query.message`, so in grammY a button
+  handler that removed the message with `ctx.deleteMessage()` now calls
+  `ctx.deleteEphemeralMessage()`. In tests, find these messages with
+  `getEphemeralMessage(chatId, ephemeralMessageId)`, or a `message` wait by author and text,
+  instead of `getMessage`, and press their buttons with `pressEphemeralButton` instead of
+  `pressButton`. Test helpers that key messages by `message_id` must use `ephemeral_message_id`
+  for them.
 - **Ephemeral messages to non-members are refused** (`USER_NOT_PARTICIPANT`), as are those to bots
-  and outside groups. Have the receiver join first. A bot that is not an administrator needs the
-  `callback_query_id` of the receiver's button press from the last 15 seconds.
+  (`USER_IS_BOT`) and outside groups (`PEER_ID_INVALID`). Have the receiver join first. A bot that
+  is not an administrator gets `CHAT_ADMIN_REQUIRED` unless it passes
+  `ephemeral_message_parameters.callback_query_id`: the id of a press on its own button by the
+  receiver, from the last 15 seconds.
 - **Each pin posts a `pinned_message` service message**, in private chats too. `getMessages` and
   `getDirectMessages` list it, and every bot in the chat receives it, the pinning bot included.
   Find messages by id or text instead of position, and expect one more `message` update per pin.
-- **A ban no longer deletes the user's messages**, as on Telegram. If your bot should remove them,
-  it must call `deleteMessage` or `deleteMessages`; tests then see what it deleted. A person banned
-  in a basic group is `left`, not `kicked`, and the ban posts `left_chat_member`.
+- **A ban no longer deletes the user's messages**, as on Telegram, even with
+  `revoke_messages: true`, which only decides whether the removed user can still see the chat's
+  earlier messages. If your bot should remove the messages, it must delete them with
+  `deleteMessage` or `deleteMessages`, so it has to keep their ids; tests then see what it deleted.
+  A person banned in a basic group is `left`, not `kicked`, and the ban posts `left_chat_member`.
 - **Call receipt `params` are text as sent**, such as `chat_id: "-100123"` and `user_id: "42"`.
   Compare with strings (`String(GROUP)`), also in call waits that narrow by `params`.
 - **`getWebhookInfo` reports errors.** It now includes `last_error_date` and `last_error_message`,
   `max_connections`, `ip_address`, and the real `pending_update_count`. The last error stays after
   later deliveries succeed, until the next `setWebhook` that changes the webhook, or
-  `deleteWebhook`. Match the fields you need rather than the whole object.
-- **`update_id` is per bot.** Each bot numbers its own updates, so two bots can get the same
-  `update_id`. Pass `botId` to `redeliverUpdate` (`bot_id` over HTTP) when more than one bot got
-  it.
+  `deleteWebhook`. `allowed_updates` comes back in Telegram's order, not the order the bot gave,
+  and is left out when it is the default, so compare it as a set.
+- **`update_id` is per bot.** Each bot numbers its own updates, and bots added in the same second
+  start at the same number, so two bots often get the same `update_id`. With more than one bot,
+  always pass `botId` to `redeliverUpdate` (`bot_id` over HTTP); without it, such a redelivery fails
+  with `More than one bot got update N; name one with bot_id`.
 - **`chat_member`, `message_reaction` and `chat_join_request` reach only bots with the needed
   rights**: the first two only administrators that list them in `allowed_updates`, the last only
   bots with `can_invite_users`. Give the bot those rights with `setBotMembership` in tests that
@@ -1304,34 +1441,48 @@ old behavior can fail. Each item says what changed and how to adapt the test.
   or no longer in a supergroup or channel gets a 403 for every call there, reads included.
   `promoteChatMember` and `unbanChatMember` refuse basic groups, and `restrictChatMember` works only
   in supergroups.
-- **Webhooks behave as Telegram's.** A webhook that does not answer 2XX gets the update again
-  instead of losing it, a Bot API call in its answer runs, and different chats' updates go out at
-  once, up to `max_connections`. `setWebhook` refuses URLs and secret tokens Telegram refuses and
-  resolves the host name, so use one that resolves, such as `127.0.0.1`. A new long poll ends the
-  one before with 409, so run one poller per bot.
+- **Webhooks behave as Telegram's.** A webhook gets a minute to answer (was 10 seconds), and one
+  that does not answer 2XX gets the update again instead of losing it. Test actions wait for the
+  first attempt, so a webhook that never answers, such as one whose handler threw, holds the action
+  for a minute and can time out your test: make your webhook answer even when a handler throws. A
+  Bot API call in its answer runs, and updates in different queues go out at once, up to
+  `max_connections` ([Webhooks and polling](#webhooks-and-polling)). `setWebhook` refuses URLs and
+  secret tokens Telegram refuses and resolves the host name, so use one that resolves, such as
+  `127.0.0.1`. A new long poll ends the one before with 409, so run one poller per bot.
 - **Text is cleaned and limited.** Text and captions are trimmed and limited to 4096 and 1024
   characters, and text that shows nothing fails; `parse_mode` wins over explicit entities. Members'
   text is trimmed too, and a blank post fails with `MESSAGE_EMPTY`. In members' text, `bot_command`
-  is found anywhere, `hashtag` and `cashtag` are found too, and `package.json` is not a link.
-- **Edits, buttons and flags follow Telegram's rules.** `editMessageText` needs a text message and
-  `editMessageCaption` media; forwards and messages sent with a reply keyboard can't be edited. A
-  text-only inline button, or `callback_data` over 64 bytes, is refused, and a press reaches the
-  bot that put the keyboard on the message. A flag inside `reply_markup`, `reply_parameters`,
-  `link_preview_options` or `permissions` must be a JSON boolean: `true`, not `"true"`.
+  is found anywhere, and `hashtag` and `cashtag` are found too. Without a scheme, a domain is a
+  link only with a common top-level domain, as Telegram detects it: `example.com` and `shop.xyz`
+  are links; `spam.test`, `evil.local` and `package.json` are not. In test posts, use a real
+  top-level domain or `http://`.
+- **Edits, buttons, reactions and flags follow Telegram's rules.** `editMessageText` needs a text
+  message and `editMessageCaption` media; forwards and messages sent with a reply keyboard can't be
+  edited. A text-only inline button
+  (`can't parse InlineKeyboardButton: Text buttons are not allowed in the inline keyboard`),
+  `callback_data` over 64 bytes (`BUTTON_DATA_INVALID`) or a `reply_markup` that is not JSON
+  (`can't parse reply keyboard markup JSON object`) is refused, and a press reaches the bot that put
+  the keyboard on the message. `setMessageReaction` takes only the emoji Telegram lists
+  (`REACTION_INVALID` otherwise), and a custom emoji needs `custom_emoji_id`. A flag inside
+  `reply_markup`, `reply_parameters`, `link_preview_options` or `permissions` must be a JSON
+  boolean: `true`, not `"true"`.
 - **Commands and invite links.** Commands are kept per scope and language. Invite links need
-  `can_invite_users`, and each administrator has its own primary link.
+  `can_invite_users` (`not enough rights to manage chat invite link`), and each administrator has
+  its own primary link.
 - **Bots get more updates.** A bot gets the service messages its own calls post
   (`new_chat_title`, `new_chat_photo`, `delete_chat_photo`, `pinned_message`), and `stopPoll` sends
   the closed poll as a `poll` update. Bot API calls answer without waiting for the updates they
   cause.
 - **Pins.** `getChat`'s `pinned_message` is the most recent pin by sending date, not the last one
   pinned, and `unpinChatMessage` with nothing pinned fails with `message to unpin not found`.
-- **Some refusals are gone.** `sendMediaGroup` with one item sends an ordinary message, and
-  `reply_parameters.chat_id` replies to another chat; both were refused. The current chat title set
-  again succeeds, and a longer title or description is cut instead of refused. A bot may message a
-  join requester for five minutes. A business send without `can_reply` is a 400, not a 403.
+- **Some refusals are gone.** `sendMediaGroup` with one item sends an ordinary message, a poll may
+  have one option, and `reply_parameters.chat_id` replies to another chat; all were refused. The
+  current chat title set again succeeds, and a longer title or description is cut instead of
+  refused. A bot may message a join requester for five minutes. A business send without
+  `can_reply` is a 400, not a 403.
 - **Injected failures.** A rule's default description follows its code (`Forbidden` for 403, and
-  so on), and a 429 needs `retryAfter`.
+  so on). `failNext` rejects a 429 rule without `retryAfter`, with
+  `a 429 failure needs a retry_after`; add `retryAfter: 1`.
 - **HTTP control errors.** A failed HTTP wait, drain or clock advance answers `{ error }` with 400,
   408 or 409 instead of a 500.
 
