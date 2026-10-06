@@ -748,6 +748,41 @@ export async function startTestServer({
       : "supergroup";
   }
 
+  /**
+   * Refuse a call to a group or channel the way Telegram's Bot API server does
+   * before any method runs (Client.cpp check_chat_access): a chat the bot was
+   * never in is not found; a bot kicked from or no longer in a supergroup or
+   * channel is refused even reads; in a basic group a bot that left or was
+   * removed may still read the chat and its own status (`readOnly`), but
+   * nothing else. An upgraded basic group answers with the new chat id; only
+   * getChat and leaveChat get past that (`readsUpgraded`).
+   */
+  function checkChatAccess(chat, caller, { readOnly, readsUpgraded }) {
+    if (!chat.members.has(caller.id)) {
+      throw new TelegramError(400, "Bad Request: chat not found");
+    }
+    if (chat.migratedTo != null && !readsUpgraded) {
+      throw new TelegramError(
+        400,
+        "Bad Request: group chat was upgraded to a supergroup chat",
+        { migrate_to_chat_id: chat.migratedTo },
+      );
+    }
+    if (chat.type === "group" && readOnly) return;
+    if (memberStatus(chat, caller.id).status === "kicked") {
+      throw new TelegramError(
+        403,
+        `Forbidden: bot was kicked from the ${chatKind(chat)} chat`,
+      );
+    }
+    if (!isInChat(chat, caller.id)) {
+      throw new TelegramError(
+        403,
+        `Forbidden: bot is not a member of the ${chatKind(chat)} chat`,
+      );
+    }
+  }
+
   /** Refuse a bot's send the way Telegram does when it may not post there. */
   function requireCanSend(chat, caller) {
     // A private chat here is with the first bot: users write only to it, and
@@ -764,18 +799,6 @@ export async function startTestServer({
       return;
     }
     const member = memberStatus(chat, caller.id);
-    if (member.status === "kicked") {
-      throw new TelegramError(
-        403,
-        `Forbidden: bot was kicked from the ${chatKind(chat)} chat`,
-      );
-    }
-    if (!isInChat(chat, caller.id)) {
-      throw new TelegramError(
-        403,
-        `Forbidden: bot is not a member of the ${chatKind(chat)} chat`,
-      );
-    }
     if (
       chat.type === "channel" &&
       !hasRight(chat, caller.id, "can_post_messages")
@@ -807,12 +830,6 @@ export async function startTestServer({
   /** A group pins with can_pin_messages, a channel with can_edit_messages. */
   function requirePinRights(chat, caller) {
     if (chat.type === "private") return;
-    if (!isInChat(chat, caller.id)) {
-      throw new TelegramError(
-        403,
-        `Forbidden: bot is not a member of the ${chatKind(chat)} chat`,
-      );
-    }
     const right =
       chat.type === "channel" ? "can_edit_messages" : "can_pin_messages";
     if (!hasRight(chat, caller.id, right)) {
@@ -861,12 +878,6 @@ export async function startTestServer({
       throw new TelegramError(400, "Bad Request: message can't be deleted");
     }
     if (chat.type === "private") return;
-    if (!isInChat(chat, caller.id)) {
-      throw new TelegramError(
-        403,
-        `Forbidden: bot is not a member of the ${chatKind(chat)} chat`,
-      );
-    }
     const own = Number(entry.message.from?.id) === caller.id;
     const allowed =
       hasRight(chat, caller.id, "can_delete_messages") ||
@@ -1131,8 +1142,7 @@ export async function startTestServer({
     const before = memberStatus(chat, record.id);
     const wasIn = isInChat(chat, record.id);
     const botsBefore = botsIn(chat);
-    if (status === "left") chat.members.delete(record.id);
-    else chat.members.set(record.id, { status, ...(rights ? { rights } : {}) });
+    chat.members.set(record.id, { status, ...(rights ? { rights } : {}) });
     const after = chatMemberObject(chat, record.id);
     appliedCheckpoint();
     await emitMemberChange(chat, record.id, before, actor);
@@ -1971,6 +1981,10 @@ export async function startTestServer({
     },
     leaveChat: async (p, caller) => {
       const chat = requireChat(p.chat_id);
+      // TDLib refuses to leave a basic group that was upgraded.
+      if (chat.migratedTo != null) {
+        throw new TelegramError(400, "Bad Request: chat is deactivated");
+      }
       if (isInChat(chat, caller.id)) {
         await setBotMembership(chat, caller, { status: "left", actor: caller });
       }
@@ -2528,6 +2542,14 @@ export async function startTestServer({
     },
   };
 
+  // Methods that only read the chat they name (Client.cpp AccessRights::Read),
+  // besides getChatMember about the bot itself.
+  const READ_ONLY_METHODS = new Set([
+    "getchat",
+    "leavechat",
+    "setmessagereaction",
+  ]);
+
   const methodsByLowerName = new Map(
     Object.entries(methods).map(([name, handler]) => [
       name.toLowerCase(),
@@ -2916,6 +2938,9 @@ export async function startTestServer({
   /** The message a forward or copy reads, when the bot can see it. */
   function forwardable(p, caller) {
     const sourceChat = botChat(p.from_chat_id);
+    if (sourceChat.type !== "private") {
+      checkChatAccess(sourceChat, caller, { readOnly: true });
+    }
     const entry = sourceChat.messages.get(Number(p.message_id));
     if (
       !entry ||
@@ -4825,33 +4850,48 @@ ${buttons}
         });
         return;
       }
-      // A basic group upgraded to a supergroup answers every call with the new
-      // id in ResponseParameters.migrate_to_chat_id.
+      // Bot API method names are case-insensitive.
+      const lowerMethod = method.toLowerCase();
+      const handler = methodsByLowerName.get(lowerMethod);
+      // The chat a method names must be one the bot may use, as Telegram's
+      // server checks first; an upgraded basic group answers with the new id
+      // in ResponseParameters.migrate_to_chat_id.
       // https://core.telegram.org/bots/api#responseparameters
       const addressed = chats.get(Number(params.chat_id));
-      if (addressed?.migratedTo != null) {
-        recordCall(
-          {
-            applied: false,
-            outcome: "rejected",
-            status: 400,
-            completed_at: clock.now(),
-            method,
-            bot_id: caller.id,
-            params: summarize(params),
-            at: receivedAt,
-            failed: 400,
-          },
-          response,
-        );
-        send(response, 400, {
-          ok: false,
-          error_code: 400,
-          description:
-            "Bad Request: group chat was upgraded to a supergroup chat",
-          parameters: { migrate_to_chat_id: addressed.migratedTo },
-        });
-        return;
+      if (addressed && handler) {
+        try {
+          checkChatAccess(addressed, caller, {
+            readOnly:
+              READ_ONLY_METHODS.has(lowerMethod) ||
+              (lowerMethod === "getchatmember" &&
+                Number(params.user_id) === caller.id),
+            readsUpgraded:
+              lowerMethod === "getchat" || lowerMethod === "leavechat",
+          });
+        } catch (error) {
+          if (!(error instanceof TelegramError)) throw error;
+          recordCall(
+            {
+              applied: false,
+              outcome: "rejected",
+              status: error.code,
+              completed_at: clock.now(),
+              method,
+              bot_id: caller.id,
+              params: summarize(params),
+              at: receivedAt,
+              failed: error.code,
+            },
+            response,
+          );
+          send(response, error.code, {
+            ok: false,
+            error_code: error.code,
+            description: error.message,
+            ...(error.parameters ? { parameters: error.parameters } : {}),
+          });
+          return;
+        }
       }
       const faultTrace = {};
       const failure = takeFailure(method, caller, params, faultTrace);
@@ -4892,8 +4932,6 @@ ${buttons}
         });
         return;
       }
-      // Bot API method names are case-insensitive.
-      const handler = methodsByLowerName.get(method.toLowerCase());
       if (!handler) {
         Object.assign(receipt, {
           outcome: unimplementedMode === "ok" ? "unimplemented_ok" : "rejected",

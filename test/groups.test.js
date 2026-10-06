@@ -285,6 +285,28 @@ describe("basic groups and the upgrade to a supergroup", () => {
     ).toBe(true);
     expect(hook.ofType("my_chat_member")).toHaveLength(1);
   });
+
+  it("still reads the old id with getChat, and refuses leaveChat there as deactivated", async () => {
+    const { fake, api, me } = await setup();
+    const group = await fake.createChat({ type: "group", ownerId: OWNER });
+    await fake.setBotMembership(group, me.id, { status: "administrator" });
+    const supergroup = await fake.migrateToSupergroup(group, { by: OWNER });
+
+    expect((await api("getChat", { chat_id: group })).result).toMatchObject({
+      id: group,
+      type: "group",
+    });
+    expect(await api("leaveChat", { chat_id: group })).toMatchObject({
+      status: 400,
+      description: "Bad Request: chat is deactivated",
+    });
+    expect(
+      await api("getChatMember", { chat_id: group, user_id: OWNER }),
+    ).toMatchObject({
+      status: 400,
+      parameters: { migrate_to_chat_id: supergroup },
+    });
+  });
 });
 
 describe("people changing the chat", () => {

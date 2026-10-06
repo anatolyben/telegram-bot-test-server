@@ -215,10 +215,17 @@ The details a moderation bot depends on, each covered by a test:
   that promoted that administrator, and `getChatAdministrators` leaves out other bots unless
   `return_bots` is set. Only the bot that sent a message hears its buttons pressed.
   Users write privately only to the first bot, so no other bot can message them (403).
+- **Which chats a bot may use.** Checked before any method runs, as Telegram's Bot API server
+  does. A chat the bot was never in is `400 Bad Request: chat not found`. A bot kicked from a
+  supergroup or channel gets `403 Forbidden: bot was kicked from the supergroup chat` (or
+  `channel chat`) for every call, reads like `getChat` included, and one that left or was removed
+  gets `403 Forbidden: bot is not a member of the supergroup chat`. In a basic group, a bot that
+  left or was removed can still call `getChat`, `leaveChat` and `getChatMember` about itself; every
+  other call gets the `group chat` form of the same errors.
 - **Polls.** `sendPoll` needs a question and 2 to 12 options and keeps `is_anonymous`,
   `allows_multiple_answers`, `description` and an attached photo; `stopPoll` closes a poll once.
 - **Forwards and copies.** A forward carries `forward_origin`; a copy does not. A bot cannot forward
-  from a chat it is not in.
+  from a chat it is not in; the source chat gets the same checks as above.
 - **Pins.** Pinned messages are kept, newest first, and `getChat` returns the latest as
   `pinned_message`.
 - **What members send.** Besides text and photos, members post videos, animations (which carry a
@@ -265,10 +272,15 @@ The details a moderation bot depends on, each covered by a test:
 - **Basic groups and the upgrade** ([migration](https://core.telegram.org/api/channel#migration)).
   A basic group has a negative id without the `-100` prefix. The creator or an administrator can
   upgrade it: a new supergroup takes its members, administrators and bots, the old chat posts
-  `migrate_to_chat_id` and the new one `migrate_from_chat_id`, and every later Bot API call to the
-  old id fails with `400 Bad Request: group chat was upgraded to a supergroup chat` and
-  `parameters.migrate_to_chat_id` ([ResponseParameters](https://core.telegram.org/bots/api#responseparameters)).
-  Unverified: whether bots also get `my_chat_member` on the upgrade; this server sends none.
+  `migrate_to_chat_id` and the new one `migrate_from_chat_id`. Later Bot API calls to the old id
+  fail with `400 Bad Request: group chat was upgraded to a supergroup chat` and
+  `parameters.migrate_to_chat_id` ([ResponseParameters](https://core.telegram.org/bots/api#responseparameters)),
+  except two: `getChat` still returns the old group, and `leaveChat` fails with
+  `400 Bad Request: chat is deactivated`. Unverified: Telegram's server raises the upgrade error
+  only for calls that write or read the member list, and what its other reads of the old id
+  (`getChatMember` about the bot itself, `setMessageReaction`, edits) answer is not documented, so
+  this server keeps the upgrade error for them. Also unverified: whether bots get
+  `my_chat_member` on the upgrade; this server sends none.
 - **People changing the chat.** A person with `can_change_info` renames the chat or sets its photo,
   with the same `new_chat_title` and `new_chat_photo` service messages as `setChatTitle` and
   `setChatPhoto`; `getChat` returns the title and a `ChatPhoto`, and `getFile` serves the photo.
@@ -777,8 +789,9 @@ Existing `calls` retains its authenticated, parsed-request scope. New
 `afterSeq` is local to each journal; `requestId` is unique across both. A call
 wait without an outcome/stage can resolve at receipt, before execution.
 Unauthorized URL tokens are not journaled; malformed bodies
-are retained as `raw_body` and suppressed in diagnostics. Migrated-chat failures
-receive the same identity/timeline as other parsed calls. Owner RPCs retain their
+are retained as `raw_body` and suppressed in diagnostics. Calls refused for chat
+access (including an upgraded basic group) receive the same identity/timeline as
+other parsed calls. Owner RPCs retain their
 existing owner ledger and duration fields. Owner receipts now use fake time,
 start as `pending`, and become `cancelled` if shutdown interrupts a delay before
 execution. `getOwnerCalls()` is detached too. These are diagnostic outcomes of

@@ -73,8 +73,8 @@ describe("more than one bot", () => {
       SECOND_TOKEN,
     );
     expect(refused).toMatchObject({
-      status: 403,
-      description: "Forbidden: bot is not a member of the supergroup chat",
+      status: 400,
+      description: "Bad Request: chat not found",
     });
 
     await fake.setBotMembership(GROUP, second.id, { status: "administrator" });
@@ -310,7 +310,7 @@ describe("polls, forwards and media", () => {
     });
     expect(forward).toMatchObject({
       status: 400,
-      description: "Bad Request: message to forward not found",
+      description: "Bad Request: chat not found",
     });
   });
 
@@ -771,6 +771,104 @@ describe("bot membership", () => {
     expect(await admins({ return_bots: true })).toEqual(
       [OWNER, me.id, second.id].sort(),
     );
+  });
+
+  it("refuses a bot kicked from or no longer in a supergroup or channel, even for reads", async () => {
+    const { fake, api, second } = await setup();
+    const ann = await fake.createUser();
+    await fake.join(GROUP, ann);
+    const calls = [
+      ["getChat", {}],
+      ["getChatMember", { user_id: ann }],
+      ["getChatMember", { user_id: second.id }],
+      ["getChatAdministrators", {}],
+      ["getChatMemberCount", {}],
+      ["leaveChat", {}],
+      ["banChatMember", { user_id: ann }],
+    ];
+    const answers = async (chat) =>
+      Promise.all(
+        calls.map(async ([method, params]) => {
+          const answer = await api(
+            method,
+            { chat_id: chat, ...params },
+            SECOND_TOKEN,
+          );
+          return [answer.status, answer.description];
+        }),
+      );
+
+    await fake.setBotMembership(GROUP, second.id, { status: "kicked" });
+    expect(new Set((await answers(GROUP)).map(JSON.stringify))).toEqual(
+      new Set([
+        JSON.stringify([
+          403,
+          "Forbidden: bot was kicked from the supergroup chat",
+        ]),
+      ]),
+    );
+    await fake.setBotMembership(GROUP, second.id, { status: "left" });
+    expect(new Set((await answers(GROUP)).map(JSON.stringify))).toEqual(
+      new Set([
+        JSON.stringify([
+          403,
+          "Forbidden: bot is not a member of the supergroup chat",
+        ]),
+      ]),
+    );
+    const channel = await fake.createChat({ type: "channel", ownerId: OWNER });
+    await fake.setBotMembership(channel, second.id, { status: "kicked" });
+    expect(
+      await api("getChat", { chat_id: channel }, SECOND_TOKEN),
+    ).toMatchObject({
+      status: 403,
+      description: "Forbidden: bot was kicked from the channel chat",
+    });
+  });
+
+  it("lets a bot removed from a basic group read the chat and its own status, but nothing else", async () => {
+    const { fake, api, second } = await setup();
+    const group = await fake.createChat({ type: "group", ownerId: OWNER });
+    await fake.setBotMembership(group, second.id, { status: "member" });
+    const call = (method, params = {}) =>
+      api(method, { chat_id: group, ...params }, SECOND_TOKEN);
+
+    await fake.setBotMembership(group, second.id, { status: "left" });
+    expect((await call("getChat")).result).toMatchObject({ type: "group" });
+    expect(
+      (await call("getChatMember", { user_id: second.id })).result.status,
+    ).toBe("left");
+    for (const [method, params] of [
+      ["getChatMemberCount", {}],
+      ["getChatMember", { user_id: OWNER }],
+      ["sendMessage", { text: "hi" }],
+    ]) {
+      expect(await call(method, params)).toMatchObject({
+        status: 403,
+        description: "Forbidden: bot is not a member of the group chat",
+      });
+    }
+    await fake.setBotMembership(group, second.id, { status: "kicked" });
+    expect(
+      (await call("getChatMember", { user_id: second.id })).result.status,
+    ).toBe("kicked");
+    expect(await call("getChatAdministrators")).toMatchObject({
+      status: 403,
+      description: "Forbidden: bot was kicked from the group chat",
+    });
+  });
+
+  it("answers chat not found for a chat the bot was never in", async () => {
+    const { fake, api } = await setup();
+    const hidden = await fake.createChat({ ownerId: OWNER });
+    for (const method of ["getChat", "getChatMemberCount", "sendMessage"]) {
+      expect(
+        await api(method, { chat_id: hidden, text: "hi" }, SECOND_TOKEN),
+      ).toMatchObject({
+        status: 400,
+        description: "Bad Request: chat not found",
+      });
+    }
   });
 
   it("says can_be_edited only to the bot that promoted the administrator", async () => {
