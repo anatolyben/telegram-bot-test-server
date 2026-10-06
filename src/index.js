@@ -2103,6 +2103,8 @@ export async function startTestServer({
       requireUser(userId);
       assertCanModerate(chat, userId, { caller });
       const before = memberStatus(chat, userId);
+      const wasIn = isInChat(chat, userId);
+      const botsBefore = botsIn(chat);
       chat.members.set(userId, {
         status: "kicked",
         until_date: ["supergroup", "channel"].includes(chat.type)
@@ -2112,6 +2114,17 @@ export async function startTestServer({
       // revoke_messages decides what the removed user can still see; a ban
       // deletes nothing for the chat's other members (only deleteMessage does).
       memberChanged(chat, userId, before, caller);
+      // A basic group removes the member with messages.deleteChatUser, which
+      // "sends a service message on it"; a removed bot hears of it too.
+      if (chat.type === "group" && wasIn) {
+        emit(
+          "message",
+          addMessage(chat, caller, {
+            left_chat_member: userObject(requireUser(userId)),
+          }),
+          { to: [...new Set([...botsBefore, ...botsIn(chat)])] },
+        );
+      }
       return true;
     },
     unbanChatMember: (p, caller) => {

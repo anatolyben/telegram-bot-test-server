@@ -491,7 +491,10 @@ field named like a session, token, hash, key, secret, password or phone is recor
 - When the bot restricts, bans, unbans or approves a member, the server sends the resulting
   `chat_member` update back to the bot, as Telegram does. Nothing is sent when nothing changed.
 - Joining, leaving and an approved join request produce both a `chat_member` update and the
-  `new_chat_members` / `left_chat_member` service message.
+  `new_chat_members` / `left_chat_member` service message. A ban in a basic group also posts
+  `left_chat_member` from the bot that banned, which that bot receives too, as
+  [messages.deleteChatUser](https://core.telegram.org/method/messages.deleteChatUser) "sends a
+  service message". Unverified: whether a supergroup ban posts one; this server posts none.
 
 The fake delivers resulting updates asynchronously. Tests should wait for the exact update
 rather than depend on response/update ordering; the Bot API does not promise that ordering.
