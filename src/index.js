@@ -777,7 +777,15 @@ export async function startTestServer({
     });
   }
 
+  /** Client::check_chat's first check: chat_id must be given. */
+  function requireChatId(chatId) {
+    if (chatId == null || chatId === "") {
+      throw new TelegramError(400, "Bad Request: chat_id is empty");
+    }
+  }
+
   function requireChat(chatId) {
+    requireChatId(chatId);
     const chat = chats.get(Number(chatId));
     if (!chat) throw new TelegramError(400, "Bad Request: chat not found");
     return chat;
@@ -808,6 +816,7 @@ export async function startTestServer({
    * can only write to users who have messaged it first, as on Telegram.
    */
   function botChat(chatId) {
+    requireChatId(chatId);
     const id = Number(chatId);
     if (chats.has(id)) return chats.get(id);
     if (privateChats.has(id)) return privateChats.get(id);
@@ -819,6 +828,18 @@ export async function startTestServer({
       );
     }
     throw new TelegramError(400, "Bad Request: chat not found");
+  }
+
+  /**
+   * user_id as Client::get_user_id reads it: the integer its leading digits
+   * spell, which must be positive.
+   */
+  function userIdParam(value) {
+    const id = parseInt(String(value ?? ""), 10);
+    if (!(id > 0)) {
+      throw new TelegramError(400, "Bad Request: invalid user_id specified");
+    }
+    return id;
   }
 
   function requireUser(userId) {
@@ -1750,6 +1771,7 @@ export async function startTestServer({
       return true;
     },
     getChat: (p) => {
+      requireChatId(p.chat_id);
       if (String(p.chat_id).startsWith("@")) {
         const entry = publicByUsername.get(
           String(p.chat_id).slice(1).toLowerCase(),
@@ -1829,7 +1851,10 @@ export async function startTestServer({
         accepted_gift_types: { ...NO_GIFTS },
       };
     },
-    getChatMember: (p) => chatMemberObject(requireChat(p.chat_id), p.user_id),
+    getChatMember: (p) => {
+      const userId = userIdParam(p.user_id);
+      return chatMemberObject(requireChat(p.chat_id), userId);
+    },
     getChatAdministrators: (p) => {
       const chat = requireChat(p.chat_id);
       return [...chat.members.entries()]
@@ -1841,7 +1866,7 @@ export async function startTestServer({
       return [...chat.members.keys()].filter((id) => isInChat(chat, id)).length;
     },
     getUserProfilePhotos: (p) => {
-      const user = requireUser(p.user_id);
+      const user = requireUser(userIdParam(p.user_id));
       const offset = Math.max(0, numberParam(p.offset, 0));
       const limit = Math.min(100, Math.max(1, numberParam(p.limit, 100)));
       const photos = (user.photos ?? []).slice(offset, offset + limit);
@@ -2191,6 +2216,7 @@ export async function startTestServer({
       return true;
     },
     restrictChatMember: (p, caller) => {
+      const userId = userIdParam(p.user_id);
       const chat = requireChat(p.chat_id);
       if (chat.type !== "supergroup") {
         throw new TelegramError(
@@ -2198,7 +2224,6 @@ export async function startTestServer({
           "Bad Request: restrictChatMember requires a supergroup",
         );
       }
-      const userId = Number(p.user_id);
       requireUser(userId);
       assertCanModerate(chat, userId, { self: "can't restrict self", caller });
       const before = chatMemberObject(chat, userId);
@@ -2225,8 +2250,8 @@ export async function startTestServer({
       return true;
     },
     banChatMember: (p, caller) => {
+      const userId = userIdParam(p.user_id);
       const chat = requireChat(p.chat_id);
-      const userId = Number(p.user_id);
       requireUser(userId);
       assertCanModerate(chat, userId, { caller });
       const before = chatMemberObject(chat, userId);
@@ -2248,9 +2273,9 @@ export async function startTestServer({
       return true;
     },
     unbanChatMember: (p, caller) => {
+      const userId = userIdParam(p.user_id);
       const chat = requireChat(p.chat_id);
       requireRight(chat, caller, "can_restrict_members");
-      const userId = Number(p.user_id);
       requireUser(userId);
       const current = memberStatus(chat, userId);
       const before = chatMemberObject(chat, userId);
@@ -2272,9 +2297,9 @@ export async function startTestServer({
       return true;
     },
     approveChatJoinRequest: (p, caller) => {
+      const userId = userIdParam(p.user_id);
       const chat = requireChat(p.chat_id);
       requireRight(chat, caller, "can_invite_users");
-      const userId = Number(p.user_id);
       if (!chat.joinRequests.has(userId)) {
         throw new TelegramError(400, "Bad Request: HIDE_REQUESTER_MISSING");
       }
@@ -2301,9 +2326,9 @@ export async function startTestServer({
       return true;
     },
     declineChatJoinRequest: (p, caller) => {
+      const userId = userIdParam(p.user_id);
       const chat = requireChat(p.chat_id);
       requireRight(chat, caller, "can_invite_users");
-      const userId = Number(p.user_id);
       if (!chat.joinRequests.delete(userId)) {
         throw new TelegramError(400, "Bad Request: HIDE_REQUESTER_MISSING");
       }
@@ -2345,26 +2370,35 @@ export async function startTestServer({
     sendAudio: (p, caller) => sendMedia(p, caller, "audio"),
     sendVideoNote: (p, caller) => sendMedia(p, caller, "video_note"),
     sendLocation: (p, caller) =>
-      sendFrom(p, caller, { location: coordinates(p) }),
+      sendFrom(p, caller, {
+        location: coordinates(p, "Bad Request: invalid location specified"),
+      }),
     sendVenue: (p, caller) => {
+      const location = coordinates(
+        p,
+        "Bad Request: wrong venue location specified",
+      );
+      // UNVERIFIED: Telegram's Bot API and TDLib do not check these; the
+      // answer for an empty title or address is not documented.
       if (!p.title || !p.address) {
         throw new TelegramError(
           400,
           "Bad Request: venue needs title and address",
         );
       }
-      const location = coordinates(p);
       return sendFrom(p, caller, {
         venue: { location, title: String(p.title), address: String(p.address) },
         location,
       });
     },
     sendContact: (p, caller) => {
-      if (!p.phone_number || !p.first_name) {
-        throw new TelegramError(
-          400,
-          "Bad Request: contact needs phone_number and first_name",
-        );
+      for (const field of ["phone_number", "first_name"]) {
+        if (p[field] === undefined || p[field] === "") {
+          throw new TelegramError(
+            400,
+            `Bad Request: parameter "${field}" is required`,
+          );
+        }
       }
       return sendFrom(p, caller, {
         contact: {
@@ -2467,8 +2501,8 @@ export async function startTestServer({
       });
     },
     promoteChatMember: async (p, caller) => {
+      const userId = userIdParam(p.user_id);
       const chat = requireChat(p.chat_id);
-      const userId = Number(p.user_id);
       requireUser(userId);
       if (!hasRight(chat, caller.id, "can_promote_members")) {
         throw new TelegramError(400, "Bad Request: not enough rights");
@@ -2514,8 +2548,8 @@ export async function startTestServer({
       return true;
     },
     setChatAdministratorCustomTitle: async (p, caller) => {
+      const userId = userIdParam(p.user_id);
       const chat = requireChat(p.chat_id);
-      const userId = Number(p.user_id);
       const member = memberStatus(chat, userId);
       if (
         member.status !== "administrator" ||
@@ -2675,7 +2709,7 @@ export async function startTestServer({
       if (!entry || entry.deleted) {
         throw new TelegramError(400, "Bad Request: MESSAGE_ID_INVALID");
       }
-      const user = requireUser(p.user_id);
+      const user = requireUser(userIdParam(p.user_id));
       if (entry.reactions?.has(user.id)) {
         await changeReaction(chat, entry, user, []);
       }
@@ -2944,7 +2978,16 @@ export async function startTestServer({
     });
   }
 
-  function coordinates(p) {
+  /**
+   * latitude and longitude as Client::get_location reads them; TDLib refuses
+   * a point off the map with `invalid` (Location.cpp, Venue.cpp).
+   */
+  function coordinates(p, invalid) {
+    for (const field of ["latitude", "longitude"]) {
+      if (String(p[field] ?? "").trim() === "") {
+        throw new TelegramError(400, `Bad Request: ${field} is empty`);
+      }
+    }
     const latitude = Number(p.latitude);
     const longitude = Number(p.longitude);
     if (
@@ -2953,7 +2996,7 @@ export async function startTestServer({
       Math.abs(latitude) > 90 ||
       Math.abs(longitude) > 180
     ) {
-      throw new TelegramError(400, "Bad Request: wrong latitude or longitude");
+      throw new TelegramError(400, invalid);
     }
     return { latitude, longitude };
   }

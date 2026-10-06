@@ -296,6 +296,73 @@ describe("bad input", () => {
     }
   });
 
+  it("answers missing or invalid required parameters with Telegram's texts", async () => {
+    const { server, api } = await setup();
+    const ann = await server.createUser();
+    await server.join(GROUP, ann);
+    const venue = { title: "Office", address: "1 Main St" };
+
+    for (const [method, params, description] of [
+      ["sendMessage", { text: "hi" }, "Bad Request: chat_id is empty"],
+      ["getChat", {}, "Bad Request: chat_id is empty"],
+      [
+        "restrictChatMember",
+        { chat_id: GROUP, permissions: {} },
+        "Bad Request: invalid user_id specified",
+      ],
+      [
+        "banChatMember",
+        { user_id: "abc" },
+        "Bad Request: invalid user_id specified",
+      ],
+      [
+        "getChatMember",
+        { chat_id: GROUP, user_id: -5 },
+        "Bad Request: invalid user_id specified",
+      ],
+      [
+        "sendContact",
+        { chat_id: GROUP, first_name: "Ann" },
+        'Bad Request: parameter "phone_number" is required',
+      ],
+      [
+        "sendContact",
+        { chat_id: GROUP, phone_number: "+15550100" },
+        'Bad Request: parameter "first_name" is required',
+      ],
+      ["sendLocation", { chat_id: GROUP }, "Bad Request: latitude is empty"],
+      [
+        "sendLocation",
+        { chat_id: GROUP, latitude: 1 },
+        "Bad Request: longitude is empty",
+      ],
+      [
+        "sendLocation",
+        { chat_id: GROUP, latitude: 100, longitude: 0 },
+        "Bad Request: invalid location specified",
+      ],
+      [
+        "sendVenue",
+        { chat_id: GROUP, ...venue },
+        "Bad Request: latitude is empty",
+      ],
+      [
+        "sendVenue",
+        { chat_id: GROUP, latitude: 100, longitude: 0, ...venue },
+        "Bad Request: wrong venue location specified",
+      ],
+    ]) {
+      expect(await api(method, params)).toMatchObject({
+        error_code: 400,
+        description,
+      });
+    }
+    // user_id is read as Telegram reads an integer: its leading digits.
+    expect(
+      await api("getChatMember", { chat_id: GROUP, user_id: `${ann}abc` }),
+    ).toMatchObject({ ok: true, result: { user: { id: ann } } });
+  });
+
   it("answers an unexpected failure with Telegram's bare 500 and logs the cause", async () => {
     const lines = [];
     const { api } = await setup({
