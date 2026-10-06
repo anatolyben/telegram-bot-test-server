@@ -660,6 +660,10 @@ export interface TelegramBotTestServer {
    * first bot's; every other bot gets its own for the same file.
    */
   getMessages(chatId: number): Promise<Message[]>;
+  /**
+   * A regular message by its message_id; an ephemeral one (message_id 0) is
+   * found with getEphemeralMessage.
+   */
   getMessage(
     chatId: number,
     messageId: number,

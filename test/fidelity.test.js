@@ -890,6 +890,137 @@ describe("ephemeral messages", () => {
     expect(message).not.toHaveProperty("photo");
   });
 
+  it("puts an ephemeral text or caption edit in a text message's text and a media message's caption", async () => {
+    const { server, api, member } = await setup();
+    const ann = await member();
+    const send = async (method, fields) =>
+      (
+        await api(method, {
+          chat_id: GROUP,
+          ...fields,
+          ephemeral_message_parameters: { receiver_user_id: ann },
+        })
+      ).result.ephemeral_message_id;
+    const photo = await send("sendPhoto", {
+      photo: "https://example.com/a.jpg",
+      caption: "cap",
+    });
+    const text = await send("sendMessage", { text: "hello" });
+    const edit = (method, id, fields) =>
+      api(method, {
+        chat_id: GROUP,
+        receiver_user_id: ann,
+        ephemeral_message_id: id,
+        ...fields,
+      });
+
+    expect(
+      await edit("editEphemeralMessageText", photo, {
+        text: "<b>new</b>",
+        parse_mode: "HTML",
+      }),
+    ).toMatchObject({ ok: true });
+    const captioned = (await server.getEphemeralMessage(GROUP, photo)).message;
+    expect(captioned).toMatchObject({
+      photo: expect.any(Array),
+      caption: "new",
+      caption_entities: [{ type: "bold", offset: 0, length: 3 }],
+    });
+    expect(captioned).not.toHaveProperty("text");
+    // As a caption, the text may have 1024 characters.
+    expect(
+      await edit("editEphemeralMessageText", photo, { text: "x".repeat(1025) }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: MEDIA_CAPTION_TOO_LONG",
+    });
+    expect(
+      await edit("editEphemeralMessageCaption", text, { caption: "changed" }),
+    ).toMatchObject({ ok: true });
+    const changed = (await server.getEphemeralMessage(GROUP, text)).message;
+    expect(changed).toMatchObject({ text: "changed" });
+    expect(changed).not.toHaveProperty("caption");
+    // Telegram has no empty text, and no caption on a sticker.
+    const sticker = await send("sendSticker", {
+      sticker: "https://example.com/s.webp",
+    });
+    await edit("editEphemeralMessageCaption", text, { caption: "" });
+    await edit("editEphemeralMessageCaption", sticker, { caption: "cap" });
+    expect(
+      (await server.getEphemeralMessage(GROUP, text)).message,
+    ).toMatchObject({ text: "changed" });
+    expect(
+      (await server.getEphemeralMessage(GROUP, sticker)).message,
+    ).not.toHaveProperty("caption");
+  });
+
+  it("refuses to send a poll, a dice or a live location as an ephemeral message", async () => {
+    const { api, member } = await setup();
+    const ann = await member();
+    const send = (method, fields) =>
+      api(method, {
+        chat_id: GROUP,
+        ...fields,
+        ephemeral_message_parameters: { receiver_user_id: ann },
+      });
+    const place = { latitude: 1, longitude: 2 };
+
+    for (const [method, fields] of [
+      [
+        "sendPoll",
+        { question: "Ready?", options: [{ text: "Yes" }, { text: "No" }] },
+      ],
+      ["sendDice", {}],
+      ["sendLocation", { ...place, live_period: 60 }],
+    ]) {
+      expect(await send(method, fields)).toMatchObject({
+        status: 400,
+        description: "Bad Request: unallowed message content specified",
+      });
+    }
+    expect(await send("sendLocation", place)).toMatchObject({
+      ok: true,
+      result: { message_id: 0 },
+    });
+  });
+
+  it("checks an ephemeral send's reply and content before whether the bot may send it", async () => {
+    const { server, api, member } = await setup();
+    const ann = await member();
+    const stranger = await server.createUser();
+    const send = (method, receiver, fields) =>
+      api(method, {
+        chat_id: GROUP,
+        ...fields,
+        ephemeral_message_parameters: { receiver_user_id: receiver },
+      });
+    const missingReply = {
+      text: "psst",
+      reply_parameters: { message_id: 999999 },
+    };
+    const notFound = {
+      status: 400,
+      description: "Bad Request: message to be replied not found",
+    };
+
+    expect(await send("sendMessage", stranger, missingReply)).toMatchObject(
+      notFound,
+    );
+    expect(
+      await send("sendPoll", stranger, {
+        question: "Ready?",
+        options: [{ text: "Yes" }, { text: "No" }],
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: unallowed message content specified",
+    });
+    await server.setBotMembership(GROUP, BOT, { status: "member" });
+    expect(await send("sendMessage", ann, missingReply)).toMatchObject(
+      notFound,
+    );
+  });
+
   it("checks the inline keyboard of an ephemeral edit as the request is read, and its callback_data", async () => {
     const { api, member } = await setup();
     const ann = await member();
@@ -912,11 +1043,22 @@ describe("ephemeral messages", () => {
       status: 400,
       description: "Bad Request: BUTTON_DATA_INVALID",
     });
-    // A text button is refused before the message is looked up.
+    // A text button is refused before the message is looked up, but after
+    // receiver_user_id is read.
     expect(await edit(id + 1, {})).toMatchObject({
       status: 400,
       description:
         "Bad Request: can't parse InlineKeyboardButton: Text buttons are not allowed in the inline keyboard",
+    });
+    expect(
+      await api("editEphemeralMessageReplyMarkup", {
+        chat_id: GROUP,
+        ephemeral_message_id: id,
+        reply_markup: { inline_keyboard: [[{ text: "Go" }]] },
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: invalid receiver_user_id specified",
     });
   });
 

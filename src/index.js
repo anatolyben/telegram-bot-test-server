@@ -1294,13 +1294,13 @@ export async function startTestServer({
   }
 
   /**
-   * user_id as Client::get_user_id reads it: the integer its leading digits
-   * spell, which must be positive.
+   * user_id, or another user id parameter, as Client::get_user_id reads it:
+   * the integer its leading digits spell, which must be positive.
    */
-  function userIdParam(value) {
+  function userIdParam(value, field = "user_id") {
     const id = parseInt(String(value ?? ""), 10);
     if (!(id > 0)) {
-      throw new TelegramError(400, "Bad Request: invalid user_id specified");
+      throw new TelegramError(400, `Bad Request: invalid ${field} specified`);
     }
     return id;
   }
@@ -3256,15 +3256,30 @@ export async function startTestServer({
     // Ephemeral messages are edited and deleted by the bot that sent them,
     // through their own methods, which return True.
     editEphemeralMessageText: (p, caller) =>
-      editEphemeralMessage(p, caller, textEdit(p)),
+      editEphemeralMessage(
+        p,
+        caller,
+        ephemeralTextEdit(textFields(p, "Bad Request: MESSAGE_TOO_LONG")),
+      ),
     editEphemeralMessageReplyMarkup: (p, caller) =>
       editEphemeralMessage(p, caller, () => {}),
-    editEphemeralMessageCaption: (p, caller) =>
-      editEphemeralMessage(p, caller, captionEdit(p)),
+    editEphemeralMessageCaption: (p, caller) => {
+      const formatted = captionFields(p, "Bad Request: MEDIA_CAPTION_TOO_LONG");
+      return editEphemeralMessage(
+        p,
+        caller,
+        ephemeralTextEdit({
+          text: formatted.caption,
+          entities: formatted.caption_entities,
+        }),
+      );
+    },
     editEphemeralMessageMedia: (p, caller) =>
       editEphemeralMessage(p, caller, mediaEdit(p, caller)),
     deleteEphemeralMessage: (p, caller) => {
-      ownEphemeralMessage(p, caller, { readOnly: true }).deleted = true;
+      const receiverId = userIdParam(p.receiver_user_id, "receiver_user_id");
+      ownEphemeralMessage(p, caller, receiverId, { readOnly: true }).deleted =
+        true;
       appliedCheckpoint();
       waits.notify();
       return true;
@@ -4339,14 +4354,16 @@ export async function startTestServer({
     const chat = botChat(p.chat_id, caller, { send: true });
     requireCanSend(chat, caller);
     requireTopic(chat, p.message_thread_id);
-    const receiver =
-      ephemeral?.receiver_user_id != null
-        ? ephemeralReceiver(chat, caller, ephemeral)
-        : null;
     const reply = replyFields(chat, p, caller, parameters);
     // Content given as a function is read only now, after the chat and reply
     // checks, as TDLib reads a file or live location only when it sends.
     const body = typeof fields === "function" ? fields() : fields;
+    // Telegram's server, not the Bot API server or TDLib, decides who may
+    // get an ephemeral message, so that comes after their checks.
+    const receiver =
+      ephemeral?.receiver_user_id != null
+        ? ephemeralReceiver(chat, caller, ephemeral, body)
+        : null;
     requireButtonData(markup);
     if (counts) countSend(chat, caller);
     const content = {
@@ -4374,10 +4391,22 @@ export async function startTestServer({
    * named by callback_query_id or reply_parameters.ephemeral_message_id
    * (https://core.telegram.org/bots/api#ephemeral-messages-and-commands).
    * Members cannot send ephemeral messages here, so only a callback query from
-   * the receiver in this chat qualifies.
-   * UNVERIFIED: Telegram does not document these errors.
+   * the receiver qualifies. First, TDLib refuses content it does not send as
+   * an ephemeral message: a poll, a dice or a live location
+   * (MessagesManager::send_ephemeral_message,
+   * is_allowed_ephemeral_message_content).
+   * UNVERIFIED: Telegram does not document the errors after that one.
    */
-  function ephemeralReceiver(chat, caller, ephemeral) {
+  function ephemeralReceiver(chat, caller, ephemeral, body) {
+    if (
+      ["poll", "dice"].includes(contentType(body)) ||
+      body.location?.live_period
+    ) {
+      throw new TelegramError(
+        400,
+        "Bad Request: unallowed message content specified",
+      );
+    }
     const receiver = requireUser(ephemeral.receiver_user_id);
     if (!["group", "supergroup"].includes(chat.type)) {
       throw new TelegramError(400, "Bad Request: PEER_ID_INVALID");
@@ -4394,7 +4423,6 @@ export async function startTestServer({
     const query = recentQueries.get(String(ephemeral.callback_query_id ?? ""));
     if (
       query?.botId !== caller.id ||
-      query.chatId !== chat.id ||
       query.userId !== receiver.id ||
       clock.now() - query.at > EPHEMERAL_REPLY_MS
     ) {
@@ -4478,12 +4506,13 @@ export async function startTestServer({
    * The reply fields of a bot send. Its reply parameters answer a message in
    * this chat with reply_to_message, or, with chat_id, one in another chat the
    * bot can read with external_reply; a quote must be found in the message it
-   * answers. Else, in a forum topic, the send answers the topic's creation
-   * message.
+   * answers. A message_id of 0 or less names no message, as none does
+   * (Client.cpp check_reply_parameters). Else, in a forum topic, the send
+   * answers the topic's creation message.
    * https://core.telegram.org/bots/api#replyparameters
    */
   function replyFields(chat, p, caller, parameters) {
-    if (parameters?.message_id == null) {
+    if (parameters?.message_id == null || Number(parameters.message_id) <= 0) {
       const topic =
         p.message_thread_id && chat.topics
           ? chat.messages.get(Number(p.message_thread_id))
@@ -5364,12 +5393,14 @@ export async function startTestServer({
    * reply_markup removes the keyboard, as a regular edit does, or whether one
    * that changes nothing is refused; this server removes it and accepts the
    * edit. Its keyboard is checked as a regular edit's: read with the request,
-   * before the chat (do_edit_ephemeral_message in telegram-bot-api's
-   * Client.cpp), and its callback_data once the message is found.
+   * after receiver_user_id and before the chat (do_edit_ephemeral_message in
+   * telegram-bot-api's Client.cpp), and its callback_data once the message is
+   * found.
    */
   function editEphemeralMessage(p, caller, apply) {
+    const receiverId = userIdParam(p.receiver_user_id, "receiver_user_id");
     const markup = inlineMarkup(p.reply_markup);
-    const entry = ownEphemeralMessage(p, caller);
+    const entry = ownEphemeralMessage(p, caller, receiverId);
     requireButtonData(markup);
     entry.message = editedMessage(entry.message, markup, apply);
     appliedCheckpoint();
@@ -5388,19 +5419,13 @@ export async function startTestServer({
   }
 
   /**
-   * The ephemeral message chat_id, receiver_user_id and ephemeral_message_id
-   * name, sent by the calling bot. The Bot API server reads receiver_user_id
-   * before the chat (get_user_id in telegram-bot-api's Client.cpp).
+   * The ephemeral message chat_id, ephemeral_message_id and the receiver's id,
+   * read before the chat (get_user_id in telegram-bot-api's Client.cpp), name,
+   * sent by the calling bot.
    * UNVERIFIED: Telegram does not document the error for a message that does
    * not exist or was deleted.
    */
-  function ownEphemeralMessage(p, caller, access = {}) {
-    if (!(Number(p.receiver_user_id) > 0)) {
-      throw new TelegramError(
-        400,
-        "Bad Request: invalid receiver_user_id specified",
-      );
-    }
+  function ownEphemeralMessage(p, caller, receiverId, access = {}) {
     const entry = botChat(p.chat_id, caller, access).ephemeral?.get(
       Number(p.ephemeral_message_id),
     );
@@ -5408,7 +5433,7 @@ export async function startTestServer({
       !entry ||
       entry.deleted ||
       entry.message.from.id !== caller.id ||
-      String(entry.message.receiver_user.id) !== String(p.receiver_user_id)
+      entry.message.receiver_user.id !== receiverId
     ) {
       throw new TelegramError(400, "Bad Request: MESSAGE_ID_INVALID");
     }
@@ -5416,9 +5441,9 @@ export async function startTestServer({
   }
 
   /**
-   * The text edit of editMessageText and editEphemeralMessageText. TDLib does
-   * not check an edit's length (edit_message_text, edit_ephemeral_message);
-   * Telegram's server refuses a long one with MESSAGE_TOO_LONG.
+   * The text edit of editMessageText. TDLib does not check an edit's length
+   * (edit_message_text); Telegram's server refuses a long one with
+   * MESSAGE_TOO_LONG.
    */
   function textEdit(p) {
     const formatted = textFields(p, "Bad Request: MESSAGE_TOO_LONG");
@@ -5430,9 +5455,9 @@ export async function startTestServer({
   }
 
   /**
-   * The caption edit of editMessageCaption and editEphemeralMessageCaption. An
-   * empty caption removes it: Telegram leaves an empty one out. As with text,
-   * Telegram's server refuses a long caption edit (TDLib checks only sends).
+   * The caption edit of editMessageCaption. An empty caption removes it:
+   * Telegram leaves an empty one out. As with text, Telegram's server refuses
+   * a long caption edit (TDLib checks only sends).
    */
   function captionEdit(p) {
     const formatted = captionFields(p, "Bad Request: MEDIA_CAPTION_TOO_LONG");
@@ -5440,6 +5465,45 @@ export async function startTestServer({
       delete message.caption;
       delete message.caption_entities;
       Object.assign(message, formatted);
+    };
+  }
+
+  /**
+   * The edit of editEphemeralMessageText and editEphemeralMessageCaption. TDLib
+   * sends both as the same request with one message text
+   * (EditEphemeralMessageQuery in MessageQueryManager.cpp), so Telegram's
+   * server applies either to a text message's text or a media message's
+   * caption. UNVERIFIED: Telegram does not document which of these edits its
+   * server refuses. Here a caption longer than 1024 characters fails as a
+   * caption edit does, and an empty text leaves a text message as it was, as
+   * any text leaves content that takes no caption.
+   */
+  function ephemeralTextEdit({ text = "", entities, link_preview_options }) {
+    return (message) => {
+      const type = contentType(message);
+      if (type === "text") {
+        if (!text) return;
+        delete message.entities;
+        delete message.link_preview_options;
+        Object.assign(message, {
+          text,
+          ...(entities ? { entities } : {}),
+          ...(link_preview_options ? { link_preview_options } : {}),
+        });
+        return;
+      }
+      if (!CAPTIONED_CONTENT.includes(type)) return;
+      if ([...text].length > 1024) {
+        throw new TelegramError(400, "Bad Request: MEDIA_CAPTION_TOO_LONG");
+      }
+      delete message.caption;
+      delete message.caption_entities;
+      if (text) {
+        Object.assign(message, {
+          caption: text,
+          ...(entities ? { caption_entities: entities } : {}),
+        });
+      }
     };
   }
 
@@ -6581,7 +6645,6 @@ export async function startTestServer({
     }
     recentQueries.set(queryId, {
       botId: (sender ?? bot).id,
-      chatId: chat.id,
       userId: user.id,
       at: clock.now(),
     });

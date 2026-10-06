@@ -1409,6 +1409,77 @@ describe("each bot is itself", () => {
     await ephemeralPress;
     expect(first.ofType("callback_query")).toEqual([]);
   });
+
+  it("lets only the bot that received a callback query answer it with an ephemeral message", async () => {
+    const { fake, api, second } = await setup();
+    const hook = await startReceiver();
+    await api("setWebhook", { url: hook.url });
+    await fake.setBotMembership(GROUP, second.id, { status: "member" });
+    const prompt = await api("sendMessage", {
+      chat_id: GROUP,
+      text: "Verify",
+      reply_markup: {
+        inline_keyboard: [[{ text: "OK", callback_data: "ok" }]],
+      },
+    });
+    const press = fake.pressButton(
+      GROUP,
+      prompt.result.message_id,
+      OWNER,
+      "ok",
+    );
+    await expect.poll(() => hook.ofType("callback_query").length).toBe(1);
+    const [query] = hook.ofType("callback_query");
+    await api("answerCallbackQuery", { callback_query_id: query.id });
+    await press;
+
+    expect(
+      await api(
+        "sendMessage",
+        {
+          chat_id: GROUP,
+          text: "verified",
+          ephemeral_message_parameters: {
+            receiver_user_id: OWNER,
+            callback_query_id: query.id,
+          },
+        },
+        SECOND_TOKEN,
+      ),
+    ).toMatchObject({ status: 400 });
+  });
+
+  it("lets only the bot that sent an ephemeral message edit or delete it", async () => {
+    const { fake, api, second } = await setup();
+    await fake.setBotMembership(GROUP, second.id, { status: "member" });
+    const id = (
+      await api("sendMessage", {
+        chat_id: GROUP,
+        text: "only you",
+        ephemeral_message_parameters: { receiver_user_id: OWNER },
+      })
+    ).result.ephemeral_message_id;
+    const target = {
+      chat_id: GROUP,
+      receiver_user_id: OWNER,
+      ephemeral_message_id: id,
+    };
+
+    expect(
+      await api(
+        "editEphemeralMessageText",
+        { ...target, text: "mine now" },
+        SECOND_TOKEN,
+      ),
+    ).toMatchObject({ status: 400 });
+    expect(
+      await api("deleteEphemeralMessage", target, SECOND_TOKEN),
+    ).toMatchObject({ status: 400 });
+    expect(await fake.getEphemeralMessage(GROUP, id)).toMatchObject({
+      deleted: false,
+      message: { text: "only you" },
+    });
+  });
 });
 
 describe("bot membership", () => {

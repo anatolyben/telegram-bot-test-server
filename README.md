@@ -100,7 +100,7 @@ immediately.
 | `postGuestBotReply(chatId, userId, botUsername, text)`                                                                                | The user calls a guest bot (Bot API 10.0 guest mode); its answer appears in the group from that bot, with `guest_bot_caller_user` set.                                      |
 | `sendDirectMessage(userId, text)`                                                                                                     | The user messages the bot privately; empty text fails with `MESSAGE_EMPTY`.                                                                                                 |
 | `pressDirectButton(userId, messageId, data)`                                                                                          | The user presses a button in their private chat with the bot.                                                                                                               |
-| `getMessages(chatId)`, `getMessage(chatId, id)`                                                                                       | The chat's messages, ephemeral ones included, and whether one was deleted. Their file_ids are the first bot's.                                                              |
+| `getMessages(chatId)`, `getMessage(chatId, id)`                                                                                       | The chat's messages, ephemeral ones included; `getMessage` finds a regular one by `message_id` and says whether it was deleted. Their file_ids are the first bot's.         |
 | `getEphemeralMessage(chatId, ephemeralMessageId)`                                                                                     | An ephemeral message by its `ephemeral_message_id`, and whether it was deleted.                                                                                             |
 | `getDirectMessages(userId)`                                                                                                           | The private chat between the user and the bot.                                                                                                                              |
 | `getMember(chatId, userId)`                                                                                                           | The member as `getChatMember` returns them to the first bot: status, restrictions, ban.                                                                                     |
@@ -236,16 +236,22 @@ The details a moderation bot depends on, each covered by a test:
 - **Ephemeral messages** ([Bot API](https://core.telegram.org/bots/api#ephemeral-messages-and-commands)).
   A send with `ephemeral_message_parameters` is shown to one member. It returns `message_id` 0,
   `receiver_user` and an `ephemeral_message_id` of its own, and takes no message id from the chat.
-  The regular edit and delete methods cannot reach it; the `editEphemeralMessage…` methods and
-  `deleteEphemeralMessage` change it and return `true`. The receiver must be a member of the group or
-  supergroup and not a bot. A bot that administers the chat may send one at any time; any other bot
-  needs the `callback_query_id` of the receiver's button press in that chat, at most 15 seconds old.
-  Members cannot send ephemeral commands here, so `reply_parameters.ephemeral_message_id` never
-  qualifies. Unverified: Telegram does not document the errors (`PEER_ID_INVALID` outside groups,
-  `USER_IS_BOT`, `USER_NOT_PARTICIPANT`, `CHAT_ADMIN_REQUIRED` without an eligible action, and
-  `MESSAGE_ID_INVALID` for an unknown or deleted ephemeral message), or whether an ephemeral edit
-  without `reply_markup` removes the keyboard (it does here) and an edit that changes nothing fails
-  (it does not here). Tests see these messages in `getMessages`, with their receiver, and find one
+  A poll, a dice or a live location cannot be sent this way (`unallowed message content specified`).
+  The regular edit and delete methods cannot reach it; only the bot that sent it changes it, with the
+  `editEphemeralMessage…` methods and `deleteEphemeralMessage`, which return `true`.
+  `editEphemeralMessageText` and `editEphemeralMessageCaption` reach Telegram as the same request,
+  so either one changes a text message's text or a media message's caption. The receiver must be a
+  member of the group or supergroup and not a bot. A bot that administers the chat may send one at
+  any time; any other bot needs the `callback_query_id` of a button press it received from the
+  receiver, at most 15 seconds old. Who may get the message is checked after the chat, the reply and
+  the content. Members cannot send ephemeral commands here, so `reply_parameters.ephemeral_message_id`
+  never qualifies. Unverified: Telegram does not document the errors (`PEER_ID_INVALID` outside
+  groups, `USER_IS_BOT`, `USER_NOT_PARTICIPANT`, `CHAT_ADMIN_REQUIRED` without an eligible action,
+  and `MESSAGE_ID_INVALID` for an unknown or deleted ephemeral message, or one another bot sent),
+  whether an ephemeral edit without `reply_markup` removes the keyboard (it does here) and an edit
+  that changes nothing fails (it does not here), or which text edits it refuses (here a caption may
+  have 1024 characters, and an empty text, or a caption for content that takes none, leaves the
+  message as it was). Tests see these messages in `getMessages`, with their receiver, and find one
   by `ephemeral_message_id` with `getEphemeralMessage`; `pressEphemeralButton` presses its buttons as
   the receiver. A `message` wait by author and exact text finds them too.
 - **Inline keyboards.** Every button needs an action: a button with only `text` (or an empty
@@ -806,7 +812,9 @@ counts once. Longer sends fail with `message is too long` or `message caption is
 (also `editMessageMedia` and copies of media); Telegram's server answers a longer
 `editMessageText` with `MESSAGE_TOO_LONG` and a longer `editMessageCaption` with
 `MEDIA_CAPTION_TOO_LONG`. The ephemeral edits give the same answers, though Telegram does not
-document them. Raw text over 32 KB fails before parsing with `text is too long`.
+document them; a text edit of an ephemeral media message sets its caption, so more than 1024
+characters fail with `MEDIA_CAPTION_TOO_LONG`. Raw text over 32 KB fails before parsing with
+`text is too long`.
 
 `<tg-time unix="1647531900" format="wDT">…</tg-time>` in HTML and
 `![…](tg://time?unix=1647531900&format=wDT)` in MarkdownV2 make a `date_time` entity with
@@ -827,7 +835,8 @@ or every error description is byte-for-byte identical.
 
 `reply_parameters` and the older `reply_to_message_id` populate `reply_to_message`, without
 nested reply chains, in every send method including `sendMediaGroup`, and
-`allow_sending_without_reply` is supported. With `reply_parameters.chat_id` the bot replies to a
+`allow_sending_without_reply` is supported. A `message_id` of 0, an ephemeral message's, names no
+message, so the send is not a reply. With `reply_parameters.chat_id` the bot replies to a
 message in another chat it can read: the message gets `external_reply` (the original's origin, its
 chat and id for a supergroup or channel, and its media without the caption) instead of
 `reply_to_message`, plus an automatic `quote` of the original's text or caption. A reply to a

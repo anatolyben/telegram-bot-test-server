@@ -542,6 +542,19 @@ describe("bot sends", () => {
     });
     expect(without.ok).toBe(true);
     expect(without.result.reply_to_message).toBeUndefined();
+    // Message id 0, an ephemeral message's, names no message to reply to.
+    for (const zero of [
+      { reply_parameters: { message_id: 0 } },
+      { reply_to_message_id: 0 },
+    ]) {
+      const plain = await api("sendMessage", {
+        chat_id: GROUP,
+        text: "x",
+        ...zero,
+      });
+      expect(plain.ok).toBe(true);
+      expect(plain.result.reply_to_message).toBeUndefined();
+    }
 
     const stored = await server.getMessage(GROUP, reply.result.message_id);
     expect(stored.message.reply_to_message.message_id).toBe(question);
