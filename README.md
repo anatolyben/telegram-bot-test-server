@@ -87,7 +87,7 @@ response happens after that, so wait for the outcome rather than checking it imm
 | `updateProfile(userId, fields)`                                                                                                       | The user changes their name, username or bio.                                                                                                                               |
 | `addProfilePhoto(userId, bytes)`                                                                                                      | The user adds a profile photo.                                                                                                                                              |
 | `join(chatId, userId)`                                                                                                                | The user joins the group.                                                                                                                                                   |
-| `joinByLink(inviteLink, userId)`                                                                                                      | The user opens an invite link: joins, or files a join request if the link requires approval.                                                                                |
+| `joinByLink(inviteLink, userId)`                                                                                                      | The user opens an invite link: joins, or files a join request if the link requires approval. A revoked, expired or full link fails.                                         |
 | `leave(chatId, userId)`                                                                                                               | The user leaves.                                                                                                                                                            |
 | `post(chatId, userId, text)`                                                                                                          | The user posts a message; returns its `message_id`. Also takes `{ text, photo, media, caption, replyTo, threadId, forwardFrom }`. Fails if the user is not allowed to post. |
 | `postAlbum(chatId, userId, items)`                                                                                                    | The user posts 2 to 10 photos or videos as one album (`media_group_id`).                                                                                                    |
@@ -210,8 +210,19 @@ The details a moderation bot depends on, each covered by a test:
 - **Command menus.** `setMyCommands`, `getMyCommands` and `deleteMyCommands` keep one list for each
   `scope` and `language_code`. `getMyCommands` returns only the list set for that exact scope and
   language (an empty list if there is none), and `deleteMyCommands` removes only that list.
-- **Invite links.** Exporting a new primary link revokes the previous one; joining through a
-  revoked link fails.
+- **Invite links.** Creating, exporting, editing and revoking links needs `can_invite_users`
+  (`not enough rights to manage chat invite link` otherwise). Each administrator has its own
+  primary link: `exportChatInviteLink` replaces only the calling bot's, `getChat` returns it as
+  `invite_link` (generating one when the bot has none), revoking it generates a new one, and it
+  cannot be edited (`CHAT_INVITE_PERMANENT`). A bot edits and revokes only links it created. A
+  link's `member_limit` counts the members who joined through it and are still in the chat; a join
+  past it, after `expire_date` or through a revoked link fails with `INVITE_HASH_EXPIRED`, and a
+  link that creates join requests cannot have a `member_limit`. A bot sees a link another
+  administrator created with the second half of its hash replaced by `...`. Links are
+  `https://t.me/+` followed by a random hash. Unverified: the characters that hide the half (the
+  Bot API docs print "…"; TDLib expects `...`, which this server sends), the error for revoking
+  another administrator's link (here `CHAT_ADMIN_REQUIRED`), and the error for joining through a
+  full link (here `INVITE_HASH_EXPIRED`, as Telegram's apps call such a link expired).
 - **Entities.** Member messages and captions carry `bot_command`, `mention`, `email` and `url`
   entities with UTF-16 offsets, in groups and in private chats.
 - **Media.** Sent photos, documents, videos, animations and stickers carry the fields the Bot API
@@ -548,7 +559,7 @@ The test actions above, over HTTP, for tests written in other languages. All rou
 | `POST chats/:id/messages/:messageId/callback`          | The user `{ user_id, data }` presses an inline button; returns the bot's answer.                                                                                                                                                                                         |
 | `GET chats/:id/members/:userId`                        | The member as `getChatMember` would return it.                                                                                                                                                                                                                           |
 | `GET chats/:id/join-requests`                          | User ids with a pending join request.                                                                                                                                                                                                                                    |
-| `POST invites/:hash/join`                              | The user `{ user_id }` opens `https://t.me/+<hash>`: joins, or files a join request if the link requires one.                                                                                                                                                            |
+| `POST invites/:hash/join`                              | The user `{ user_id }` opens `https://t.me/+<hash>`: joins, or files a join request if the link requires one. A revoked, expired or full link answers 400 `INVITE_HASH_EXPIRED`.                                                                                         |
 | `POST invites/:hash/check`                             | Whether the user `{ user_id }` is in the link's chat.                                                                                                                                                                                                                    |
 | `POST chats/:id/guest-bot-reply`                       | A guest bot answers the user `{ caller_user_id, bot_username, text }` in the group; returns `{ message_id }`.                                                                                                                                                            |
 | `POST users/:id/dm`                                    | The user sends the bot a direct message `{ text }`.                                                                                                                                                                                                                      |

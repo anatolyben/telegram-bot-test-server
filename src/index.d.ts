@@ -538,7 +538,10 @@ export interface TelegramBotTestServer {
   addProfilePhoto(userId: number, bytes: Uint8Array): Promise<unknown>;
   /** The user joins a chat directly. */
   join(chatId: number, userId: number): Promise<{ status: "member" }>;
-  /** The user opens an invite link: joins, or files a join request if the link requires one. */
+  /**
+   * The user opens an invite link: joins, or files a join request if the link requires one.
+   * Rejects with INVITE_HASH_EXPIRED when the link is revoked, past its expire_date, or full.
+   */
   joinByLink(
     inviteLink: string,
     userId: number,

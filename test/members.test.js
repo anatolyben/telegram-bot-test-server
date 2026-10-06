@@ -484,8 +484,20 @@ describe("administrators and chat settings", () => {
     ).toEqual(kinds.map((kind) => [me.id, kind]));
   });
 
-  it("edits the bot's own invite links", async () => {
+  it("edits the bot's own invite links, except its primary link", async () => {
     const { api } = await setup();
+    const primary = (await api("exportChatInviteLink", { chat_id: GROUP }))
+      .result;
+    expect(
+      await api("editChatInviteLink", {
+        chat_id: GROUP,
+        invite_link: primary,
+        name: "Primary",
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: CHAT_INVITE_PERMANENT",
+    });
     const link = (await api("createChatInviteLink", { chat_id: GROUP })).result
       .invite_link;
     const edited = await api("editChatInviteLink", {
