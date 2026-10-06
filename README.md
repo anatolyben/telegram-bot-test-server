@@ -575,7 +575,8 @@ The test actions above, over HTTP, for tests written in other languages. All rou
 | `GET calls`                                            | Every Bot API call received, with the bot that made it, and the unsupported methods called.                                                                                                                                                                              |
 
 A button press waits up to 10 seconds for the bot to call `answerCallbackQuery` and returns
-`{ answered, text, show_alert }`.
+`{ answered, text, show_alert }`. An answer Telegram refuses, such as text over 200 characters, does
+not count.
 
 ## Formatting, replies and uploads
 
