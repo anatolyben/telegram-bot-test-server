@@ -1104,10 +1104,13 @@ describe("reactions and join request queries", () => {
       description:
         "Bad Request: can't parse ReactionType: invalid reaction type specified",
     });
-    expect(await react([{ type: "emoji", emoji: "" }])).toMatchObject({
-      status: 400,
-      description: "Bad Request: invalid reaction type specified",
-    });
+    // TDLib reads "$" as the paid reaction and "#…" as a custom emoji.
+    for (const emoji of ["", "$", "#1"]) {
+      expect(await react([{ type: "emoji", emoji }])).toMatchObject({
+        status: 400,
+        description: "Bad Request: invalid reaction type specified",
+      });
+    }
     expect(await react([{ type: "emoji", emoji: "🦄🦄" }])).toMatchObject({
       status: 400,
       description: "Bad Request: REACTION_INVALID",
@@ -1151,7 +1154,7 @@ describe("reactions and join request queries", () => {
   });
 
   it("removes a chat's reaction by actor_chat_id instead of user_id", async () => {
-    const { fake, api, member } = await setup();
+    const { fake, api, member, me } = await setup();
     const id = await fake.post(GROUP, member, "anonymous admins react too");
     const remove = (params) =>
       api("deleteMessageReaction", { chat_id: GROUP, message_id: id, ...params });
@@ -1164,9 +1167,33 @@ describe("reactions and join request queries", () => {
       status: 400,
       description: "Bad Request: sender_chat_id is empty",
     });
-    expect(await remove({ actor_chat_id: "@channel" })).toMatchObject({
+    // The id must read back exactly as a 64-bit integer.
+    for (const actor of ["@channel", "007", "-0", "99999999999999999999"]) {
+      expect(await remove({ actor_chat_id: actor })).toMatchObject({
+        status: 400,
+        description: "Bad Request: sender_chat_id is not a valid Integer",
+      });
+    }
+    expect(await remove({ actor_chat_id: 0 })).toMatchObject({
       status: 400,
-      description: "Bad Request: sender_chat_id is not a valid Integer",
+      description: "Bad Request: invalid chat identifier specified",
+    });
+    expect(await remove({ actor_chat_id: -1009999999999 })).toMatchObject({
+      status: 400,
+      description: "Bad Request: reaction sender not found",
+    });
+    // A user's id names the user, whose reaction goes.
+    await fake.react(GROUP, id, member, "👍");
+    expect(await remove({ actor_chat_id: member })).toMatchObject({
+      ok: true,
+    });
+    expect((await fake.getMessage(GROUP, id)).reactions).toEqual({});
+
+    // The ids are read before Telegram checks the bot's rights.
+    await fake.setBotMembership(GROUP, me.id, { status: "member" });
+    expect(await remove({})).toMatchObject({
+      status: 400,
+      description: "Bad Request: sender_chat_id is empty",
     });
   });
 

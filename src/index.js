@@ -199,6 +199,7 @@ const OBJECT_PARAMS = new Set([
   "ephemeral_message_parameters",
   "options",
   "correct_option_ids",
+  "explanation_entities",
   "entities",
   "caption_entities",
   "reaction",
@@ -752,13 +753,14 @@ function pollOptionText(option) {
 
 /**
  * A quiz's correct_option_ids, or else the older correct_option_id, read as
- * the Bot API server reads them.
+ * the Bot API server reads them; an empty correct_option_id is -1
+ * (Client.cpp get_integer_arg).
  */
 function correctOptionIds(p) {
   if (p.correct_option_ids === undefined) {
-    return p.correct_option_id === undefined
-      ? []
-      : [Number.parseInt(String(p.correct_option_id), 10) || 0];
+    if (p.correct_option_id === undefined) return [];
+    const id = String(p.correct_option_id);
+    return [id === "" ? -1 : Number.parseInt(id, 10) || 0];
   }
   const ids = p.correct_option_ids;
   // As in jsonList, a string that reads as JSON was a JSON string.
@@ -793,6 +795,41 @@ function correctOptionIds(p) {
     }
     return id;
   });
+}
+
+/**
+ * deleteMessageReaction's actor_chat_id as the Bot API server reads it
+ * (check_chat_no_fail): text that td::to_integer_safe writes back unchanged
+ * as a 64-bit integer. TDLib then takes only a valid chat id
+ * (DialogId::is_valid): a user id up to 2^40 - 1, or a negative id from
+ * -4e12, but not -1e12 or -2e12.
+ */
+function actorChatId(value) {
+  const text = String(value ?? "");
+  if (!text) {
+    throw new TelegramError(400, "Bad Request: sender_chat_id is empty");
+  }
+  const id = /^-?\d+$/.test(text) ? BigInt(text) : null;
+  if (id === null || String(id) !== text || BigInt.asIntN(64, id) !== id) {
+    throw new TelegramError(
+      400,
+      "Bad Request: sender_chat_id is not a valid Integer",
+    );
+  }
+  const valid =
+    id > 0n
+      ? id < 2n ** 40n
+      : id < 0n &&
+        id >= -4_000_000_000_000n &&
+        id !== -1_000_000_000_000n &&
+        id !== -2_000_000_000_000n;
+  if (!valid) {
+    throw new TelegramError(
+      400,
+      "Bad Request: invalid chat identifier specified",
+    );
+  }
+  return Number(id);
 }
 
 /**
@@ -3107,16 +3144,39 @@ export async function startTestServer({
   }
 
   /**
-   * A Bot API payload as one bot sees it: every file_id in it that bot's own.
-   * Stored messages carry the first bot's, as the control API shows them.
+   * A Bot API payload as one bot sees it: every file_id in it that bot's own,
+   * and an open quiz whose correct options it does not know (knowsAnswers)
+   * without them and its explanation, in a forward, a reply or a pin too.
+   * Stored messages carry the first bot's file_ids and every quiz's answers,
+   * as the control API shows them.
    */
   function seenBy(record, payload) {
-    if (record.id === bot.id || payload === undefined) return payload;
-    return JSON.parse(JSON.stringify(payload), (key, value) =>
-      FILE_ID_FIELDS.has(key) && files.has(value)
-        ? fileIdFor(files.get(value).file, record.id)
-        : value,
-    );
+    if (payload === undefined) return payload;
+    const json = JSON.stringify(payload);
+    if (record.id === bot.id && !json.includes('"type":"quiz"')) {
+      return payload;
+    }
+    return JSON.parse(json, (key, value) => {
+      if (FILE_ID_FIELDS.has(key) && files.has(value)) {
+        return fileIdFor(files.get(value).file, record.id);
+      }
+      if (value?.poll && !knowsAnswers(value, stored(value), record.id)) {
+        const {
+          correct_option_id: _id,
+          correct_option_ids: _ids,
+          explanation: _explanation,
+          explanation_entities: _entities,
+          ...poll
+        } = value.poll;
+        return { ...value, poll };
+      }
+      return value;
+    });
+  }
+
+  /** The stored entry of a message or reply a payload shows, if known. */
+  function stored(message) {
+    return chats.get(message.chat?.id)?.messages.get(message.message_id);
   }
 
   /**
@@ -3644,19 +3704,44 @@ export async function startTestServer({
       waits.notify();
       return true;
     },
-    // A poll may carry a photo, uploaded with it as attach://<name>.
+    // A poll may carry a photo, uploaded with it as attach://<name>. The
+    // question, the options and a quiz's explanation are cleaned and trimmed
+    // as message text is (Client.cpp process_send_poll_query, then TDLib's
+    // get_formatted_text in MessageContent.cpp and PollOption.cpp), and the
+    // limits apply to what is left.
     sendPoll: (p, caller) => {
+      const question = formatOrFail(String(p.question ?? "")).text;
       const texts = jsonList(
         p.options === undefined ? "" : p.options,
         "options",
         "InputPollOption",
         pollOptionText,
-      );
-      const quiz = p.type === "quiz";
+      ).map((text) => formatText(text).text);
+      const type = String(p.type ?? "");
+      const quiz = type === "quiz";
+      const explanation = quiz
+        ? formatOrFail(
+            String(p.explanation ?? ""),
+            p.explanation_parse_mode,
+            p.explanation_entities,
+          )
+        : null;
       const correct = quiz ? correctOptionIds(p) : [];
+      if (!quiz && type !== "" && type !== "regular") {
+        throw new TelegramError(
+          400,
+          "Bad Request: unsupported poll type specified",
+        );
+      }
       const chat = botChat(p.chat_id, caller, { send: true });
-      if (!String(p.question ?? "").trim()) {
+      if (isEmptyText(question)) {
         throw new TelegramError(400, "Bad Request: text must be non-empty");
+      }
+      if ([...question].length > 300) {
+        throw new TelegramError(
+          400,
+          "Bad Request: poll question length must not exceed 300",
+        );
       }
       if (texts.length === 0) {
         throw new TelegramError(
@@ -3671,10 +3756,10 @@ export async function startTestServer({
         );
       }
       for (const text of texts) {
-        if (!text.trim()) {
+        if (isEmptyText(text)) {
           throw new TelegramError(400, "Bad Request: text must be non-empty");
         }
-        if ([...text.trim()].length > 100) {
+        if ([...text].length > 100) {
           throw new TelegramError(
             400,
             "Bad Request: poll options length must not exceed 100",
@@ -3716,7 +3801,7 @@ export async function startTestServer({
       return sendFrom(p, caller, {
         poll: {
           id: String(nextPollId),
-          question: String(p.question),
+          question,
           // persistent_id is the option's data. Telegram does not document
           // its form; TDLib, when it chose it for a new poll, counted from "0".
           options: texts.map((text, index) => ({
@@ -3738,6 +3823,12 @@ export async function startTestServer({
           // older correct_option_id.
           ...(correct.length === 1 ? { correct_option_id: correct[0] } : {}),
           ...(quiz ? { correct_option_ids: correct } : {}),
+          ...(explanation?.text
+            ? {
+                explanation: explanation.text,
+                explanation_entities: explanation.entities,
+              }
+            : {}),
           ...(p.description ? { description: String(p.description) } : {}),
           ...(photo ? { media: { photo: photoSizes(photo) } } : {}),
         },
@@ -4498,40 +4589,41 @@ export async function startTestServer({
       } else entry.reactions.delete(caller.id);
       return true;
     },
-    // Removes a user's reaction, or a chat's (actor_chat_id) when no user_id
-    // is given; needs can_delete_messages.
+    // Removes a user's reaction, or the reaction of the sender actor_chat_id
+    // names when no user_id is given; needs can_delete_messages. The Bot API
+    // server reads the ids and finds the message, TDLib then checks the
+    // sender, and Telegram's server the rights last (Client.cpp
+    // process_delete_message_reaction_query,
+    // MessageQueryManager::delete_reaction_by_sender).
     deleteMessageReaction: (p, caller) => {
       // user_id is read before the chat.
       const byUser = p.user_id != null && p.user_id !== "";
-      const userId = byUser ? userIdParam(p.user_id) : null;
+      let senderId = byUser ? userIdParam(p.user_id) : null;
       const chat = requireChat(p.chat_id, caller);
+      const entry = chat.messages.get(Number(p.message_id));
+      if (!entry || entry.deleted) {
+        throw new TelegramError(400, "Bad Request: MESSAGE_ID_INVALID");
+      }
+      if (!byUser) {
+        senderId = actorChatId(p.actor_chat_id);
+        // A positive id is a user's, whose reaction goes as with user_id.
+        if (!(senderId > 0 ? users.has(senderId) : chats.has(senderId))) {
+          throw new TelegramError(
+            400,
+            "Bad Request: reaction sender not found",
+          );
+        }
+      }
+      const user = senderId > 0 ? requireUser(senderId) : null;
       if (!hasRight(chat, caller.id, "can_delete_messages")) {
         throw new TelegramError(
           400,
           "Bad Request: not enough rights to delete reactions",
         );
       }
-      const entry = chat.messages.get(Number(p.message_id));
-      if (!entry || entry.deleted) {
-        throw new TelegramError(400, "Bad Request: MESSAGE_ID_INVALID");
-      }
-      if (!byUser) {
-        const actor = String(p.actor_chat_id ?? "");
-        if (!actor) {
-          throw new TelegramError(400, "Bad Request: sender_chat_id is empty");
-        }
-        if (!/^-?\d+$/.test(actor)) {
-          throw new TelegramError(
-            400,
-            "Bad Request: sender_chat_id is not a valid Integer",
-          );
-        }
-        // Members react as themselves here, so no chat's reaction is ever
-        // there to remove.
-        return true;
-      }
-      const user = requireUser(userId);
-      if (entry.reactions?.has(user.id)) {
+      // Members react as themselves here, so no chat's reaction is ever
+      // there to remove.
+      if (user && entry.reactions?.has(user.id)) {
         void changeReaction(chat, entry, user, []);
       }
       return true;
@@ -5676,14 +5768,30 @@ export async function startTestServer({
   }
 
   /**
+   * Whether a bot knows the correct options of the poll in a message, stored
+   * as `entry`: any poll but an open quiz, a quiz it sent itself, not as a
+   * forward, or one in a private chat
+   * (https://core.telegram.org/bots/api#poll). Only then does the poll it
+   * sees carry them and the explanation (PollManager::get_poll_object), and
+   * only then can it copy the quiz (PollManager::has_input_media).
+   */
+  function knowsAnswers(message, entry, botId) {
+    const poll = message.poll;
+    return (
+      poll?.type !== "quiz" ||
+      poll.is_closed ||
+      message.chat?.type === "private" ||
+      (entry?.author === botId && !entry.message.forward_origin)
+    );
+  }
+
+  /**
    * The message a forward or copy reads, when the bot can see it. A service
    * message can be neither forwarded nor copied, and a protected one only
    * copied by a bot (TDLib can_forward_message). A copy also needs an open
-   * quiz's correct options (dup_message_content, PollManager::has_input_media),
-   * which a bot knows only for a quiz it sent, not forwarded, or one in a
-   * private chat (https://core.telegram.org/bots/api#poll). Only the content
-   * goes along: a single album item leaves its album behind
-   * (get_forwarded_messages).
+   * quiz's correct options (dup_message_content), which the bot may not know
+   * (knowsAnswers). Only the content goes along: a single album item leaves
+   * its album behind (get_forwarded_messages).
    */
   function forwardable(p, caller, copy) {
     // The source is only read (AccessRights::Read), so an upgraded basic
@@ -5703,16 +5811,10 @@ export async function startTestServer({
         `Bad Request: message to ${copy ? "copy" : "forward"} not found`,
       );
     }
-    const poll = entry.message.poll;
-    const unknownQuiz =
-      poll?.type === "quiz" &&
-      !poll.is_closed &&
-      sourceChat.type !== "private" &&
-      (entry.author !== caller.id || entry.message.forward_origin);
     if (
       contentType(entry.message) === null ||
       (!copy && entry.message.has_protected_content) ||
-      (copy && unknownQuiz)
+      (copy && !knowsAnswers(entry.message, entry, caller.id))
     ) {
       throw new TelegramError(
         400,

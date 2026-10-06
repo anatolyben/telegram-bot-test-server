@@ -382,29 +382,35 @@ The details a moderation bot depends on, each covered by a test:
   `leaveChat`, `getChatMember` about itself, `setMessageReaction`, `deleteEphemeralMessage`, and
   naming the chat as the source of a forward, copy or reply; every other call gets the
   `group chat` form of the same errors.
-- **Polls.** `sendPoll` needs a question and 1 to 12 options of up to 100 characters each. It
-  keeps `is_anonymous`, `allows_multiple_answers`, `allows_revoting` (on by default for regular
-  polls, off for quizzes), `members_only` (channels only), `is_closed`, `description` and an
-  attached photo, and gives each option a `persistent_id`. A quiz needs `correct_option_ids` (or
-  the older `correct_option_id`), and the bot that sent it sees them in the poll. `stopPoll` closes
-  a poll once; a poll in a message the bot can't edit (see **Editing**) fails with
-  `poll can't be stopped`. The bot that stopped it and the bot that sent it then get the closed
-  poll as a `poll` update, as [Update](https://core.telegram.org/bots/api#update) says. Members do
-  not vote.
+- **Polls.** `sendPoll` needs a question of up to 300 characters and 1 to 12 options of up to 100
+  characters each. Both are kept trimmed of spaces and newlines, as Telegram keeps them, and the
+  limits count what is left; one that then shows nothing fails with `text must be non-empty`.
+  `question_parse_mode` and an option's `text_parse_mode` are not read. A `type` other than
+  `regular` or `quiz` fails with `unsupported poll type specified`. It keeps `is_anonymous`,
+  `allows_multiple_answers`, `allows_revoting` (on by default for regular polls, off for
+  quizzes), `members_only` (channels only), `is_closed`, `description` and an attached photo, and
+  gives each option a `persistent_id`. A quiz needs `correct_option_ids` (or the older
+  `correct_option_id`) and may have an `explanation`, formatted with `explanation_parse_mode` or
+  `explanation_entities`; its 200-character limit is not checked. While a quiz is open, only a bot
+  that knows its correct options sees them and the explanation in the poll, in forwards, replies
+  and pins too: the bot that sent it itself, not as a forward, or a bot in a private chat
+  ([Poll](https://core.telegram.org/bots/api#poll)). Once it is closed every bot sees them.
+  `stopPoll` closes a poll once; a poll in a message the bot can't edit (see **Editing**) fails
+  with `poll can't be stopped`. The bot that stopped it and the bot that sent it then get the
+  closed poll as a `poll` update, as [Update](https://core.telegram.org/bots/api#update) says.
+  Members do not vote.
 - **Forwards and copies.** A forward carries `forward_origin`; a copy does not. A forward of a
   forward keeps the first origin and its date. A bot cannot forward from a chat it is not in; the
   source chat gets the checks above for a call that needs only read access, before the chat the
   message goes to. A missing message fails with `message to forward not found` or
   `message to copy not found`. Service messages can't be forwarded or copied
   (`the message can't be forwarded` / `copied`). Nor can an open quiz be copied by a bot that does
-  not know its correct options, which it knows only for a quiz it sent itself, not as a forward,
-  or one in a private chat ([Poll](https://core.telegram.org/bots/api#poll)); once the quiz is
-  closed any bot copies it. A send with `protect_content`, a forward or an album included, has
-  `has_protected_content`; it can't be forwarded, but the bot can still copy it. One item of an
-  album is forwarded or copied without its `media_group_id`. A copy's `caption` replaces the
-  original on media that takes one, formatted with `parse_mode` or `caption_entities`, and an empty
-  one removes it; a text message gets no caption, so the 1024-character limit applies only to
-  media.
+  not know its correct options (see **Polls**); once the quiz is closed any bot copies it. A send
+  with `protect_content`, a forward or an album included, has `has_protected_content`; it can't be
+  forwarded, but the bot can still copy it. One item of an album is forwarded or copied without
+  its `media_group_id`. A copy's `caption` replaces the original on media that takes one,
+  formatted with `parse_mode` or `caption_entities`, and an empty one removes it; a text message
+  gets no caption, so the 1024-character limit applies only to media.
 - **Pins** ([unpinChatMessage](https://core.telegram.org/bots/api#unpinchatmessage)). Pinned
   messages are kept newest first by sending date. `getChat` returns the most recent one that was
   not deleted as `pinned_message`, and `unpinChatMessage` without `message_id` unpins it. This
@@ -427,10 +433,14 @@ The details a moderation bot depends on, each covered by a test:
 - **Reactions.** A member's reaction reaches the chat's administrator bots as `message_reaction`,
   only when they list it in `allowed_updates`, as on Telegram. A bot sets at most one reaction,
   and only an emoji from the [ReactionTypeEmoji](https://core.telegram.org/bots/api#reactiontypeemoji)
-  list (any other emoji fails with `REACTION_INVALID`, and a paid reaction is refused). A reaction
-  on an album lands on its first message that is not deleted. The bot removes a member's reaction
-  with `deleteMessageReaction` and `can_delete_messages`; `actor_chat_id` may stand in for
-  `user_id`, though members here never react as a chat.
+  list (any other emoji fails with `REACTION_INVALID`, and a paid reaction is refused) or a custom
+  emoji. A custom emoji is accepted without checking that it is already on the message or allowed
+  by the chat's administrators. A reaction on an album lands on its first message that is not
+  deleted. The bot removes a member's reaction with `deleteMessageReaction` and
+  `can_delete_messages`; `actor_chat_id` may stand in for `user_id`, though members here never
+  react as a chat. A user's id there removes that user's reaction, and a chat this server does not
+  know fails with `reaction sender not found`. The ids and the message are checked before the
+  bot's rights.
 - **Administrators and chat settings.** `promoteChatMember` needs `can_promote_members` and grants
   only rights the bot holds. Rights the kind of chat does not have (below) are dropped first, as
   TDLib drops them; any one right left makes an administrator, `can_send_welcome_messages`,

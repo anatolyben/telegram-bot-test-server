@@ -780,13 +780,39 @@ describe("polls, forwards and media", () => {
     expect(await send({ question: "", options: ["A"] })).toMatchObject(
       refusal("Bad Request: text must be non-empty"),
     );
+    // A zero-width space shows nothing.
+    expect(await send({ options: ["A", "\u200b"] })).toMatchObject(
+      refusal("Bad Request: text must be non-empty"),
+    );
+    expect(
+      await send({ question: "x".repeat(301), options: ["A"] }),
+    ).toMatchObject(
+      refusal("Bad Request: poll question length must not exceed 300"),
+    );
+    // The Bot API server refuses more than 32 KB before reading the options.
+    expect(
+      await send({ question: "x".repeat(32769), options: undefined }),
+    ).toMatchObject(refusal("Bad Request: text is too long"));
+    expect(await send({ options: ["A"], type: "survey" })).toMatchObject(
+      refusal("Bad Request: unsupported poll type specified"),
+    );
     // The limit counts characters, not UTF-16 code units.
     expect(await send({ options: ["🦄".repeat(100)] })).toMatchObject({
       ok: true,
     });
+    // The question and options are kept trimmed, and the limits apply to
+    // what is left.
+    const trimmed = await send({
+      question: `  ${"x".repeat(300)}  `,
+      options: [" Yes ", { text: "No\n" }],
+    });
+    expect(trimmed.result.poll).toMatchObject({
+      question: "x".repeat(300),
+      options: [{ text: "Yes" }, { text: "No" }],
+    });
   });
 
-  it("requires a quiz's correct options and returns them to the bot that sent it", async () => {
+  it("requires a quiz's correct options and returns them and the explanation to the bot that sent it", async () => {
     const { api } = await setup();
     const quiz = (fields) =>
       api("sendPoll", {
@@ -824,16 +850,25 @@ describe("polls, forwards and media", () => {
         description: `Bad Request: ${description}`,
       });
     }
+    // An empty correct_option_id is no option at all, not option 0.
+    expect(await quiz({ correct_option_id: "" })).toMatchObject({
+      status: 400,
+      description: "Bad Request: wrong quiz correct_option_id",
+    });
 
     const sent = await quiz({
       correct_option_ids: [0, 2],
       allows_multiple_answers: true,
+      explanation: "<b>4</b> is even",
+      explanation_parse_mode: "HTML",
     });
     expect(sent.result.poll).toMatchObject({
       type: "quiz",
       allows_multiple_answers: true,
       allows_revoting: false,
       correct_option_ids: [0, 2],
+      explanation: "4 is even",
+      explanation_entities: [{ type: "bold", offset: 0, length: 1 }],
     });
     expect(sent.result.poll.correct_option_id).toBeUndefined();
     expect(
@@ -883,20 +918,69 @@ describe("polls, forwards and media", () => {
   });
 
   it("sends the closed poll as a poll update to the bot that stopped it", async () => {
-    const { api } = await setup();
+    const { fake, api, second } = await setup();
+    await fake.setBotMembership(GROUP, second.id, { status: "administrator" });
     const hook = await startReceiver();
-    await api("setWebhook", { url: hook.url });
-    const sent = await api("sendPoll", {
-      chat_id: GROUP,
-      question: "Lunch?",
-      options: ["Pizza", "Salad"],
-      description: "Vote by noon",
-    });
-    await api("stopPoll", { chat_id: GROUP, message_id: sent.result.message_id });
+    await api("setWebhook", { url: hook.url }, SECOND_TOKEN);
+    const sent = await api(
+      "sendPoll",
+      {
+        chat_id: GROUP,
+        question: "Lunch?",
+        options: ["Pizza", "Salad"],
+        description: "Vote by noon",
+      },
+      SECOND_TOKEN,
+    );
+    await api(
+      "stopPoll",
+      { chat_id: GROUP, message_id: sent.result.message_id },
+      SECOND_TOKEN,
+    );
 
     await expect.poll(() => hook.ofType("poll").length).toBe(1);
     const { description: _description, ...poll } = sent.result.poll;
     expect(hook.ofType("poll")).toEqual([{ ...poll, is_closed: true }]);
+    // Another administrator bot neither sent nor stopped the poll.
+    const updates = (await api("getUpdates")).result;
+    expect(updates.filter((update) => update.poll)).toEqual([]);
+  });
+
+  it("shows an open quiz's correct options and explanation only to the bot that sent it", async () => {
+    const { fake, api, second } = await setup();
+    await fake.setBotMembership(GROUP, second.id, { status: "member" });
+    const quiz = await api("sendPoll", {
+      chat_id: GROUP,
+      question: "Primes?",
+      options: ["2", "4"],
+      type: "quiz",
+      correct_option_ids: [0],
+      explanation: "4 is even",
+    });
+    const {
+      correct_option_id: _id,
+      correct_option_ids: _ids,
+      explanation: _explanation,
+      explanation_entities: _entities,
+      ...unanswered
+    } = quiz.result.poll;
+    expect(quiz.result.poll).toMatchObject({
+      correct_option_id: 0,
+      correct_option_ids: [0],
+      explanation: "4 is even",
+      explanation_entities: [],
+    });
+
+    const forward = await api(
+      "forwardMessage",
+      {
+        chat_id: GROUP,
+        from_chat_id: GROUP,
+        message_id: quiz.result.message_id,
+      },
+      SECOND_TOKEN,
+    );
+    expect(forward.result.poll).toEqual(unanswered);
   });
 
   it("forwards with the message's origin and copies without it", async () => {
