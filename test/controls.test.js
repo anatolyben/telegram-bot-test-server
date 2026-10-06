@@ -295,6 +295,30 @@ it("restores a detached complete fixture, counters, queued updates, faults and r
   await fake.releaseSnapshot(baseline);
   await expect(fake.restore(baseline)).rejects.toThrow(/snapshot/);
 });
+it("restores the flood control history with the fixture's time", async () => {
+  const { fake, api } = await setup({
+    clock: { now: 1800000000000 },
+    floodControl: true,
+  });
+  expect(await api("sendMessage", { chat_id: CHAT, text: "a" })).toMatchObject({
+    ok: true,
+  });
+  const saved = await fake.snapshot();
+  await fake.advanceTime(1000);
+  expect(await api("sendMessage", { chat_id: CHAT, text: "b" })).toMatchObject({
+    ok: true,
+  });
+  await fake.restore(saved);
+  expect(await api("sendMessage", { chat_id: CHAT, text: "c" })).toMatchObject({
+    status: 429,
+    parameters: { retry_after: 2 },
+  });
+  await fake.advanceTime(1000);
+  expect(await api("sendMessage", { chat_id: CHAT, text: "c" })).toMatchObject({
+    ok: true,
+  });
+  await fake.releaseSnapshot(saved);
+});
 it("restores media bytes, owner-account state and webhook replay bytes without cross-instance delivery", async () => {
   const { fake, api, user } = await setup();
   const updates = [];

@@ -46,6 +46,12 @@ export interface TelegramBotTestServerOptions {
    * ("error", default), or `true` ("ok").
    */
   unimplemented?: "error" | "ok";
+  /**
+   * Answer a bot's sends with Telegram's 429 "Too Many Requests: retry after N"
+   * once they exceed the limits Telegram publishes: one message a second in a
+   * chat, 20 a minute in a group, 30 a second across all chats. Default false.
+   */
+  floodControl?: boolean;
   log?: (line: string) => void;
 }
 

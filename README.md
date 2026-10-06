@@ -147,6 +147,7 @@ over HTTP through the control API described below, from Python, Go or anything e
 | `chats`                      | `[]`             | Supergroups `{ id, title, ownerId, ownerName? }`. The bot is an administrator.               |
 | `publicChats`                | `[]`             | Channels, groups and bots `{ username, type, title? }` resolvable by `getChat("@username")`. |
 | `unimplemented`              | `"error"`        | What an unsupported method returns: a 404 error naming it, or `"ok"` for `true`.             |
+| `floodControl`               | `false`          | Answer sends over Telegram's published limits with 429 ([Flood control](#flood-control)).    |
 | `log`                        | none             | Receives one line per notable event (unsupported methods, webhook failures).                 |
 
 ## Supported Bot API methods
@@ -273,6 +274,39 @@ The details a moderation bot depends on, each covered by a test:
 - **Forum topics.** In a forum, a send to a `message_thread_id` that is not a topic fails with
   `message thread not found`. A member's message in a topic that answers nothing replies to the
   topic's creation message, as on Telegram.
+
+### Flood control
+
+Off by default. With `floodControl: true`, the server refuses a bot's sends the way Telegram does
+once the bot goes over the limits Telegram publishes in its
+[Bots FAQ](https://core.telegram.org/bots/faq#my-bot-is-hitting-limits-how-do-i-avoid-this):
+
+- one message a second in a chat. Telegram says it may allow short bursts above this; this server
+  does not;
+- 20 messages a minute in a group or supergroup;
+- 30 messages a second from one bot across all its chats (paid broadcasts are not modelled).
+
+These numbers are Telegram's published guidance, not its internal algorithm, which Telegram does not
+publish. A bot that stays within them here can still be limited differently on Telegram.
+
+Each bot has its own limits. A call that sends a message counts once, after its parameters are
+checked: `sendMessage`, the other `send…` methods, `forwardMessage` and `copyMessage`, and an album
+from `sendMediaGroup` counts once. Edits, deletions, `sendChatAction` and business messages
+(`business_connection_id`) are not counted. A send over a limit stores nothing, does not count, and
+gets the answer Telegram's Bot API server gives: HTTP 429, a `Retry-After` header and
+
+```json
+{
+  "ok": false,
+  "error_code": 429,
+  "description": "Too Many Requests: retry after 41",
+  "parameters": { "retry_after": 41 }
+}
+```
+
+`retry_after` is the whole seconds until the send would fit, plus one, as the Bot API server rounds
+its own limits. The limits run on the server clock, so with `clock` a test moves past them with
+`advanceTime`, and a snapshot keeps and restores the recent sends.
 
 ### Telegram Login (OpenID Connect)
 
@@ -553,9 +587,10 @@ and MIME type when reused by `file_id` ([Document](https://core.telegram.org/bot
 
 ## What it does not do
 
-- Inline mode, payments, games, sticker sets, reaction counts, votes in polls, or Telegram's rate limits
-  (a test makes a call fail with a 429 through `POST failures` instead). Channels have no
-  subscribers and forum topics cannot be closed or deleted.
+- Inline mode, payments, games, sticker sets, reaction counts, votes in polls, or Telegram's exact
+  rate limits: `floodControl` applies only its published numbers (a test can also make any call
+  fail with a 429 through `POST failures`). Channels have no subscribers and forum topics cannot be
+  closed or deleted.
 - Expiry is evaluated on state access, without a scheduler or an automatic expiry webhook. Restarting loses all state; restart recovery belongs to the application under test.
 - Webhook retries: an update the webhook rejects, or does not answer within 10 seconds, is logged and
   dropped rather than retried.
@@ -698,8 +733,9 @@ work instead of silently mixing in-flight execution with restored state.
 
 Restore replaces users, bots, chat/private/business/owner fixtures, media bytes,
 memberships, messages, invite/join state, counters, calls, fault rules and their
-attempt counters, saved update bytes, queues, webhook/subscription settings and
-login codes. Aliases between bot/user/update records are retained. Finite expiry
+attempt counters, saved update bytes, queues, webhook/subscription settings,
+login codes and flood control's recent sends. Aliases between bot/user/update
+records are retained. Finite expiry
 work is reconstructed from restored membership. Snapshots are detached and reusable;
 `releaseSnapshot(handle)` frees them. Restore cancels older waits. A monotonically
 increasing restore epoch prevents request identities colliding when fixture IDs
@@ -709,8 +745,8 @@ and application state are not snapshotted.
 
 With `clock: { now: milliseconds }`, `advanceTime(ms)` serializes advances and
 runs due fake expiry and Bot/owner response-fault delays in deadline order. It
-also controls fake message/login/business timestamps. Real mode remains the
-default; real time is not rewound by restore. Manual time is restored with the
+also controls fake message/login/business timestamps and flood control. Real
+mode remains the default; real time is not rewound by restore. Manual time is restored with the
 fixture. Global `Date`, timers and the consuming application's jobs are untouched.
 Webhook network I/O, its safety deadline, long polling and diagnostic waits still
 use wall time. A clock advance is not a network-delivery or enforcement barrier.

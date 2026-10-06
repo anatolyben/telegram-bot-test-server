@@ -15,10 +15,11 @@ afterEach(async () => {
   while (cleanups.length) await cleanups.pop()();
 });
 
-async function setup() {
+async function setup(options = {}) {
   const server = await startTestServer({
     botToken: TOKEN,
     chats: [{ id: GROUP, title: "Test Group", ownerId: OWNER }],
+    ...options,
   });
   cleanups.push(() => server.stop());
   async function api(method, params = {}) {
@@ -427,6 +428,86 @@ describe("Bot API details", () => {
     expect(await api("getFile", { file_id: video.file_id })).toMatchObject({
       ok: true,
     });
+  });
+});
+
+// https://core.telegram.org/bots/faq#my-bot-is-hitting-limits-how-do-i-avoid-this
+describe("flood control", () => {
+  const limited = { clock: { now: 1_800_000_000_000 }, floodControl: true };
+
+  it("answers the Bot API server's 429 to a 21st message in a group within a minute", async () => {
+    const { server } = await setup(limited);
+    const send = (text) =>
+      fetch(`${server.origin}/bot${TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: GROUP, text }),
+      });
+    for (let i = 1; i <= 20; i += 1) {
+      expect((await send(`notice ${i}`)).status).toBe(200);
+      await server.advanceTime(1000);
+    }
+
+    const refused = await send("notice 21");
+    expect(refused.status).toBe(429);
+    expect(refused.headers.get("retry-after")).toBe("41");
+    expect(await refused.json()).toEqual({
+      ok: false,
+      error_code: 429,
+      description: "Too Many Requests: retry after 41",
+      parameters: { retry_after: 41 },
+    });
+    expect(
+      (await server.getMessages(GROUP)).map((message) => message.text),
+    ).not.toContain("notice 21");
+
+    await server.advanceTime(41_000);
+    expect((await send("notice 21")).status).toBe(200);
+  });
+
+  it("allows one message a second in a chat, counting an album as one", async () => {
+    const { server, api } = await setup(limited);
+    const video = (await api("sendVideo", { chat_id: GROUP, video: "x" }))
+      .result.video.file_id;
+    expect(
+      await api("sendMessage", { chat_id: GROUP, text: "too soon" }),
+    ).toMatchObject({ status: 429, parameters: { retry_after: 2 } });
+
+    await server.advanceTime(1000);
+    const album = await api("sendMediaGroup", {
+      chat_id: GROUP,
+      media: [
+        { type: "video", media: video },
+        { type: "video", media: video },
+      ],
+    });
+    expect(album.result).toHaveLength(2);
+    expect(
+      await api("sendMessage", { chat_id: GROUP, text: "too soon" }),
+    ).toMatchObject({ status: 429, parameters: { retry_after: 2 } });
+  });
+
+  it("allows a bot 30 messages a second across all its chats", async () => {
+    const { server, api } = await setup(limited);
+    const subscribers = [];
+    for (let i = 0; i < 31; i += 1) {
+      const id = await server.createUser();
+      await server.sendDirectMessage(id, "subscribe");
+      subscribers.push(id);
+    }
+    for (const id of subscribers.slice(0, 30)) {
+      expect(
+        await api("sendMessage", { chat_id: id, text: "news" }),
+      ).toMatchObject({ ok: true });
+    }
+
+    const last = { chat_id: subscribers[30], text: "news" };
+    expect(await api("sendMessage", last)).toMatchObject({
+      status: 429,
+      parameters: { retry_after: 2 },
+    });
+    await server.advanceTime(1000);
+    expect(await api("sendMessage", last)).toMatchObject({ ok: true });
   });
 });
 
