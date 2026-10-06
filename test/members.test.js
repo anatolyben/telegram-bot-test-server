@@ -528,6 +528,83 @@ describe("reactions and join request queries", () => {
       .toEqual([]);
   });
 
+  it("refuses paid reactions and emoji outside Telegram's reaction list", async () => {
+    const { fake, api, member } = await setup();
+    const id = await fake.post(GROUP, member, "react to me");
+    const react = (reaction) =>
+      api("setMessageReaction", { chat_id: GROUP, message_id: id, reaction });
+
+    expect(await react([{ type: "paid" }])).toMatchObject({
+      status: 400,
+      description:
+        "Bad Request: can't parse ReactionType: invalid reaction type specified",
+    });
+    expect(await react([{ type: "emoji", emoji: "" }])).toMatchObject({
+      status: 400,
+      description: "Bad Request: invalid reaction type specified",
+    });
+    expect(await react([{ type: "emoji", emoji: "🦄🦄" }])).toMatchObject({
+      status: 400,
+      description: "Bad Request: REACTION_INVALID",
+    });
+    expect((await fake.getMessage(GROUP, id)).reactions).toEqual({});
+
+    expect(await react([{ type: "emoji", emoji: "❤" }])).toMatchObject({
+      ok: true,
+    });
+    expect((await fake.getMessage(GROUP, id)).reactions).toEqual({
+      123456: ["❤"],
+    });
+  });
+
+  it("sets a reaction on an album's first remaining message", async () => {
+    const { fake, api, member } = await setup();
+    const album = await fake.postAlbum(GROUP, member, [
+      { type: "photo", bytes: BYTES },
+      { type: "photo", bytes: BYTES },
+      { type: "photo", bytes: BYTES },
+    ]);
+    const [first, second, third] = album.message_ids;
+    const reactionsOf = async (id) =>
+      (await fake.getMessage(GROUP, id)).reactions;
+
+    await api("setMessageReaction", {
+      chat_id: GROUP,
+      message_id: third,
+      reaction: [{ type: "emoji", emoji: "👍" }],
+    });
+    expect(await reactionsOf(first)).toEqual({ 123456: ["👍"] });
+    expect(await reactionsOf(third)).toEqual({});
+
+    await api("deleteMessage", { chat_id: GROUP, message_id: first });
+    await api("setMessageReaction", {
+      chat_id: GROUP,
+      message_id: third,
+      reaction: [{ type: "emoji", emoji: "🔥" }],
+    });
+    expect(await reactionsOf(second)).toEqual({ 123456: ["🔥"] });
+  });
+
+  it("removes a chat's reaction by actor_chat_id instead of user_id", async () => {
+    const { fake, api, member } = await setup();
+    const id = await fake.post(GROUP, member, "anonymous admins react too");
+    const remove = (params) =>
+      api("deleteMessageReaction", { chat_id: GROUP, message_id: id, ...params });
+
+    expect(await remove({ actor_chat_id: GROUP })).toMatchObject({
+      ok: true,
+      result: true,
+    });
+    expect(await remove({})).toMatchObject({
+      status: 400,
+      description: "Bad Request: sender_chat_id is empty",
+    });
+    expect(await remove({ actor_chat_id: "@channel" })).toMatchObject({
+      status: 400,
+      description: "Bad Request: sender_chat_id is not a valid Integer",
+    });
+  });
+
   it("gives a guard bot join requests as queries it answers", async () => {
     const { fake, api } = await setup();
     const guard = await fake.addBot({

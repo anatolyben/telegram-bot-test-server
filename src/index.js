@@ -164,6 +164,13 @@ const DICE = Object.freeze({
   "🎰": 64,
 });
 
+// The emoji a bot may react with: ReactionTypeEmoji's list, Bot API 10.3.
+const REACTION_EMOJI = new Set(
+  "❤ 👍 👎 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🤮 💩 🙏 👌 🕊 🤡 🥱 🥴 😍 🐳 ❤‍🔥 🌚 🌭 💯 🤣 ⚡ 🍌 🏆 💔 🤨 😐 🍓 🍾 💋 🖕 😈 😴 😭 🤓 👻 👨‍💻 👀 🎃 🙈 😇 😨 🤝 ✍ 🤗 🫡 🎅 🎄 ☃ 💅 🤪 🗿 🆒 💘 🙉 🦄 😘 💊 🙊 😎 👾 🤷‍♂ 🤷 🤷‍♀ 😡".split(
+    " ",
+  ),
+);
+
 // What a member can post besides text and photos: the permission it needs,
 // the file's folder and extension, and whether it takes a caption.
 const MEMBER_MEDIA = Object.freeze({
@@ -293,6 +300,69 @@ function parseJsonObject(body) {
     );
   }
   return value;
+}
+
+/**
+ * A JSON-serialized list parameter, read as the Bot API server reads it: a
+ * string is decoded and null is an empty list. read returns each item, or
+ * throws an Error that says what is wrong with it.
+ */
+function jsonList(value, name, className, read) {
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      throw new TelegramError(
+        400,
+        `Bad Request: can't parse ${name} JSON object`,
+      );
+    }
+  }
+  if (value === null) return [];
+  if (!Array.isArray(value)) {
+    throw new TelegramError(
+      400,
+      `Bad Request: expected an Array of ${className}`,
+    );
+  }
+  return value.map((item) => {
+    try {
+      return read(item);
+    } catch (error) {
+      throw new TelegramError(
+        400,
+        `Bad Request: can't parse ${className}: ${error.message}`,
+      );
+    }
+  });
+}
+
+/** A required string field of a JSON object in a list parameter. */
+function requiredString(object, name) {
+  const value = object[name];
+  if (value === undefined) throw new Error(`Can't find field "${name}"`);
+  if (typeof value === "number") return String(value);
+  if (typeof value !== "string") {
+    throw new Error(`Field "${name}" must be of type String`);
+  }
+  return value;
+}
+
+/** A ReactionType: only emoji and custom_emoji, so never a paid reaction. */
+function reactionType(reaction) {
+  if (
+    reaction === null ||
+    typeof reaction !== "object" ||
+    Array.isArray(reaction)
+  ) {
+    throw new Error("expected an Object");
+  }
+  const type = requiredString(reaction, "type");
+  if (type === "emoji") {
+    return { type, emoji: requiredString(reaction, "emoji") };
+  }
+  if (type === "custom_emoji") return reaction;
+  throw new Error("invalid reaction type specified");
 }
 
 async function readRequestParams(request, body) {
@@ -2419,16 +2489,48 @@ export async function startTestServer({
       invite.creates_join_request = createsJoinRequest;
       return { ...invite };
     },
-    // A bot sets at most one reaction of its own on a message.
+    // A bot sets at most one reaction of its own on a message, an emoji from
+    // ReactionTypeEmoji's list; an album takes it on its first message.
     setMessageReaction: (p, caller) => {
+      const reactions =
+        p.reaction === undefined || p.reaction === ""
+          ? []
+          : jsonList(p.reaction, "reaction types", "ReactionType", reactionType);
       const chat = botChat(p.chat_id);
-      const entry = chat.messages.get(Number(p.message_id));
+      let entry = chat.messages.get(Number(p.message_id));
       if (!entry || entry.deleted) {
         throw new TelegramError(400, "Bad Request: MESSAGE_ID_INVALID");
       }
-      const reactions = Array.isArray(p.reaction) ? p.reaction : [];
+      const group = entry.message.media_group_id;
+      if (group) {
+        entry = [...chat.messages.values()].find(
+          (other) => !other.deleted && other.message.media_group_id === group,
+        );
+      }
+      // TDLib reads "" as no reaction, "$" as the paid one and "#…" as a
+      // custom emoji, so none of them is an emoji reaction.
+      if (
+        reactions.some(
+          ({ type, emoji }) =>
+            type === "emoji" &&
+            (emoji === "" || emoji === "$" || emoji.startsWith("#")),
+        )
+      ) {
+        throw new TelegramError(
+          400,
+          "Bad Request: invalid reaction type specified",
+        );
+      }
       if (reactions.length > 1) {
         throw new TelegramError(400, "Bad Request: REACTIONS_TOO_MANY");
+      }
+      if (
+        reactions.some(
+          (reaction) =>
+            reaction.type === "emoji" && !REACTION_EMOJI.has(reaction.emoji),
+        )
+      ) {
+        throw new TelegramError(400, "Bad Request: REACTION_INVALID");
       }
       entry.reactions ??= new Map();
       if (reactions.length) {
@@ -2439,7 +2541,8 @@ export async function startTestServer({
       } else entry.reactions.delete(caller.id);
       return true;
     },
-    // Removes a user's reaction; needs can_delete_messages.
+    // Removes a user's reaction, or a chat's (actor_chat_id) when no user_id
+    // is given; needs can_delete_messages.
     deleteMessageReaction: async (p, caller) => {
       const chat = requireChat(p.chat_id);
       if (!hasRight(chat, caller.id, "can_delete_messages")) {
@@ -2451,6 +2554,21 @@ export async function startTestServer({
       const entry = chat.messages.get(Number(p.message_id));
       if (!entry || entry.deleted) {
         throw new TelegramError(400, "Bad Request: MESSAGE_ID_INVALID");
+      }
+      if (p.user_id == null || p.user_id === "") {
+        const actor = String(p.actor_chat_id ?? "");
+        if (!actor) {
+          throw new TelegramError(400, "Bad Request: sender_chat_id is empty");
+        }
+        if (!/^-?\d+$/.test(actor)) {
+          throw new TelegramError(
+            400,
+            "Bad Request: sender_chat_id is not a valid Integer",
+          );
+        }
+        // Members react as themselves here, so no chat's reaction is ever
+        // there to remove.
+        return true;
       }
       const user = requireUser(p.user_id);
       if (entry.reactions?.has(user.id)) {

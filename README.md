@@ -225,8 +225,12 @@ The details a moderation bot depends on, each covered by a test:
   `media_group_id` and forwards with `forward_origin` (a user, a hidden user or a channel post).
   An edit by the author reaches bots as `edited_message` with `edit_date`.
 - **Reactions.** A member's reaction reaches the chat's administrator bots as `message_reaction`,
-  only when they list it in `allowed_updates`, as on Telegram. A bot sets at most one reaction, and
-  removes a member's with `deleteMessageReaction` and `can_delete_messages`.
+  only when they list it in `allowed_updates`, as on Telegram. A bot sets at most one reaction,
+  and only an emoji from the [ReactionTypeEmoji](https://core.telegram.org/bots/api#reactiontypeemoji)
+  list (any other emoji fails with `REACTION_INVALID`, and a paid reaction is refused). A reaction
+  on an album lands on its first message that is not deleted. The bot removes a member's reaction
+  with `deleteMessageReaction` and `can_delete_messages`; `actor_chat_id` may stand in for
+  `user_id`, though members here never react as a chat.
 - **Administrators and chat settings.** `promoteChatMember` needs `can_promote_members` and grants
   only rights the bot holds; the bot can then edit and title the administrators it promoted.
   `setChatTitle`, `setChatDescription`, `setChatPhoto` and `deleteChatPhoto` need `can_change_info`,
