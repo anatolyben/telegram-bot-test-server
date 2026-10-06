@@ -214,13 +214,15 @@ The details a moderation bot depends on, each covered by a test:
   inline keyboard, after which its buttons can no longer be pressed. As in TDLib's
   [`can_edit_message`](https://github.com/tdlib/td/blob/master/td/telegram/MessagesManager.cpp),
   a forward, and a message sent with a reply keyboard, `remove_keyboard` or `force_reply`, can't be
-  edited either. Editing a message the bot can't edit fails with `message can't be edited`, or
-  `message media can't be edited` from `editMessageMedia`.
+  edited either, nor can its poll be stopped. Editing a message the bot can't edit fails with
+  `message can't be edited`, or `message media can't be edited` from `editMessageMedia`.
   `editMessageText` needs a text message (`there is no text in the message to edit`), and
   `editMessageCaption` a photo, video, animation, audio, document or voice message
   (`there is no caption in the message to edit`); `editMessageMedia` replaces a photo, live photo,
   video, animation, audio, document or text. A sticker, video note, location, contact or dice only
-  has its inline keyboard changed. An empty caption is left out of the message.
+  has its inline keyboard changed. A live location still counts as editable while its
+  `live_period` runs, so text and caption edits then fail with the two errors above rather than
+  `message can't be edited`. An empty caption is left out of the message.
 - **Channels** ([Update](https://core.telegram.org/bots/api#update),
   [ChatAdministratorRights](https://core.telegram.org/bots/api#chatadministratorrights)). Every
   message in a channel comes from the channel: `sender_chat` is the channel and there is no `from`,
@@ -325,7 +327,8 @@ The details a moderation bot depends on, each covered by a test:
   location with `live_period` is a live location with its `heading` and `proximity_alert_radius`,
   refused out of Telegram's ranges, and off the map with `invalid live location specified`.
   `sendMediaGroup` sends up to 10 items as one album; a single item is sent as an ordinary
-  message, as TDLib does.
+  message, as TDLib does. As in Telegram's Bot API server, it reads `reply_parameters` before
+  `media`, and checks the replied message before it reads any file or counts the album.
 - **Files** ([sending files](https://core.telegram.org/bots/api#sending-files)). Each bot gets its
   own opaque `file_id` for a file, and `file_unique_id` is the same for every bot. A bot can send
   again, `getFile` and download (with its own token) only the file_ids it was given. `getFile` on
@@ -379,14 +382,19 @@ The details a moderation bot depends on, each covered by a test:
   polls, off for quizzes), `members_only` (channels only), `is_closed`, `description` and an
   attached photo, and gives each option a `persistent_id`. A quiz needs `correct_option_ids` (or
   the older `correct_option_id`), and the bot that sent it sees them in the poll. `stopPoll` closes
-  a poll once; a poll in a message the bot can't edit fails with `poll can't be stopped`. The bot
-  that stopped it and the bot that sent it then get the closed poll as a `poll` update, as
-  [Update](https://core.telegram.org/bots/api#update) says. Members do not vote.
+  a poll once; a poll in a message the bot can't edit (see **Editing**) fails with
+  `poll can't be stopped`. The bot that stopped it and the bot that sent it then get the closed
+  poll as a `poll` update, as [Update](https://core.telegram.org/bots/api#update) says. Members do
+  not vote.
 - **Forwards and copies.** A forward carries `forward_origin`; a copy does not. A forward of a
   forward keeps the first origin and its date. A bot cannot forward from a chat it is not in; the
   source chat gets the checks above for a call that needs only read access, before the chat the
-  message goes to. Service messages can't be forwarded or copied
-  (`the message can't be forwarded` / `copied`). A send with `protect_content` has
+  message goes to. A missing message fails with `message to forward not found` or
+  `message to copy not found`. Service messages can't be forwarded or copied
+  (`the message can't be forwarded` / `copied`). Nor can an open quiz be copied by a bot that does
+  not know its correct options, which it knows only for a quiz it sent itself, not as a forward,
+  or one in a private chat ([Poll](https://core.telegram.org/bots/api#poll)); once the quiz is
+  closed any bot copies it. A send with `protect_content`, a forward or an album included, has
   `has_protected_content`; it can't be forwarded, but the bot can still copy it. One item of an
   album is forwarded or copied without its `media_group_id`. A copy's `caption` replaces the
   original on media that takes one, formatted with `parse_mode` or `caption_entities`, and an empty
@@ -906,12 +914,14 @@ nested reply chains, in every send method including `sendMediaGroup`, and
 `allow_sending_without_reply` is supported. A `message_id` of 0, an ephemeral message's, names no
 message, so the send is not a reply. With `reply_parameters.chat_id` the bot replies to a
 message in another chat it can read: the message gets `external_reply` (the original's origin, its
-chat and id for a supergroup or channel, and its media without the caption) instead of
-`reply_to_message`, plus an automatic `quote` of the original's text or caption. A reply to a
-supergroup or channel the bot is not in fails with `message to be replied not found`, and to an
-unknown chat with `chat not found`. A `quote` (with `quote_parse_mode` or `quote_entities`) must be
-an exact substring of the original, including its bold, italic, underline, strikethrough, spoiler,
-custom emoji and date entities, or the send fails with `QUOTE_TEXT_INVALID`
+chat and id for a supergroup or channel, and its media without the caption, a live photo as
+`live_photo` alone) instead of `reply_to_message`, plus an automatic `quote` of the original's text
+or caption. The other chat gets the checks under **Which chats a bot may use**: `chat not found`
+for an unknown chat or one the bot was never in, and a 403 for a supergroup or channel it left or
+was kicked from. A missing or deleted message fails with `message to be replied not found`. A
+`quote` (with `quote_parse_mode` or `quote_entities`) must be an exact substring of the original,
+including its bold, italic, underline, strikethrough, spoiler, custom emoji and date entities, or
+the send fails with `QUOTE_TEXT_INVALID`
 ([messages.sendMessage](https://core.telegram.org/method/messages.sendMessage)); the message then
 carries `quote` with `is_manual` and the `quote_position` given. Forum-topic sends without an
 explicit reply attach the topic's creation message. Not implemented: replies to another forum

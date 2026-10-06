@@ -646,6 +646,38 @@ describe("bot sends", () => {
       "origin",
     ]);
     expect(toText.result.quote).toEqual({ text: "plain words", position: 0 });
+    // A live photo is shown as live_photo alone, without the photo the
+    // message also carries for older bots.
+    const still = (
+      await api("sendPhoto", {
+        chat_id: other,
+        photo: "https://example.com/a.jpg",
+      })
+    ).result;
+    const motion = (
+      await api("sendVideo", {
+        chat_id: other,
+        video: "https://example.com/a.mp4",
+      })
+    ).result;
+    const live = await api("editMessageMedia", {
+      chat_id: other,
+      message_id: still.message_id,
+      media: {
+        type: "live_photo",
+        media: motion.video.file_id,
+        photo: still.photo[0].file_id,
+      },
+    });
+    const toLive = await api("sendMessage", {
+      chat_id: GROUP,
+      text: "nice",
+      reply_parameters: { chat_id: other, message_id: still.message_id },
+    });
+    expect(toLive.result.external_reply.live_photo).toEqual(
+      live.result.live_photo,
+    );
+    expect(toLive.result.external_reply).not.toHaveProperty("photo");
 
     const closed = await server.createChat({ title: "Closed", ownerId: OWNER });
     await server.join(closed, ann);
@@ -701,6 +733,12 @@ describe("bot sends", () => {
     ]) {
       expect(unchanged.result).not.toHaveProperty("link_preview_options");
     }
+    const legacy = await api("sendMessage", {
+      chat_id: GROUP,
+      text: "see https://example.com/e",
+      disable_web_page_preview: true,
+    });
+    expect(legacy.result.link_preview_options).toEqual({ is_disabled: true });
 
     const edited = await api("editMessageText", {
       chat_id: GROUP,
@@ -709,6 +747,13 @@ describe("bot sends", () => {
       link_preview_options: { is_disabled: true },
     });
     expect(edited.result.link_preview_options).toEqual({ is_disabled: true });
+    // An edit without link_preview_options goes back to the defaults.
+    const reset = await api("editMessageText", {
+      chat_id: GROUP,
+      message_id: chosen.result.message_id,
+      text: "read https://example.com/f",
+    });
+    expect(reset.result).not.toHaveProperty("link_preview_options");
   });
 
   it("replies to a forum topic's creation message by default", async () => {

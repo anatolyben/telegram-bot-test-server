@@ -4129,6 +4129,8 @@ export async function startTestServer({
     // alone; one item is sent as an ordinary message (TDLib
     // MessagesManager::send_message_group, check_message_group_message_contents).
     sendMediaGroup: (p, caller) => {
+      // The reply is read before the media (process_send_media_group_query).
+      const parameters = replyParameters(p);
       if (p.media === undefined || p.media === "") {
         throw new TelegramError(
           400,
@@ -4156,8 +4158,8 @@ export async function startTestServer({
         );
       }
       requireCanSend(chat, caller);
-      // Telegram parses every InputMedia caption, then reads every file,
-      // before it sends any of the album.
+      // Telegram parses every InputMedia caption before it checks the reply,
+      // and sends none of the album if one fails.
       const formatted = items.map((item) => {
         const caption = captionFields(item);
         if (namedFile(p, item.media) === null) {
@@ -4168,46 +4170,47 @@ export async function startTestServer({
         }
         return caption;
       });
-      // Then it reads every file, as send_message_group does before it counts
-      // the album.
-      const media = items.map((item) =>
-        // An album's documents go as plain files (Client.cpp get_input_media).
-        sentFile(p, item.media, item.type, caller, senderMeta(item), {
-          typeName: item.type === "document" ? "DocumentAsFile" : undefined,
-        }),
-      );
-      if (items.length > 10) {
-        throw new TelegramError(
-          400,
-          "Bad Request: too many messages to send as an album",
-        );
-      }
-      for (const alone of ["document", "audio"]) {
-        if (types.includes(alone) && types.some((type) => type !== alone)) {
-          throw new TelegramError(
-            400,
-            `Bad Request: ${alone} can't be mixed with other media types`,
-          );
-        }
-      }
-      const mediaGroupId =
-        items.length > 1 ? String(nextMediaGroupId++) : undefined;
-      // One send of every item, each answering the same message.
+      // One send of every item, each answering the same message, which is
+      // checked (check_reply_parameters) before send_message_group reads
+      // every file and counts the album.
       return sendFrom(
         {
           chat_id: p.chat_id,
           message_thread_id: p.message_thread_id,
-          reply_parameters: p.reply_parameters,
-          reply_to_message_id: p.reply_to_message_id,
-          allow_sending_without_reply: p.allow_sending_without_reply,
+          reply_parameters: parameters ?? undefined,
           protect_content: p.protect_content,
         },
         caller,
-        media.map((file, index) => ({
-          ...mediaFields(file.kind, file),
-          ...formatted[index],
-          ...(mediaGroupId ? { media_group_id: mediaGroupId } : {}),
-        })),
+        () => {
+          const media = items.map((item) =>
+            // An album's documents go as plain files (Client.cpp
+            // get_input_media).
+            sentFile(p, item.media, item.type, caller, senderMeta(item), {
+              typeName: item.type === "document" ? "DocumentAsFile" : undefined,
+            }),
+          );
+          if (items.length > 10) {
+            throw new TelegramError(
+              400,
+              "Bad Request: too many messages to send as an album",
+            );
+          }
+          for (const alone of ["document", "audio"]) {
+            if (types.includes(alone) && types.some((type) => type !== alone)) {
+              throw new TelegramError(
+                400,
+                `Bad Request: ${alone} can't be mixed with other media types`,
+              );
+            }
+          }
+          const mediaGroupId =
+            items.length > 1 ? String(nextMediaGroupId++) : undefined;
+          return media.map((file, index) => ({
+            ...mediaFields(file.kind, file),
+            ...formatted[index],
+            ...(mediaGroupId ? { media_group_id: mediaGroupId } : {}),
+          }));
+        },
       );
     },
     promoteChatMember: (p, caller) => {
@@ -4905,20 +4908,11 @@ export async function startTestServer({
           privateChats.get(Number(parameters.chat_id)));
     if (!source) throw new TelegramError(400, "Bad Request: chat not found");
     // Another group or channel is checked for reading (check_chat with
-    // AccessRights::Read in Client.cpp check_reply_parameters).
+    // AccessRights::Read in Client.cpp check_reply_parameters). Only a public
+    // supergroup or channel lets a non-member through to have_message_access,
+    // and none here holds messages.
     if (source !== chat && source.type !== "private") {
       checkChatAccess(source, caller, { readOnly: true, readsUpgraded: true });
-    }
-    // Only members read a supergroup's or a channel's messages (Client.cpp
-    // have_message_access).
-    if (
-      ["supergroup", "channel"].includes(source.type) &&
-      !isInChat(source, caller.id)
-    ) {
-      throw new TelegramError(
-        400,
-        "Bad Request: message to be replied not found",
-      );
     }
     const entry = source.messages.get(Number(parameters.message_id));
     if (
@@ -5051,12 +5045,13 @@ export async function startTestServer({
    * ExternalReplyInfo for a reply to another chat: the message's origin, its
    * chat and id when the chat is a supergroup or a channel, and its media
    * without the caption, or a text's link preview options (TDLib
-   * RepliedMessageInfo.cpp, Client.cpp JsonExternalReplyInfo).
+   * RepliedMessageInfo.cpp, Client.cpp JsonExternalReplyInfo). A live photo
+   * is live_photo alone, without the photo a message also carries.
    * https://core.telegram.org/bots/api#externalreplyinfo
    */
   function externalReply(chat, message) {
     const origin = messageOrigin(chat, message);
-    const type = contentType(message);
+    const type = message.live_photo ? "live_photo" : contentType(message);
     const content =
       type === "text"
         ? message.link_preview_options
@@ -5612,8 +5607,12 @@ export async function startTestServer({
   /**
    * The message a forward or copy reads, when the bot can see it. A service
    * message can be neither forwarded nor copied, and a protected one only
-   * copied by a bot (TDLib can_forward_message). Only the content goes along:
-   * a single album item leaves its album behind (get_forwarded_messages).
+   * copied by a bot (TDLib can_forward_message). A copy also needs an open
+   * quiz's correct options (dup_message_content, PollManager::has_input_media),
+   * which a bot knows only for a quiz it sent, not forwarded, or one in a
+   * private chat (https://core.telegram.org/bots/api#poll). Only the content
+   * goes along: a single album item leaves its album behind
+   * (get_forwarded_messages).
    */
   function forwardable(p, caller, copy) {
     // The source is only read (AccessRights::Read), so an upgraded basic
@@ -5628,11 +5627,21 @@ export async function startTestServer({
       entry.deleted ||
       (sourceChat.type !== "private" && !isInChat(sourceChat, caller.id))
     ) {
-      throw new TelegramError(400, "Bad Request: message to forward not found");
+      throw new TelegramError(
+        400,
+        `Bad Request: message to ${copy ? "copy" : "forward"} not found`,
+      );
     }
+    const poll = entry.message.poll;
+    const unknownQuiz =
+      poll?.type === "quiz" &&
+      !poll.is_closed &&
+      sourceChat.type !== "private" &&
+      (entry.author !== caller.id || entry.message.forward_origin);
     if (
       contentType(entry.message) === null ||
-      (!copy && entry.message.has_protected_content)
+      (!copy && entry.message.has_protected_content) ||
+      (copy && unknownQuiz)
     ) {
       throw new TelegramError(
         400,
@@ -5666,18 +5675,21 @@ export async function startTestServer({
 
   /**
    * Whether the bot may edit a message or stop its poll, as TDLib's
-   * MessagesManager::can_edit_message decides: its own messages, and in a
-   * channel any post with can_edit_messages, but its own only while it has
-   * can_post_messages. A media edit is refused with its own text
-   * (edit_message_media), and stopPoll ("poll") with get_message_poll_id's.
+   * MessagesManager::can_edit_message decides: never a forward or a message
+   * sent with a reply keyboard; its own messages, and in a channel any post
+   * with can_edit_messages, but its own only while it has can_post_messages.
+   * A media edit is refused with its own text (edit_message_media), and
+   * stopPoll ("poll") with get_message_poll_id's.
    */
   function requireEditable(chat, entry, caller, kind) {
     const own = entry.author === caller.id;
     const allowed =
-      chat.type === "channel"
+      !entry.message.forward_origin &&
+      !entry.replyKeyboard &&
+      (chat.type === "channel"
         ? hasRight(chat, caller.id, "can_edit_messages") ||
           (own && hasRight(chat, caller.id, "can_post_messages"))
-        : own;
+        : own);
     if (!allowed) {
       const refusal =
         kind === "media"
@@ -5691,22 +5703,22 @@ export async function startTestServer({
 
   /**
    * Whether a bot may make this kind of edit ("text", "caption", "media" or
-   * "reply_markup") to a message it may edit, as TDLib's can_edit_message and
-   * edit methods decide (MessagesManager.cpp). A forward, or a message sent
-   * with a reply keyboard, can't be edited at all; text edits need a text
-   * message, caption edits media that takes a caption, and media edits media
-   * or text. Other content only has its inline keyboard changed; an open poll
-   * counts as editable, since it can still be stopped.
+   * "reply_markup") to a message it may edit (requireEditable), as TDLib's
+   * can_edit_message and edit methods decide (MessagesManager.cpp). Text
+   * edits need a text message, caption edits media that takes a caption, and
+   * media edits media or text. Other content only has its inline keyboard
+   * changed; an open poll counts as editable, since it can still be stopped,
+   * and so does a live location during its live_period.
    */
   function requireEditableContent(entry, kind) {
     const message = entry.message;
     const type = contentType(message);
     const editable =
-      !message.forward_origin &&
-      !entry.replyKeyboard &&
-      (EDITABLE_CONTENT.includes(type) ||
-        (kind === "reply_markup" && type !== null) ||
-        (type === "poll" && !message.poll.is_closed));
+      EDITABLE_CONTENT.includes(type) ||
+      (kind === "reply_markup" && type !== null) ||
+      (type === "poll" && !message.poll.is_closed) ||
+      (type === "location" &&
+        now() - message.date < (message.location.live_period ?? 0));
     if (kind === "media") {
       if (!editable || !MEDIA_EDITABLE_CONTENT.includes(type)) {
         throw new TelegramError(

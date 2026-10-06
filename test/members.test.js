@@ -556,8 +556,8 @@ describe("more send methods", () => {
     expect(single.result[0].media_group_id).toBeUndefined();
   });
 
-  it("sends an album as a reply", async () => {
-    const { fake, upload, member } = await setup();
+  it("sends an album as a reply, read before its media and checked before its files", async () => {
+    const { fake, api, upload, member } = await setup();
     const asked = await fake.post(GROUP, member, "send the photos");
 
     const sent = await upload("sendMediaGroup", {
@@ -574,6 +574,28 @@ describe("more send methods", () => {
     expect(
       sent.result.map((message) => message.reply_to_message?.message_id),
     ).toEqual([asked, asked]);
+
+    expect(
+      await api("sendMediaGroup", {
+        chat_id: GROUP,
+        media: "not json",
+        reply_parameters: "{bad",
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: can't parse reply parameters JSON object",
+    });
+    const unknown = { type: "photo", media: "not-a-file-id" };
+    expect(
+      await api("sendMediaGroup", {
+        chat_id: GROUP,
+        media: [unknown, unknown],
+        reply_parameters: { message_id: 999999 },
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: message to be replied not found",
+    });
   });
 });
 

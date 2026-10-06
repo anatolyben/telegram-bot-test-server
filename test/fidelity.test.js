@@ -492,9 +492,17 @@ describe("messages and buttons", () => {
   });
 
   it("edits text only in a text message and a caption only in a media message", async () => {
-    const { api } = await setup();
+    const { server, api } = await setup({ clock: { now: 1_800_000_000_000 } });
     const text = (await api("sendMessage", { chat_id: GROUP, text: "plain" }))
       .result;
+    const live = (
+      await api("sendLocation", {
+        chat_id: GROUP,
+        latitude: 51.5,
+        longitude: -0.12,
+        live_period: 60,
+      })
+    ).result;
     const photo = (
       await api("sendPhoto", {
         chat_id: GROUP,
@@ -529,22 +537,47 @@ describe("messages and buttons", () => {
       status: 400,
       description: "Bad Request: there is no caption in the message to edit",
     });
-    for (const method of ["editMessageText", "editMessageCaption"]) {
-      expect(
-        await api(method, {
-          chat_id: GROUP,
-          message_id: sticker.message_id,
-          text: "x",
-          caption: "x",
-        }),
-      ).toMatchObject({
-        status: 400,
-        description: "Bad Request: message can't be edited",
-      });
+    // A live location stays editable during its period, with no text or
+    // caption to edit.
+    expect(
+      await api("editMessageText", {
+        chat_id: GROUP,
+        message_id: live.message_id,
+        text: "x",
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: there is no text in the message to edit",
+    });
+    expect(
+      await api("editMessageCaption", {
+        chat_id: GROUP,
+        message_id: live.message_id,
+        caption: "x",
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: there is no caption in the message to edit",
+    });
+    await server.advanceTime(60_000);
+    for (const message of [sticker, live]) {
+      for (const method of ["editMessageText", "editMessageCaption"]) {
+        expect(
+          await api(method, {
+            chat_id: GROUP,
+            message_id: message.message_id,
+            text: "x",
+            caption: "x",
+          }),
+        ).toMatchObject({
+          status: 400,
+          description: "Bad Request: message can't be edited",
+        });
+      }
     }
   });
 
-  it("refuses to edit a forwarded message or one sent with a reply keyboard", async () => {
+  it("refuses to edit a forwarded message or one sent with a reply keyboard, or stop its poll", async () => {
     const { server, api, member } = await setup();
     const said = await server.post(GROUP, await member(), "original words");
     const forward = (
@@ -605,6 +638,32 @@ describe("messages and buttons", () => {
         },
       }),
     ).toMatchObject(cantEdit);
+
+    const poll = { chat_id: GROUP, question: "Lunch?", options: ["Yes", "No"] };
+    const keyboardPoll = (
+      await api("sendPoll", {
+        ...poll,
+        reply_markup: { keyboard: [[{ text: "A" }]] },
+      })
+    ).result;
+    const forwardedPoll = (
+      await api("forwardMessage", {
+        chat_id: GROUP,
+        from_chat_id: GROUP,
+        message_id: (await api("sendPoll", poll)).result.message_id,
+      })
+    ).result;
+    for (const message of [keyboardPoll, forwardedPoll]) {
+      expect(
+        await api("stopPoll", {
+          chat_id: GROUP,
+          message_id: message.message_id,
+        }),
+      ).toMatchObject({
+        status: 400,
+        description: "Bad Request: poll can't be stopped",
+      });
+    }
   });
 
   it("leaves out a caption an edit empties", async () => {

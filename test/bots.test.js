@@ -944,7 +944,7 @@ describe("polls, forwards and media", () => {
     });
   });
 
-  it("protects a message's content from forwarding, but lets the bot copy it", async () => {
+  it("protects a message, forward or album sent with protect_content, but lets the bot copy it", async () => {
     const { fake, api } = await setup();
     const sent = await api("sendMessage", {
       chat_id: GROUP,
@@ -967,6 +967,25 @@ describe("polls, forwards and media", () => {
     const copied = await fake.getMessage(GROUP, copy.result.message_id);
     expect(copied.message.text).toBe("members only");
     expect(copied.message).not.toHaveProperty("has_protected_content");
+
+    const forward = await api("forwardMessage", {
+      chat_id: GROUP,
+      from_chat_id: GROUP,
+      message_id: copy.result.message_id,
+      protect_content: true,
+    });
+    expect(forward.result.has_protected_content).toBe(true);
+    const album = await api("sendMediaGroup", {
+      chat_id: GROUP,
+      media: [
+        { type: "photo", media: "https://example.com/a.jpg" },
+        { type: "photo", media: "https://example.com/b.jpg" },
+      ],
+      protect_content: true,
+    });
+    expect(
+      album.result.map((message) => message.has_protected_content),
+    ).toEqual([true, true]);
   });
 
   it("keeps the first origin when it forwards a forwarded message", async () => {
@@ -1010,6 +1029,50 @@ describe("polls, forwards and media", () => {
       status: 400,
       description: "Bad Request: the message can't be copied",
     });
+  });
+
+  it("names a missing message as the one to forward or to copy", async () => {
+    const { api } = await setup();
+    const missing = { chat_id: GROUP, from_chat_id: GROUP, message_id: 999 };
+
+    expect(await api("forwardMessage", missing)).toMatchObject({
+      status: 400,
+      description: "Bad Request: message to forward not found",
+    });
+    expect(await api("copyMessage", missing)).toMatchObject({
+      status: 400,
+      description: "Bad Request: message to copy not found",
+    });
+  });
+
+  it("copies an open quiz only for the bot that sent it, and a closed one for any bot", async () => {
+    const { fake, api, second } = await setup();
+    await fake.setBotMembership(GROUP, second.id, { status: "member" });
+    const quiz = await api("sendPoll", {
+      chat_id: GROUP,
+      question: "Primes?",
+      options: ["2", "4"],
+      type: "quiz",
+      correct_option_ids: [0],
+    });
+    const source = {
+      chat_id: GROUP,
+      from_chat_id: GROUP,
+      message_id: quiz.result.message_id,
+    };
+
+    // Another bot does not know an open quiz's correct options, which a copy
+    // needs.
+    expect(await api("copyMessage", source, SECOND_TOKEN)).toMatchObject({
+      status: 400,
+      description: "Bad Request: the message can't be copied",
+    });
+    expect((await api("copyMessage", source)).ok).toBe(true);
+    await api("stopPoll", {
+      chat_id: GROUP,
+      message_id: quiz.result.message_id,
+    });
+    expect((await api("copyMessage", source, SECOND_TOKEN)).ok).toBe(true);
   });
 
   it("puts a copy's new caption only on media, formatted, and leaves out an empty one", async () => {
