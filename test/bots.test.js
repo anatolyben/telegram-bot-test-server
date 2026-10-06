@@ -2638,3 +2638,191 @@ describe("precise fault receipts", () => {
     });
   });
 });
+
+describe("poll votes", () => {
+  async function pollSetup(fields) {
+    const { fake, api, second } = await setup();
+    const hook = await startReceiver();
+    const other = await startReceiver();
+    await api("setWebhook", { url: hook.url });
+    await api("setWebhook", { url: other.url }, SECOND_TOKEN);
+    await fake.setBotMembership(GROUP, second.id, { status: "administrator" });
+    const poll = (
+      await api("sendPoll", {
+        chat_id: GROUP,
+        question: "Lunch?",
+        options: ["Pizza", "Salad", "Soup"],
+        ...fields,
+      })
+    ).result;
+    const ann = await fake.createUser({ first_name: "Ann" });
+    await fake.join(GROUP, ann);
+    return { fake, api, hook, other, poll, ann };
+  }
+
+  it("tells the bot that sent a public poll who voted for what, and the new counts", async () => {
+    const { fake, hook, other, poll, ann } = await pollSetup({
+      is_anonymous: false,
+      allows_multiple_answers: true,
+    });
+    const [pizza, , soup] = poll.poll.options;
+
+    await fake.vote(GROUP, poll.message_id, ann, [2, 0]);
+    expect(hook.ofType("poll_answer")).toEqual([
+      {
+        poll_id: poll.poll.id,
+        user: expect.objectContaining({ id: ann, first_name: "Ann" }),
+        option_ids: [0, 2],
+        option_persistent_ids: [pizza.persistent_id, soup.persistent_id],
+      },
+    ]);
+    expect(hook.ofType("poll")).toEqual([
+      expect.objectContaining({
+        id: poll.poll.id,
+        total_voter_count: 1,
+        options: [
+          expect.objectContaining({ text: "Pizza", voter_count: 1 }),
+          expect.objectContaining({ text: "Salad", voter_count: 0 }),
+          expect.objectContaining({ text: "Soup", voter_count: 1 }),
+        ],
+      }),
+    ]);
+    expect(
+      (await fake.getMessage(GROUP, poll.message_id)).message.poll,
+    ).toMatchObject({ total_voter_count: 1 });
+
+    // An empty choice retracts the vote.
+    await fake.vote(GROUP, poll.message_id, ann, []);
+    expect(hook.ofType("poll_answer").at(-1)).toMatchObject({
+      option_ids: [],
+      option_persistent_ids: [],
+    });
+    expect(hook.ofType("poll").at(-1)).toMatchObject({ total_voter_count: 0 });
+    // Bots get votes only in the polls they sent.
+    expect(other.ofType("poll_answer")).toEqual([]);
+    expect(other.ofType("poll")).toEqual([]);
+  });
+
+  it("sends only the new counts for an anonymous poll", async () => {
+    const { fake, hook, poll, ann } = await pollSetup({});
+    await fake.vote(GROUP, poll.message_id, ann, [1]);
+    expect(hook.ofType("poll")).toEqual([
+      expect.objectContaining({ id: poll.poll.id, total_voter_count: 1 }),
+    ]);
+    expect(hook.ofType("poll_answer")).toEqual([]);
+  });
+
+  it("refuses the votes Telegram's app refuses", async () => {
+    const { fake, api, poll, ann } = await pollSetup({});
+    const vote = (options, user = ann, messageId = poll.message_id) =>
+      fake.vote(GROUP, messageId, user, options);
+
+    await expect(vote([0, 1])).rejects.toThrow(
+      "Can't choose more than 1 option in the poll",
+    );
+    await expect(vote([3])).rejects.toThrow(
+      "Invalid option identifier specified",
+    );
+    const outsider = await fake.createUser({ first_name: "Out" });
+    await expect(vote([0], outsider)).rejects.toThrow("Can't access the chat");
+    const text = await fake.post(GROUP, ann, "not a poll");
+    await expect(vote([0], ann, text)).rejects.toThrow("Message is not a poll");
+    await expect(vote([0], ann, 999_999)).rejects.toThrow("Message not found");
+
+    const quiz = (
+      await api("sendPoll", {
+        chat_id: GROUP,
+        question: "2+2?",
+        options: ["4", "5"],
+        type: "quiz",
+        correct_option_id: 0,
+      })
+    ).result;
+    await vote([1], ann, quiz.message_id);
+    await expect(vote([0], ann, quiz.message_id)).rejects.toThrow(
+      "Can't revote in a quiz",
+    );
+    await expect(vote([], ann, quiz.message_id)).rejects.toThrow(
+      "Can't retract vote in the poll",
+    );
+
+    await api("stopPoll", { chat_id: GROUP, message_id: poll.message_id });
+    await expect(vote([0])).rejects.toThrow("Can't answer closed poll");
+  });
+
+  it("delivers a member's poll as a message, and none of its votes", async () => {
+    const { fake, api, hook, ann } = await pollSetup({});
+    const id = await fake.post(GROUP, ann, {
+      poll: { question: "Movie?", options: ["Yes", "No"], is_anonymous: false },
+    });
+    expect(hook.ofType("message").at(-1)).toMatchObject({
+      message_id: id,
+      from: { id: ann },
+      poll: {
+        question: "Movie?",
+        options: [
+          expect.objectContaining({ text: "Yes", voter_count: 0 }),
+          expect.objectContaining({ text: "No", voter_count: 0 }),
+        ],
+        is_anonymous: false,
+        type: "regular",
+      },
+    });
+    const bob = await fake.createUser({ first_name: "Bob" });
+    await fake.join(GROUP, bob);
+    await fake.vote(GROUP, id, bob, [0]);
+    expect(
+      (await fake.getMessage(GROUP, id)).message.poll.options[0].voter_count,
+    ).toBe(1);
+    expect(hook.ofType("poll_answer")).toEqual([]);
+    expect(hook.ofType("poll")).toEqual([]);
+
+    await api("restrictChatMember", {
+      chat_id: GROUP,
+      user_id: bob,
+      permissions: { can_send_messages: true, can_send_polls: false },
+    });
+    await expect(
+      fake.post(GROUP, bob, { poll: { question: "Q?", options: ["A"] } }),
+    ).rejects.toThrow(/CHAT_WRITE_FORBIDDEN/);
+  });
+
+  it("takes a vote in a poll the bot sent to a private chat", async () => {
+    const { fake, api, hook, ann } = await pollSetup({});
+    await fake.sendDirectMessage(ann, "/start");
+    const poll = (
+      await api("sendPoll", {
+        chat_id: ann,
+        question: "Rate us?",
+        options: ["Good", "Bad"],
+        is_anonymous: false,
+      })
+    ).result;
+    await fake.voteDirect(ann, poll.message_id, [0]);
+    expect(hook.ofType("poll_answer")).toEqual([
+      expect.objectContaining({ poll_id: poll.poll.id, option_ids: [0] }),
+    ]);
+  });
+});
+
+describe("polls in channels", () => {
+  it("takes only anonymous polls in a channel", async () => {
+    const { fake, api } = await setup();
+    const me = (await api("getMe")).result;
+    const channel = await fake.createChat({ type: "channel", ownerId: OWNER });
+    await fake.setBotMembership(channel, me.id, { status: "administrator" });
+    const send = (is_anonymous) =>
+      api("sendPoll", {
+        chat_id: channel,
+        question: "Which?",
+        options: ["A", "B"],
+        is_anonymous,
+      });
+    expect(await send(false)).toMatchObject({
+      status: 400,
+      description:
+        "Bad Request: non-anonymous polls can't be sent to channel chats",
+    });
+    expect((await send(true)).ok).toBe(true);
+  });
+});

@@ -399,8 +399,20 @@ itself, not as a forward, or a bot in a private chat
 ([Poll](https://core.telegram.org/bots/api#poll)). Once it is closed every bot sees them. `stopPoll`
 closes a poll once; a poll in a message the bot can't edit (see [Editing](#editing)) fails with
 `poll can't be stopped`. The bot that stopped it and the bot that sent it then get the closed poll
-as a `poll` update, as [Update](https://core.telegram.org/bots/api#update) says. Members do not
-vote.
+as a `poll` update, as [Update](https://core.telegram.org/bots/api#update) says. A channel takes
+anonymous polls only (`non-anonymous polls can't be sent to channel chats`).
+
+Members vote with the `vote` test action, checked as Telegram's app checks a vote (TDLib's
+`set_poll_answer`): a closed poll, more than one option in a single-answer poll, an option that
+does not exist, a changed or retracted vote where revoting is off (every quiz, by default), or a
+voter who is not in the chat are refused with TDLib's texts. Bots get votes only in the polls they
+sent ([Update](https://core.telegram.org/bots/api#update)): that bot gets the poll's new counts as
+a `poll` update and, for a poll that is not anonymous, a `poll_answer` with the voter, `option_ids`
+and `option_persistent_ids` (empty when the vote is taken back). Both wait in the poll's own
+webhook queue, as the Bot API server queues them by poll id. Unverified, because Telegram does not
+document it: the order of the two updates (`poll_answer` comes first here), and that a vote that
+changes nothing sends no update. Members also post polls of their own, and may send one to a bot
+in private, as TDLib allows; the bot gets the message but none of its votes.
 
 ### Reactions
 

@@ -2336,7 +2336,8 @@ export async function startTestServer({
    * The queue an update waits in for the webhook, numbered as Telegram's Bot
    * API server numbers it (telegram-bot-api Client.cpp, the webhook_queue_id
    * of each add_update: an id plus a kind shifted left by 33 bits): messages
-   * by chat, member changes, join requests and button presses by user. One
+   * by chat, member changes, join requests and button presses by user, a
+   * poll's updates by poll. One
    * queue's updates arrive in order, one at a time; different queues are
    * delivered at once. Any other update has a queue of its own, numbered
    * after all of these (WebhookActor's unique_queue_id_).
@@ -2365,6 +2366,10 @@ export async function startTestServer({
       case "edited_business_message":
       case "deleted_business_messages":
         return queue(payload.chat.id, 11);
+      case "poll":
+        return queue(payload.id);
+      case "poll_answer":
+        return queue(payload.poll_id);
       default:
         return (1n << 60n) + BigInt(updateId);
     }
@@ -3856,132 +3861,20 @@ export async function startTestServer({
       waits.notify();
       return true;
     },
-    // A poll may carry a photo, uploaded with it as attach://<name>. The
-    // question, the options and a quiz's explanation are cleaned and trimmed
-    // as message text is (Client.cpp process_send_poll_query, then TDLib's
-    // get_formatted_text in MessageContent.cpp and PollOption.cpp), and the
-    // limits apply to what is left.
+    // A poll may carry a photo, uploaded with it as attach://<name>.
     sendPoll: (p, caller) => {
-      const question = formatOrFail(String(p.question ?? "")).text;
-      const texts = jsonList(
-        p.options === undefined ? "" : p.options,
-        "options",
-        "InputPollOption",
-        pollOptionText,
-      ).map((text) => formatText(text).text);
-      const type = String(p.type ?? "");
-      const quiz = type === "quiz";
-      const explanation = quiz
-        ? formatOrFail(
-            String(p.explanation ?? ""),
-            p.explanation_parse_mode,
-            p.explanation_entities,
-          )
-        : null;
-      const correct = quiz ? correctOptionIds(p) : [];
-      if (!quiz && type !== "" && type !== "regular") {
-        throw new TelegramError(
-          400,
-          "Bad Request: unsupported poll type specified",
-        );
-      }
-      const chat = botChat(p.chat_id, caller, { send: true });
-      if (isEmptyText(question)) {
-        throw new TelegramError(400, "Bad Request: text must be non-empty");
-      }
-      if ([...question].length > 300) {
-        throw new TelegramError(
-          400,
-          "Bad Request: poll question length must not exceed 300",
-        );
-      }
-      if (texts.length === 0) {
-        throw new TelegramError(
-          400,
-          "Bad Request: poll must have at least one answer option",
-        );
-      }
-      if (texts.length > 12) {
-        throw new TelegramError(
-          400,
-          "Bad Request: poll can't have more than 12 options",
-        );
-      }
-      for (const text of texts) {
-        if (isEmptyText(text)) {
-          throw new TelegramError(400, "Bad Request: text must be non-empty");
-        }
-        if ([...text].length > 100) {
-          throw new TelegramError(
-            400,
-            "Bad Request: poll options length must not exceed 100",
-          );
-        }
-      }
-      if (quiz && correct.length === 0) {
-        throw new TelegramError(
-          400,
-          "Bad Request: correct quiz option list must be non-empty",
-        );
-      }
-      if (correct.some((id, index) => index > 0 && id <= correct[index - 1])) {
-        throw new TelegramError(
-          400,
-          "Bad Request: correct quiz option list must be increasing",
-        );
-      }
-      if (correct.some((id) => id < 0 || id >= texts.length)) {
-        throw new TelegramError(
-          400,
-          "Bad Request: wrong quiz correct_option_id",
-        );
-      }
-      const membersOnly = isTrue(p.members_only);
-      if (membersOnly && chat.type !== "channel") {
-        throw new TelegramError(
-          400,
-          "Bad Request: poll voters can be restricted only in channel chats",
-        );
-      }
+      const { poll } = newPoll(p, () =>
+        botChat(p.chat_id, caller, { send: true }),
+      );
       const attached =
         typeof p.media?.media === "string" &&
         p.media.media.startsWith("attach://")
           ? p[p.media.media.slice("attach://".length)]
           : null;
       const photo = Buffer.isBuffer(attached) ? registerPhoto(attached) : null;
-      nextPollId += 1n;
       return sendFrom(p, caller, {
         poll: {
-          id: String(nextPollId),
-          question,
-          // persistent_id is the option's data. Telegram does not document
-          // its form; TDLib, when it chose it for a new poll, counted from "0".
-          options: texts.map((text, index) => ({
-            persistent_id: String.fromCharCode(48 + index),
-            text,
-            voter_count: 0,
-          })),
-          total_voter_count: 0,
-          is_closed: isTrue(p.is_closed),
-          is_anonymous: p.is_anonymous === undefined || isTrue(p.is_anonymous),
-          allows_multiple_answers: isTrue(p.allows_multiple_answers),
-          allows_revoting:
-            p.allows_revoting === undefined
-              ? !quiz
-              : isTrue(p.allows_revoting),
-          members_only: membersOnly,
-          type: quiz ? "quiz" : "regular",
-          // The Bot API server still adds the single correct option as the
-          // older correct_option_id.
-          ...(correct.length === 1 ? { correct_option_id: correct[0] } : {}),
-          ...(quiz ? { correct_option_ids: correct } : {}),
-          ...(explanation?.text
-            ? {
-                explanation: explanation.text,
-                explanation_entities: explanation.entities,
-              }
-            : {}),
-          ...(p.description ? { description: String(p.description) } : {}),
+          ...poll,
           ...(photo ? { media: { photo: photoSizes(photo) } } : {}),
         },
       });
@@ -7301,15 +7194,32 @@ export async function startTestServer({
           body.data,
         );
       }
+      if (method === "POST" && subId && parts[4] === "vote") {
+        if (!existing) throw new TelegramError(400, "Message not found");
+        return vote(existing, requireUser(id), subId, body.option_ids);
+      }
       if (method === "POST" && !subId) {
-        const fields = memberText(body.text);
-        const message = addMessage(messageChat(id), requireUser(id), fields);
-        await emit("message", message);
-        return { message_id: message.message_id };
+        requireUser(id);
+        return post(messageChat(id), { ...body, user_id: Number(id) });
       }
     }
     if (resource === "chats" && id && sub === "albums" && method === "POST") {
       return postAlbum(requireChat(id), body);
+    }
+    if (
+      resource === "chats" &&
+      id &&
+      sub === "messages" &&
+      subId &&
+      parts[4] === "vote" &&
+      method === "POST"
+    ) {
+      return vote(
+        requireChat(id),
+        requireUser(body.user_id),
+        subId,
+        body.option_ids,
+      );
     }
     if (
       resource === "chats" &&
@@ -7761,12 +7671,16 @@ export async function startTestServer({
       reply_to: replyTo,
       message_thread_id: threadId,
       forward_from: forwardFrom,
+      poll,
     },
     { mediaGroupId = null } = {},
   ) {
     const user = requireUser(userId);
     requireTopic(chat, threadId);
     const type = photoBase64 ? "photo" : (media?.type ?? null);
+    if (poll != null && (type || text != null)) {
+      throw new TelegramError(400, "a poll is sent without text or media");
+    }
     if (type && type !== "photo" && !MEMBER_MEDIA[type]) {
       throw new TelegramError(
         400,
@@ -7774,17 +7688,22 @@ export async function startTestServer({
       );
     }
     const permission =
-      type === "photo"
-        ? "can_send_photos"
-        : type
-          ? MEMBER_MEDIA[type].permission
-          : "can_send_messages";
+      poll != null
+        ? "can_send_polls"
+        : type === "photo"
+          ? "can_send_photos"
+          : type
+            ? MEMBER_MEDIA[type].permission
+            : "can_send_messages";
     // A channel has no member permissions: only the creator and
-    // administrators with can_post_messages post there.
+    // administrators with can_post_messages post there. A private chat is
+    // the user's own conversation with the bot.
     if (
-      chat.type === "channel"
-        ? !hasRight(chat, user.id, "can_post_messages")
-        : !canPost(chat, userId, permission)
+      chat.type === "private"
+        ? false
+        : chat.type === "channel"
+          ? !hasRight(chat, user.id, "can_post_messages")
+          : !canPost(chat, userId, permission)
     ) {
       throw new TelegramError(403, "CHAT_WRITE_FORBIDDEN");
     }
@@ -7807,6 +7726,13 @@ export async function startTestServer({
       if (caption && (type === "photo" || MEMBER_MEDIA[type].caption)) {
         Object.assign(fields, memberCaption(caption));
       }
+    } else if (poll != null) {
+      // Users send polls to groups, channels and a bot's private chat, but
+      // not to another person's (TDLib can_send_message_content).
+      fields.poll = newPoll(
+        typeof poll === "object" ? poll : {},
+        () => chat,
+      ).poll;
     } else {
       Object.assign(fields, memberText(text));
     }
@@ -7831,6 +7757,285 @@ export async function startTestServer({
     const message = addMessage(chat, user, fields);
     await emit("message", message);
     return { message_id: message.message_id };
+  }
+
+  /**
+   * A test action's message (text, or an object with a photo, media, poll,
+   * caption, reply or forward) as the control API's request body.
+   */
+  function memberBody(message) {
+    return typeof message === "string"
+      ? { text: message }
+      : {
+          ...(message.text !== undefined ? { text: message.text } : {}),
+          ...(message.photo
+            ? {
+                photo_base64: Buffer.from(message.photo).toString("base64"),
+              }
+            : {}),
+          ...(message.media
+            ? {
+                media: {
+                  type: message.media.type,
+                  base64: Buffer.from(message.media.bytes ?? []).toString(
+                    "base64",
+                  ),
+                  ...(message.media.fileName
+                    ? { file_name: message.media.fileName }
+                    : {}),
+                  ...(message.media.mimeType
+                    ? { mime_type: message.media.mimeType }
+                    : {}),
+                },
+              }
+            : {}),
+          ...(message.forwardFrom
+            ? {
+                forward_from: {
+                  ...(message.forwardFrom.userId != null
+                    ? { user_id: message.forwardFrom.userId }
+                    : {}),
+                  ...(message.forwardFrom.chatId != null
+                    ? { chat_id: message.forwardFrom.chatId }
+                    : {}),
+                  ...(message.forwardFrom.messageId != null
+                    ? { message_id: message.forwardFrom.messageId }
+                    : {}),
+                  ...(message.forwardFrom.senderName
+                    ? { sender_name: message.forwardFrom.senderName }
+                    : {}),
+                },
+              }
+            : {}),
+          ...(message.poll ? { poll: message.poll } : {}),
+          ...(message.caption ? { caption: message.caption } : {}),
+          ...(message.replyTo != null ? { reply_to: message.replyTo } : {}),
+          ...(message.threadId != null
+            ? { message_thread_id: message.threadId }
+            : {}),
+        };
+  }
+
+  /**
+   * A person's vote in a poll from the Telegram app, checked as TDLib checks
+   * it (MessagesManager::get_message_poll_id, then
+   * PollManager::set_poll_answer, with their error texts). An empty choice
+   * retracts the vote. The bot that sent the poll gets its new state as a poll
+   * update and, unless the poll is anonymous, the vote as poll_answer
+   * (https://core.telegram.org/bots/api#update: bots get votes only in the
+   * polls they sent). UNVERIFIED: the order of those two updates, and that a
+   * vote which changes nothing sends neither.
+   */
+  async function vote(chat, user, messageId, optionIds) {
+    const entry = chat.messages.get(Number(messageId));
+    if (!entry || entry.deleted) {
+      throw new TelegramError(400, "Message not found");
+    }
+    const poll = entry.message.poll;
+    if (!poll) throw new TelegramError(400, "Message is not a poll");
+    if (
+      chat.type === "private" ? chat.id !== user.id : !isInChat(chat, user.id)
+    ) {
+      throw new TelegramError(400, "Can't access the chat");
+    }
+    if (
+      !Array.isArray(optionIds) ||
+      !optionIds.every((id) => Number.isInteger(id))
+    ) {
+      throw new TelegramError(
+        400,
+        "option_ids must be a list of option indexes",
+      );
+    }
+    // td::unique: sorted, each option once.
+    const ids = [...new Set(optionIds)].sort((left, right) => left - right);
+    if (poll.is_closed) {
+      throw new TelegramError(400, "Can't answer closed poll");
+    }
+    if (!poll.allows_multiple_answers && ids.length > 1) {
+      throw new TelegramError(
+        400,
+        "Can't choose more than 1 option in the poll",
+      );
+    }
+    if (!poll.allows_revoting && ids.length === 0) {
+      throw new TelegramError(400, "Can't retract vote in the poll");
+    }
+    if (ids.some((id) => id < 0 || id >= poll.options.length)) {
+      throw new TelegramError(400, "Invalid option identifier specified");
+    }
+    entry.votes ??= {};
+    const before = entry.votes[user.id] ?? [];
+    if (before.length && !poll.allows_revoting) {
+      throw new TelegramError(400, "Can't revote in a quiz");
+    }
+    if (before.join() === ids.join()) return structuredClone(poll);
+    for (const id of before) poll.options[id].voter_count -= 1;
+    for (const id of ids) poll.options[id].voter_count += 1;
+    if (ids.length) entry.votes[user.id] = ids;
+    else delete entry.votes[user.id];
+    poll.total_voter_count = Object.keys(entry.votes).length;
+    appliedCheckpoint();
+    const sender = [...bots.values()].find(
+      (record) => record.id === entry.author,
+    );
+    if (sender) {
+      // Only a message's poll carries its description and media.
+      const { description: _description, media: _media, ...state } = poll;
+      await Promise.all([
+        poll.is_anonymous
+          ? null
+          : emit(
+              "poll_answer",
+              {
+                poll_id: poll.id,
+                user: userObject(user),
+                option_ids: ids,
+                option_persistent_ids: ids.map(
+                  (id) => poll.options[id].persistent_id,
+                ),
+              },
+              { to: [sender] },
+            ),
+        emit("poll", structuredClone(state), { to: [sender] }),
+      ]);
+    }
+    waits.notify();
+    return structuredClone(poll);
+  }
+
+  /**
+   * A new poll from sendPoll's parameters, or from a member's poll in the same
+   * shape, with its chat. The question, the options and a quiz's explanation
+   * are cleaned and trimmed as message text is (Client.cpp
+   * process_send_poll_query, then TDLib's get_formatted_text in
+   * MessageContent.cpp and PollOption.cpp), and the limits apply to what is
+   * left. `chatFor` finds the chat where the Bot API server does, after the
+   * poll type and before the question.
+   */
+  function newPoll(p, chatFor) {
+    const question = formatOrFail(String(p.question ?? "")).text;
+    const texts = jsonList(
+      p.options === undefined ? "" : p.options,
+      "options",
+      "InputPollOption",
+      pollOptionText,
+    ).map((text) => formatText(text).text);
+    const type = String(p.type ?? "");
+    const quiz = type === "quiz";
+    const explanation = quiz
+      ? formatOrFail(
+          String(p.explanation ?? ""),
+          p.explanation_parse_mode,
+          p.explanation_entities,
+        )
+      : null;
+    const correct = quiz ? correctOptionIds(p) : [];
+    if (!quiz && type !== "" && type !== "regular") {
+      throw new TelegramError(
+        400,
+        "Bad Request: unsupported poll type specified",
+      );
+    }
+    const chat = chatFor();
+    if (isEmptyText(question)) {
+      throw new TelegramError(400, "Bad Request: text must be non-empty");
+    }
+    if ([...question].length > 300) {
+      throw new TelegramError(
+        400,
+        "Bad Request: poll question length must not exceed 300",
+      );
+    }
+    if (texts.length === 0) {
+      throw new TelegramError(
+        400,
+        "Bad Request: poll must have at least one answer option",
+      );
+    }
+    if (texts.length > 12) {
+      throw new TelegramError(
+        400,
+        "Bad Request: poll can't have more than 12 options",
+      );
+    }
+    for (const text of texts) {
+      if (isEmptyText(text)) {
+        throw new TelegramError(400, "Bad Request: text must be non-empty");
+      }
+      if ([...text].length > 100) {
+        throw new TelegramError(
+          400,
+          "Bad Request: poll options length must not exceed 100",
+        );
+      }
+    }
+    if (quiz && correct.length === 0) {
+      throw new TelegramError(
+        400,
+        "Bad Request: correct quiz option list must be non-empty",
+      );
+    }
+    if (correct.some((id, index) => index > 0 && id <= correct[index - 1])) {
+      throw new TelegramError(
+        400,
+        "Bad Request: correct quiz option list must be increasing",
+      );
+    }
+    if (correct.some((id) => id < 0 || id >= texts.length)) {
+      throw new TelegramError(400, "Bad Request: wrong quiz correct_option_id");
+    }
+    const membersOnly = isTrue(p.members_only);
+    // TDLib's can_send_message_content: a channel takes anonymous polls only.
+    if (
+      chat.type === "channel" &&
+      !(p.is_anonymous === undefined || isTrue(p.is_anonymous))
+    ) {
+      throw new TelegramError(
+        400,
+        "Bad Request: non-anonymous polls can't be sent to channel chats",
+      );
+    }
+    if (membersOnly && chat.type !== "channel") {
+      throw new TelegramError(
+        400,
+        "Bad Request: poll voters can be restricted only in channel chats",
+      );
+    }
+    nextPollId += 1n;
+    return {
+      chat,
+      poll: {
+        id: String(nextPollId),
+        question,
+        // persistent_id is the option's data. Telegram does not document
+        // its form; TDLib, when it chose it for a new poll, counted from "0".
+        options: texts.map((text, index) => ({
+          persistent_id: String.fromCharCode(48 + index),
+          text,
+          voter_count: 0,
+        })),
+        total_voter_count: 0,
+        is_closed: isTrue(p.is_closed),
+        is_anonymous: p.is_anonymous === undefined || isTrue(p.is_anonymous),
+        allows_multiple_answers: isTrue(p.allows_multiple_answers),
+        allows_revoting:
+          p.allows_revoting === undefined ? !quiz : isTrue(p.allows_revoting),
+        members_only: membersOnly,
+        type: quiz ? "quiz" : "regular",
+        // The Bot API server still adds the single correct option as the
+        // older correct_option_id.
+        ...(correct.length === 1 ? { correct_option_id: correct[0] } : {}),
+        ...(quiz ? { correct_option_ids: correct } : {}),
+        ...(explanation?.text
+          ? {
+              explanation: explanation.text,
+              explanation_entities: explanation.entities,
+            }
+          : {}),
+        ...(p.description ? { description: String(p.description) } : {}),
+      },
+    };
   }
 
   // ── HTTP ───────────────────────────────────────────────────────────────
@@ -8899,64 +9104,13 @@ ${buttons}
       }),
     leave: (chatId, userId) =>
       act("POST", `chats/${chatId}/leave`, { user_id: userId }),
-    post: async (chatId, userId, message) => {
-      const fields =
-        typeof message === "string"
-          ? { text: message }
-          : {
-              ...(message.text !== undefined ? { text: message.text } : {}),
-              ...(message.photo
-                ? {
-                    photo_base64: Buffer.from(message.photo).toString("base64"),
-                  }
-                : {}),
-              ...(message.media
-                ? {
-                    media: {
-                      type: message.media.type,
-                      base64: Buffer.from(message.media.bytes ?? []).toString(
-                        "base64",
-                      ),
-                      ...(message.media.fileName
-                        ? { file_name: message.media.fileName }
-                        : {}),
-                      ...(message.media.mimeType
-                        ? { mime_type: message.media.mimeType }
-                        : {}),
-                    },
-                  }
-                : {}),
-              ...(message.forwardFrom
-                ? {
-                    forward_from: {
-                      ...(message.forwardFrom.userId != null
-                        ? { user_id: message.forwardFrom.userId }
-                        : {}),
-                      ...(message.forwardFrom.chatId != null
-                        ? { chat_id: message.forwardFrom.chatId }
-                        : {}),
-                      ...(message.forwardFrom.messageId != null
-                        ? { message_id: message.forwardFrom.messageId }
-                        : {}),
-                      ...(message.forwardFrom.senderName
-                        ? { sender_name: message.forwardFrom.senderName }
-                        : {}),
-                    },
-                  }
-                : {}),
-              ...(message.caption ? { caption: message.caption } : {}),
-              ...(message.replyTo != null ? { reply_to: message.replyTo } : {}),
-              ...(message.threadId != null
-                ? { message_thread_id: message.threadId }
-                : {}),
-            };
-      return (
+    post: async (chatId, userId, message) =>
+      (
         await act("POST", `chats/${chatId}/messages`, {
           user_id: userId,
-          ...fields,
+          ...memberBody(message),
         })
-      ).message_id;
-    },
+      ).message_id,
     postAlbum: async (chatId, userId, items, { threadId } = {}) =>
       act("POST", `chats/${chatId}/albums`, {
         user_id: userId,
@@ -8993,8 +9147,17 @@ ${buttons}
         `chats/${chatId}/ephemeral-messages/${ephemeralMessageId}/callback`,
         { user_id: userId, data },
       ),
-    sendDirectMessage: async (userId, text) =>
-      (await act("POST", `users/${userId}/dm`, { text })).message_id,
+    sendDirectMessage: async (userId, message) =>
+      (await act("POST", `users/${userId}/dm`, memberBody(message))).message_id,
+    vote: (chatId, messageId, userId, optionIds) =>
+      act("POST", `chats/${chatId}/messages/${messageId}/vote`, {
+        user_id: userId,
+        option_ids: optionIds,
+      }),
+    voteDirect: (userId, messageId, optionIds) =>
+      act("POST", `users/${userId}/dm/${messageId}/vote`, {
+        option_ids: optionIds,
+      }),
     postGuestBotReply: async (chatId, callerUserId, botUsername, text) =>
       (
         await act("POST", `chats/${chatId}/guest-bot-reply`, {

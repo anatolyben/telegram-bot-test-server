@@ -192,7 +192,19 @@ await server.join(GROUP, ann);
 const hello = await server.post(GROUP, ann, "Hello!");
 await server.post(GROUP, ann, { text: "Is anyone here?", replyTo: hello });
 await server.sendDirectMessage(ann, "/start"); // a private message to the bot
+const photo = Buffer.from("...image bytes..."); // e.g. await readFile("receipt.jpg")
+await server.sendDirectMessage(ann, { photo, caption: "my receipt" });
 await server.leave(GROUP, ann);
+```
+
+Members vote in polls. The bot that sent the poll gets a `poll` update with the new counts, and a
+`poll_answer` saying who chose what unless the poll is anonymous; other bots get neither, as on
+Telegram:
+
+```js
+// Your bot sent a poll with sendPoll; pollMessageId is its message_id.
+await server.vote(GROUP, pollMessageId, ann, [0]); // Ann picks the first option
+await server.vote(GROUP, pollMessageId, ann, []); // and takes her vote back
 ```
 
 A press on an inline button resolves with the bot's `answerCallbackQuery` answer:
@@ -922,14 +934,23 @@ the bot's Bot API root. Each action resolves once the update it causes has been 
 **Posting**
 
 - `post(chatId, userId, text)`: the user posts a message; returns its `message_id`. Also takes
-  `{ text, photo, media, caption, replyTo, threadId, forwardFrom }`: `photo` is image bytes (a PNG,
-  GIF or JPEG header gives its size); `media` is `{ type, bytes, fileName?, mimeType? }` with `type`
-  `video`, `animation`, `sticker`, `voice`, `audio`, `video_note` or `document`; a caption goes
-  with every kind but stickers and video notes; `replyTo` is the `message_id` it replies to;
-  `threadId` is a forum topic; `forwardFrom` is `{ userId }`, `{ senderName }` (a hidden user) or
-  `{ chatId, messageId? }` (a channel post). Fails if the user is not allowed to post. Text and
-  captions are trimmed as Telegram's apps send them, and text that then shows nothing fails with
+  `{ text, photo, media, caption, replyTo, threadId, forwardFrom, poll }`: `photo` is image bytes
+  (a PNG, GIF or JPEG header gives its size); `media` is `{ type, bytes, fileName?, mimeType? }`
+  with `type` `video`, `animation`, `sticker`, `voice`, `audio`, `video_note` or `document`; a
+  caption goes with every kind but stickers and video notes; `replyTo` is the `message_id` it
+  replies to; `threadId` is a forum topic; `forwardFrom` is `{ userId }`, `{ senderName }` (a hidden
+  user) or `{ chatId, messageId? }` (a channel post); `poll` is a poll of the user's own, a message
+  by itself, with `sendPoll`'s fields (`question`, `options`, `type`, `is_anonymous`,
+  `allows_multiple_answers`, `allows_revoting`, `correct_option_ids`, `explanation`) and checks,
+  and needs `can_send_polls`. Fails if the user is not allowed to post. Text and captions are
+  trimmed as Telegram's apps send them, and text that then shows nothing fails with
   `MESSAGE_EMPTY`.
+- `vote(chatId, messageId, userId, optionIds)`: the user votes in a poll: option indexes, or `[]` to
+  take the vote back. Fails as Telegram's app refuses: `Can't answer closed poll`,
+  `Can't choose more than 1 option in the poll`, `Invalid option identifier specified`,
+  `Can't revote in a quiz` (or in any poll without `allows_revoting`),
+  `Can't retract vote in the poll`, `Can't access the chat` for someone not in it, and
+  `Message is not a poll`. Resolves with the poll once the bot that sent it has its updates.
 - `postAlbum(chatId, userId, items, { threadId })`: the user posts 2 to 10 photos or videos as one
   album (`media_group_id`); `items` are `{ type: "photo" | "video", bytes, caption? }`. Returns
   `{ media_group_id, message_ids }`.
@@ -961,8 +982,12 @@ the bot's Bot API root. Each action resolves once the update it causes has been 
 
 **Private chats**
 
-- `sendDirectMessage(userId, text)`: the user messages the bot privately; returns the
-  `message_id`. Empty text fails with `MESSAGE_EMPTY`.
+- `sendDirectMessage(userId, message)`: the user messages the bot privately; returns the
+  `message_id`. `message` is text, or anything `post` takes but `threadId`: a photo, other media
+  with a caption, a reply to one of the bot's messages, a forward or a poll. Empty text fails with
+  `MESSAGE_EMPTY`.
+- `voteDirect(userId, messageId, optionIds)`: the user votes in a poll the bot sent to their private
+  chat; works like `vote`.
 - `getDirectMessages(userId)`: an array of the messages in the private chat between the user and
   the bot, newest first.
 
@@ -1106,7 +1131,10 @@ that fails answers `{ error }` with an HTTP status.
 - `POST chats/:id/messages`: the user posts `{ user_id, text }`, `{ user_id, photo_base64,
   caption? }` or `{ user_id, media: { type, base64, file_name?, mime_type? }, caption? }`,
   optionally `reply_to`, `message_thread_id` or
-  `forward_from: { user_id | sender_name | chat_id, message_id? }`; returns `{ message_id }`.
+  `forward_from: { user_id | sender_name | chat_id, message_id? }`, or a poll
+  `{ user_id, poll: { question, options, ... } }`; returns `{ message_id }`.
+- `POST chats/:id/messages/:messageId/vote`: the user `{ user_id, option_ids }` votes in a poll
+  (`option_ids: []` takes the vote back); returns the poll.
 - `POST chats/:id/albums`: the user posts an album
   `{ user_id, items: [{ type: "photo" | "video", base64, caption? }] }`; returns
   `{ media_group_id, message_ids }`.
@@ -1144,7 +1172,11 @@ count.
 
 **Private chats**
 
-- `POST users/:id/dm`: the user sends the bot a direct message `{ text }`.
+- `POST users/:id/dm`: the user sends the bot a direct message, with the same body as
+  `POST chats/:id/messages` without `user_id` and `message_thread_id`: `{ text }`,
+  `{ photo_base64, caption? }`, `{ media, caption? }`, `reply_to`, `forward_from` or `poll`.
+- `POST users/:id/dm/:messageId/vote`: the user `{ option_ids }` votes in a poll the bot sent
+  privately.
 - `GET users/:id/dm`: an array of the private chat's messages, newest first.
 
 **Bots and chats**
@@ -1332,7 +1364,8 @@ messages, text formatting and replies, and request parsing and update delivery.
 
 ## What it does not do
 
-- Inline mode, payments, games, sticker sets, reaction counts, votes in polls, or Telegram's exact
+- Inline mode, payments, games, sticker sets, reaction counts, options added to a poll after it was
+  sent, votes on behalf of a channel (`voter_chat`), or Telegram's exact
   rate limits: `floodControl` applies only its published numbers (a test can also make any call
   fail with a 429 through `POST failures`). Channel signatures are not modeled, and forum topics
   cannot be closed or deleted.
@@ -1496,6 +1529,10 @@ fields below.
   - New: the `floodControl` option (off by default), the `editEphemeralMessage…` and
     `deleteEphemeralMessage` methods, and the `pinMessage`, `getEphemeralMessage` and
     `pressEphemeralButton` test actions.
+  - New: members vote in polls (`vote`, `voteDirect`), and the bot that sent a poll gets `poll` and
+    `poll_answer` updates; members post polls of their own; direct messages to the bot carry
+    photos, other media, captions, replies, forwards and polls, not only text. A channel takes
+    anonymous polls only.
   - The default bot is now `example_bot` ("Example Bot").
   - Tests written for 0.10.0 may need changes: see
     [Upgrading from 0.10.0](#upgrading-from-0100).

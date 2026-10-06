@@ -1421,3 +1421,52 @@ describe("reactions and join request queries", () => {
     expect((await fake.getMember(GROUP, applicant)).status).toBe("member");
   });
 });
+
+describe("direct messages", () => {
+  it("delivers a member's photo, file, reply and forward to the bot privately", async () => {
+    const { fake, api, member } = await setup();
+    await fake.sendDirectMessage(member, "/start");
+    const prompt = (
+      await api("sendMessage", { chat_id: member, text: "Send a receipt" })
+    ).result;
+
+    const photo = await fake.sendDirectMessage(member, {
+      photo: BYTES,
+      caption: "receipt",
+      replyTo: prompt.message_id,
+    });
+    const file = await fake.sendDirectMessage(member, {
+      media: { type: "document", bytes: BYTES, fileName: "receipt.pdf" },
+    });
+    const source = await fake.createUser({ first_name: "Source" });
+    const forward = await fake.sendDirectMessage(member, {
+      text: "look",
+      forwardFrom: { userId: source },
+    });
+    const messages = await fake.getDirectMessages(member);
+    const byId = (id) => messages.find((message) => message.message_id === id);
+
+    expect(byId(photo)).toMatchObject({
+      chat: { id: member, type: "private" },
+      photo: expect.arrayContaining([
+        expect.objectContaining({ file_id: expect.any(String) }),
+      ]),
+      caption: "receipt",
+      reply_to_message: {
+        message_id: prompt.message_id,
+        text: "Send a receipt",
+      },
+    });
+    expect(byId(file)).toMatchObject({
+      document: { file_name: "receipt.pdf" },
+    });
+    expect(byId(forward)).toMatchObject({
+      text: "look",
+      forward_origin: { type: "user", sender_user: { id: source } },
+    });
+    const updates = (await api("getUpdates")).result.map((u) => u.message);
+    expect(updates.map((message) => message?.message_id)).toEqual(
+      expect.arrayContaining([photo, file, forward]),
+    );
+  });
+});

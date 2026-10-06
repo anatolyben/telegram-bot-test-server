@@ -66,6 +66,8 @@ export interface TelegramBotTestServerOptions {
 
 /** A message as the server stores it, in the Bot API's Message shape. */
 export type Message = { message_id: number; [field: string]: unknown };
+/** A Bot API Poll: id, question, options with voter_count, total_voter_count, ... */
+export type Poll = { id: string; [field: string]: unknown };
 
 /** A chat member in the Bot API's ChatMember shape. */
 export type ChatMember = {
@@ -149,6 +151,20 @@ export interface PostedMessage {
     senderName?: string;
     chatId?: number;
     messageId?: number;
+  };
+  /**
+   * A poll, as a message of its own (no text or media), with sendPoll's
+   * fields and checks. Needs can_send_polls in a group.
+   */
+  poll?: {
+    question: string;
+    options: Array<string | { text: string }>;
+    type?: "regular" | "quiz";
+    is_anonymous?: boolean;
+    allows_multiple_answers?: boolean;
+    allows_revoting?: boolean;
+    correct_option_ids?: number[];
+    explanation?: string;
   };
 }
 
@@ -674,10 +690,32 @@ export interface TelegramBotTestServer {
     text: string,
   ): Promise<number>;
   /**
-   * The user sends the bot a direct message; returns the message_id. Text
-   * that shows nothing once trimmed fails with MESSAGE_EMPTY.
+   * The user sends the bot a direct message: text, or anything post() takes
+   * (a photo, media, a caption, a reply, a forward or a poll); returns the
+   * message_id. Text that shows nothing once trimmed fails with MESSAGE_EMPTY.
    */
-  sendDirectMessage(userId: number, text: string): Promise<number>;
+  sendDirectMessage(
+    userId: number,
+    message: string | Omit<PostedMessage, "threadId">,
+  ): Promise<number>;
+  /**
+   * The user votes in a poll: option indexes, or an empty list to retract.
+   * Refused as Telegram's app refuses it ("Can't answer closed poll", "Can't
+   * revote in a quiz", ...). The bot that sent the poll gets a poll update,
+   * and a poll_answer when the poll is not anonymous. Resolves with the poll.
+   */
+  vote(
+    chatId: number,
+    messageId: number,
+    userId: number,
+    optionIds: number[],
+  ): Promise<Poll>;
+  /** The user votes in a poll the bot sent to their private chat. */
+  voteDirect(
+    userId: number,
+    messageId: number,
+    optionIds: number[],
+  ): Promise<Poll>;
   /** The user presses an inline button in their private chat with the bot. */
   pressDirectButton(
     userId: number,
