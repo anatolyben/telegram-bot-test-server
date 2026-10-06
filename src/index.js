@@ -818,6 +818,23 @@ export async function startTestServer({
     }
   }
 
+  /**
+   * The most recent pinned message by sending date, which getChat shows and
+   * unpinChatMessage without message_id unpins. chat.pinned is kept newest
+   * first by message id, which follows the sending date.
+   */
+  function latestPin(chat) {
+    return (chat.pinned ?? [])
+      .map((id) => chat.messages.get(id))
+      .find((entry) => entry && !entry.deleted);
+  }
+
+  /** A pinned message as the Bot API shows it: without reply_to_message. */
+  function pinnedMessage(message) {
+    const { reply_to_message: _reply, ...pinned } = message;
+    return pinned;
+  }
+
   /** Whether the user may post, given their own and the chat's permissions. */
   function canPost(chat, userId, permission = "can_send_messages") {
     const member = memberStatus(chat, userId);
@@ -1565,12 +1582,10 @@ export async function startTestServer({
       const id = Number(p.chat_id);
       if (chats.has(id)) {
         const chat = chats.get(id);
-        const pinned = chat.messages.get((chat.pinned ?? [])[0]);
+        const pinned = latestPin(chat);
         return {
           ...chatObject(chat),
-          ...(pinned && !pinned.deleted
-            ? { pinned_message: pinned.message }
-            : {}),
+          ...(pinned ? { pinned_message: pinnedMessage(pinned.message) } : {}),
           permissions: { ...chat.permissions },
           ...(chat.description ? { description: chat.description } : {}),
           ...(chat.photo
@@ -1593,6 +1608,9 @@ export async function startTestServer({
       const user = users.get(id);
       if (!user) throw new TelegramError(400, "Bad Request: chat not found");
       const photo = user.photos?.[0];
+      const pinned = privateChats.has(id)
+        ? latestPin(privateChats.get(id))
+        : undefined;
       return {
         id: user.id,
         type: "private",
@@ -1610,6 +1628,7 @@ export async function startTestServer({
               },
             }
           : {}),
+        ...(pinned ? { pinned_message: pinnedMessage(pinned.message) } : {}),
         accent_color_id: 0,
         max_reaction_count: 11,
         accepted_gift_types: { ...NO_GIFTS },
@@ -1895,14 +1914,31 @@ export async function startTestServer({
       if (!entry || entry.deleted) {
         throw new TelegramError(400, "Bad Request: message to pin not found");
       }
-      chat.pinned = [id, ...(chat.pinned ?? []).filter((each) => each !== id)];
+      chat.pinned = [...new Set([id, ...(chat.pinned ?? [])])].sort(
+        (a, b) => b - a,
+      );
+      // Telegram posts the pin as a service message, and the Bot API delivers
+      // it to the pinning bot too (need_skip_update_message keeps an outgoing
+      // messagePinMessage). Not awaited: the bot may be inside its webhook.
+      emit(
+        "message",
+        addMessage(chat, caller, {
+          pinned_message: pinnedMessage(entry.message),
+        }),
+        chat.type === "private" ? { to: [caller] } : {},
+      );
       return true;
     },
     unpinChatMessage: (p, caller) => {
       const chat = botChat(p.chat_id);
       requirePinRights(chat, caller);
-      const id =
-        p.message_id == null ? (chat.pinned ?? [])[0] : Number(p.message_id);
+      // No message_id (or 0) means the most recent pin.
+      const asked = Number(p.message_id);
+      const entry = asked > 0 ? chat.messages.get(asked) : latestPin(chat);
+      if (!entry || entry.deleted) {
+        throw new TelegramError(400, "Bad Request: message to unpin not found");
+      }
+      const id = entry.message.message_id;
       chat.pinned = (chat.pinned ?? []).filter((each) => each !== id);
       return true;
     },
@@ -2326,7 +2362,7 @@ export async function startTestServer({
       await memberChanged(chat, userId, before, caller);
       return true;
     },
-    setChatTitle: async (p, caller) => {
+    setChatTitle: (p, caller) => {
       const chat = requireChat(p.chat_id);
       requireInfoRight(chat, caller, "title");
       const title = String(p.title ?? "").trim();
@@ -2337,11 +2373,10 @@ export async function startTestServer({
         throw new TelegramError(400, "Bad Request: chat title is not modified");
       }
       chat.title = title;
-      await emit(
-        "message",
-        addMessage(chat, caller, { new_chat_title: title }),
-        { except: caller.id },
-      );
+      // The Bot API delivers the service message to the bot that made the
+      // change too (need_skip_update_message keeps outgoing title, photo and
+      // pin messages). Not awaited: the bot may be inside its webhook.
+      emit("message", addMessage(chat, caller, { new_chat_title: title }));
       return true;
     },
     setChatDescription: (p, caller) => {
@@ -2363,7 +2398,7 @@ export async function startTestServer({
       chat.description = description || undefined;
       return true;
     },
-    setChatPhoto: async (p, caller) => {
+    setChatPhoto: (p, caller) => {
       const chat = requireChat(p.chat_id);
       requireInfoRight(chat, caller, "photo");
       if (!Buffer.isBuffer(p.photo)) {
@@ -2373,25 +2408,20 @@ export async function startTestServer({
         );
       }
       chat.photo = registerPhoto(p.photo);
-      await emit(
+      emit(
         "message",
         addMessage(chat, caller, { new_chat_photo: photoSizes(chat.photo) }),
-        { except: caller.id },
       );
       return true;
     },
-    deleteChatPhoto: async (p, caller) => {
+    deleteChatPhoto: (p, caller) => {
       const chat = requireChat(p.chat_id);
       requireInfoRight(chat, caller, "photo");
       if (!chat.photo) {
         throw new TelegramError(400, "Bad Request: CHAT_NOT_MODIFIED");
       }
       chat.photo = undefined;
-      await emit(
-        "message",
-        addMessage(chat, caller, { delete_chat_photo: true }),
-        { except: caller.id },
-      );
+      emit("message", addMessage(chat, caller, { delete_chat_photo: true }));
       return true;
     },
     editChatInviteLink: (p, caller) => {

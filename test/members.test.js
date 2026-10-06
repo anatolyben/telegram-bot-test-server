@@ -465,6 +465,25 @@ describe("administrators and chat settings", () => {
     });
   });
 
+  it("delivers the service messages of the bot's own chat changes to that bot too", async () => {
+    const { api, upload, me } = await setup();
+
+    await api("setChatTitle", { chat_id: GROUP, title: "Renamed" });
+    await upload("setChatPhoto", { chat_id: String(GROUP), photo: BYTES });
+    await api("deleteChatPhoto", { chat_id: GROUP });
+
+    const kinds = ["new_chat_title", "new_chat_photo", "delete_chat_photo"];
+    expect(
+      (await api("getUpdates")).result
+        .map((update) => update.message)
+        .filter((message) => kinds.some((kind) => message?.[kind]))
+        .map((message) => [
+          message.from.id,
+          kinds.find((kind) => message[kind]),
+        ]),
+    ).toEqual(kinds.map((kind) => [me.id, kind]));
+  });
+
   it("edits the bot's own invite links", async () => {
     const { api } = await setup();
     const link = (await api("createChatInviteLink", { chat_id: GROUP })).result
