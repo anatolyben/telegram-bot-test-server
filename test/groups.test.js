@@ -180,6 +180,40 @@ describe("adding the bot through a startgroup link", () => {
   });
 });
 
+describe("adding the bot through a startchannel link", () => {
+  it("needs admin rights, takes no start parameter and posts no /start", async () => {
+    const { fake, api, hook, me } = await setup();
+    await api("setWebhook", {
+      url: hook.url,
+      allowed_updates: ["message", "channel_post", "my_chat_member"],
+    });
+    const channel = await fake.createChat({ type: "channel", ownerId: OWNER });
+
+    await expect(
+      fake.addBotViaLink(channel, me.id, { by: OWNER }),
+    ).rejects.toThrow(/admin rights/);
+    await expect(
+      fake.addBotViaLink(channel, me.id, {
+        by: OWNER,
+        startParameter: "abc",
+        rights: { can_post_messages: true },
+      }),
+    ).rejects.toThrow(/start parameter/);
+    expect((await fake.getMember(channel, me.id)).status).toBe("left");
+
+    await fake.addBotViaLink(channel, me.id, {
+      by: OWNER,
+      rights: { can_post_messages: true },
+    });
+    expect(await fake.getMember(channel, me.id)).toMatchObject({
+      status: "administrator",
+      can_post_messages: true,
+    });
+    expect(hook.kinds()).toEqual(["my_chat_member"]);
+    expect(await fake.getMessages(channel)).toEqual([]);
+  });
+});
+
 describe("who may add the bot as an administrator", () => {
   it("needs can_promote_members from an administrator", async () => {
     const { fake, api, me } = await setup();

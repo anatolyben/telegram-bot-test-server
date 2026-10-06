@@ -16,8 +16,10 @@
  * (POST /_fake/bots). Each bot has its own webhook or update queue, and its
  * own membership and rights in each chat, and Telegram's rules about them
  * hold: a bot posts only where it is a member, edits and stops only its own
- * messages, pins only with the right to, and learns of its own membership
- * through my_chat_member. Tests can also make the next calls fail
+ * messages (in a channel, others' with can_edit_messages), pins only with the
+ * right to, and learns of its own membership through my_chat_member. A
+ * channel's messages come from the channel and reach bots as channel_post.
+ * Tests can also make the next calls fail
  * (/_fake/failures), including a call that takes effect but never answers.
  *
  * Nothing here talks to Telegram.
@@ -199,6 +201,13 @@ const INLINE_BUTTON_ACTIONS = Object.freeze([
   "copy_text",
   "disabled",
 ]);
+
+// The updates a channel's messages and their edits arrive as
+// (https://core.telegram.org/bots/api#update).
+const CHANNEL_UPDATES = Object.freeze({
+  message: "channel_post",
+  edited_message: "edited_channel_post",
+});
 
 class TelegramError extends Error {
   constructor(code, description, parameters = null) {
@@ -923,7 +932,7 @@ export async function startTestServer({
         `Forbidden: bot is not a member of the ${chatKind(chat)} chat`,
       );
     }
-    const own = Number(entry.message.from?.id) === caller.id;
+    const own = entry.author === caller.id;
     const allowed =
       hasRight(chat, caller.id, "can_delete_messages") ||
       (chat.type === "group" &&
@@ -1088,11 +1097,14 @@ export async function startTestServer({
   /**
    * Deliver an update to the bots that receive it: those in the group or
    * channel it happened in, the bot a private chat is with, or the bots named.
+   * A channel's messages go out as channel_post and edited_channel_post.
    */
   function emit(type, payload, { to = null, except = null } = {}) {
     waits.notify();
     const chatId = payload?.chat?.id ?? payload?.message?.chat?.id;
     const chat = chatId == null ? null : chats.get(Number(chatId));
+    const kind =
+      chat?.type === "channel" ? (CHANNEL_UPDATES[type] ?? type) : type;
     const recipients =
       to ??
       (chat
@@ -1101,7 +1113,7 @@ export async function startTestServer({
           )
         : [bot]);
     return Promise.all(
-      recipients.map((record) => emitTo(record, type, payload)),
+      recipients.map((record) => emitTo(record, kind, payload)),
     );
   }
 
@@ -1309,11 +1321,22 @@ export async function startTestServer({
    * who can add members. An existing administrator's rights are combined with
    * the requested ones. The link then invokes messages.startBot with the
    * parameter, which posts "/start@<bot> <parameter>" from the person
-   * (https://core.telegram.org/bots/features#deep-linking).
+   * (https://core.telegram.org/bots/features#deep-linking). A channel's
+   * t.me/<bot>?startchannel&admin=<rights> link always asks for admin rights,
+   * has no parameter and never invokes messages.startBot.
    */
   async function addBotViaLink(chat, record, { by, startParameter, rights }) {
     const actor = requireUser(by ?? creatorOf(chat));
     const asAdmin = rights != null;
+    if (chat.type === "channel" && !asAdmin) {
+      throw new TelegramError(400, "a startchannel link needs admin rights");
+    }
+    if (chat.type === "channel" && startParameter) {
+      throw new TelegramError(
+        400,
+        "a startchannel link has no start parameter",
+      );
+    }
     if (
       asAdmin ? !canAddAdmins(chat, actor.id) : !canAddMembers(chat, actor.id)
     ) {
@@ -1340,6 +1363,7 @@ export async function startTestServer({
     } else if (!isInChat(chat, record.id)) {
       await setBotMembership(chat, record, { status: "member", actor });
     }
+    if (chat.type === "channel") return chatMemberObject(chat, record.id);
     const text =
       `/start@${record.username}` +
       (startParameter ? ` ${String(startParameter)}` : "");
@@ -1446,15 +1470,26 @@ export async function startTestServer({
     return record;
   }
 
+  /**
+   * Store a new message. A channel's messages are sent by the channel itself,
+   * with sender_chat and no from (Bot API server Client.cpp); who posted it is
+   * kept as the entry's author for the rules that depend on it.
+   */
   function addMessage(chat, from, fields) {
     const message = {
       message_id: chat.nextMessageId++,
-      from: userObject(from),
+      ...(chat.type === "channel"
+        ? { sender_chat: chatObject(chat) }
+        : { from: userObject(from) }),
       chat: chatObject(chat),
       date: now(),
       ...fields,
     };
-    chat.messages.set(message.message_id, { message, deleted: false });
+    chat.messages.set(message.message_id, {
+      message,
+      deleted: false,
+      author: from.id,
+    });
     appliedCheckpoint();
     waits.notify();
     return message;
@@ -2010,9 +2045,7 @@ export async function startTestServer({
           "Bad Request: message with poll to stop not found",
         );
       }
-      if (entry.message.from?.id !== caller.id) {
-        throw new TelegramError(400, "Bad Request: message can't be edited");
-      }
+      requireEditable(chat, entry, caller);
       if (entry.message.poll.is_closed) {
         throw new TelegramError(
           400,
@@ -3175,6 +3208,7 @@ export async function startTestServer({
     const {
       message_id: _id,
       from: _from,
+      sender_chat: _senderChat,
       chat: _chat,
       date: _date,
       edit_date: _edited,
@@ -3191,9 +3225,27 @@ export async function startTestServer({
   }
 
   /**
-   * Apply a bot edit to a stored message, as Telegram does: only the bot's own
-   * messages can be edited, an edit without reply_markup removes the inline
-   * keyboard, and an edit that changes nothing is refused.
+   * Whether the bot may edit a message or stop its poll, as TDLib's
+   * MessagesManager::can_edit_message decides: its own messages, and in a
+   * channel any post with can_edit_messages, but its own only while it has
+   * can_post_messages.
+   */
+  function requireEditable(chat, entry, caller) {
+    const own = entry.author === caller.id;
+    const allowed =
+      chat.type === "channel"
+        ? hasRight(chat, caller.id, "can_edit_messages") ||
+          (own && hasRight(chat, caller.id, "can_post_messages"))
+        : own;
+    if (!allowed) {
+      throw new TelegramError(400, "Bad Request: message can't be edited");
+    }
+  }
+
+  /**
+   * Apply a bot edit to a stored message, as Telegram does: only messages the
+   * bot may edit (requireEditable), an edit without reply_markup removes the
+   * inline keyboard, and an edit that changes nothing is refused.
    */
   function editMessage(p, caller, apply) {
     const markup = inlineMarkup(p.reply_markup);
@@ -3202,9 +3254,7 @@ export async function startTestServer({
     if (!entry || entry.deleted) {
       throw new TelegramError(400, "Bad Request: message to edit not found");
     }
-    if (entry.message.from.id !== caller.id) {
-      throw new TelegramError(400, "Bad Request: message can't be edited");
-    }
+    requireEditable(chat, entry, caller);
     requireButtonData(markup);
     const previous = structuredClone(entry.message);
     const edited = structuredClone(entry.message);
@@ -3391,10 +3441,8 @@ export async function startTestServer({
           : [chat.messages.get(condition.messageId)].filter(Boolean);
       const matching = entries.filter(
         (entry) =>
-          (condition.userId == null ||
-            entry.message.from?.id === condition.userId) &&
-          (condition.botId == null ||
-            entry.message.from?.id === condition.botId) &&
+          (condition.userId == null || entry.author === condition.userId) &&
+          (condition.botId == null || entry.author === condition.botId) &&
           (condition.text == null || entry.message.text === condition.text) &&
           (condition.caption == null ||
             entry.message.caption === condition.caption),
@@ -4216,7 +4264,7 @@ export async function startTestServer({
     const queryId = randomBytes(8).readBigUInt64BE().toString();
     // Only the bot that sent the message hears its buttons pressed.
     const sender = [...bots.values()].find(
-      (record) => record.id === entry.message.from?.id,
+      (record) => record.id === entry.author,
     );
     openQueries.set(queryId, (sender ?? bot).id);
     await emit(
@@ -4417,7 +4465,7 @@ export async function startTestServer({
     if (!entry || entry.deleted) {
       throw new TelegramError(400, "MESSAGE_ID_INVALID");
     }
-    if (entry.message.from?.id !== Number(userId)) {
+    if (entry.author !== Number(userId)) {
       throw new TelegramError(403, "MESSAGE_AUTHOR_REQUIRED");
     }
     const message = entry.message;
@@ -4514,7 +4562,13 @@ export async function startTestServer({
         : type
           ? MEMBER_MEDIA[type].permission
           : "can_send_messages";
-    if (!canPost(chat, userId, permission)) {
+    // A channel has no member permissions: only the creator and
+    // administrators with can_post_messages post there.
+    if (
+      chat.type === "channel"
+        ? !hasRight(chat, user.id, "can_post_messages")
+        : !canPost(chat, userId, permission)
+    ) {
       throw new TelegramError(403, "CHAT_WRITE_FORBIDDEN");
     }
     const fields = {};
@@ -5329,7 +5383,7 @@ ${buttons}
         ? (
             chats.get(Number(params.chat_id)) ??
             privateChats.get(Number(params.chat_id))
-          )?.messages.get(Number(params.message_id))?.message.from?.id
+          )?.messages.get(Number(params.message_id))?.author
         : undefined)
     );
   }

@@ -369,7 +369,9 @@ export interface TelegramBotTestServer {
   /**
    * A person adds the bot through its t.me/<bot>?startgroup=<parameter> link:
    * the bot joins (as an administrator when rights are given, combined with
-   * any it has), then the person's "/start@<bot> <parameter>" is posted.
+   * any it has), then the person's "/start@<bot> <parameter>" is posted. In a
+   * channel it is the t.me/<bot>?startchannel&admin=<rights> link: rights are
+   * required, there is no startParameter, and nothing is posted.
    * Returns the bot's membership.
    */
   addBotViaLink(
@@ -547,7 +549,11 @@ export interface TelegramBotTestServer {
     userId: number,
   ): Promise<{ chat_id: number; status: "member" | "requested" }>;
   leave(chatId: number, userId: number): Promise<{ status: string }>;
-  /** The user posts in a chat; returns the message_id. Fails if they may not post. */
+  /**
+   * The user posts in a chat; returns the message_id. Fails if they may not
+   * post: in a channel, only the creator and administrators with
+   * can_post_messages may, and bots get the post as channel_post.
+   */
   post(
     chatId: number,
     userId: number,
@@ -564,7 +570,10 @@ export interface TelegramBotTestServer {
     }>,
     options?: { threadId?: number },
   ): Promise<{ media_group_id: string; message_ids: number[] }>;
-  /** The author edits their message's text or caption; bots get edited_message. */
+  /**
+   * The author edits their message's text or caption; bots get edited_message
+   * (edited_channel_post in a channel).
+   */
   editMessage(
     chatId: number,
     messageId: number,

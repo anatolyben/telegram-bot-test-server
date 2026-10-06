@@ -195,6 +195,123 @@ describe("channels and rights", () => {
     expect(sent.result.chat).toMatchObject({ id: channel, type: "channel" });
   });
 
+  it("sends a channel's messages as channel_post and edited_channel_post from the channel itself", async () => {
+    const { fake, api } = await setup();
+    const me = (await api("getMe")).result;
+    const hook = await startReceiver();
+    await api("setWebhook", { url: hook.url });
+    const channel = await fake.createChat({
+      title: "News",
+      type: "channel",
+      ownerId: OWNER,
+    });
+    await fake.setBotMembership(channel, me.id, { status: "administrator" });
+    const byChannel = { sender_chat: { id: channel, type: "channel" } };
+
+    const sent = await api("sendMessage", { chat_id: channel, text: "bot" });
+    const post = await fake.post(channel, OWNER, "owner");
+    await fake.editMessage(channel, post, OWNER, { text: "owner, edited" });
+    await fake.renameChat(channel, { by: OWNER, title: "News 2" });
+
+    expect(sent.result).toMatchObject({ ...byChannel, text: "bot" });
+    await expect.poll(() => hook.ofType("channel_post").length).toBe(2);
+    const [posted, renamed] = hook.ofType("channel_post");
+    const [edited] = hook.ofType("edited_channel_post");
+    expect(posted).toMatchObject({ ...byChannel, text: "owner" });
+    expect(edited).toMatchObject({ ...byChannel, text: "owner, edited" });
+    expect(renamed).toMatchObject({ ...byChannel, new_chat_title: "News 2" });
+    for (const message of [sent.result, posted, edited, renamed]) {
+      expect(message.from).toBeUndefined();
+    }
+    expect(hook.ofType("message")).toEqual([]);
+    expect(hook.ofType("edited_message")).toEqual([]);
+  });
+
+  it("lets only the creator and administrators with can_post_messages post in a channel", async () => {
+    const { fake, api } = await setup();
+    const me = (await api("getMe")).result;
+    const channel = await fake.createChat({ type: "channel", ownerId: OWNER });
+    await fake.setBotMembership(channel, me.id, {
+      status: "administrator",
+      rights: { can_promote_members: true },
+    });
+    const [subscriber, editor, poster] = [
+      await fake.createUser(),
+      await fake.createUser(),
+      await fake.createUser(),
+    ];
+    for (const user of [subscriber, editor, poster]) {
+      await fake.join(channel, user);
+    }
+    await api("promoteChatMember", {
+      chat_id: channel,
+      user_id: editor,
+      can_edit_messages: true,
+    });
+    await api("promoteChatMember", {
+      chat_id: channel,
+      user_id: poster,
+      can_post_messages: true,
+    });
+
+    for (const user of [subscriber, editor]) {
+      await expect(fake.post(channel, user, "hello")).rejects.toThrow(
+        /CHAT_WRITE_FORBIDDEN/,
+      );
+    }
+    for (const user of [OWNER, poster]) {
+      await expect(fake.post(channel, user, "hello")).resolves.toBeTypeOf(
+        "number",
+      );
+    }
+  });
+
+  it("edits and stops others' channel posts with can_edit_messages, and its own only while it may post", async () => {
+    const { fake, api } = await setup();
+    const me = (await api("getMe")).result;
+    const channel = await fake.createChat({ type: "channel", ownerId: OWNER });
+    const rights = (can_post_messages, can_edit_messages) =>
+      fake.setBotMembership(channel, me.id, {
+        status: "administrator",
+        rights: { can_post_messages, can_edit_messages },
+      });
+    const addButton = (messageId) =>
+      api("editMessageReplyMarkup", {
+        chat_id: channel,
+        message_id: messageId,
+        reply_markup: {
+          inline_keyboard: [[{ text: "Like", callback_data: "1" }]],
+        },
+      });
+    const refused = {
+      status: 400,
+      description: "Bad Request: message can't be edited",
+    };
+    await rights(true, false);
+    const own = (await api("sendMessage", { chat_id: channel, text: "mine" }))
+      .result.message_id;
+    const poll = (
+      await api("sendPoll", {
+        chat_id: channel,
+        question: "Which?",
+        options: ["A", "B"],
+      })
+    ).result.message_id;
+    const owners = await fake.post(channel, OWNER, "the owner's");
+
+    expect(await addButton(owners)).toMatchObject(refused);
+    await rights(false, true);
+    expect(await addButton(owners)).toMatchObject({
+      ok: true,
+      result: { message_id: owners, reply_markup: expect.any(Object) },
+    });
+    await rights(false, false);
+    expect(await addButton(own)).toMatchObject(refused);
+    expect(
+      await api("stopPoll", { chat_id: channel, message_id: poll }),
+    ).toMatchObject(refused);
+  });
+
   it("pins with the right to, and shows the pinned message on getChat", async () => {
     const { fake, api } = await setup();
     const me = (await api("getMe")).result;
