@@ -938,33 +938,46 @@ describe("each bot is itself", () => {
     });
   });
 
-  it("sends a button press only to the bot that sent the message", async () => {
+  it("sends a button press only to the bot that sent the message, ephemeral or not", async () => {
     const { fake, api, second } = await setup();
     const first = await startReceiver();
     const other = await startReceiver();
     await api("setWebhook", { url: first.url });
     await api("setWebhook", { url: other.url }, SECOND_TOKEN);
-    await fake.setBotMembership(GROUP, second.id, { status: "member" });
-    const sent = await api(
-      "sendMessage",
-      {
-        chat_id: GROUP,
-        text: "vote",
-        reply_markup: {
-          inline_keyboard: [[{ text: "Yes", callback_data: "yes" }]],
-        },
+    await fake.setBotMembership(GROUP, second.id, { status: "administrator" });
+    const vote = {
+      chat_id: GROUP,
+      text: "vote",
+      reply_markup: {
+        inline_keyboard: [[{ text: "Yes", callback_data: "yes" }]],
       },
+    };
+    const sent = await api("sendMessage", vote, SECOND_TOKEN);
+    const ephemeral = await api(
+      "sendMessage",
+      { ...vote, ephemeral_message_parameters: { receiver_user_id: OWNER } },
       SECOND_TOKEN,
     );
+    const answer = (index) =>
+      api(
+        "answerCallbackQuery",
+        { callback_query_id: other.ofType("callback_query")[index].id },
+        SECOND_TOKEN,
+      );
 
     const press = fake.pressButton(GROUP, sent.result.message_id, OWNER, "yes");
     await expect.poll(() => other.ofType("callback_query").length).toBe(1);
-    await api(
-      "answerCallbackQuery",
-      { callback_query_id: other.ofType("callback_query")[0].id },
-      SECOND_TOKEN,
-    );
+    await answer(0);
     await press;
+    const ephemeralPress = fake.pressEphemeralButton(
+      GROUP,
+      ephemeral.result.ephemeral_message_id,
+      OWNER,
+      "yes",
+    );
+    await expect.poll(() => other.ofType("callback_query").length).toBe(2);
+    await answer(1);
+    await ephemeralPress;
     expect(first.ofType("callback_query")).toEqual([]);
   });
 });

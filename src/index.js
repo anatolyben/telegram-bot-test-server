@@ -1649,6 +1649,7 @@ export async function startTestServer({
     chat.ephemeral.set(message.ephemeral_message_id, {
       message,
       deleted: false,
+      author: from.id,
       after: chat.nextMessageId - 1,
     });
     appliedCheckpoint();
@@ -3516,7 +3517,7 @@ export async function startTestServer({
     }
     requireEditable(chat, entry, caller);
     requireButtonData(markup);
-    const edited = editedMessage(entry.message, p, apply);
+    const edited = editedMessage(entry.message, markup, apply);
     const same = (message) =>
       JSON.stringify([
         message.text,
@@ -3543,21 +3544,24 @@ export async function startTestServer({
    * return True. UNVERIFIED: Telegram does not document whether an edit without
    * reply_markup removes the keyboard, as a regular edit does, or whether one
    * that changes nothing is refused; this server removes it and accepts the
-   * edit.
+   * edit. Its keyboard is checked as a regular edit's: read with the request,
+   * before the chat (do_edit_ephemeral_message in telegram-bot-api's
+   * Client.cpp), and its callback_data once the message is found.
    */
   function editEphemeralMessage(p, caller, apply) {
+    const markup = inlineMarkup(p.reply_markup);
     const entry = ownEphemeralMessage(p, caller);
-    entry.message = editedMessage(entry.message, p, apply);
+    requireButtonData(markup);
+    entry.message = editedMessage(entry.message, markup, apply);
     appliedCheckpoint();
     waits.notify();
     return true;
   }
 
   /** A copy of the message with the edit, reply_markup and edit_date applied. */
-  function editedMessage(message, p, apply) {
+  function editedMessage(message, markup, apply) {
     const edited = structuredClone(message);
     apply(edited);
-    const markup = inlineMarkup(p.reply_markup);
     if (markup) edited.reply_markup = markup;
     else delete edited.reply_markup;
     edited.edit_date = now();

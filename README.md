@@ -226,7 +226,8 @@ The details a moderation bot depends on, each covered by a test:
 - **Inline keyboards.** Every button needs an action: a button with only `text` (or an empty
   `callback_data`) fails with Telegram's `Text buttons are not allowed in the inline keyboard`.
   `callback_data` is limited to 64 bytes of UTF-8, not 64 characters; longer data fails with
-  `BUTTON_DATA_INVALID`. Sends, business sends and edits all check this.
+  `BUTTON_DATA_INVALID`. Sends, business sends and edits, ephemeral edits included, all check
+  this.
 - **Callback queries.** Answering a query that was never sent fails. Answer text is limited to 200
   characters; a longer answer fails with `MESSAGE_TOO_LONG` and the query stays open, so the bot can
   answer it again. `chat_instance` is an opaque number that is the same for every press in a chat;

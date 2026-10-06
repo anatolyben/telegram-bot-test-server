@@ -695,6 +695,36 @@ describe("ephemeral messages", () => {
     expect(message).not.toHaveProperty("photo");
   });
 
+  it("checks the inline keyboard of an ephemeral edit as the request is read, and its callback_data", async () => {
+    const { api, member } = await setup();
+    const ann = await member();
+    const id = (
+      await api("sendMessage", {
+        chat_id: GROUP,
+        text: "only you",
+        ephemeral_message_parameters: { receiver_user_id: ann },
+      })
+    ).result.ephemeral_message_id;
+    const edit = (ephemeralMessageId, button) =>
+      api("editEphemeralMessageReplyMarkup", {
+        chat_id: GROUP,
+        receiver_user_id: ann,
+        ephemeral_message_id: ephemeralMessageId,
+        reply_markup: { inline_keyboard: [[{ text: "Go", ...button }]] },
+      });
+
+    expect(await edit(id, { callback_data: "x".repeat(65) })).toMatchObject({
+      status: 400,
+      description: "Bad Request: BUTTON_DATA_INVALID",
+    });
+    // A text button is refused before the message is looked up.
+    expect(await edit(id + 1, {})).toMatchObject({
+      status: 400,
+      description:
+        "Bad Request: can't parse InlineKeyboardButton: Text buttons are not allowed in the inline keyboard",
+    });
+  });
+
   it("sends the receiver's button press with the ephemeral message, which no one else can press", async () => {
     const { server, api, member } = await setup();
     const ann = await member();
