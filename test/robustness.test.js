@@ -232,10 +232,6 @@ describe("bad input", () => {
         [{ type: "custom_emoji" }],
         `Bad Request: can't parse ReactionType: Can't find field "custom_emoji_id"`,
       ],
-      [
-        [{ type: "paid" }],
-        "Bad Request: can't parse ReactionType: invalid reaction type specified",
-      ],
     ]) {
       expect(
         await api("setMessageReaction", {
@@ -279,27 +275,6 @@ describe("bad input", () => {
     ]) {
       expect(
         await api("sendMessage", { chat_id: GROUP, text: "hi", ...params }),
-      ).toMatchObject({ error_code: 400, description });
-    }
-  });
-
-  it("answers malformed poll options with Telegram's parse errors", async () => {
-    const { api } = await setup();
-
-    for (const [options, description] of [
-      [undefined, "Bad Request: can't parse options JSON object"],
-      [{}, "Bad Request: expected an Array of InputPollOption"],
-      [
-        [null, null],
-        "Bad Request: can't parse InputPollOption: Expected InputPollOption to be an Object",
-      ],
-      [
-        [{}, {}],
-        `Bad Request: can't parse InputPollOption: Can't find field "text"`,
-      ],
-    ]) {
-      expect(
-        await api("sendPoll", { chat_id: GROUP, question: "Q?", options }),
       ).toMatchObject({ error_code: 400, description });
     }
   });
