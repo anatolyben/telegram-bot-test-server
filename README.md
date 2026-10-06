@@ -171,12 +171,12 @@ with `business_connection_id`.
 These are not modelled: `setMyDescription`, `setMyShortDescription`,
 `setChatMenuButton`, `setMyDefaultAdministratorRights`.
 
-Any other method gets Telegram's answer to a method it does not know: 404
+They and any other method not listed get Telegram's answer to a method it does not know: 404
 `Not Found: method not found`, so a test cannot pass against behaviour the server does not have.
 `getCalls()` (`GET /_fake/calls`) lists the unsupported methods called, and `log` reports each
-once. With `unimplemented: "ok"`, an unsupported method that Telegram
-documents as returning `True` answers `true` instead; any other still gets the 404. Methods are
-added when a real bot needs them; the goal is not full coverage of the Bot API.
+once. With `unimplemented: "ok"`, an unsupported method that Telegram documents as returning
+`True` answers `true` instead; any other still gets the 404. Methods are added when a real bot
+needs them; the goal is not full coverage of the Bot API.
 
 Method names are case-insensitive. Parameters come as a query string, JSON, or URL-encoded or
 multipart form data, read as Telegram's server reads them: a body of any other type is ignored, a
