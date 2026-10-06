@@ -339,16 +339,15 @@ describe("basic groups and the upgrade to a supergroup", () => {
       .toEqual([[me.id, member]]);
   });
 
-  it("still reads the old id with getChat, and refuses leaveChat there as deactivated", async () => {
+  it("still reads the old id with getChat, without an invite link, and refuses leaveChat there as deactivated", async () => {
     const { fake, api, me } = await setup();
     const group = await fake.createChat({ type: "group", ownerId: OWNER });
     await fake.setBotMembership(group, me.id, { status: "administrator" });
     const supergroup = await fake.migrateToSupergroup(group, { by: OWNER });
 
-    expect((await api("getChat", { chat_id: group })).result).toMatchObject({
-      id: group,
-      type: "group",
-    });
+    const old = (await api("getChat", { chat_id: group })).result;
+    expect(old).toMatchObject({ id: group, type: "group" });
+    expect(old).not.toHaveProperty("invite_link");
     expect(await api("leaveChat", { chat_id: group })).toMatchObject({
       status: 400,
       description: "Bad Request: chat is deactivated",

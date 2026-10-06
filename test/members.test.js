@@ -911,6 +911,12 @@ describe("administrators and chat settings", () => {
       status: 400,
       description: "Bad Request: CHAT_INVITE_PERMANENT",
     });
+    expect(
+      await api("editChatInviteLink", { chat_id: GROUP, name: "No link" }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: invite link must be non-empty",
+    });
     const link = (await api("createChatInviteLink", { chat_id: GROUP })).result
       .invite_link;
     const edited = await api("editChatInviteLink", {
@@ -927,9 +933,54 @@ describe("administrators and chat settings", () => {
       await api("editChatInviteLink", {
         chat_id: GROUP,
         invite_link: link,
+        member_limit: 50,
         creates_join_request: true,
       }),
-    ).toMatchObject({ status: 400 });
+    ).toMatchObject({
+      status: 400,
+      description:
+        "Bad Request: member limit can't be specified for links requiring administrator approval",
+    });
+  });
+
+  it("sets every field of an edited link, and the ones left out to their defaults", async () => {
+    const { api } = await setup();
+    const link = (
+      await api("createChatInviteLink", {
+        chat_id: GROUP,
+        name: "One-shot",
+        member_limit: 1,
+        expire_date: Math.floor(Date.now() / 1000) + 3600,
+      })
+    ).result.invite_link;
+    const edit = async (fields) =>
+      (
+        await api("editChatInviteLink", {
+          chat_id: GROUP,
+          invite_link: link,
+          ...fields,
+        })
+      ).result;
+    const plain = {
+      invite_link: link,
+      creator: expect.any(Object),
+      creates_join_request: false,
+      is_primary: false,
+      is_revoked: false,
+    };
+
+    expect(await edit({ name: "Renamed" })).toEqual({
+      ...plain,
+      name: "Renamed",
+    });
+    expect(await edit({ creates_join_request: true })).toEqual({
+      ...plain,
+      creates_join_request: true,
+    });
+    expect(
+      await edit({ member_limit: 100001, creates_join_request: false }),
+    ).toEqual({ ...plain, member_limit: 100000 });
+    expect(await edit({ member_limit: 0, expire_date: 0 })).toEqual(plain);
   });
 });
 

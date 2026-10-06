@@ -267,18 +267,22 @@ The details a moderation bot depends on, each covered by a test:
   Telegram's text, such as `chat_id is empty` or `invalid user_id specified`. If this server itself
   fails, the bot gets Telegram's bare `500 Internal Server Error`, and the cause goes to `log`.
 - **Invite links.** Creating, exporting, editing and revoking links needs `can_invite_users`
-  (`not enough rights to manage chat invite link` otherwise). Each administrator has its own
-  primary link: `exportChatInviteLink` replaces only the calling bot's, `getChat` returns it as
-  `invite_link` (generating one when the bot has none), revoking it generates a new one, and it
-  cannot be edited (`CHAT_INVITE_PERMANENT`). A bot edits and revokes only links it created. A
-  link's `member_limit` counts the members who joined through it and are still in the chat; a join
-  past it, after `expire_date` or through a revoked link fails with `INVITE_HASH_EXPIRED`, and a
-  link that creates join requests cannot have a `member_limit`. A bot sees a link another
-  administrator created with the second half of its hash replaced by `...`. Links are
-  `https://t.me/+` followed by a random hash. Unverified: the characters that hide the half (the
-  Bot API docs print "…"; TDLib expects `...`, which this server sends), the error for revoking
-  another administrator's link (here `CHAT_ADMIN_REQUIRED`), and the error for joining through a
-  full link (here `INVITE_HASH_EXPIRED`, as Telegram's apps call such a link expired).
+  (`not enough rights to manage chat invite link` otherwise); editing or revoking without a link
+  fails with `invite link must be non-empty`. Each administrator has its own primary link:
+  `exportChatInviteLink` replaces only the calling bot's, `getChat` returns it as `invite_link`
+  (generating one when the bot has none; an upgraded basic group has none), revoking it generates
+  a new one, and it cannot be edited (`CHAT_INVITE_PERMANENT`). A bot edits and revokes only links
+  it created. An edit sets every field: one it leaves out goes back to its default (no name, no
+  `expire_date`, no `member_limit`, no join requests). `member_limit` is capped at 100000. A
+  link's `member_limit` counts the members who joined through it and are still in the chat,
+  restricted or promoted ones included; a join past it, after `expire_date` or through a revoked
+  link fails with `INVITE_HASH_EXPIRED`, and a link that creates join requests cannot have a
+  `member_limit`. A bot sees a link another administrator created with the second part of its hash
+  replaced by `...` (TDLib's form; the Bot API docs print "…"). Links are `https://t.me/+`
+  followed by a random hash. Unverified: how much of the hash is hidden (here the
+  second half), the error for revoking another administrator's link (here `CHAT_ADMIN_REQUIRED`),
+  and the error for joining through a full link (here `INVITE_HASH_EXPIRED`, as Telegram's apps
+  call such a link expired).
 - **Entities.** Member messages and captions carry the entities Telegram finds by itself, found
   the way TDLib finds them: `mention`, `bot_command` (anywhere it does not touch a letter, digit,
   `_`, `/`, `<` or `>`), `hashtag`, `cashtag`, `url` and `email`, with UTF-16 offsets, in groups

@@ -875,6 +875,55 @@ describe("invite links and join requests", () => {
       description:
         "Bad Request: member limit can't be specified for links requiring administrator approval",
     });
+    // The Bot API server clamps member_limit to 0-100000.
+    expect(
+      (
+        await api("createChatInviteLink", {
+          chat_id: GROUP,
+          member_limit: 100001,
+        })
+      ).result.member_limit,
+    ).toBe(100000);
+  });
+
+  it("counts a member who joined through a link while they stay, restricted or not", async () => {
+    const { fake, api } = await setup();
+    const link = (
+      await api("createChatInviteLink", { chat_id: GROUP, member_limit: 1 })
+    ).result.invite_link;
+    const ann = await fake.createUser();
+    await fake.joinByLink(link, ann);
+    const restrict = (permissions) =>
+      api("restrictChatMember", { chat_id: GROUP, user_id: ann, permissions });
+
+    await restrict({ can_send_messages: false });
+    await expect(
+      fake.joinByLink(link, await fake.createUser()),
+    ).rejects.toThrow("INVITE_HASH_EXPIRED");
+    // Passing every permission lifts the restriction.
+    await restrict(
+      Object.fromEntries(
+        [
+          "can_send_messages",
+          "can_send_audios",
+          "can_send_documents",
+          "can_send_photos",
+          "can_send_videos",
+          "can_send_video_notes",
+          "can_send_voice_notes",
+          "can_send_polls",
+          "can_send_other_messages",
+          "can_add_web_page_previews",
+          "can_change_info",
+          "can_invite_users",
+          "can_pin_messages",
+          "can_manage_topics",
+        ].map((key) => [key, true]),
+      ),
+    );
+    await expect(
+      fake.joinByLink(link, await fake.createUser()),
+    ).rejects.toThrow("INVITE_HASH_EXPIRED");
   });
 
   it("refuses a join through a link once its expire_date has passed", async () => {
@@ -907,6 +956,12 @@ describe("invite links and join requests", () => {
     const link = (await api("createChatInviteLink", { chat_id: GROUP })).result
       .invite_link;
 
+    expect(await api("revokeChatInviteLink", { chat_id: GROUP })).toMatchObject(
+      {
+        status: 400,
+        description: "Bad Request: invite link must be non-empty",
+      },
+    );
     expect(
       await api("revokeChatInviteLink", {
         chat_id: GROUP,
@@ -931,7 +986,7 @@ describe("invite links and join requests", () => {
     });
   });
 
-  it("replaces a revoked primary link with a new one", async () => {
+  it("returns a revoked primary link in full and leaves a working primary link", async () => {
     const { fake, api } = await setup();
     const primary = (await api("exportChatInviteLink", { chat_id: GROUP }))
       .result;
