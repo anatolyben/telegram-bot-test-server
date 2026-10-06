@@ -39,6 +39,24 @@ async function startReceiver() {
   };
 }
 
+/** A multipart Bot API call; each Buffer goes up as a file named after its field. */
+async function upload(fake, method, fields) {
+  const body = new FormData();
+  for (const [key, value] of Object.entries(fields)) {
+    if (Buffer.isBuffer(value)) body.append(key, new Blob([value]), key);
+    else
+      body.append(
+        key,
+        typeof value === "object" ? JSON.stringify(value) : String(value),
+      );
+  }
+  const response = await fetch(`${fake.origin}/bot${TOKEN}/${method}`, {
+    method: "POST",
+    body,
+  });
+  return { status: response.status, ...(await response.json()) };
+}
+
 async function setup() {
   const fake = await startTestServer({
     botToken: TOKEN,
@@ -366,6 +384,124 @@ describe("polls, forwards and media", () => {
     expect(unchanged.status).toBe(400);
     expect(unchanged.description).toMatch(/message is not modified/);
   });
+
+  it("edits media into a video, animation, audio or live photo with the fields a send gives", async () => {
+    const { fake } = await setup();
+    const sent = await upload(fake, "sendPhoto", {
+      chat_id: GROUP,
+      photo: PHOTO,
+    });
+    const edit = (media, files) =>
+      upload(fake, "editMessageMedia", {
+        chat_id: GROUP,
+        message_id: sent.result.message_id,
+        media,
+        ...files,
+      });
+
+    const video = await edit(
+      {
+        type: "video",
+        media: "attach://clip",
+        width: 100,
+        height: 200,
+        duration: 7,
+      },
+      { clip: Buffer.from("video") },
+    );
+    expect(video.result.video).toMatchObject({
+      width: 100,
+      height: 200,
+      duration: 7,
+    });
+    expect(video.result.photo).toBeUndefined();
+    const animation = await edit(
+      { type: "animation", media: "attach://gif" },
+      { gif: Buffer.from("animation") },
+    );
+    expect(animation.result.document).toMatchObject({
+      file_id: animation.result.animation.file_id,
+      file_unique_id: animation.result.animation.file_unique_id,
+    });
+    expect(animation.result.video).toBeUndefined();
+    const audio = await edit(
+      {
+        type: "audio",
+        media: "attach://song",
+        title: "Song",
+        performer: "Band",
+        duration: 120,
+      },
+      { song: Buffer.from("audio") },
+    );
+    expect(audio.result.audio).toMatchObject({
+      title: "Song",
+      performer: "Band",
+      duration: 120,
+    });
+    expect(audio.result.animation).toBeUndefined();
+    expect(audio.result.document).toBeUndefined();
+    const live = await edit(
+      { type: "live_photo", media: "attach://motion", photo: "attach://still" },
+      { motion: Buffer.from("motion"), still: PHOTO },
+    );
+    expect(live.result.live_photo).toMatchObject({
+      photo: live.result.photo,
+      file_id: expect.any(String),
+      width: expect.any(Number),
+      height: expect.any(Number),
+      duration: expect.any(Number),
+    });
+    expect(live.result.audio).toBeUndefined();
+  });
+
+  it("refuses media edits Telegram does not allow", async () => {
+    const { api } = await setup();
+    const url = "https://example.com/a.jpg";
+    const album = await api("sendMediaGroup", {
+      chat_id: GROUP,
+      media: [
+        { type: "photo", media: url },
+        { type: "photo", media: url },
+      ],
+    });
+    const edit = (message, media) =>
+      api("editMessageMedia", {
+        chat_id: GROUP,
+        message_id: message.message_id,
+        media,
+      });
+    const [first] = album.result;
+
+    expect(await edit(first, { type: "sticker", media: url })).toMatchObject({
+      status: 400,
+      description:
+        'Bad Request: can\'t parse InputMedia: type "sticker" is unsupported',
+    });
+    expect(await edit(first, { type: "photo" })).toMatchObject({
+      status: 400,
+      description: "Bad Request: can't parse InputMedia: media not found",
+    });
+    expect(await edit(first, { type: "animation", media: url })).toMatchObject({
+      status: 400,
+      description:
+        "Bad Request: message content type can't be used in an album",
+    });
+    expect(await edit(first, { type: "document", media: url })).toMatchObject({
+      status: 400,
+      description: "Bad Request: can't change media type in the album",
+    });
+    expect(
+      (await edit(first, { type: "video", media: url })).result.video,
+    ).toBeDefined();
+    const sticker = await api("sendSticker", { chat_id: GROUP, sticker: url });
+    expect(
+      await edit(sticker.result, { type: "photo", media: url }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: message media can't be edited",
+    });
+  });
 });
 
 describe("failures a test asks for", () => {
@@ -522,23 +658,58 @@ describe("each bot is itself", () => {
     ).toEqual([second.id]);
   });
 
-  it("lets any bot download a file by its own token", async () => {
-    const { fake, api } = await setup();
+  it("gives each bot its own file_id for a file, which it downloads by its own token", async () => {
+    const { fake, api, second } = await setup();
+    await fake.setBotMembership(GROUP, second.id, { status: "member" });
     const member = await fake.createUser();
     await fake.join(GROUP, member);
-    const id = await fake.post(GROUP, member, {
-      photo: PHOTO,
-    });
-    const { message } = await fake.getMessage(GROUP, id);
-    const file = await api(
-      "getFile",
-      { file_id: message.photo.at(-1).file_id },
-      SECOND_TOKEN,
-    );
+    await fake.post(GROUP, member, { photo: PHOTO });
+    const photoFor = async (token) =>
+      (await api("getUpdates", {}, token)).result
+        .map((update) => update.message?.photo)
+        .find(Boolean)
+        .at(-1);
+    const first = await photoFor(TOKEN);
+    const other = await photoFor(SECOND_TOKEN);
+
+    expect(other.file_id).not.toBe(first.file_id);
+    expect(other.file_unique_id).toBe(first.file_unique_id);
+    const file = await api("getFile", { file_id: other.file_id }, SECOND_TOKEN);
     const download = await fetch(
       `${fake.origin}/file/bot${SECOND_TOKEN}/${file.result.file_path}`,
     );
     expect(Buffer.from(await download.arrayBuffer())).toEqual(PHOTO);
+    const firstPath = (await api("getFile", { file_id: first.file_id })).result
+      .file_path;
+    const foreign = await fetch(
+      `${fake.origin}/file/bot${SECOND_TOKEN}/${firstPath}`,
+    );
+    expect(foreign.status).toBe(404);
+  });
+
+  it("refuses a file_id that another bot was given", async () => {
+    const { fake, api, second } = await setup();
+    await fake.setBotMembership(GROUP, second.id, { status: "member" });
+    const member = await fake.createUser();
+    await fake.join(GROUP, member);
+    const id = await fake.post(GROUP, member, { photo: PHOTO });
+    const fileId = (await fake.getMessage(GROUP, id)).message.photo.at(
+      -1,
+    ).file_id;
+
+    expect(
+      await api("sendPhoto", { chat_id: GROUP, photo: fileId }, SECOND_TOKEN),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: wrong file identifier/HTTP URL specified",
+    });
+    expect(
+      await api("getFile", { file_id: fileId }, SECOND_TOKEN),
+    ).toMatchObject({
+      status: 400,
+      description:
+        "Bad Request: wrong file_id or the file is temporarily unavailable",
+    });
   });
 
   it("refuses a second bot's message to someone who wrote only to the first", async () => {
@@ -708,7 +879,7 @@ describe("chats created during a run", () => {
     await fake.setBotMembership(channel, me.id, { status: "administrator" });
     const post = await api("sendPhoto", {
       chat_id: channel,
-      photo: "not-a-file-id",
+      photo: "https://example.com/photo.jpg",
       caption: "old",
     });
 
