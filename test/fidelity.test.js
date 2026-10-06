@@ -1545,35 +1545,107 @@ describe("flood control", () => {
 
   it("answers the Bot API server's 429 to a 21st message in a group within a minute", async () => {
     const { server } = await setup(limited);
-    const send = (text) =>
+    const send = (params) =>
       fetch(`${server.origin}/bot${TOKEN}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: GROUP, text }),
+        body: JSON.stringify({ chat_id: GROUP, ...params }),
       });
-    for (let i = 1; i <= 20; i += 1) {
-      expect((await send(`notice ${i}`)).status).toBe(200);
+    for (let i = 1; i <= 19; i += 1) {
+      expect((await send({ text: `notice ${i}` })).status).toBe(200);
       await server.advanceTime(1000);
     }
+    // A send refused for its parameters does not count.
+    const badButton = { text: "Open", callback_data: "x".repeat(65) };
+    expect(
+      (
+        await send({
+          text: "notice 20",
+          reply_markup: { inline_keyboard: [[badButton]] },
+        })
+      ).status,
+    ).toBe(400);
+    expect((await send({ text: "notice 20" })).status).toBe(200);
+    await server.advanceTime(1000);
 
-    const refused = await send("notice 21");
+    const refused = await send({ text: "notice 21" });
     expect(refused.status).toBe(429);
-    expect(refused.headers.get("retry-after")).toBe("41");
+    expect(refused.headers.get("retry-after")).toBe("40");
     expect(await refused.json()).toEqual({
       ok: false,
       error_code: 429,
-      description: "Too Many Requests: retry after 41",
-      parameters: { retry_after: 41 },
+      description: "Too Many Requests: retry after 40",
+      parameters: { retry_after: 40 },
+    });
+    // Nor does a send refused with 429: asking again gets the same wait.
+    expect(await (await send({ text: "notice 21" })).json()).toMatchObject({
+      parameters: { retry_after: 40 },
     });
     expect(
       (await server.getMessages(GROUP)).map((message) => message.text),
     ).not.toContain("notice 21");
 
-    await server.advanceTime(41_000);
-    expect((await send("notice 21")).status).toBe(200);
+    await server.advanceTime(40_000);
+    expect((await send({ text: "notice 21" })).status).toBe(200);
   });
 
-  it("allows one message a second in a chat, counting an album as one", async () => {
+  // TDLib, for a bot, waits out a flood wait of up to 8 seconds and sends
+  // again (NetQueryCreator.cpp total_timeout_limit, NetQueryDelayer::delay).
+  it("holds a second message within a second in a chat until it fits, then sends it", async () => {
+    const { server, api } = await setup(limited);
+    const user = await server.createUser();
+    await server.sendDirectMessage(user, "hi");
+    expect(
+      await api("sendMessage", { chat_id: user, text: "part 1" }),
+    ).toMatchObject({ ok: true });
+
+    const second = api("sendMessage", { chat_id: user, text: "part 2" });
+    await server.waitFor({
+      kind: "call",
+      botId: BOT,
+      method: "sendMessage",
+      params: { text: "part 2" },
+    });
+    await server.advanceTime(1000);
+    expect(await second).toMatchObject({
+      ok: true,
+      result: { text: "part 2", date: 1_800_000_001 },
+    });
+  });
+
+  it("answers 429 once a send's waits add up to more than 8 seconds", async () => {
+    const { server, api } = await setup(limited);
+    const user = await server.createUser();
+    await server.sendDirectMessage(user, "hi");
+    const sends = Array.from({ length: 10 }, (_, i) =>
+      api("sendMessage", { chat_id: user, text: `part ${i + 1}` }),
+    );
+    for (let i = 1; i <= 10; i += 1) {
+      await server.waitFor({
+        kind: "call",
+        botId: BOT,
+        method: "sendMessage",
+        params: { text: `part ${i}` },
+      });
+    }
+    // One send fits each second; the others wait again.
+    for (let second = 1; second <= 9; second += 1) {
+      await server.advanceTime(1000);
+    }
+    const answers = await Promise.all(sends);
+    expect(answers.filter((answer) => answer.ok)).toHaveLength(9);
+    expect(answers.filter((answer) => !answer.ok)).toEqual([
+      {
+        ok: false,
+        status: 429,
+        error_code: 429,
+        description: "Too Many Requests: retry after 1",
+        parameters: { retry_after: 1 },
+      },
+    ]);
+  });
+
+  it("counts every message of an album against a group's 20 a minute", async () => {
     const { server, api } = await setup(limited);
     const video = (
       await api("sendVideo", {
@@ -1581,25 +1653,24 @@ describe("flood control", () => {
         video: "https://example.com/a.mp4",
       })
     ).result.video.file_id;
-    expect(
-      await api("sendMessage", { chat_id: GROUP, text: "too soon" }),
-    ).toMatchObject({ status: 429, parameters: { retry_after: 2 } });
+    const album = {
+      chat_id: GROUP,
+      media: Array.from({ length: 10 }, () => ({
+        type: "video",
+        media: video,
+      })),
+    };
+    await server.advanceTime(1000);
+    expect((await api("sendMediaGroup", album)).result).toHaveLength(10);
 
     await server.advanceTime(1000);
-    const album = await api("sendMediaGroup", {
-      chat_id: GROUP,
-      media: [
-        { type: "video", media: video },
-        { type: "video", media: video },
-      ],
+    expect(await api("sendMediaGroup", album)).toMatchObject({
+      status: 429,
+      parameters: { retry_after: 58 },
     });
-    expect(album.result).toHaveLength(2);
-    expect(
-      await api("sendMessage", { chat_id: GROUP, text: "too soon" }),
-    ).toMatchObject({ status: 429, parameters: { retry_after: 2 } });
   });
 
-  it("allows a bot 30 messages a second across all its chats", async () => {
+  it("holds a bot's 31st message within a second across its chats until it fits", async () => {
     const { server, api } = await setup(limited);
     const subscribers = [];
     for (let i = 0; i < 31; i += 1) {
@@ -1613,13 +1684,18 @@ describe("flood control", () => {
       ).toMatchObject({ ok: true });
     }
 
-    const last = { chat_id: subscribers[30], text: "news" };
-    expect(await api("sendMessage", last)).toMatchObject({
-      status: 429,
-      parameters: { retry_after: 2 },
+    const last = api("sendMessage", { chat_id: subscribers[30], text: "news" });
+    await server.waitFor({
+      kind: "call",
+      botId: BOT,
+      method: "sendMessage",
+      chatId: subscribers[30],
     });
     await server.advanceTime(1000);
-    expect(await api("sendMessage", last)).toMatchObject({ ok: true });
+    expect(await last).toMatchObject({
+      ok: true,
+      result: { date: 1_800_000_001 },
+    });
   });
 
   it("answers 429 to a setWebhook with a URL within a second of the previous one", async () => {

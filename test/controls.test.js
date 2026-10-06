@@ -309,14 +309,16 @@ it("restores the flood control history with the fixture's time", async () => {
     ok: true,
   });
   await fake.restore(saved);
-  expect(await api("sendMessage", { chat_id: CHAT, text: "c" })).toMatchObject({
-    status: 429,
-    parameters: { retry_after: 2 },
+  // "c" waits out the second after "a", then goes.
+  const c = api("sendMessage", { chat_id: CHAT, text: "c" });
+  await fake.waitFor({
+    kind: "call",
+    botId: BOT,
+    method: "sendMessage",
+    params: { text: "c" },
   });
   await fake.advanceTime(1000);
-  expect(await api("sendMessage", { chat_id: CHAT, text: "c" })).toMatchObject({
-    ok: true,
-  });
+  expect(await c).toMatchObject({ ok: true, result: { date: 1800000001 } });
   await fake.releaseSnapshot(saved);
 });
 it("restores queued updates that still expire a day after they happened", async () => {

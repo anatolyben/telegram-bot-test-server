@@ -152,7 +152,7 @@ over HTTP through the control API described below, from Python, Go or anything e
 | `chats`                      | `[]`             | Supergroups `{ id, title, ownerId, ownerName? }`. The bot is an administrator.               |
 | `publicChats`                | `[]`             | Channels, groups and bots `{ username, type, title? }` resolvable by `getChat("@username")`. |
 | `unimplemented`              | `"error"`        | Telegram's 404 for an unsupported method, or `"ok"`: `true` for one that returns True.       |
-| `floodControl`               | `false`          | Answer sends over Telegram's published limits with 429 ([Flood control](#flood-control)).    |
+| `floodControl`               | `false`          | Hold or refuse sends over Telegram's published limits ([Flood control](#flood-control)).     |
 | `log`                        | none             | Receives one line per notable event (unsupported methods, webhook failures).                 |
 
 ## Supported Bot API methods
@@ -496,36 +496,41 @@ The details a moderation bot depends on, each covered by a test:
 
 ### Flood control
 
-Off by default. With `floodControl: true`, the server refuses a bot's sends the way Telegram does
+Off by default. With `floodControl: true`, the server limits a bot's sends the way Telegram does
 once the bot goes over the limits Telegram publishes in its
 [Bots FAQ](https://core.telegram.org/bots/faq#my-bot-is-hitting-limits-how-do-i-avoid-this):
 
-- one message a second in a chat. Telegram says it may allow short bursts above this; this server
-  does not;
+- one message a second in a chat. Telegram says it may allow short bursts above this; here an album
+  is such a burst, sent once the chat's last message is a second old;
 - 20 messages a minute in a group or supergroup;
 - 30 messages a second from one bot across all its chats (paid broadcasts are not modelled).
 
 These numbers are Telegram's published guidance, not its internal algorithm, which Telegram does not
 publish. A bot that stays within them here can still be limited differently on Telegram.
 
-Each bot has its own limits. A call that sends a message counts once, after its parameters are
-checked: `sendMessage`, the other `send…` methods, `forwardMessage` and `copyMessage`, and an album
-from `sendMediaGroup` counts once. Edits, deletions, `sendChatAction` and business messages
-(`business_connection_id`) are not counted. A send over a limit stores nothing, does not count, and
-gets the answer Telegram's Bot API server gives: HTTP 429, a `Retry-After` header and
+Each bot has its own limits. A call that sends messages counts them after its parameters are
+checked: `sendMessage`, the other `send…` methods, `forwardMessage` and `copyMessage` count one
+message, and `sendMediaGroup` counts every message of the album. Edits, deletions, `sendChatAction`
+and business messages (`business_connection_id`) are not counted.
+
+A send over a limit has to wait. As Telegram's Bot API server does, this server holds a send that
+has to wait 8 seconds or less, then sends it and answers 200: the bot sees only the delay. If the
+send then has to wait again, the waits add up. A send whose waits would come to more than 8 seconds
+stores nothing, does not count, and gets HTTP 429, a `Retry-After` header and
 
 ```json
 {
   "ok": false,
   "error_code": 429,
-  "description": "Too Many Requests: retry after 41",
-  "parameters": { "retry_after": 41 }
+  "description": "Too Many Requests: retry after 40",
+  "parameters": { "retry_after": 40 }
 }
 ```
 
-`retry_after` is the whole seconds until the send would fit, plus one, as the Bot API server rounds
-its own limits. The limits run on the server clock, so with `clock` a test moves past them with
-`advanceTime`, and a snapshot keeps and restores the recent sends.
+`retry_after` is the seconds of its last wait, rounded up to whole seconds as Telegram gives them.
+The limits run on the server clock, so with `clock` a held send is answered only once a test moves
+the clock past its wait with `advanceTime`. While a send is held, `snapshot()` and `restore()`
+refuse, as for a response delay; a snapshot keeps and restores the recent sends.
 
 `floodControl` also applies a limit of the Bot API server itself: a `setWebhook` with a URL less
 than a second after the previous one gets 429 `Too Many Requests: retry after 1` before anything
@@ -1091,8 +1096,8 @@ identity remain fixed. External webhook consumers, sockets, timers, databases
 and application state are not snapshotted.
 
 With `clock: { now: milliseconds }`, `advanceTime(ms)` serializes advances and
-runs due fake expiry and Bot/owner response-fault delays in deadline order. It
-also controls fake message/login/business timestamps and flood control. Real
+runs due fake expiry, Bot/owner response-fault delays and sends held by flood control in deadline
+order. It also controls fake message/login/business timestamps and flood control. Real
 mode remains the default; real time is not rewound by restore. Manual time is restored with the
 fixture. Global `Date`, timers and the consuming application's jobs are untouched.
 Webhook retry waits and delayed getUpdates conflicts run on it too. Webhook network
