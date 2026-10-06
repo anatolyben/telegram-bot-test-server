@@ -140,7 +140,7 @@ npx telegram-bot-test-server --token 123456:TEST --port 8081 --config chats.json
 | -------------------- | --------------- | ------------------------------------------------------ |
 | `--token`            | required        | The bot's token.                                       |
 | `--port`, `--host`   | 8081, 127.0.0.1 | Where to listen.                                       |
-| `--username`         | `fake_test_bot` | The bot's username.                                    |
+| `--username`         | `example_bot`   | The bot's username.                                    |
 | `--config`           | none            | A JSON file with `chats` and `publicChats`.            |
 | `--unimplemented-ok` | off             | Answer `true` to unsupported methods that return True. |
 
@@ -154,8 +154,8 @@ over HTTP through the control API described below, from Python, Go or anything e
 | ---------------------------- | ---------------- | -------------------------------------------------------------------------------------------- |
 | `botToken`                   | required         | `<numeric id>:<secret>`. Calls with any other token get 401.                                 |
 | `port`, `host`               | `0`, `127.0.0.1` | Where to listen. Port 0 picks a free port.                                                   |
-| `botUsername`                | `fake_test_bot`  | Returned by `getMe`.                                                                         |
-| `botName`                    | `Fake Test Bot`  | Returned by `getMe`.                                                                         |
+| `botUsername`                | `example_bot`    | Returned by `getMe`.                                                                         |
+| `botName`                    | `Example Bot`    | Returned by `getMe`.                                                                         |
 | `supportsJoinRequestQueries` | `false`          | A guard bot: where it has `can_invite_users`, join requests reach it with a `query_id`.      |
 | `loginClientSecret`          | random           | The first bot's Telegram Login client secret.                                                |
 | `chats`                      | `[]`             | Supergroups `{ id, title, ownerId, ownerName? }`. The bot is an administrator.               |

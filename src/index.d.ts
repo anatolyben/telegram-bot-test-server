@@ -26,9 +26,9 @@ export interface TelegramBotTestServerOptions {
   clock?: { now: number };
   /** Default "127.0.0.1". */
   host?: string;
-  /** Default "fake_test_bot". */
+  /** Default "example_bot". */
   botUsername?: string;
-  /** Default "Fake Test Bot". */
+  /** Default "Example Bot". */
   botName?: string;
   /**
    * The bot is a guard bot: in a chat where it has can_invite_users, join
