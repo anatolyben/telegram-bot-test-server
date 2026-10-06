@@ -926,6 +926,7 @@ it("answers Bot API calls at once while the updates they cause wait for a held w
           })
         ).json(),
       () => api("deleteChatPhoto", { chat_id: CHAT }),
+      () => api("pinChatMessage", { chat_id: CHAT, message_id: reacted }),
       () =>
         api("deleteMessageReaction", {
           chat_id: CHAT,

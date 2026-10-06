@@ -1607,6 +1607,20 @@ export async function startTestServer({
   }
 
   /**
+   * Pin a message for whoever pinned it, keeping chat.pinned newest first.
+   * Returns the pinned_message service message Telegram posts for the pin.
+   */
+  function pin(chat, entry, from) {
+    const id = entry.message.message_id;
+    chat.pinned = [...new Set([id, ...(chat.pinned ?? [])])].sort(
+      (a, b) => b - a,
+    );
+    return addMessage(chat, from, {
+      pinned_message: pinnedMessage(entry.message),
+    });
+  }
+
+  /**
    * Whether the user may post, given their own and the chat's permissions. A
    * channel's subscribers have none: TDLib keeps no member permissions in a
    * broadcast channel (RestrictedRights with ChannelType::Broadcast).
@@ -2543,14 +2557,18 @@ export async function startTestServer({
     );
   }
 
-  /** Whether a person may change the chat's title or photo. */
-  function canChangeInfo(chat, userId) {
+  /**
+   * Whether a person holds a right such as can_change_info: the creator
+   * always, an administrator granted it, a member the chat's permissions
+   * allow.
+   */
+  function personHasRight(chat, userId, right) {
     const member = memberStatus(chat, userId);
     if (member.status === "creator") return true;
     if (member.status === "administrator") {
-      return hasRight(chat, userId, "can_change_info");
+      return hasRight(chat, userId, right);
     }
-    return canPost(chat, userId, "can_change_info");
+    return canPost(chat, userId, right);
   }
 
   /**
@@ -2668,7 +2686,7 @@ export async function startTestServer({
   /** A person renames the chat; bots get the new_chat_title service message. */
   async function renameByPerson(chat, { by, title }) {
     const actor = requireUser(by ?? creatorOf(chat));
-    if (!canChangeInfo(chat, actor.id)) {
+    if (!personHasRight(chat, actor.id, "can_change_info")) {
       throw new TelegramError(400, "CHAT_ADMIN_REQUIRED");
     }
     const name = String(title ?? "").trim();
@@ -2685,7 +2703,7 @@ export async function startTestServer({
   /** A person sets the chat photo; bots get the new_chat_photo service message. */
   async function changePhotoByPerson(chat, { by, base64 }) {
     const actor = requireUser(by ?? creatorOf(chat));
-    if (!canChangeInfo(chat, actor.id)) {
+    if (!personHasRight(chat, actor.id, "can_change_info")) {
       throw new TelegramError(400, "CHAT_ADMIN_REQUIRED");
     }
     const bytes = Buffer.from(String(base64 ?? ""), "base64");
@@ -2694,6 +2712,27 @@ export async function startTestServer({
     const message = addMessage(chat, actor, {
       new_chat_photo: photoSizes(chat.photo),
     });
+    await emit("message", message);
+    return { message_id: message.message_id };
+  }
+
+  /**
+   * A person pins a message; bots get the pinned_message service message.
+   * Pinning takes can_pin_messages, in a channel can_edit_messages
+   * (DialogManager::can_pin_messages).
+   */
+  async function pinByPerson(chat, messageId, { user_id: userId }) {
+    const actor = requireUser(userId);
+    const entry = chat.messages.get(Number(messageId));
+    if (!entry || entry.deleted) {
+      throw new TelegramError(400, "MESSAGE_ID_INVALID");
+    }
+    const right =
+      chat.type === "channel" ? "can_edit_messages" : "can_pin_messages";
+    if (!personHasRight(chat, actor.id, right)) {
+      throw new TelegramError(400, "CHAT_ADMIN_REQUIRED");
+    }
+    const message = pin(chat, entry, actor);
     await emit("message", message);
     return { message_id: message.message_id };
   }
@@ -3260,9 +3299,12 @@ export async function startTestServer({
       const user = users.get(id);
       if (!user) throw new TelegramError(400, "Bad Request: chat not found");
       const photo = user.photos?.[0];
-      const pinned = privateChats.has(id)
-        ? latestPin(privateChats.get(id))
-        : undefined;
+      // The pin is in the user's private chat with the first bot, which users
+      // write to; another bot's private chat with them is another chat.
+      const pinned =
+        caller.id === bot.id && privateChats.has(id)
+          ? latestPin(privateChats.get(id))
+          : undefined;
       return {
         id: user.id,
         type: "private",
@@ -3551,38 +3593,34 @@ export async function startTestServer({
       const copy = sendFrom(p, caller, content);
       return { message_id: copy.message_id };
     },
+    // The message is looked up before the rights: the Bot API server's
+    // check_message, then TDLib's can_pin_message.
     pinChatMessage: (p, caller) => {
       const chat = botChat(p.chat_id, caller);
-      requirePinRights(chat, caller);
-      const id = Number(p.message_id);
-      const entry = chat.messages.get(id);
+      const entry = chat.messages.get(Number(p.message_id));
       if (!entry || entry.deleted) {
         throw new TelegramError(400, "Bad Request: message to pin not found");
       }
-      chat.pinned = [...new Set([id, ...(chat.pinned ?? [])])].sort(
-        (a, b) => b - a,
-      );
-      // Telegram posts the pin as a service message, and the Bot API delivers
-      // it to the pinning bot too (need_skip_update_message keeps an outgoing
-      // messagePinMessage). Not awaited: the bot may be inside its webhook.
+      requirePinRights(chat, caller);
+      // The Bot API delivers the service message to the pinning bot too
+      // (need_skip_update_message keeps an outgoing messagePinMessage). Not
+      // awaited: the bot may be inside its webhook.
       emit(
         "message",
-        addMessage(chat, caller, {
-          pinned_message: pinnedMessage(entry.message),
-        }),
+        pin(chat, entry, caller),
         chat.type === "private" ? { to: [caller] } : {},
       );
       return true;
     },
     unpinChatMessage: (p, caller) => {
       const chat = botChat(p.chat_id, caller);
-      requirePinRights(chat, caller);
       // No message_id (or 0) means the most recent pin.
       const asked = Number(p.message_id);
       const entry = asked > 0 ? chat.messages.get(asked) : latestPin(chat);
       if (!entry || entry.deleted) {
         throw new TelegramError(400, "Bad Request: message to unpin not found");
       }
+      requirePinRights(chat, caller);
       const id = entry.message.message_id;
       chat.pinned = (chat.pinned ?? []).filter((each) => each !== id);
       return true;
@@ -6674,6 +6712,16 @@ export async function startTestServer({
       id &&
       sub === "messages" &&
       subId &&
+      parts[4] === "pin" &&
+      method === "POST"
+    ) {
+      return pinByPerson(requireChat(id), subId, body);
+    }
+    if (
+      resource === "chats" &&
+      id &&
+      sub === "messages" &&
+      subId &&
       parts[4] === "callback"
     ) {
       const user = requireUser(body.user_id);
@@ -8294,6 +8342,10 @@ ${buttons}
       act("POST", `chats/${chatId}/messages/${messageId}/reactions`, {
         user_id: userId,
         emoji,
+      }),
+    pinMessage: (chatId, messageId, userId) =>
+      act("POST", `chats/${chatId}/messages/${messageId}/pin`, {
+        user_id: userId,
       }),
     pressButton: (chatId, messageId, userId, data) =>
       act("POST", `chats/${chatId}/messages/${messageId}/callback`, {

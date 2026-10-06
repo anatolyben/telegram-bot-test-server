@@ -616,6 +616,16 @@ export interface TelegramBotTestServer {
     emoji: string | null,
   ): Promise<{ reactions: Record<string, string[]> }>;
   /**
+   * The user pins a message, with can_pin_messages (in a channel,
+   * can_edit_messages). Every bot in the chat gets the pinned_message service
+   * message; returns its message_id.
+   */
+  pinMessage(
+    chatId: number,
+    messageId: number,
+    userId: number,
+  ): Promise<{ message_id: number }>;
+  /**
    * The user presses an inline button under a message in a chat. The bot that
    * put the keyboard on the message, by sending it or by the last edit that
    * set the keyboard, gets the callback_query.

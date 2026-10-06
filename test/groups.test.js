@@ -466,6 +466,54 @@ describe("people changing the chat", () => {
       fake.changeChatPhoto(group, { by: member, bytes: PHOTO }),
     ).rejects.toThrow(/CHAT_ADMIN_REQUIRED/);
   });
+
+  it("pins a message, with the pinned_message service message bots get", async () => {
+    const { fake, api, hook, me } = await setup();
+    const group = await fake.createChat({ ownerId: OWNER });
+    await fake.setBotMembership(group, me.id, { status: "member" });
+    const rules = await fake.post(group, OWNER, "rules");
+
+    const pin = await fake.pinMessage(group, rules, OWNER);
+
+    await expect
+      .poll(() => hook.ofType("message").filter((m) => m.pinned_message))
+      .toEqual([
+        {
+          message_id: pin.message_id,
+          from: expect.objectContaining({ id: OWNER }),
+          chat: expect.objectContaining({ id: group }),
+          date: expect.any(Number),
+          pinned_message: expect.objectContaining({
+            message_id: rules,
+            text: "rules",
+          }),
+        },
+      ]);
+    expect(
+      (await api("getChat", { chat_id: group })).result.pinned_message
+        .message_id,
+    ).toBe(rules);
+  });
+
+  it("refuses to pin for someone without can_pin_messages, or a message that is not there", async () => {
+    const { fake, api, me } = await setup();
+    const group = await fake.createChat({ ownerId: OWNER });
+    await fake.setBotMembership(group, me.id, { status: "administrator" });
+    const member = await fake.createUser();
+    await fake.join(group, member);
+    await api("setChatPermissions", {
+      chat_id: group,
+      permissions: { can_send_messages: true, can_pin_messages: false },
+    });
+    const rules = await fake.post(group, member, "rules");
+
+    await expect(fake.pinMessage(group, rules, member)).rejects.toThrow(
+      /CHAT_ADMIN_REQUIRED/,
+    );
+    await expect(fake.pinMessage(group, 999_999, OWNER)).rejects.toThrow(
+      /MESSAGE_ID_INVALID/,
+    );
+  });
 });
 
 describe("member count and leaving", () => {

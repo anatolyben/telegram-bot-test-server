@@ -95,6 +95,7 @@ immediately.
 | `postAlbum(chatId, userId, items)`                                                                                                    | The user posts 2 to 10 photos or videos as one album (`media_group_id`).                                                                                                    |
 | `editMessage(chatId, messageId, userId, { text, caption })`                                                                           | The author edits their message; bots get `edited_message` (`edited_channel_post` in a channel).                                                                             |
 | `react(chatId, messageId, userId, emoji)`                                                                                             | The user reacts to a message, or takes the reaction back with `null`.                                                                                                       |
+| `pinMessage(chatId, messageId, userId)`                                                                                               | A person with `can_pin_messages` (in a channel, `can_edit_messages`) pins the message; bots get the `pinned_message` service message.                                       |
 | `pressButton(chatId, messageId, userId, data)`                                                                                        | The user presses an inline button; resolves with the bot's `answerCallbackQuery` answer.                                                                                    |
 | `pressEphemeralButton(chatId, ephemeralMessageId, userId, data)`                                                                      | The receiver presses an inline button on an ephemeral message; resolves like `pressButton`.                                                                                 |
 | `postGuestBotReply(chatId, userId, botUsername, text)`                                                                                | The user calls a guest bot (Bot API 10.0 guest mode); its answer appears in the group from that bot, with `guest_bot_caller_user` set.                                      |
@@ -380,11 +381,15 @@ The details a moderation bot depends on, each covered by a test:
   one removes it; a text message gets no caption, so the 1024-character limit applies only to
   media.
 - **Pins** ([unpinChatMessage](https://core.telegram.org/bots/api#unpinchatmessage)). Pinned
-  messages are kept newest first by sending date. `getChat` returns the most recent one as
-  `pinned_message`, in groups, channels and private chats, and `unpinChatMessage` without
-  `message_id` unpins it; with nothing to unpin it fails with `message to unpin not found`. Each
-  pin posts the `pinned_message` service message, which reaches every bot in the chat, the pinning
-  bot included. Neither `pinned_message` carries the pinned message's `reply_to_message`.
+  messages are kept newest first by sending date. `getChat` returns the most recent one that was
+  not deleted as `pinned_message`, and `unpinChatMessage` without `message_id` unpins it. This
+  works in groups, channels and private chats; a private chat's pin shows only to the first bot,
+  since that is the bot users write to. The message is checked before the bot's rights: a missing
+  message fails with `message to pin not found` or `message to unpin not found` (also when nothing
+  is pinned), and only an existing one with `not enough rights to manage pinned messages in the
+  chat`. Each pin, by a bot or by a person (`pinMessage`), posts the `pinned_message` service
+  message, which reaches every bot in the chat, the pinning bot included. Neither `pinned_message`
+  carries the pinned message's `reply_to_message`.
 - **What members send.** Besides text and photos, members post videos, animations (which carry a
   `document` too), stickers, voice notes, audio, video notes and documents, each needing its own
   permission (`can_send_videos`, `can_send_voice_notes`, ...), plus albums sharing a
@@ -779,6 +784,7 @@ The test actions above, over HTTP, for tests written in other languages. All rou
 | `POST chats/:id/albums`                                | The user posts an album `{ user_id, items: [{ type: "photo" \| "video", base64, caption? }] }`; returns `{ media_group_id, message_ids }`.                                                                                                                               |
 | `POST chats/:id/messages/:messageId/edit`              | The author `{ user_id }` edits the `text` or `caption`.                                                                                                                                                                                                                  |
 | `POST chats/:id/messages/:messageId/reactions`         | The user `{ user_id, emoji }` reacts, or takes the reaction back with `emoji: null`.                                                                                                                                                                                     |
+| `POST chats/:id/messages/:messageId/pin`               | The user `{ user_id }` pins the message, with `can_pin_messages` (in a channel, `can_edit_messages`); returns the service message's `{ message_id }`.                                                                                                                    |
 | `GET chats/:id/messages`                               | Messages not deleted, newest first, ephemeral ones (`message_id` 0, with `receiver_user`) included in the order they were sent.                                                                                                                                          |
 | `GET chats/:id/ephemeral-messages/:eid`                | `{ exists, deleted, message }` for the ephemeral message with `ephemeral_message_id` `:eid`.                                                                                                                                                                             |
 | `POST chats/:id/ephemeral-messages/:eid/callback`      | Its receiver `{ user_id, data }` presses an inline button; returns the bot's answer.                                                                                                                                                                                     |
