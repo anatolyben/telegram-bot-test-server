@@ -2294,32 +2294,29 @@ export async function startTestServer({
     }
     // Each bot has its own update queue, numbered without gaps.
     record.lastUpdateId += 1;
-    const update = {
-      update_id: record.lastUpdateId,
-      [type]: seenBy(record, inviteLinkSeenBy(record, payload)),
-    };
+    const updateId = record.lastUpdateId;
     // Serialised now, so later state changes cannot rewrite a sent update.
-    const body = JSON.stringify(update);
+    const body = `{"update_id":${updateId},${JSON.stringify(type)}:${seenBy(record, inviteLinkSeenBy(record, payload))}}`;
     // Telegram keeps an update for a day after it happened, a button press
     // for 150 seconds (the timeouts of telegram-bot-api's add_update calls).
     const happened =
       type === "business_connection"
         ? now()
         : (payload.edit_date ?? payload.date ?? now());
-    sentUpdates.set(updateKey(record.id, update.update_id), {
+    sentUpdates.set(updateKey(record.id, updateId), {
       record,
       body,
       expiresAt: type === "callback_query" ? now() + 150 : happened + 86_400,
-      queue: webhookQueue(type, payload, update.update_id),
+      queue: webhookQueue(type, payload, updateId),
     });
     record.queue.push(JSON.parse(body));
     if (!record.webhook || stopped) {
       wakePollers(record);
-      return { updateId: update.update_id, delivered: Promise.resolve() };
+      return { updateId, delivered: Promise.resolve() };
     }
     const delivered = new Promise((handed) => {
-      record.sending.set(update.update_id, {
-        receipt: newAttempt(record, update.update_id),
+      record.sending.set(updateId, {
+        receipt: newAttempt(record, updateId),
         delay: 1,
         fails: 0,
         readyAt: clock.now(),
@@ -2328,7 +2325,7 @@ export async function startTestServer({
       });
     });
     pump(record);
-    return { updateId: update.update_id, delivered };
+    return { updateId, delivered };
   }
 
   function updateKey(botId, updateId) {
@@ -3299,15 +3296,18 @@ export async function startTestServer({
    * and an open quiz whose correct options it does not know (knowsAnswers)
    * without them and its explanation, in a forward, a reply or a pin too.
    * Stored messages carry the first bot's file_ids and every quiz's answers,
-   * as the control API shows them.
+   * as the control API shows them. Returned as JSON text, which the caller
+   * sends as it is, so a payload is serialized once.
    */
   function seenBy(record, payload) {
-    if (payload === undefined) return payload;
     const json = JSON.stringify(payload);
-    if (record.id === bot.id && !json.includes('"type":"quiz"')) {
-      return payload;
+    if (
+      json === undefined ||
+      (record.id === bot.id && !json.includes('"type":"quiz"'))
+    ) {
+      return json;
     }
-    return JSON.parse(json, (key, value) => {
+    const seen = JSON.parse(json, (key, value) => {
       if (FILE_ID_FIELDS.has(key) && files.has(value)) {
         return fileIdFor(files.get(value).file, record.id);
       }
@@ -3323,6 +3323,7 @@ export async function startTestServer({
       }
       return value;
     });
+    return JSON.stringify(seen);
   }
 
   /** The stored entry of a message or reply a payload shows, if known. */
@@ -8211,11 +8212,28 @@ ${buttons}
   }
 
   function send(response, status, payload, headers = {}) {
+    sendJson(response, status, JSON.stringify(payload), headers);
+  }
+
+  function sendJson(response, status, json, headers = {}) {
     response.writeHead(status, {
       "Content-Type": "application/json",
       ...headers,
     });
-    response.end(JSON.stringify(payload));
+    response.end(json);
+  }
+
+  /**
+   * A successful call's answer, written as JSON.stringify writes
+   * { ok: true, result, description }, around the result's JSON text.
+   */
+  function okJson(resultJson, description) {
+    let json = '{"ok":true';
+    if (resultJson !== undefined) json += `,"result":${resultJson}`;
+    if (description !== undefined) {
+      json += `,"description":${JSON.stringify(description)}`;
+    }
+    return `${json}}`;
   }
 
   const server = http.createServer(async (request, response) => {
@@ -8466,16 +8484,14 @@ ${buttons}
           return;
         }
         if (failure?.delay_ms) await delayResponse(failure.delay_ms);
-        send(
+        const described = result instanceof Described;
+        sendJson(
           response,
           200,
-          result instanceof Described
-            ? {
-                ok: true,
-                result: seenBy(caller, result.result),
-                description: result.description,
-              }
-            : { ok: true, result: seenBy(caller, result) },
+          okJson(
+            seenBy(caller, described ? result.result : result),
+            described ? result.description : undefined,
+          ),
         );
       } catch (error) {
         Object.assign(receipt, {
