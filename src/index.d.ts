@@ -387,7 +387,7 @@ export interface TelegramBotTestServer {
     chatId: number,
     change: { by?: number; bytes: Uint8Array },
   ): Promise<{ message_id: number }>;
-  /** The chat, its pinned message ids (newest first) and members. */
+  /** The chat, its pinned message ids (newest first by sending date) and members. */
   getChat(chatId: number): Promise<{
     id: number;
     type: string;

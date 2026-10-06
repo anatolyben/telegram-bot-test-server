@@ -230,6 +230,112 @@ describe("channels and rights", () => {
   });
 });
 
+describe("pins", () => {
+  it("shows and unpins the most recent pin by sending date, without its reply", async () => {
+    const { api } = await setup();
+    const older = await api("sendMessage", { chat_id: GROUP, text: "older" });
+    const newer = await api("sendMessage", {
+      chat_id: GROUP,
+      text: "newer",
+      reply_parameters: { message_id: older.result.message_id },
+    });
+    for (const sent of [newer, older]) {
+      await api("pinChatMessage", {
+        chat_id: GROUP,
+        message_id: sent.result.message_id,
+      });
+    }
+
+    const { reply_to_message: reply, ...shown } = newer.result;
+    expect(reply).toBeDefined();
+    expect(
+      (await api("getChat", { chat_id: GROUP })).result.pinned_message,
+    ).toEqual(shown);
+    expect((await api("unpinChatMessage", { chat_id: GROUP })).result).toBe(
+      true,
+    );
+    expect(
+      (await api("getChat", { chat_id: GROUP })).result.pinned_message
+        .message_id,
+    ).toBe(older.result.message_id);
+  });
+
+  it("refuses to unpin a message that is not there", async () => {
+    const { api } = await setup();
+    const notFound = {
+      status: 400,
+      description: "Bad Request: message to unpin not found",
+    };
+
+    expect(await api("unpinChatMessage", { chat_id: GROUP })).toMatchObject(
+      notFound,
+    );
+    expect(
+      await api("unpinChatMessage", { chat_id: GROUP, message_id: 999_999 }),
+    ).toMatchObject(notFound);
+  });
+
+  it("posts the pinned_message service message to every bot in the chat, the pinning bot too", async () => {
+    const { fake, api, second } = await setup();
+    const me = (await api("getMe")).result;
+    await fake.setBotMembership(GROUP, second.id, { status: "member" });
+    const question = await api("sendMessage", { chat_id: GROUP, text: "?" });
+    const rules = await api("sendMessage", {
+      chat_id: GROUP,
+      text: "rules",
+      reply_parameters: { message_id: question.result.message_id },
+    });
+
+    await api("pinChatMessage", {
+      chat_id: GROUP,
+      message_id: rules.result.message_id,
+    });
+    const after = await api("sendMessage", { chat_id: GROUP, text: "after" });
+
+    const { reply_to_message: _reply, ...pinned } = rules.result;
+    for (const token of [TOKEN, SECOND_TOKEN]) {
+      const pins = (await api("getUpdates", {}, token)).result
+        .map((update) => update.message)
+        .filter((message) => message?.pinned_message);
+      expect(pins).toEqual([
+        {
+          message_id: rules.result.message_id + 1,
+          from: expect.objectContaining({ id: me.id }),
+          chat: rules.result.chat,
+          date: expect.any(Number),
+          pinned_message: pinned,
+        },
+      ]);
+    }
+    expect(after.result.message_id).toBe(rules.result.message_id + 2);
+  });
+
+  it("pins in a private chat, telling the bot and showing it on getChat", async () => {
+    const { fake, api } = await setup();
+    const user = await fake.createUser();
+    await fake.sendDirectMessage(user, "/start");
+    const menu = await api("sendMessage", { chat_id: user, text: "menu" });
+
+    await api("pinChatMessage", {
+      chat_id: user,
+      message_id: menu.result.message_id,
+    });
+
+    expect(
+      (await api("getChat", { chat_id: user })).result.pinned_message,
+    ).toEqual(menu.result);
+    const pins = (await api("getUpdates")).result
+      .map((update) => update.message)
+      .filter((message) => message?.pinned_message);
+    expect(pins).toMatchObject([
+      {
+        chat: { id: user, type: "private" },
+        pinned_message: { message_id: menu.result.message_id },
+      },
+    ]);
+  });
+});
+
 describe("polls, forwards and media", () => {
   it("sends a poll with its settings and stops it once", async () => {
     const { api } = await setup();

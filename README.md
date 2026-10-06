@@ -217,8 +217,12 @@ The details a moderation bot depends on, each covered by a test:
   `allows_multiple_answers`, `description` and an attached photo; `stopPoll` closes a poll once.
 - **Forwards and copies.** A forward carries `forward_origin`; a copy does not. A bot cannot forward
   from a chat it is not in.
-- **Pins.** Pinned messages are kept, newest first, and `getChat` returns the latest as
-  `pinned_message`.
+- **Pins** ([unpinChatMessage](https://core.telegram.org/bots/api#unpinchatmessage)). Pinned
+  messages are kept newest first by sending date. `getChat` returns the most recent one as
+  `pinned_message`, in groups, channels and private chats, and `unpinChatMessage` without
+  `message_id` unpins it; with nothing to unpin it fails with `message to unpin not found`. Each
+  pin posts the `pinned_message` service message, which reaches every bot in the chat, the pinning
+  bot included. Neither `pinned_message` carries the pinned message's `reply_to_message`.
 - **What members send.** Besides text and photos, members post videos, animations (which carry a
   `document` too), stickers, voice notes, audio, video notes and documents, each needing its own
   permission (`can_send_videos`, `can_send_voice_notes`, ...), plus albums sharing a
@@ -230,7 +234,8 @@ The details a moderation bot depends on, each covered by a test:
 - **Administrators and chat settings.** `promoteChatMember` needs `can_promote_members` and grants
   only rights the bot holds; the bot can then edit and title the administrators it promoted.
   `setChatTitle`, `setChatDescription`, `setChatPhoto` and `deleteChatPhoto` need `can_change_info`,
-  refuse a change that changes nothing, and post Telegram's service messages.
+  refuse a change that changes nothing, and post Telegram's service messages to every bot in the
+  chat, the bot that made the change included.
 - **Join request queries (Bot API 10.x).** A guard bot (`supportsJoinRequestQueries`) gets each join
   request with a `query_id`, which it answers with `answerChatJoinRequestQuery`
   (`chat_join_request_query_id`, `result`: `approve`, `decline` or `queue`).
@@ -259,7 +264,9 @@ The details a moderation bot depends on, each covered by a test:
   `my_chat_member` first.
 - **Service messages about the bot itself.** A bot gets the `new_chat_members` and
   `left_chat_member` messages that name it, as the
-  [Message](https://core.telegram.org/bots/api#message) fields say it "may be the bot itself".
+  [Message](https://core.telegram.org/bots/api#message) fields say it "may be the bot itself". It
+  also gets the `new_chat_title`, `new_chat_photo`, `delete_chat_photo` and `pinned_message`
+  messages its own calls post, as Telegram's Bot API server delivers them.
 - **Basic groups and the upgrade** ([migration](https://core.telegram.org/api/channel#migration)).
   A basic group has a negative id without the `-100` prefix. The creator or an administrator can
   upgrade it: a new supergroup takes its members, administrators and bots, the old chat posts
