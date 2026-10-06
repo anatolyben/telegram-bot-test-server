@@ -667,6 +667,138 @@ describe("bot membership", () => {
       description: "Bad Request: can't restrict self",
     });
   });
+
+  it("sends chat_member only to the chat's administrator bots", async () => {
+    const { fake, api, second } = await setup();
+    await fake.setBotMembership(GROUP, second.id, { status: "member" });
+    const hook = await startReceiver();
+    await api(
+      "setWebhook",
+      { url: hook.url, allowed_updates: ["message", "chat_member"] },
+      SECOND_TOKEN,
+    );
+
+    const ann = await fake.createUser();
+    await fake.join(GROUP, ann);
+    await fake.setBotMembership(GROUP, second.id, { status: "administrator" });
+    const bob = await fake.createUser();
+    await fake.join(GROUP, bob);
+
+    const joined = hook
+      .ofType("message")
+      .flatMap((message) => message.new_chat_members ?? [])
+      .map((user) => user.id);
+    expect(joined).toEqual(expect.arrayContaining([ann, bob]));
+    expect(
+      hook
+        .ofType("chat_member")
+        .map((change) => change.new_chat_member.user.id),
+    ).toEqual([bob]);
+  });
+
+  it("sends chat_join_request only to bots that can invite users", async () => {
+    const { fake, api, second } = await setup();
+    await fake.setBotMembership(GROUP, second.id, {
+      status: "administrator",
+      rights: { can_invite_users: false },
+    });
+    const hook = await startReceiver();
+    await api("setWebhook", { url: hook.url }, SECOND_TOKEN);
+    const link = (
+      await api("createChatInviteLink", {
+        chat_id: GROUP,
+        creates_join_request: true,
+      })
+    ).result.invite_link;
+
+    await fake.joinByLink(link, await fake.createUser());
+    await fake.setBotMembership(GROUP, second.id, { status: "administrator" });
+    const bob = await fake.createUser();
+    await fake.joinByLink(link, bob);
+
+    expect(
+      hook.ofType("chat_join_request").map((request) => request.from.id),
+    ).toEqual([bob]);
+  });
+
+  it("tells a bot through my_chat_member when another bot promotes, demotes or bans it", async () => {
+    const { fake, api, second } = await setup();
+    const me = (await api("getMe")).result;
+    await fake.setBotMembership(GROUP, me.id, {
+      status: "administrator",
+      rights: { can_promote_members: true },
+    });
+    const hook = await startReceiver();
+    await api("setWebhook", { url: hook.url }, SECOND_TOKEN);
+    await fake.setBotMembership(GROUP, second.id, { status: "member" });
+
+    const promote = (rights) =>
+      api("promoteChatMember", {
+        chat_id: GROUP,
+        user_id: second.id,
+        ...rights,
+      });
+    expect((await promote({ can_delete_messages: true })).ok).toBe(true);
+    expect((await promote({})).ok).toBe(true);
+    expect(
+      (await api("banChatMember", { chat_id: GROUP, user_id: second.id })).ok,
+    ).toBe(true);
+
+    await expect
+      .poll(() =>
+        hook
+          .ofType("my_chat_member")
+          .map((change) => [change.from.id, change.new_chat_member.status]),
+      )
+      .toEqual([
+        [OWNER, "member"],
+        [me.id, "administrator"],
+        [me.id, "member"],
+        [me.id, "kicked"],
+      ]);
+  });
+
+  it("says can_be_edited only to the bot that promoted the administrator", async () => {
+    const { fake, api, second } = await setup();
+    const me = (await api("getMe")).result;
+    await fake.setBotMembership(GROUP, me.id, {
+      status: "administrator",
+      rights: { can_promote_members: true },
+    });
+    await fake.setBotMembership(GROUP, second.id, { status: "administrator" });
+    const hooks = [await startReceiver(), await startReceiver()];
+    await api("setWebhook", {
+      url: hooks[0].url,
+      allowed_updates: ["chat_member"],
+    });
+    await api(
+      "setWebhook",
+      { url: hooks[1].url, allowed_updates: ["chat_member"] },
+      SECOND_TOKEN,
+    );
+    const ann = await fake.createUser();
+    await fake.join(GROUP, ann);
+
+    await api("promoteChatMember", {
+      chat_id: GROUP,
+      user_id: ann,
+      can_delete_messages: true,
+    });
+
+    const editable = async (token) =>
+      (await api("getChatMember", { chat_id: GROUP, user_id: ann }, token))
+        .result.can_be_edited;
+    expect(await editable(TOKEN)).toBe(true);
+    expect(await editable(SECOND_TOKEN)).toBe(false);
+    await expect
+      .poll(() =>
+        hooks.map((hook) => hook.ofType("chat_member").at(-1)?.new_chat_member),
+      )
+      .toEqual([
+        expect.objectContaining({ can_be_edited: true }),
+        expect.objectContaining({ can_be_edited: false }),
+      ]);
+  });
 });
 
 describe("chats created during a run", () => {

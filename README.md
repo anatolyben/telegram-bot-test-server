@@ -99,7 +99,7 @@ response happens after that, so wait for the outcome rather than checking it imm
 | `pressDirectButton(userId, messageId, data)`                                                                                          | The user presses a button in their private chat with the bot.                                                                                                               |
 | `getMessages(chatId)`, `getMessage(chatId, id)`                                                                                       | The chat's messages, and whether one was deleted.                                                                                                                           |
 | `getDirectMessages(userId)`                                                                                                           | The private chat between the user and the bot.                                                                                                                              |
-| `getMember(chatId, userId)`                                                                                                           | The member as `getChatMember` returns them: status, restrictions, ban.                                                                                                      |
+| `getMember(chatId, userId)`                                                                                                           | The member as `getChatMember` returns them to the first bot: status, restrictions, ban.                                                                                     |
 | `getJoinRequests(chatId)`                                                                                                             | User ids waiting for approval.                                                                                                                                              |
 | `addBot({ token, username, firstName, loginClientSecret })`                                                                           | Another bot, with its own webhook or update queue; it is in no chat yet.                                                                                                    |
 | `approveLogin(authUrl, userId)`                                                                                                       | The user logs in on the Telegram Login page for that `/auth` URL; returns the `redirect_uri` URL with `code` and `state`.                                                   |
@@ -209,10 +209,11 @@ The details a moderation bot depends on, each covered by a test:
 - **More than one bot.** Each bot has its own webhook or update queue and its own membership and
   rights in each chat. A bot posts only where it is a member (a channel needs `can_post_messages`),
   edits and stops only its own messages and polls, pins only with `can_pin_messages` (a channel's
-  `can_edit_messages`), and deletes others' messages only with `can_delete_messages`. Being added,
-  promoted or removed reaches that bot as `my_chat_member` and the chat's other bots as
-  `chat_member`; only the bot that sent a message hears its buttons pressed. Users write privately
-  only to the first bot, so no other bot can message them (403).
+  `can_edit_messages`), and deletes others' messages only with `can_delete_messages`. A bot hears
+  of its own status changing as `my_chat_member`, whether the owner or another bot changed it; the
+  chat's administrator bots hear of it as `chat_member`. `can_be_edited` is true only for the bot
+  that promoted that administrator. Only the bot that sent a message hears its buttons pressed.
+  Users write privately only to the first bot, so no other bot can message them (403).
 - **Polls.** `sendPoll` needs a question and 2 to 12 options and keeps `is_anonymous`,
   `allows_multiple_answers`, `description` and an attached photo; `stopPoll` closes a poll once.
 - **Forwards and copies.** A forward carries `forward_origin`; a copy does not. A bot cannot forward
@@ -251,7 +252,7 @@ The details a moderation bot depends on, each covered by a test:
   [deep linking](https://core.telegram.org/bots/features#deep-linking)). With admin rights
   requested, only the creator or an administrator with `can_promote_members` may add it; without,
   anyone who can add members (`can_invite_users`). Otherwise the person gets `CHAT_ADMIN_REQUIRED`.
-  The bot gets `my_chat_member` from the person, the chat's other bots `chat_member`, all bots the
+  The bot gets `my_chat_member` from the person, the chat's administrator bots `chat_member`, all bots the
   `new_chat_members` message, and then the person's `/start@<bot> <parameter>` with a
   `bot_command` entity, as `messages.startBot` posts. An administrator's existing rights are
   combined with the requested ones, and `/start` is still posted. Unverified: Telegram does not
@@ -461,6 +462,10 @@ field named like a session, token, hash, key, secret, password or phone is recor
 - `allowed_updates`, from `setWebhook` or `getUpdates`, is respected. As on Telegram,
   `chat_member`, `message_reaction` and `message_reaction_count` updates are only sent when
   explicitly requested.
+- Rights decide who hears what, as the [Update](https://core.telegram.org/bots/api#update) docs
+  say: `chat_member` and `message_reaction` reach only bots that are administrators in the chat,
+  and `chat_join_request` only bots with `can_invite_users`. A bot gets `my_chat_member` whenever
+  its own status changes, whoever changed it.
 - When the bot restricts, bans, unbans or approves a member, the server sends the resulting
   `chat_member` update back to the bot, as Telegram does. Nothing is sent when nothing changed.
 - Joining, leaving and an approved join request produce both a `chat_member` update and the

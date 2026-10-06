@@ -656,9 +656,17 @@ export async function startTestServer({
     return member;
   }
 
-  function chatMemberObject(chat, userId) {
+  /** The member's ChatMember object, as the given bot sees it. */
+  function chatMemberObject(chat, userId, viewer = null) {
+    return memberObject(chat, userId, memberStatus(chat, userId), viewer);
+  }
+
+  /**
+   * A ChatMember object for one state of a member. can_be_edited belongs to
+   * the bot that asks: only the bot that promoted an administrator may edit it.
+   */
+  function memberObject(chat, userId, member, viewer = null) {
     const user = requireUser(userId);
-    const member = memberStatus(chat, userId);
     const base = { user: userObject(user), status: member.status };
     if (member.status === "administrator") {
       // A channel administrator posts and edits; a group administrator pins.
@@ -695,8 +703,7 @@ export async function startTestServer({
             };
       return {
         ...base,
-        // A bot can edit the administrators it promoted.
-        can_be_edited: member.promotedBy != null,
+        can_be_edited: viewer != null && member.promotedBy === viewer.id,
         is_anonymous: false,
         ...rights,
         // Rights the owner granted or withheld when promoting.
@@ -907,10 +914,16 @@ export async function startTestServer({
     );
   }
 
-  /** Send a chat_member update only when the member actually changed. */
+  /**
+   * Send a chat_member update only when the member actually changed. `before`
+   * is the member's state from memberStatus; a change stores a new state.
+   */
   function memberChanged(chat, userId, before, actor, extra) {
     const after = chatMemberObject(chat, userId);
-    if (JSON.stringify(before) === JSON.stringify(after))
+    if (
+      JSON.stringify(memberObject(chat, userId, before)) ===
+      JSON.stringify(after)
+    )
       return Promise.resolve();
     scheduleExpiry(chat, userId);
     appliedCheckpoint();
@@ -943,16 +956,35 @@ export async function startTestServer({
     waits.notify();
     const chatId = payload?.chat?.id ?? payload?.message?.chat?.id;
     const chat = chatId == null ? null : chats.get(Number(chatId));
-    const recipients =
+    const recipients = (
       to ??
       (chat
         ? [...bots.values()].filter(
             (record) => record.id !== except && isInChat(chat, record.id),
           )
-        : [bot]);
+        : [bot])
+    ).filter((record) => !chat || receives(chat, record, type));
     return Promise.all(
       recipients.map((record) => emitTo(record, type, payload)),
     );
+  }
+
+  /**
+   * Whether a bot's rights in the chat let it receive this update type: only
+   * administrators get chat_member and message_reaction, and only bots with
+   * can_invite_users get chat_join_request
+   * (https://core.telegram.org/bots/api#update).
+   */
+  function receives(chat, record, type) {
+    if (type === "chat_member" || type === "message_reaction") {
+      return ["administrator", "creator"].includes(
+        memberStatus(chat, record.id).status,
+      );
+    }
+    if (type === "chat_join_request") {
+      return hasRight(chat, record.id, "can_invite_users");
+    }
+    return true;
   }
 
   /**
@@ -1059,45 +1091,51 @@ export async function startTestServer({
     return record.delivery;
   }
 
+  /**
+   * Tell the bots that a member changed from `before` (a memberStatus state):
+   * a bot hears of its own membership through my_chat_member, whoever changed
+   * it, and the chat's other bots through chat_member, each with its own
+   * can_be_edited.
+   */
   function emitMemberChange(chat, userId, before, actor, extra = {}) {
-    return emit(
-      "chat_member",
-      {
-        chat: chatObject(chat),
-        from: userObject(actor),
-        date: now(),
-        old_chat_member: before,
-        new_chat_member: chatMemberObject(chat, userId),
-        ...extra,
-      },
-      // A bot hears of its own membership through my_chat_member alone.
-      { except: users.get(Number(userId))?.is_bot ? Number(userId) : null },
+    waits.notify();
+    const change = (viewer) => ({
+      chat: chatObject(chat),
+      from: userObject(actor),
+      date: now(),
+      old_chat_member: memberObject(chat, userId, before, viewer),
+      new_chat_member: chatMemberObject(chat, userId, viewer),
+      ...extra,
+    });
+    const target = [...bots.values()].find(
+      (record) => record.id === Number(userId),
     );
+    const others = [...bots.values()].filter(
+      (record) =>
+        record !== target &&
+        isInChat(chat, record.id) &&
+        receives(chat, record, "chat_member"),
+    );
+    return Promise.all([
+      ...(target ? [emitTo(target, "my_chat_member", change(target))] : []),
+      ...others.map((record) => emitTo(record, "chat_member", change(record))),
+    ]);
   }
 
   /**
    * Someone adds, promotes, demotes or removes a bot. Telegram tells that bot
-   * through my_chat_member, the chat's other bots through chat_member, and a
-   * group's members through a service message.
+   * through my_chat_member, the chat's administrator bots through chat_member,
+   * and a group's members through a service message.
    */
   async function setBotMembership(chat, record, { status, rights, actor }) {
-    const before = chatMemberObject(chat, record.id);
+    const before = memberStatus(chat, record.id);
     const wasIn = isInChat(chat, record.id);
     const botsBefore = botsIn(chat);
     if (status === "left") chat.members.delete(record.id);
     else chat.members.set(record.id, { status, ...(rights ? { rights } : {}) });
     const after = chatMemberObject(chat, record.id);
     appliedCheckpoint();
-    waits.notify();
-    const change = {
-      chat: chatObject(chat),
-      from: userObject(actor),
-      date: now(),
-      old_chat_member: before,
-      new_chat_member: after,
-    };
-    await emitTo(record, "my_chat_member", change);
-    await emit("chat_member", change, { except: record.id });
+    await emitMemberChange(chat, record.id, before, actor);
     const isIn = isInChat(chat, record.id);
     if (chat.type !== "channel" && wasIn !== isIn) {
       const service = addMessage(
@@ -1613,12 +1651,13 @@ export async function startTestServer({
         accepted_gift_types: { ...NO_GIFTS },
       };
     },
-    getChatMember: (p) => chatMemberObject(requireChat(p.chat_id), p.user_id),
-    getChatAdministrators: (p) => {
+    getChatMember: (p, caller) =>
+      chatMemberObject(requireChat(p.chat_id), p.user_id, caller),
+    getChatAdministrators: (p, caller) => {
       const chat = requireChat(p.chat_id);
       return [...chat.members.entries()]
         .filter(([, m]) => ["creator", "administrator"].includes(m.status))
-        .map(([id]) => chatMemberObject(chat, id));
+        .map(([id]) => chatMemberObject(chat, id, caller));
     },
     getChatMemberCount: (p) => {
       const chat = requireChat(p.chat_id);
@@ -1982,8 +2021,7 @@ export async function startTestServer({
       const userId = Number(p.user_id);
       requireUser(userId);
       assertCanModerate(chat, userId, { self: "can't restrict self", caller });
-      const before = chatMemberObject(chat, userId);
-      const current = memberStatus(chat, userId);
+      const before = memberStatus(chat, userId);
       const permissions = normalizePermissions(
         p.permissions,
         p.use_independent_chat_permissions,
@@ -1991,7 +2029,7 @@ export async function startTestServer({
       const inChat = isInChat(chat, userId);
       // Passing every permission as true lifts the restriction.
       if (PERMISSION_KEYS.every((key) => permissions[key])) {
-        if (current.status === "restricted") {
+        if (before.status === "restricted") {
           chat.members.set(userId, { status: inChat ? "member" : "left" });
         }
       } else {
@@ -2010,7 +2048,7 @@ export async function startTestServer({
       const userId = Number(p.user_id);
       requireUser(userId);
       assertCanModerate(chat, userId, { caller });
-      const before = chatMemberObject(chat, userId);
+      const before = memberStatus(chat, userId);
       chat.members.set(userId, {
         status: "kicked",
         until_date: ["supergroup", "channel"].includes(chat.type)
@@ -2027,9 +2065,8 @@ export async function startTestServer({
       requireRight(chat, caller, "can_restrict_members");
       const userId = Number(p.user_id);
       requireUser(userId);
-      const current = memberStatus(chat, userId);
-      const before = chatMemberObject(chat, userId);
-      if (current.status === "kicked") {
+      const before = memberStatus(chat, userId);
+      if (before.status === "kicked") {
         chat.members.set(userId, { status: "left" });
       } else if (isTrue(p.only_if_banned)) {
         return true;
@@ -2037,9 +2074,9 @@ export async function startTestServer({
         // Without only_if_banned, Telegram guarantees the user is not a member
         // afterwards: a current member is removed, keeping any restriction.
         assertCanModerate(chat, userId, { caller });
-        if (current.status === "restricted") {
-          chat.members.set(userId, { ...current, is_member: false });
-        } else if (current.status === "member") {
+        if (before.status === "restricted") {
+          chat.members.set(userId, { ...before, is_member: false });
+        } else if (before.status === "member") {
           chat.members.set(userId, { status: "left" });
         }
       }
@@ -2059,7 +2096,7 @@ export async function startTestServer({
         state: "approved",
         botId: caller.id,
       });
-      const before = chatMemberObject(chat, userId);
+      const before = memberStatus(chat, userId);
       admit(chat, userId);
       // via_join_request is only for requests made without an invite link;
       // every request here came through one, so the link is reported instead.
@@ -2274,7 +2311,6 @@ export async function startTestServer({
           throw new TelegramError(400, "Bad Request: RIGHT_FORBIDDEN");
         }
       }
-      const before = chatMemberObject(chat, userId);
       if (Object.values(rights).some(Boolean)) {
         // Any right implies can_manage_chat, as on Telegram.
         chat.members.set(userId, {
@@ -2285,7 +2321,7 @@ export async function startTestServer({
       } else {
         chat.members.set(userId, { status: "member" });
       }
-      await memberChanged(chat, userId, before, caller);
+      await memberChanged(chat, userId, current, caller);
       return true;
     },
     setChatAdministratorCustomTitle: async (p, caller) => {
@@ -2311,9 +2347,8 @@ export async function startTestServer({
       if ([...title].length > 16) {
         throw new TelegramError(400, "Bad Request: ADMIN_RANK_INVALID");
       }
-      const before = chatMemberObject(chat, userId);
       chat.members.set(userId, { ...member, customTitle: title || undefined });
-      await memberChanged(chat, userId, before, caller);
+      await memberChanged(chat, userId, member, caller);
       return true;
     },
     setChatTitle: async (p, caller) => {
@@ -3121,7 +3156,7 @@ export async function startTestServer({
           .map((entry) => ({ exists: true, ...entry })),
       };
     }
-    const member = chatMemberObject(chat, condition.userId);
+    const member = chatMemberObject(chat, condition.userId, bot);
     if (condition.kind === "member") {
       const matched =
         member.status === condition.status &&
@@ -3691,7 +3726,7 @@ export async function startTestServer({
           : { exists: false, deleted: false };
       }
       if (sub === "members" && method === "GET" && subId) {
-        return chatMemberObject(chat, subId);
+        return chatMemberObject(chat, subId, bot);
       }
       if (sub === "topics") {
         if (!chat.topics) {
@@ -3981,9 +4016,13 @@ export async function startTestServer({
         ...(user.bio ? { bio: user.bio } : {}),
         invite_link: { ...invite },
       };
-      // A guard bot in the chat gets the request as a query to answer.
+      // A guard bot in the chat gets the request as a query to answer. Only
+      // bots with can_invite_users receive join requests at all.
       const guard = [...bots.values()].find(
-        (record) => record.joinRequestQueries && isInChat(chat, record.id),
+        (record) =>
+          record.joinRequestQueries &&
+          isInChat(chat, record.id) &&
+          receives(chat, record, "chat_join_request"),
       );
       const others = [...bots.values()].filter(
         (record) => record !== guard && isInChat(chat, record.id),
@@ -4004,7 +4043,7 @@ export async function startTestServer({
       await emit("chat_join_request", request, { to: others });
       return { status: "requested" };
     }
-    const before = chatMemberObject(chat, user.id);
+    const before = memberStatus(chat, user.id);
     admit(chat, user.id);
     await emitMemberChange(chat, user.id, before, user, {
       ...(invite ? { invite_link: { ...invite } } : {}),
@@ -4020,12 +4059,11 @@ export async function startTestServer({
     const user = requireUser(userId);
     if (!isInChat(chat, userId))
       return { status: memberStatus(chat, userId).status };
-    const before = chatMemberObject(chat, userId);
-    const current = memberStatus(chat, userId);
+    const before = memberStatus(chat, userId);
     chat.members.set(
       user.id,
-      current.status === "restricted"
-        ? { ...current, is_member: false }
+      before.status === "restricted"
+        ? { ...before, is_member: false }
         : { status: "left" },
     );
     await emitMemberChange(chat, user.id, before, user);
@@ -4168,23 +4206,14 @@ export async function startTestServer({
     const before = entry.reactions.get(user.id) ?? [];
     if (emojis.length) entry.reactions.set(user.id, emojis);
     else entry.reactions.delete(user.id);
-    const admins = [...bots.values()].filter((record) =>
-      ["administrator", "creator"].includes(
-        memberStatus(chat, record.id).status,
-      ),
-    );
-    await emit(
-      "message_reaction",
-      {
-        chat: chatObject(chat),
-        message_id: entry.message.message_id,
-        user: userObject(user),
-        date: now(),
-        old_reaction: reactionList(before),
-        new_reaction: reactionList(emojis),
-      },
-      { to: admins },
-    );
+    await emit("message_reaction", {
+      chat: chatObject(chat),
+      message_id: entry.message.message_id,
+      user: userObject(user),
+      date: now(),
+      old_reaction: reactionList(before),
+      new_reaction: reactionList(emojis),
+    });
     return { reactions: Object.fromEntries(entry.reactions) };
   }
 
