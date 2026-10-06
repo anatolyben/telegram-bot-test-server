@@ -2598,16 +2598,17 @@ export async function startTestServer({
       await memberChanged(chat, userId, before, caller);
       return true;
     },
+    // TDLib cleans the title and cuts it to 128 characters, and setting the
+    // current title again succeeds without a change (DialogManager.cpp
+    // set_dialog_title).
     setChatTitle: async (p, caller) => {
       const chat = requireChat(p.chat_id);
+      const title = stripEmpty(p.title, 128).replace(/\s+/g, " ");
+      if (!title) {
+        throw new TelegramError(400, "Bad Request: title must be non-empty");
+      }
       requireInfoRight(chat, caller, "title");
-      const title = String(p.title ?? "").trim();
-      if (!title || title.length > 128) {
-        throw new TelegramError(400, "Bad Request: chat title can't be empty");
-      }
-      if (title === chat.title) {
-        throw new TelegramError(400, "Bad Request: chat title is not modified");
-      }
+      if (title === chat.title) return true;
       chat.title = title;
       await emit(
         "message",
@@ -2616,16 +2617,12 @@ export async function startTestServer({
       );
       return true;
     },
+    // The description is cut to 255 characters (ChatManager.cpp
+    // set_channel_description).
     setChatDescription: (p, caller) => {
       const chat = requireChat(p.chat_id);
       requireInfoRight(chat, caller, "description");
-      const description = String(p.description ?? "");
-      if (description.length > 255) {
-        throw new TelegramError(
-          400,
-          "Bad Request: chat description is too long",
-        );
-      }
+      const description = stripEmpty(p.description, 255);
       if (description === (chat.description ?? "")) {
         throw new TelegramError(
           400,
@@ -3025,6 +3022,15 @@ export async function startTestServer({
       throw new TelegramError(400, invalid);
     }
     return { latitude, longitude };
+  }
+
+  /**
+   * Text as TDLib's strip_empty_characters leaves it: trimmed, cut to `max`
+   * characters, and empty when only invisible characters remain (misc.cpp).
+   */
+  function stripEmpty(value, max) {
+    const text = [...String(value ?? "").trim()].slice(0, max).join("").trim();
+    return /[^\s\u200b-\u200f\u202e\ufeff]/u.test(text) ? text : "";
   }
 
   /** Changing a chat's title, description or photo needs can_change_info. */

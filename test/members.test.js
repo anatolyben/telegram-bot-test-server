@@ -426,6 +426,47 @@ describe("administrators and chat settings", () => {
       .toBeGreaterThanOrEqual(2);
   });
 
+  it("cuts a long title or description instead of refusing it, and refuses an empty title", async () => {
+    const { api } = await setup();
+
+    for (const title of ["", "   "]) {
+      expect(
+        await api("setChatTitle", { chat_id: GROUP, title }),
+      ).toMatchObject({
+        status: 400,
+        description: "Bad Request: title must be non-empty",
+      });
+    }
+    expect(
+      (
+        await api("setChatTitle", {
+          chat_id: GROUP,
+          title: "  a  b " + "t".repeat(200),
+        })
+      ).result,
+    ).toBe(true);
+    expect(
+      (
+        await api("setChatDescription", {
+          chat_id: GROUP,
+          description: "d".repeat(300),
+        })
+      ).result,
+    ).toBe(true);
+    const chat = (await api("getChat", { chat_id: GROUP })).result;
+    expect(chat.title).toBe("a b " + "t".repeat(123));
+    expect(chat.description).toBe("d".repeat(255));
+    expect(
+      await api("setChatDescription", {
+        chat_id: GROUP,
+        description: "d".repeat(256),
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: chat description is not modified",
+    });
+  });
+
   it("changes a chat's title, description and photo with can_change_info", async () => {
     const { fake, api, upload, me } = await setup();
     const hook = await startReceiver();
@@ -439,9 +480,10 @@ describe("administrators and chat settings", () => {
     expect(
       (await api("setChatTitle", { chat_id: GROUP, title: "New Name" })).result,
     ).toBe(true);
+    // The same title again succeeds without a second service message.
     expect(
-      await api("setChatTitle", { chat_id: GROUP, title: "New Name" }),
-    ).toMatchObject({ description: "Bad Request: chat title is not modified" });
+      (await api("setChatTitle", { chat_id: GROUP, title: "New Name" })).result,
+    ).toBe(true);
     await api("setChatDescription", { chat_id: GROUP, description: "Rules" });
     await upload("setChatPhoto", { chat_id: String(GROUP), photo: BYTES });
 
