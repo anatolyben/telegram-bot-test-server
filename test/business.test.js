@@ -284,6 +284,28 @@ describe("answering in a business chat", () => {
     });
   });
 
+  it("refuses an inline keyboard Telegram would refuse", async () => {
+    const { fake, api, connection, person } = await connected();
+    await fake.sayInBusinessChat(connection.id, person, "person", "hi");
+    const send = (button) =>
+      api("sendMessage", {
+        business_connection_id: connection.id,
+        chat_id: person,
+        text: "x",
+        reply_markup: { inline_keyboard: [[{ text: "Go", ...button }]] },
+      });
+
+    expect(await send({})).toMatchObject({
+      status: 400,
+      description:
+        "Bad Request: can't parse InlineKeyboardButton: Text buttons are not allowed in the inline keyboard",
+    });
+    expect(await send({ callback_data: "x".repeat(65) })).toMatchObject({
+      status: 400,
+      description: "Bad Request: BUTTON_DATA_INVALID",
+    });
+  });
+
   it("refuses a chat whose person has not written in 24 hours", async () => {
     const { fake, api, connection, person } = await connected();
     const send = () =>

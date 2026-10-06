@@ -66,7 +66,10 @@ export type ChatMember = {
 };
 
 export interface ButtonAnswer {
-  /** Whether the bot called answerCallbackQuery within 10 seconds. */
+  /**
+   * Whether the bot called answerCallbackQuery within 10 seconds. An answer
+   * Telegram refuses (text over 200 characters) does not count.
+   */
   answered: boolean;
   text?: string;
   show_alert?: boolean;

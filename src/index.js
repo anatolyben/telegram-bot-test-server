@@ -183,6 +183,23 @@ const MEMBER_MEDIA = Object.freeze({
 // The media a message can carry, one at a time, and editMessageMedia replaces.
 const MEDIA_KINDS = Object.freeze(["photo", "video", "animation", "document"]);
 
+// The fields that give an inline keyboard button its action, in the order the
+// Bot API server reads them (Client.cpp get_inline_keyboard_button_type): the
+// first one set wins, and url and callback_data count only when non-empty.
+const INLINE_BUTTON_ACTIONS = Object.freeze([
+  "url",
+  "callback_data",
+  "callback_game",
+  "pay",
+  "switch_inline_query",
+  "switch_inline_query_chosen_chat",
+  "switch_inline_query_current_chat",
+  "login_url",
+  "web_app",
+  "copy_text",
+  "disabled",
+]);
+
 class TelegramError extends Error {
   constructor(code, description, parameters = null) {
     super(description);
@@ -198,6 +215,32 @@ function numberParam(value, fallback) {
   return value != null && value !== "" && Number.isFinite(number)
     ? number
     : fallback;
+}
+
+/**
+ * The command list a setMyCommands, getMyCommands or deleteMyCommands call
+ * addresses: Telegram keeps one per scope and language_code. Only the chat
+ * scopes name a chat, and only chat_member also names a user.
+ */
+function commandsKey(p) {
+  const type = p.scope?.type ?? "default";
+  const inChat = ["chat", "chat_administrators", "chat_member"].includes(type);
+  return JSON.stringify([
+    type,
+    inChat ? String(p.scope.chat_id) : null,
+    type === "chat_member" ? String(p.scope.user_id) : null,
+    String(p.language_code ?? ""),
+  ]);
+}
+
+/** The field that gives an inline keyboard button its action, if any. */
+function inlineButtonAction(button) {
+  const fields = Object(button);
+  return INLINE_BUTTON_ACTIONS.find((field) =>
+    field === "url" || field === "callback_data"
+      ? fields[field] != null && String(fields[field]) !== ""
+      : Object.hasOwn(fields, field),
+  );
 }
 
 function now() {
@@ -459,7 +502,8 @@ export async function startTestServer({
       queue: [],
       pollWaiters: new Set(),
       delivery: Promise.resolve(),
-      commands: [],
+      // Command lists by scope and language (see commandsKey).
+      commands: new Map(),
       // A guard bot that gets join request queries (Bot API 10.x).
       joinRequestQueries: joinRequestQueries === true,
       // The Telegram Login client secret BotFather shows for the bot.
@@ -1510,20 +1554,29 @@ export async function startTestServer({
       return queue.slice(0, limit);
     },
     setMyCommands: (p, caller) => {
-      caller.commands = Array.isArray(p.commands) ? p.commands : [];
+      caller.commands.set(
+        commandsKey(p),
+        Array.isArray(p.commands) ? p.commands : [],
+      );
       return true;
     },
-    deleteMyCommands: (_p, caller) => {
-      caller.commands = [];
+    deleteMyCommands: (p, caller) => {
+      caller.commands.delete(commandsKey(p));
       return true;
     },
-    getMyCommands: (_p, caller) => caller.commands,
+    // Only the list set for exactly this scope and language, else none.
+    getMyCommands: (p, caller) => caller.commands.get(commandsKey(p)) ?? [],
     answerCallbackQuery: (p, caller) => {
       if (openQueries.get(String(p.callback_query_id)) !== caller.id) {
         throw new TelegramError(
           400,
           "Bad Request: query is too old and response timeout expired or query ID is invalid",
         );
+      }
+      // The text is 0-200 characters; Telegram refuses longer text
+      // (https://core.telegram.org/method/messages.setBotCallbackAnswer).
+      if ([...String(p.text ?? "")].length > 200) {
+        throw new TelegramError(400, "Bad Request: MESSAGE_TOO_LONG");
       }
       openQueries.delete(String(p.callback_query_id));
       callbackAnswers.set(String(p.callback_query_id), {
@@ -2505,12 +2558,47 @@ export async function startTestServer({
     return value === true || value === "true";
   }
 
-  /** An inline keyboard with at least one row, or undefined. */
+  /**
+   * An inline keyboard with at least one row, or undefined. Like the Bot API
+   * server, it refuses a button without an action while reading the request,
+   * before any chat or message check.
+   */
   function inlineMarkup(markup) {
-    return Array.isArray(markup?.inline_keyboard) &&
-      markup.inline_keyboard.length > 0
-      ? markup
-      : undefined;
+    if (
+      !Array.isArray(markup?.inline_keyboard) ||
+      markup.inline_keyboard.length === 0
+    ) {
+      return undefined;
+    }
+    for (const button of markup.inline_keyboard.flat()) {
+      if (
+        typeof button === "object" &&
+        button !== null &&
+        !inlineButtonAction(button)
+      ) {
+        throw new TelegramError(
+          400,
+          "Bad Request: can't parse InlineKeyboardButton: Text buttons are not allowed in the inline keyboard",
+        );
+      }
+    }
+    return markup;
+  }
+
+  /**
+   * callback_data is 1-64 bytes (https://core.telegram.org/bots/api#inlinekeyboardbutton).
+   * Telegram's servers, not the Bot API server, refuse longer data, so this
+   * comes after the chat and message checks, as the message is stored.
+   */
+  function requireButtonData(markup) {
+    for (const button of markup?.inline_keyboard.flat() ?? []) {
+      if (
+        inlineButtonAction(button) === "callback_data" &&
+        Buffer.byteLength(String(button.callback_data)) > 64
+      ) {
+        throw new TelegramError(400, "Bad Request: BUTTON_DATA_INVALID");
+      }
+    }
   }
 
   function sendFrom(p, caller, fields) {
@@ -2525,6 +2613,7 @@ export async function startTestServer({
     requireCanSend(chat, caller);
     requireTopic(chat, p.message_thread_id);
     const replyTo = replyTarget(chat, p);
+    requireButtonData(markup);
     const message = addMessage(chat, caller, {
       ...fields,
       ...(replyTo ? { reply_to_message: replyTo } : {}),
@@ -2748,6 +2837,7 @@ export async function startTestServer({
    * (https://core.telegram.org/method/messages.sendMessage).
    */
   function sendBusinessMessage(p, caller) {
+    const markup = inlineMarkup(p.reply_markup);
     const connection = requireBusinessConnection(
       p.business_connection_id,
       caller,
@@ -2772,6 +2862,7 @@ export async function startTestServer({
     ) {
       throw new TelegramError(400, "Bad Request: BUSINESS_PEER_USAGE_MISSING");
     }
+    requireButtonData(markup);
     return addBusinessMessage(
       connection,
       userId,
@@ -2914,6 +3005,7 @@ export async function startTestServer({
    * keyboard, and an edit that changes nothing is refused.
    */
   function editMessage(p, caller, apply) {
+    const markup = inlineMarkup(p.reply_markup);
     const chat = botChat(p.chat_id);
     const entry = chat.messages.get(Number(p.message_id));
     if (!entry || entry.deleted) {
@@ -2922,10 +3014,10 @@ export async function startTestServer({
     if (entry.message.from.id !== caller.id) {
       throw new TelegramError(400, "Bad Request: message can't be edited");
     }
+    requireButtonData(markup);
     const previous = structuredClone(entry.message);
     const edited = structuredClone(entry.message);
     apply(edited);
-    const markup = inlineMarkup(p.reply_markup);
     if (markup) edited.reply_markup = markup;
     else delete edited.reply_markup;
     const same = (message) =>
@@ -3940,7 +4032,13 @@ export async function startTestServer({
         id: queryId,
         from: userObject(user),
         message: entry.message,
-        chat_instance: String(chat.id),
+        // An opaque global identifier of the chat, not its id: a signed
+        // 64-bit number, the same for every press in the chat.
+        chat_instance: createHash("sha256")
+          .update(String(chat.id))
+          .digest()
+          .readBigInt64BE(0)
+          .toString(),
         data: String(data ?? ""),
       },
       { to: sender ? [sender] : [bot] },
