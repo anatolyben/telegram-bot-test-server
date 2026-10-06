@@ -819,7 +819,7 @@ describe("polls, forwards and media", () => {
     const text = await api("sendMessage", { chat_id: GROUP, text: "plain" });
     const photo = await api("sendPhoto", {
       chat_id: GROUP,
-      photo: "x",
+      photo: "https://example.com/a.jpg",
       caption: "orig",
     });
 

@@ -414,10 +414,18 @@ describe("messages and buttons", () => {
     const text = (await api("sendMessage", { chat_id: GROUP, text: "plain" }))
       .result;
     const photo = (
-      await api("sendPhoto", { chat_id: GROUP, photo: "x", caption: "old" })
+      await api("sendPhoto", {
+        chat_id: GROUP,
+        photo: "https://example.com/a.jpg",
+        caption: "old",
+      })
     ).result;
-    const sticker = (await api("sendSticker", { chat_id: GROUP, sticker: "x" }))
-      .result;
+    const sticker = (
+      await api("sendSticker", {
+        chat_id: GROUP,
+        sticker: "https://example.com/a.webp",
+      })
+    ).result;
 
     expect(
       await api("editMessageText", {
@@ -464,8 +472,12 @@ describe("messages and buttons", () => {
         message_id: said,
       })
     ).result;
-    const photo = (await api("sendPhoto", { chat_id: GROUP, photo: "x" }))
-      .result;
+    const photo = (
+      await api("sendPhoto", {
+        chat_id: GROUP,
+        photo: "https://example.com/a.jpg",
+      })
+    ).result;
     const keyboard = (
       await api("sendMessage", {
         chat_id: GROUP,
@@ -516,7 +528,11 @@ describe("messages and buttons", () => {
   it("leaves out a caption an edit empties", async () => {
     const { api } = await setup();
     const photo = (
-      await api("sendPhoto", { chat_id: GROUP, photo: "x", caption: "old" })
+      await api("sendPhoto", {
+        chat_id: GROUP,
+        photo: "https://example.com/a.jpg",
+        caption: "old",
+      })
     ).result;
 
     const edited = await api("editMessageCaption", {
@@ -838,7 +854,7 @@ describe("ephemeral messages", () => {
     const id = (
       await api("sendPhoto", {
         chat_id: GROUP,
-        photo: "x",
+        photo: "https://example.com/a.jpg",
         caption: "old",
         ephemeral_message_parameters: { receiver_user_id: ann },
       })
@@ -849,7 +865,10 @@ describe("ephemeral messages", () => {
       ephemeral_message_id: id,
     };
     const document = (
-      await api("sendDocument", { chat_id: GROUP, document: "y" })
+      await api("sendDocument", {
+        chat_id: GROUP,
+        document: "https://example.com/a.pdf",
+      })
     ).result.document;
 
     expect(
@@ -1152,8 +1171,12 @@ describe("Bot API details", () => {
   it("gives file ids, invite links, business connections and login keys opaque identifiers", async () => {
     const { server, api } = await setup();
     const owner = await server.createUser();
-    const fileId = (await api("sendVideo", { chat_id: GROUP, video: "x" }))
-      .result.video.file_id;
+    const fileId = (
+      await api("sendVideo", {
+        chat_id: GROUP,
+        video: "https://example.com/a.mp4",
+      })
+    ).result.video.file_id;
     const identifiers = [
       fileId,
       (await api("getFile", { file_id: fileId })).result.file_path,
@@ -1260,8 +1283,12 @@ describe("flood control", () => {
 
   it("allows one message a second in a chat, counting an album as one", async () => {
     const { server, api } = await setup(limited);
-    const video = (await api("sendVideo", { chat_id: GROUP, video: "x" }))
-      .result.video.file_id;
+    const video = (
+      await api("sendVideo", {
+        chat_id: GROUP,
+        video: "https://example.com/a.mp4",
+      })
+    ).result.video.file_id;
     expect(
       await api("sendMessage", { chat_id: GROUP, text: "too soon" }),
     ).toMatchObject({ status: 429, parameters: { retry_after: 2 } });
