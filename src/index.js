@@ -558,7 +558,12 @@ function reactionType(reaction) {
   if (type === "emoji") {
     return { type, emoji: requiredString(reaction, "emoji") };
   }
-  if (type === "custom_emoji") return reaction;
+  if (type === "custom_emoji") {
+    if (reaction.custom_emoji_id === undefined) {
+      throw new Error(`Can't find field "custom_emoji_id"`);
+    }
+    return reaction;
+  }
   throw new Error("invalid reaction type specified");
 }
 

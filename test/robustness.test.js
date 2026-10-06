@@ -229,6 +229,10 @@ describe("bad input", () => {
         `Bad Request: can't parse ReactionType: Can't find field "emoji"`,
       ],
       [
+        [{ type: "custom_emoji" }],
+        `Bad Request: can't parse ReactionType: Can't find field "custom_emoji_id"`,
+      ],
+      [
         [{ type: "paid" }],
         "Bad Request: can't parse ReactionType: invalid reaction type specified",
       ],
