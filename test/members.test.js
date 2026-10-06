@@ -314,7 +314,7 @@ describe("more send methods", () => {
     });
   });
 
-  it("sends an album of 2 to 10 items, and never documents mixed with photos", async () => {
+  it("sends an album of up to 10 items, and never documents or audio mixed with others", async () => {
     const { upload } = await setup();
     const sent = await upload("sendMediaGroup", {
       chat_id: String(GROUP),
@@ -332,22 +332,40 @@ describe("more send methods", () => {
       photo: expect.any(Array),
     });
 
-    const mixed = await upload("sendMediaGroup", {
-      chat_id: String(GROUP),
-      media: [
-        { type: "photo", media: "attach://one" },
-        { type: "document", media: "attach://two" },
+    const photo = { type: "photo", media: "attach://one" };
+    for (const [media, description] of [
+      [undefined, 'Bad Request: parameter "media" is required'],
+      [[], "Bad Request: there are no messages to send"],
+      [
+        Array.from({ length: 11 }, () => photo),
+        "Bad Request: too many messages to send as an album",
       ],
-      one: BYTES,
-      two: BYTES,
-    });
-    expect(mixed.status).toBe(400);
+      [
+        [photo, { type: "document", media: "attach://one" }],
+        "Bad Request: document can't be mixed with other media types",
+      ],
+      [
+        [{ type: "audio", media: "attach://one" }, photo],
+        "Bad Request: audio can't be mixed with other media types",
+      ],
+    ]) {
+      expect(
+        await upload("sendMediaGroup", {
+          chat_id: String(GROUP),
+          ...(media ? { media } : {}),
+          one: BYTES,
+        }),
+      ).toMatchObject({ status: 400, description });
+    }
+    // One item is sent as an ordinary message, outside any album.
     const single = await upload("sendMediaGroup", {
       chat_id: String(GROUP),
-      media: [{ type: "photo", media: "attach://one" }],
+      media: [photo],
       one: BYTES,
     });
-    expect(single.status).toBe(400);
+    expect(single.result).toHaveLength(1);
+    expect(single.result[0].photo).toEqual(expect.any(Array));
+    expect(single.result[0].media_group_id).toBeUndefined();
   });
 });
 

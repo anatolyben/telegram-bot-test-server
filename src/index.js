@@ -249,7 +249,10 @@ function isObject(value) {
 function jsonParam(value, name) {
   if (value === undefined || value === "") return undefined;
   if (typeof value === "string") {
-    throw new TelegramError(400, `Bad Request: can't parse ${name} JSON object`);
+    throw new TelegramError(
+      400,
+      `Bad Request: can't parse ${name} JSON object`,
+    );
   }
   return value;
 }
@@ -2428,16 +2431,23 @@ export async function startTestServer({
       requireCanSend(chat, caller);
       return true;
     },
-    // An album of 2 to 10 photos and videos, or of documents or audios alone.
+    // An album of up to 10 photos and videos, or of documents or audios
+    // alone; one item is sent as an ordinary message (TDLib
+    // MessagesManager::send_message_group, check_message_group_message_contents).
     sendMediaGroup: (p, caller) => {
-      const items = Array.isArray(p.media) ? p.media : [];
-      if (items.length < 2 || items.length > 10) {
+      if (p.media === undefined || p.media === "") {
         throw new TelegramError(
           400,
-          "Bad Request: media group must include 2-10 items",
+          'Bad Request: parameter "media" is required',
         );
       }
-      const types = items.map((item) => item?.type);
+      const items = jsonArray(
+        jsonParam(p.media, "media"),
+        "InputMedia",
+        (item) =>
+          isObject(item) ? missingString(item, "type") : "expected an Object",
+      );
+      const types = items.map((item) => item.type);
       if (
         types.some(
           (type) => !["photo", "video", "document", "audio"].includes(type),
@@ -2445,15 +2455,13 @@ export async function startTestServer({
       ) {
         throw new TelegramError(400, "Bad Request: unsupported media type");
       }
-      for (const alone of ["document", "audio"]) {
-        if (types.includes(alone) && types.some((type) => type !== alone)) {
-          throw new TelegramError(
-            400,
-            `Bad Request: ${alone}s can't be mixed with other media types`,
-          );
-        }
-      }
       const chat = botChat(p.chat_id);
+      if (items.length === 0) {
+        throw new TelegramError(
+          400,
+          "Bad Request: there are no messages to send",
+        );
+      }
       requireCanSend(chat, caller);
       // Telegram parses every InputMedia caption before issuing an album send.
       const prepared = items.map((item) => {
@@ -2473,7 +2481,22 @@ export async function startTestServer({
         }
         return { item, formatted, reference };
       });
-      const mediaGroupId = String(nextMediaGroupId++);
+      if (items.length > 10) {
+        throw new TelegramError(
+          400,
+          "Bad Request: too many messages to send as an album",
+        );
+      }
+      for (const alone of ["document", "audio"]) {
+        if (types.includes(alone) && types.some((type) => type !== alone)) {
+          throw new TelegramError(
+            400,
+            `Bad Request: ${alone} can't be mixed with other media types`,
+          );
+        }
+      }
+      const mediaGroupId =
+        items.length > 1 ? String(nextMediaGroupId++) : undefined;
       return prepared.map(({ item, formatted, reference }) => {
         const file =
           typeof reference === "string" && files.has(reference)
@@ -2495,7 +2518,7 @@ export async function startTestServer({
           {
             ...mediaFields(item.type, file, {}),
             ...formatted,
-            media_group_id: mediaGroupId,
+            ...(mediaGroupId ? { media_group_id: mediaGroupId } : {}),
           },
         );
       });
@@ -2809,7 +2832,10 @@ export async function startTestServer({
     const markup = jsonParam(value, "reply keyboard markup");
     if (markup === undefined) return undefined;
     if (!isObject(markup)) {
-      throw new TelegramError(400, "Bad Request: object expected as reply markup");
+      throw new TelegramError(
+        400,
+        "Bad Request: object expected as reply markup",
+      );
     }
     for (const field of ["keyboard", "inline_keyboard"]) {
       if (field in markup && !Array.isArray(markup[field])) {

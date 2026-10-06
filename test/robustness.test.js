@@ -118,14 +118,16 @@ describe("bad input", () => {
       description: "Bad Request: message text is empty",
     });
     // Fields before a JSON error still count, and a trailing comma is fine.
-    expect(await send(`{"chat_id": ${GROUP}, "text": "cut", "par`)).toMatchObject(
-      { ok: true, result: { text: "cut" } },
-    );
+    expect(
+      await send(`{"chat_id": ${GROUP}, "text": "cut", "par`),
+    ).toMatchObject({ ok: true, result: { text: "cut" } });
     expect(await send(`{"chat_id": ${GROUP}, "text": "comma",}`)).toMatchObject(
       { ok: true, result: { text: "comma" } },
     );
     // A JSON-serialized parameter may come as a JSON string.
-    const keyboard = { inline_keyboard: [[{ text: "Go", callback_data: "go" }]] };
+    const keyboard = {
+      inline_keyboard: [[{ text: "Go", callback_data: "go" }]],
+    };
     expect(
       await send(
         JSON.stringify({
@@ -177,12 +179,30 @@ describe("bad input", () => {
 
     for (const [params, description] of [
       [{}, "Bad Request: message identifiers are not specified"],
-      [{ message_ids: "[" }, "Bad Request: can't parse message_ids JSON object"],
-      [{ message_ids: 5 }, "Bad Request: expected an Array of message identifiers"],
-      [{ message_ids: many }, "Bad Request: too many message identifiers specified"],
-      [{ message_ids: [null] }, "Bad Request: message identifier must be a Number"],
-      [{ message_ids: ["x"] }, "Bad Request: can't parse message identifier as a Number"],
-      [{ message_ids: [0] }, "Bad Request: invalid message identifier specified"],
+      [
+        { message_ids: "[" },
+        "Bad Request: can't parse message_ids JSON object",
+      ],
+      [
+        { message_ids: 5 },
+        "Bad Request: expected an Array of message identifiers",
+      ],
+      [
+        { message_ids: many },
+        "Bad Request: too many message identifiers specified",
+      ],
+      [
+        { message_ids: [null] },
+        "Bad Request: message identifier must be a Number",
+      ],
+      [
+        { message_ids: ["x"] },
+        "Bad Request: can't parse message identifier as a Number",
+      ],
+      [
+        { message_ids: [0] },
+        "Bad Request: invalid message identifier specified",
+      ],
     ]) {
       expect(
         await api("deleteMessages", { chat_id: GROUP, ...params }),
@@ -240,7 +260,10 @@ describe("bad input", () => {
         { reply_parameters: "abc" },
         "Bad Request: can't parse reply parameters JSON object",
       ],
-      [{ reply_parameters: 5 }, "Bad Request: object expected as reply parameters"],
+      [
+        { reply_parameters: 5 },
+        "Bad Request: object expected as reply parameters",
+      ],
       [
         { link_preview_options: "abc" },
         "Bad Request: can't parse link preview options JSON object",
