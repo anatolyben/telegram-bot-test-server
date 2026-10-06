@@ -4,6 +4,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { startTestServer } from "../src/index.js";
 
 const TOKEN = "123456:TEST-TOKEN";
+const BOT = 123456;
+const SECOND_TOKEN = "654321:SECOND-TOKEN";
 const GROUP = -1001000000001;
 const OWNER = 5000000001;
 const PHOTO = Buffer.from("fake-jpeg-bytes");
@@ -308,6 +310,238 @@ describe("invite links and join requests", () => {
         },
       ),
     ).toMatchObject({ status: 400, body: { error: "INVITE_HASH_EXPIRED" } });
+  });
+
+  it("needs can_invite_users to create, export, edit or revoke invite links", async () => {
+    const { fake, api } = await setup();
+    const link = (await api("createChatInviteLink", { chat_id: GROUP })).result
+      .invite_link;
+    const refused = {
+      status: 400,
+      description: "Bad Request: not enough rights to manage chat invite link",
+    };
+
+    await fake.setBotMembership(GROUP, BOT, {
+      status: "administrator",
+      rights: { can_invite_users: false },
+    });
+    expect(await api("createChatInviteLink", { chat_id: GROUP })).toMatchObject(
+      refused,
+    );
+    expect(await api("exportChatInviteLink", { chat_id: GROUP })).toMatchObject(
+      refused,
+    );
+    expect(
+      await api("editChatInviteLink", {
+        chat_id: GROUP,
+        invite_link: link,
+        name: "renamed",
+      }),
+    ).toMatchObject(refused);
+    expect(
+      await api("revokeChatInviteLink", { chat_id: GROUP, invite_link: link }),
+    ).toMatchObject(refused);
+    await fake.setBotMembership(GROUP, BOT, { status: "member" });
+    expect(await api("createChatInviteLink", { chat_id: GROUP })).toMatchObject(
+      refused,
+    );
+  });
+
+  it("admits at most member_limit members through a link at a time", async () => {
+    const { fake, api } = await setup();
+    const invite = (
+      await api("createChatInviteLink", { chat_id: GROUP, member_limit: 1 })
+    ).result;
+    expect(invite.member_limit).toBe(1);
+    const ann = await fake.createUser();
+
+    await fake.joinByLink(invite.invite_link, ann);
+    await expect(
+      fake.joinByLink(invite.invite_link, await fake.createUser()),
+    ).rejects.toThrow("INVITE_HASH_EXPIRED");
+    await fake.leave(GROUP, ann);
+    expect(
+      await fake.joinByLink(invite.invite_link, await fake.createUser()),
+    ).toMatchObject({ status: "member" });
+    expect(
+      await api("createChatInviteLink", {
+        chat_id: GROUP,
+        member_limit: 5,
+        creates_join_request: true,
+      }),
+    ).toMatchObject({
+      status: 400,
+      description:
+        "Bad Request: member limit can't be specified for links requiring administrator approval",
+    });
+  });
+
+  it("refuses a join through a link once its expire_date has passed", async () => {
+    const { fake, api } = await setup({ clock: { now: 1800000000000 } });
+    const invite = (
+      await api("createChatInviteLink", {
+        chat_id: GROUP,
+        expire_date: 1800000060,
+      })
+    ).result;
+    expect(invite.expire_date).toBe(1800000060);
+
+    await fake.advanceTime(59000);
+    expect(
+      await fake.joinByLink(invite.invite_link, await fake.createUser()),
+    ).toMatchObject({ status: "member" });
+    await fake.advanceTime(1000);
+    await expect(
+      fake.joinByLink(invite.invite_link, await fake.createUser()),
+    ).rejects.toThrow("INVITE_HASH_EXPIRED");
+  });
+
+  it("revokes only an existing link the bot created", async () => {
+    const { fake, api } = await setup();
+    const second = await fake.addBot({
+      token: SECOND_TOKEN,
+      username: "second_bot",
+    });
+    await fake.setBotMembership(GROUP, second.id, { status: "administrator" });
+    const link = (await api("createChatInviteLink", { chat_id: GROUP })).result
+      .invite_link;
+
+    expect(
+      await api("revokeChatInviteLink", {
+        chat_id: GROUP,
+        invite_link: "https://t.me/+NoSuchLink000000",
+      }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: INVITE_HASH_EXPIRED",
+    });
+    expect(
+      await api(
+        "revokeChatInviteLink",
+        { chat_id: GROUP, invite_link: link },
+        SECOND_TOKEN,
+      ),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: CHAT_ADMIN_REQUIRED",
+    });
+    expect(await fake.joinByLink(link, await fake.createUser())).toMatchObject({
+      status: "member",
+    });
+  });
+
+  it("replaces a revoked primary link with a new one", async () => {
+    const { fake, api } = await setup();
+    const primary = (await api("exportChatInviteLink", { chat_id: GROUP }))
+      .result;
+
+    const revoked = await api("revokeChatInviteLink", {
+      chat_id: GROUP,
+      invite_link: primary,
+    });
+    expect(revoked.result).toMatchObject({
+      invite_link: primary,
+      creator: { id: BOT },
+      creates_join_request: false,
+      is_primary: true,
+      is_revoked: true,
+    });
+    const next = (await api("getChat", { chat_id: GROUP })).result.invite_link;
+    expect(next).toEqual(expect.any(String));
+    expect(next).not.toBe(primary);
+    expect(await fake.joinByLink(next, await fake.createUser())).toMatchObject({
+      status: "member",
+    });
+  });
+
+  it("keeps a primary link for each administrator", async () => {
+    const { fake, api } = await setup();
+    const second = await fake.addBot({
+      token: SECOND_TOKEN,
+      username: "second_bot",
+    });
+    await fake.setBotMembership(GROUP, second.id, { status: "administrator" });
+    const first = (await api("exportChatInviteLink", { chat_id: GROUP }))
+      .result;
+
+    await api("exportChatInviteLink", { chat_id: GROUP }, SECOND_TOKEN);
+    expect(await fake.joinByLink(first, await fake.createUser())).toMatchObject(
+      { status: "member" },
+    );
+  });
+
+  it("gives getChat the bot's own primary link only while it may invite users", async () => {
+    const { fake, api } = await setup();
+    const chat = async () => (await api("getChat", { chat_id: GROUP })).result;
+
+    const generated = (await chat()).invite_link;
+    expect(generated).toMatch(/^https:\/\/t\.me\/\+/);
+    expect((await chat()).invite_link).toBe(generated);
+    const exported = (await api("exportChatInviteLink", { chat_id: GROUP }))
+      .result;
+    expect((await chat()).invite_link).toBe(exported);
+    await expect(
+      fake.joinByLink(generated, await fake.createUser()),
+    ).rejects.toThrow("INVITE_HASH_EXPIRED");
+    await fake.setBotMembership(GROUP, BOT, {
+      status: "administrator",
+      rights: { can_invite_users: false },
+    });
+    expect(await chat()).not.toHaveProperty("invite_link");
+  });
+
+  it("shows a link another administrator created with its second half hidden", async () => {
+    const { fake, api } = await setup();
+    const second = await fake.addBot({
+      token: SECOND_TOKEN,
+      username: "second_bot",
+    });
+    await fake.setBotMembership(GROUP, second.id, { status: "administrator" });
+    const own = await startReceiver();
+    const other = await startReceiver();
+    const allowed_updates = ["chat_join_request", "chat_member"];
+    await api("setWebhook", { url: own.url, allowed_updates });
+    await api("setWebhook", { url: other.url, allowed_updates }, SECOND_TOKEN);
+    const link = (
+      await api("createChatInviteLink", {
+        chat_id: GROUP,
+        creates_join_request: true,
+      })
+    ).result.invite_link;
+    const hash = link.slice("https://t.me/+".length);
+    const hidden = `https://t.me/+${hash.slice(0, hash.length / 2)}...`;
+    const user = await fake.createUser();
+
+    await fake.joinByLink(link, user);
+    await api("approveChatJoinRequest", { chat_id: GROUP, user_id: user });
+    await expect.poll(() => own.ofType("chat_member").length).toBe(1);
+    await expect.poll(() => other.ofType("chat_member").length).toBe(1);
+    const seen = (hook, type) => hook.ofType(type)[0].invite_link;
+    expect(seen(own, "chat_join_request").invite_link).toBe(link);
+    expect(seen(own, "chat_member").invite_link).toBe(link);
+    expect(seen(other, "chat_join_request")).toMatchObject({
+      invite_link: hidden,
+      creator: { id: BOT },
+    });
+    expect(seen(other, "chat_member").invite_link).toBe(hidden);
+  });
+
+  it("gives each invite link an opaque random hash", async () => {
+    const { api } = await setup();
+    const links = [];
+    for (let i = 0; i < 3; i += 1) {
+      links.push(
+        (await api("createChatInviteLink", { chat_id: GROUP })).result
+          .invite_link,
+      );
+    }
+
+    for (const link of links)
+      expect(link).toMatch(/^https:\/\/t\.me\/\+[\w-]+$/);
+    // No fixed marker opens the hash.
+    expect(
+      new Set(links.map((link) => link.slice(14, 18))).size,
+    ).toBeGreaterThan(1);
   });
 });
 

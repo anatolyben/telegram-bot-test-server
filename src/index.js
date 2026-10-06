@@ -896,15 +896,102 @@ export async function startTestServer({
   /**
    * Make the user a member again. A restriction outlives leaving and
    * rejoining on Telegram, so a restricted user comes back restricted.
+   * `link` is the invite link they joined through, if any.
    */
-  function admit(chat, userId) {
+  function admit(chat, userId, link = null) {
     const current = memberStatus(chat, userId);
-    chat.members.set(
-      Number(userId),
+    const member =
       current.status === "restricted"
         ? { ...current, is_member: true }
-        : { status: "member" },
+        : { status: "member" };
+    delete member.joinedVia;
+    chat.members.set(Number(userId), {
+      ...member,
+      ...(link ? { joinedVia: link } : {}),
+    });
+  }
+
+  /** Managing invite links needs the can_invite_users administrator right. */
+  function requireInviteRights(chat, caller) {
+    if (!hasRight(chat, caller.id, "can_invite_users")) {
+      throw new TelegramError(
+        400,
+        "Bad Request: not enough rights to manage chat invite link",
+      );
+    }
+  }
+
+  /** A new invite link of the caller's: https://t.me/+ and an opaque hash. */
+  function addInviteLink(chat, caller, fields = {}) {
+    const invite = {
+      invite_link: `https://t.me/+${randomBytes(12).toString("base64url")}`,
+      ...(fields.name ? { name: fields.name } : {}),
+      creator: userObject(caller),
+      ...(fields.expire_date ? { expire_date: fields.expire_date } : {}),
+      ...(fields.member_limit ? { member_limit: fields.member_limit } : {}),
+      creates_join_request: fields.creates_join_request === true,
+      is_primary: fields.is_primary === true,
+      is_revoked: false,
+    };
+    chat.inviteLinks.set(invite.invite_link, invite);
+    return invite;
+  }
+
+  /**
+   * Each administrator has a primary link of their own; a new one revokes
+   * only that administrator's previous one.
+   */
+  function replacePrimaryLink(chat, caller) {
+    for (const invite of chat.inviteLinks.values()) {
+      if (invite.is_primary && invite.creator.id === caller.id) {
+        invite.is_revoked = true;
+      }
+    }
+    return addInviteLink(chat, caller, { is_primary: true });
+  }
+
+  /** The caller's current primary link, generated when it has none. */
+  function primaryLink(chat, caller) {
+    const current = [...chat.inviteLinks.values()].find(
+      (invite) =>
+        invite.is_primary &&
+        !invite.is_revoked &&
+        invite.creator.id === caller.id,
     );
+    return current ?? replacePrimaryLink(chat, caller);
+  }
+
+  /**
+   * Whether a link no longer admits anyone: revoked, past its expire_date, or
+   * already holding member_limit members who joined through it.
+   */
+  function inviteExpired(chat, invite) {
+    if (invite.is_revoked) return true;
+    if (invite.expire_date && invite.expire_date <= now()) return true;
+    if (!invite.member_limit) return false;
+    const members = [...chat.members.entries()].filter(
+      ([id, member]) =>
+        member.joinedVia === invite.invite_link && isInChat(chat, id),
+    );
+    return members.length >= invite.member_limit;
+  }
+
+  /**
+   * A bot sees a link another administrator created with the second half of
+   * its hash replaced by "..." (ChatInviteLink.invite_link).
+   */
+  function inviteLinkSeenBy(record, payload) {
+    const invite = payload?.invite_link;
+    if (!invite || typeof invite !== "object") return payload;
+    if (invite.creator.id === record.id) return payload;
+    const hash = invite.invite_link.slice("https://t.me/+".length);
+    return {
+      ...payload,
+      invite_link: {
+        ...invite,
+        invite_link: `https://t.me/+${hash.slice(0, hash.length / 2)}...`,
+      },
+    };
   }
 
   /** Send a chat_member update only when the member actually changed. */
@@ -968,7 +1055,10 @@ export async function startTestServer({
     if (!allowed(record, type)) {
       return { updateId: null, delivered: Promise.resolve() };
     }
-    const update = { update_id: nextUpdateId(), [type]: payload };
+    const update = {
+      update_id: nextUpdateId(),
+      [type]: inviteLinkSeenBy(record, payload),
+    };
     sentUpdates.set(update.update_id, {
       record,
       body: JSON.stringify(update),
@@ -1533,7 +1623,7 @@ export async function startTestServer({
       waits.notify();
       return true;
     },
-    getChat: (p) => {
+    getChat: (p, caller) => {
       if (String(p.chat_id).startsWith("@")) {
         const entry = publicByUsername.get(
           String(p.chat_id).slice(1).toLowerCase(),
@@ -1571,6 +1661,10 @@ export async function startTestServer({
             : {}),
           permissions: { ...chat.permissions },
           ...(chat.description ? { description: chat.description } : {}),
+          // The bot's own primary link, while it may manage invite links.
+          ...(hasRight(chat, caller.id, "can_invite_users")
+            ? { invite_link: primaryLink(chat, caller).invite_link }
+            : {}),
           ...(chat.photo
             ? {
                 photo: {
@@ -2097,30 +2191,30 @@ export async function startTestServer({
     },
     createChatInviteLink: (p, caller) => {
       const chat = requireChat(p.chat_id);
-      const link = `https://t.me/+fake${randomBytes(9).toString("base64url")}`;
-      const invite = {
-        invite_link: link,
-        creator: userObject(caller),
-        creates_join_request: String(p.creates_join_request) === "true",
-        is_primary: false,
-        is_revoked: false,
-        ...(p.name ? { name: String(p.name) } : {}),
+      // An expire_date or member_limit of 0 or less means none.
+      const expireDate = Math.max(0, Number(p.expire_date) || 0);
+      const memberLimit = Math.max(0, Number(p.member_limit) || 0);
+      const createsJoinRequest = isTrue(p.creates_join_request);
+      if (createsJoinRequest && memberLimit) {
+        throw new TelegramError(
+          400,
+          "Bad Request: member limit can't be specified for links requiring administrator approval",
+        );
+      }
+      requireInviteRights(chat, caller);
+      return {
+        ...addInviteLink(chat, caller, {
+          name: p.name ? String(p.name) : "",
+          expire_date: expireDate,
+          member_limit: memberLimit,
+          creates_join_request: createsJoinRequest,
+        }),
       };
-      chat.inviteLinks.set(link, invite);
-      return invite;
     },
     exportChatInviteLink: (p, caller) => {
       const chat = requireChat(p.chat_id);
-      // A new primary link revokes the previous one.
-      for (const invite of chat.inviteLinks.values()) {
-        if (invite.is_primary) invite.is_revoked = true;
-      }
-      const invite = methods.createChatInviteLink(
-        { chat_id: p.chat_id },
-        caller,
-      );
-      invite.is_primary = true;
-      return invite.invite_link;
+      requireInviteRights(chat, caller);
+      return replacePrimaryLink(chat, caller).invite_link;
     },
     sendVoice: (p, caller) => sendMedia(p, caller, "voice"),
     sendAudio: (p, caller) => sendMedia(p, caller, "audio"),
@@ -2392,12 +2486,17 @@ export async function startTestServer({
     },
     editChatInviteLink: (p, caller) => {
       const chat = requireChat(p.chat_id);
+      requireInviteRights(chat, caller);
       const invite = chat.inviteLinks.get(String(p.invite_link));
       if (!invite || invite.is_revoked) {
         throw new TelegramError(400, "Bad Request: INVITE_HASH_EXPIRED");
       }
       if (invite.creator.id !== caller.id) {
         throw new TelegramError(400, "Bad Request: CHAT_ADMIN_REQUIRED");
+      }
+      // Only a non-primary link can be edited.
+      if (invite.is_primary) {
+        throw new TelegramError(400, "Bad Request: CHAT_INVITE_PERMANENT");
       }
       const createsJoinRequest =
         p.creates_join_request !== undefined
@@ -2483,14 +2582,23 @@ export async function startTestServer({
         methods.declineChatJoinRequest(target, caller);
       return true;
     },
-    revokeChatInviteLink: (p) => {
+    // Revokes a link the bot created; a revoked primary link is replaced by
+    // a new one.
+    revokeChatInviteLink: (p, caller) => {
       const chat = requireChat(p.chat_id);
+      requireInviteRights(chat, caller);
       const invite = chat.inviteLinks.get(String(p.invite_link));
-      if (invite) invite.is_revoked = true;
-      return {
-        ...(invite ?? { invite_link: p.invite_link }),
-        is_revoked: true,
-      };
+      if (!invite) {
+        throw new TelegramError(400, "Bad Request: INVITE_HASH_EXPIRED");
+      }
+      if (invite.creator.id !== caller.id) {
+        throw new TelegramError(400, "Bad Request: CHAT_ADMIN_REQUIRED");
+      }
+      if (!invite.is_revoked && invite.is_primary) {
+        replacePrimaryLink(chat, caller);
+      }
+      invite.is_revoked = true;
+      return { ...invite };
     },
   };
 
@@ -3970,7 +4078,7 @@ export async function startTestServer({
       throw new TelegramError(400, "USER_ALREADY_PARTICIPANT");
     }
     const invite = link ? chat.inviteLinks.get(link) : null;
-    if (link && (!invite || invite.is_revoked)) {
+    if (link && (!invite || inviteExpired(chat, invite))) {
       throw new TelegramError(400, "INVITE_HASH_EXPIRED");
     }
     if (invite?.creates_join_request) {
@@ -4011,7 +4119,7 @@ export async function startTestServer({
       return { status: "requested" };
     }
     const before = chatMemberObject(chat, user.id);
-    admit(chat, user.id);
+    admit(chat, user.id, invite?.invite_link);
     await emitMemberChange(chat, user.id, before, user, {
       ...(invite ? { invite_link: { ...invite } } : {}),
     });
