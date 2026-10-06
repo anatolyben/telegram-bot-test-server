@@ -595,7 +595,9 @@ it("gives migrated-chat rejection the same request timeline and identity as othe
   });
   await fake.setBotMembership(old, BOT, { status: "administrator" });
   await fake.migrateToSupergroup(old, { by: 5000000001 });
-  expect((await api("getChat", { chat_id: old })).status).toBe(400);
+  expect((await api("sendMessage", { chat_id: old, text: "hi" })).status).toBe(
+    400,
+  );
   const call = (await fake.getCalls()).calls.at(-1);
   expect(call).toMatchObject({
     request_id: expect.any(String),

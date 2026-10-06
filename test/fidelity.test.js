@@ -161,7 +161,12 @@ describe("moderation", () => {
         chat_id: GROUP,
         permissions: { can_send_messages: false },
       });
-      expect(denied).toMatchObject({ status: 400, ok: false });
+      expect(denied).toMatchObject({
+        status: 400,
+        ok: false,
+        description:
+          "Bad Request: not enough rights to change chat permissions",
+      });
       expect(
         (await api("getChat", { chat_id: GROUP })).result.permissions,
       ).toEqual(before);
@@ -191,7 +196,11 @@ describe("moderation", () => {
         chat_id: channel,
         permissions: { can_send_messages: false },
       }),
-    ).toMatchObject({ status: 400, ok: false });
+    ).toMatchObject({
+      status: 400,
+      ok: false,
+      description: "Bad Request: can't change channel chat permissions",
+    });
     expect((await api("getChat", { chat_id: channel })).result).toEqual(before);
   });
 
@@ -220,6 +229,29 @@ describe("moderation", () => {
     expect(await server.getMember(GROUP, bob)).toMatchObject({
       can_send_messages: false,
       can_send_other_messages: true,
+    });
+  });
+
+  it("defaults can_manage_topics to can_pin_messages, and reactions to the can_send_messages passed", async () => {
+    const { server, api, member } = await setup();
+    const ann = await member();
+
+    await api("setChatPermissions", {
+      chat_id: GROUP,
+      permissions: { can_send_messages: true, can_pin_messages: true },
+    });
+    expect(
+      (await api("getChat", { chat_id: GROUP })).result.permissions,
+    ).toMatchObject({ can_pin_messages: true, can_manage_topics: true });
+    await api("restrictChatMember", {
+      chat_id: GROUP,
+      user_id: ann,
+      permissions: { can_send_polls: true },
+    });
+    expect(await server.getMember(GROUP, ann)).toMatchObject({
+      can_send_polls: true,
+      can_send_messages: true,
+      can_react_to_messages: false,
     });
   });
 
@@ -1141,16 +1173,11 @@ describe("flood control", () => {
 
 describe("moderation physical state", () => {
   it.each([true, "true", false, undefined])(
-    "revokes only the banned author's messages in a supergroup (revoke=%s)",
+    "bans in a supergroup without deleting the banned author's messages (revoke=%s)",
     async (revoke) => {
       const { server, api, member } = await setup();
-      const ann = await member(),
-        bob = await member();
-      const other = await server.createChat({ ownerId: OWNER, title: "Other" });
-      await server.join(other, ann);
-      const a = await server.post(GROUP, ann, "ann"),
-        b = await server.post(GROUP, bob, "bob");
-      const elsewhere = await server.post(other, ann, "elsewhere");
+      const ann = await member();
+      const a = await server.post(GROUP, ann, "ann");
       expect(
         await api("banChatMember", {
           chat_id: GROUP,
@@ -1159,14 +1186,11 @@ describe("moderation physical state", () => {
         }),
       ).toMatchObject({ ok: true });
       expect(await server.getMessage(GROUP, a)).toMatchObject({
-        deleted: true,
-      });
-      expect(await server.getMessage(GROUP, b)).toMatchObject({
         deleted: false,
       });
-      expect(await server.getMessage(other, elsewhere)).toMatchObject({
-        deleted: false,
-      });
+      expect(
+        await api("deleteMessage", { chat_id: GROUP, message_id: a }),
+      ).toMatchObject({ ok: true });
       expect(
         (await api("getChatMember", { chat_id: GROUP, user_id: ann })).result
           .status,
@@ -1194,7 +1218,12 @@ describe("moderation physical state", () => {
           user_id: ann,
           permissions: { can_send_messages: false },
         }),
-      ).toMatchObject({ ok: false, status: 400 });
+      ).toMatchObject({
+        ok: false,
+        status: 400,
+        description:
+          "Bad Request: not enough rights to restrict/unrestrict chat member",
+      });
       expect(await server.getMember(GROUP, ann)).toEqual(before);
       expect(await server.getMessage(GROUP, message)).toEqual(beforeMessage);
     },
@@ -1218,7 +1247,12 @@ describe("moderation physical state", () => {
         rights: { can_invite_users: false },
       });
       expect(await api(method, { chat_id: GROUP, user_id: ann })).toMatchObject(
-        { ok: false, status: 400 },
+        {
+          ok: false,
+          status: 400,
+          description:
+            "Bad Request: not enough rights to manage chat join requests",
+        },
       );
       expect(await server.getJoinRequests(GROUP)).toEqual([ann]);
       expect((await server.getMember(GROUP, ann)).status).toBe("left");
@@ -1297,7 +1331,7 @@ describe("moderation physical state", () => {
 });
 
 describe("documented moderation boundaries", () => {
-  it("honors form-encoded revocation in a basic group and ignores its ban deadline", async () => {
+  it("keeps messages after a form-encoded revocation in a basic group and ignores its ban deadline", async () => {
     const { server } = await setup();
     const group = await server.createChat({ type: "group", ownerId: OWNER });
     await server.setBotMembership(group, BOT, { status: "administrator" });
@@ -1315,7 +1349,7 @@ describe("documented moderation boundaries", () => {
     });
     expect(await response.json()).toMatchObject({ ok: true });
     expect(await server.getMessage(group, message)).toMatchObject({
-      deleted: true,
+      deleted: false,
     });
     expect(await server.getMember(group, ann)).toMatchObject({
       status: "kicked",
@@ -1391,7 +1425,39 @@ it.each(["group", "channel"])(
         user_id: ann,
         permissions: { can_send_messages: false },
       }),
-    ).toMatchObject({ ok: false });
+    ).toMatchObject({
+      ok: false,
+      description: "Bad Request: method is available only in supergroups",
+    });
     expect(await server.getMember(chat, ann)).toEqual(before);
   },
 );
+
+it("keeps promotion and unbanning to supergroups and channels, and needs an admin to ban in a basic group", async () => {
+  const { server, api } = await setup();
+  const group = await server.createChat({ type: "group", ownerId: OWNER });
+  await server.setBotMembership(group, BOT, { status: "administrator" });
+  const ann = await server.createUser();
+  await server.join(group, ann);
+  for (const method of ["promoteChatMember", "unbanChatMember"]) {
+    expect(
+      await api(method, {
+        chat_id: group,
+        user_id: ann,
+        can_delete_messages: true,
+      }),
+    ).toMatchObject({
+      status: 400,
+      description:
+        "Bad Request: method is available only in supergroup and channel chats",
+    });
+  }
+  expect((await server.getMember(group, ann)).status).toBe("member");
+  await server.setBotMembership(group, BOT, { status: "member" });
+  expect(
+    await api("banChatMember", { chat_id: group, user_id: ann }),
+  ).toMatchObject({
+    status: 400,
+    description: "Bad Request: CHAT_ADMIN_REQUIRED",
+  });
+});

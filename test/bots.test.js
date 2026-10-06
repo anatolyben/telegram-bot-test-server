@@ -73,8 +73,8 @@ describe("more than one bot", () => {
       SECOND_TOKEN,
     );
     expect(refused).toMatchObject({
-      status: 403,
-      description: "Forbidden: bot is not a member of the supergroup chat",
+      status: 400,
+      description: "Bad Request: chat not found",
     });
 
     await fake.setBotMembership(GROUP, second.id, { status: "administrator" });
@@ -310,6 +310,20 @@ describe("channels and rights", () => {
     expect(
       await api("stopPoll", { chat_id: channel, message_id: poll }),
     ).toMatchObject(refused);
+  });
+
+  it("leaves default member permissions out of a channel's getChat", async () => {
+    const { fake, api } = await setup();
+    const me = (await api("getMe")).result;
+    const channel = await fake.createChat({ type: "channel", ownerId: OWNER });
+    await fake.setBotMembership(channel, me.id, { status: "administrator" });
+
+    const chat = (await api("getChat", { chat_id: channel })).result;
+    expect(chat.type).toBe("channel");
+    expect(chat.permissions).toBeUndefined();
+    expect(
+      (await api("getChat", { chat_id: GROUP })).result.permissions,
+    ).toBeDefined();
   });
 
   it("pins with the right to, and shows the pinned message on getChat", async () => {
@@ -691,7 +705,7 @@ describe("polls, forwards and media", () => {
     });
     expect(forward).toMatchObject({
       status: 400,
-      description: "Bad Request: message to forward not found",
+      description: "Bad Request: chat not found",
     });
   });
 
@@ -1189,6 +1203,251 @@ describe("bot membership", () => {
       status: 400,
       description: "Bad Request: can't restrict self",
     });
+  });
+
+  it("sends chat_member only to the chat's administrator bots", async () => {
+    const { fake, api, second } = await setup();
+    await fake.setBotMembership(GROUP, second.id, { status: "member" });
+    const hook = await startReceiver();
+    await api(
+      "setWebhook",
+      { url: hook.url, allowed_updates: ["message", "chat_member"] },
+      SECOND_TOKEN,
+    );
+
+    const ann = await fake.createUser();
+    await fake.join(GROUP, ann);
+    await fake.setBotMembership(GROUP, second.id, { status: "administrator" });
+    const bob = await fake.createUser();
+    await fake.join(GROUP, bob);
+
+    const joined = hook
+      .ofType("message")
+      .flatMap((message) => message.new_chat_members ?? [])
+      .map((user) => user.id);
+    expect(joined).toEqual(expect.arrayContaining([ann, bob]));
+    expect(
+      hook
+        .ofType("chat_member")
+        .map((change) => change.new_chat_member.user.id),
+    ).toEqual([bob]);
+  });
+
+  it("sends chat_join_request only to bots that can invite users", async () => {
+    const { fake, api, second } = await setup();
+    await fake.setBotMembership(GROUP, second.id, {
+      status: "administrator",
+      rights: { can_invite_users: false },
+    });
+    const hook = await startReceiver();
+    await api("setWebhook", { url: hook.url }, SECOND_TOKEN);
+    const link = (
+      await api("createChatInviteLink", {
+        chat_id: GROUP,
+        creates_join_request: true,
+      })
+    ).result.invite_link;
+
+    await fake.joinByLink(link, await fake.createUser());
+    await fake.setBotMembership(GROUP, second.id, { status: "administrator" });
+    const bob = await fake.createUser();
+    await fake.joinByLink(link, bob);
+
+    expect(
+      hook.ofType("chat_join_request").map((request) => request.from.id),
+    ).toEqual([bob]);
+  });
+
+  it("tells a bot through my_chat_member when another bot promotes, demotes or bans it", async () => {
+    const { fake, api, second } = await setup();
+    const me = (await api("getMe")).result;
+    await fake.setBotMembership(GROUP, me.id, {
+      status: "administrator",
+      rights: { can_promote_members: true },
+    });
+    const hook = await startReceiver();
+    await api("setWebhook", { url: hook.url }, SECOND_TOKEN);
+    await fake.setBotMembership(GROUP, second.id, { status: "member" });
+
+    const promote = (rights) =>
+      api("promoteChatMember", {
+        chat_id: GROUP,
+        user_id: second.id,
+        ...rights,
+      });
+    expect((await promote({ can_delete_messages: true })).ok).toBe(true);
+    expect((await promote({})).ok).toBe(true);
+    expect(
+      (await api("banChatMember", { chat_id: GROUP, user_id: second.id })).ok,
+    ).toBe(true);
+
+    await expect
+      .poll(() =>
+        hook
+          .ofType("my_chat_member")
+          .map((change) => [change.from.id, change.new_chat_member.status]),
+      )
+      .toEqual([
+        [OWNER, "member"],
+        [me.id, "administrator"],
+        [me.id, "member"],
+        [me.id, "kicked"],
+      ]);
+  });
+
+  it("lists other administrator bots only when return_bots is set", async () => {
+    const { fake, api, second } = await setup();
+    const me = (await api("getMe")).result;
+    await fake.setBotMembership(GROUP, second.id, { status: "administrator" });
+    const admins = async (params) =>
+      (await api("getChatAdministrators", { chat_id: GROUP, ...params })).result
+        .map((admin) => admin.user.id)
+        .sort();
+
+    expect(await admins({})).toEqual([OWNER, me.id].sort());
+    expect(await admins({ return_bots: true })).toEqual(
+      [OWNER, me.id, second.id].sort(),
+    );
+  });
+
+  it("refuses a bot kicked from or no longer in a supergroup or channel, even for reads", async () => {
+    const { fake, api, second } = await setup();
+    const ann = await fake.createUser();
+    await fake.join(GROUP, ann);
+    const calls = [
+      ["getChat", {}],
+      ["getChatMember", { user_id: ann }],
+      ["getChatMember", { user_id: second.id }],
+      ["getChatAdministrators", {}],
+      ["getChatMemberCount", {}],
+      ["leaveChat", {}],
+      ["banChatMember", { user_id: ann }],
+    ];
+    const answers = async (chat) =>
+      Promise.all(
+        calls.map(async ([method, params]) => {
+          const answer = await api(
+            method,
+            { chat_id: chat, ...params },
+            SECOND_TOKEN,
+          );
+          return [answer.status, answer.description];
+        }),
+      );
+
+    await fake.setBotMembership(GROUP, second.id, { status: "kicked" });
+    expect(new Set((await answers(GROUP)).map(JSON.stringify))).toEqual(
+      new Set([
+        JSON.stringify([
+          403,
+          "Forbidden: bot was kicked from the supergroup chat",
+        ]),
+      ]),
+    );
+    await fake.setBotMembership(GROUP, second.id, { status: "left" });
+    expect(new Set((await answers(GROUP)).map(JSON.stringify))).toEqual(
+      new Set([
+        JSON.stringify([
+          403,
+          "Forbidden: bot is not a member of the supergroup chat",
+        ]),
+      ]),
+    );
+    const channel = await fake.createChat({ type: "channel", ownerId: OWNER });
+    await fake.setBotMembership(channel, second.id, { status: "kicked" });
+    expect(
+      await api("getChat", { chat_id: channel }, SECOND_TOKEN),
+    ).toMatchObject({
+      status: 403,
+      description: "Forbidden: bot was kicked from the channel chat",
+    });
+  });
+
+  it("lets a bot removed from a basic group read the chat and its own status, but nothing else", async () => {
+    const { fake, api, second } = await setup();
+    const group = await fake.createChat({ type: "group", ownerId: OWNER });
+    await fake.setBotMembership(group, second.id, { status: "member" });
+    const call = (method, params = {}) =>
+      api(method, { chat_id: group, ...params }, SECOND_TOKEN);
+
+    await fake.setBotMembership(group, second.id, { status: "left" });
+    expect((await call("getChat")).result).toMatchObject({ type: "group" });
+    expect(
+      (await call("getChatMember", { user_id: second.id })).result.status,
+    ).toBe("left");
+    for (const [method, params] of [
+      ["getChatMemberCount", {}],
+      ["getChatMember", { user_id: OWNER }],
+      ["sendMessage", { text: "hi" }],
+    ]) {
+      expect(await call(method, params)).toMatchObject({
+        status: 403,
+        description: "Forbidden: bot is not a member of the group chat",
+      });
+    }
+    await fake.setBotMembership(group, second.id, { status: "kicked" });
+    expect(
+      (await call("getChatMember", { user_id: second.id })).result.status,
+    ).toBe("kicked");
+    expect(await call("getChatAdministrators")).toMatchObject({
+      status: 403,
+      description: "Forbidden: bot was kicked from the group chat",
+    });
+  });
+
+  it("answers chat not found for a chat the bot was never in", async () => {
+    const { fake, api } = await setup();
+    const hidden = await fake.createChat({ ownerId: OWNER });
+    for (const method of ["getChat", "getChatMemberCount", "sendMessage"]) {
+      expect(
+        await api(method, { chat_id: hidden, text: "hi" }, SECOND_TOKEN),
+      ).toMatchObject({
+        status: 400,
+        description: "Bad Request: chat not found",
+      });
+    }
+  });
+
+  it("says can_be_edited only to the bot that promoted the administrator", async () => {
+    const { fake, api, second } = await setup();
+    const me = (await api("getMe")).result;
+    await fake.setBotMembership(GROUP, me.id, {
+      status: "administrator",
+      rights: { can_promote_members: true },
+    });
+    await fake.setBotMembership(GROUP, second.id, { status: "administrator" });
+    const hooks = [await startReceiver(), await startReceiver()];
+    await api("setWebhook", {
+      url: hooks[0].url,
+      allowed_updates: ["chat_member"],
+    });
+    await api(
+      "setWebhook",
+      { url: hooks[1].url, allowed_updates: ["chat_member"] },
+      SECOND_TOKEN,
+    );
+    const ann = await fake.createUser();
+    await fake.join(GROUP, ann);
+
+    await api("promoteChatMember", {
+      chat_id: GROUP,
+      user_id: ann,
+      can_delete_messages: true,
+    });
+
+    const editable = async (token) =>
+      (await api("getChatMember", { chat_id: GROUP, user_id: ann }, token))
+        .result.can_be_edited;
+    expect(await editable(TOKEN)).toBe(true);
+    expect(await editable(SECOND_TOKEN)).toBe(false);
+    await expect
+      .poll(() =>
+        hooks.map((hook) => hook.ofType("chat_member").at(-1)?.new_chat_member),
+      )
+      .toEqual([
+        expect.objectContaining({ can_be_edited: true }),
+        expect.objectContaining({ can_be_edited: false }),
+      ]);
   });
 });
 

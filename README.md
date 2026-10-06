@@ -101,7 +101,7 @@ response happens after that, so wait for the outcome rather than checking it imm
 | `getMessages(chatId)`, `getMessage(chatId, id)`                                                                                       | The chat's messages, ephemeral ones included, and whether one was deleted.                                                                                                  |
 | `getEphemeralMessage(chatId, ephemeralMessageId)`                                                                                     | An ephemeral message by its `ephemeral_message_id`, and whether it was deleted.                                                                                             |
 | `getDirectMessages(userId)`                                                                                                           | The private chat between the user and the bot.                                                                                                                              |
-| `getMember(chatId, userId)`                                                                                                           | The member as `getChatMember` returns them: status, restrictions, ban.                                                                                                      |
+| `getMember(chatId, userId)`                                                                                                           | The member as `getChatMember` returns them to the first bot: status, restrictions, ban.                                                                                     |
 | `getJoinRequests(chatId)`                                                                                                             | User ids waiting for approval.                                                                                                                                              |
 | `addBot({ token, username, firstName, loginClientSecret })`                                                                           | Another bot, with its own webhook or update queue; it is in no chat yet.                                                                                                    |
 | `approveLogin(authUrl, userId)`                                                                                                       | The user logs in on the Telegram Login page for that `/auth` URL; returns the `redirect_uri` URL with `code` and `state`.                                                   |
@@ -187,10 +187,13 @@ string, JSON or multipart form data, as with Telegram.
 
 The details a moderation bot depends on, each covered by a test:
 
-- **Permissions.** Unspecified permissions are false, and unless `use_independent_chat_permissions`
-  is set, broader permissions imply narrower ones (`can_send_other_messages` implies media and text).
+- **Permissions.** Unspecified permissions are false, except that `can_manage_topics` and
+  `can_edit_tag` follow `can_pin_messages`, and `can_react_to_messages` follows `can_send_messages`
+  as passed. Then, unless `use_independent_chat_permissions` is set, broader permissions imply
+  narrower ones (`can_send_other_messages` implies media and text, `can_send_polls` implies text).
   A member needs both their own permission and the chat's default from `setChatPermissions` to post;
-  a photo needs `can_send_photos`, not only `can_send_messages`.
+  a photo needs `can_send_photos`, not only `can_send_messages`. `getChat` returns the default
+  `permissions` for groups and supergroups, not for channels.
 - **Restrictions stick.** A restricted user who leaves and rejoins is still restricted.
 - **Protected members.** Restricting or banning the chat owner, an administrator or the bot itself
   fails with Telegram's error.
@@ -216,7 +219,11 @@ The details a moderation bot depends on, each covered by a test:
   `can_post_messages` post; `post()` refuses anyone else with `CHAT_WRITE_FORBIDDEN`. A bot with
   `can_edit_messages` edits any post and stops any poll; without it, only its own, and only while it
   has `can_post_messages`.
-- **Private chats.** The bot cannot message a user who has not written to it first (403).
+- **Private chats.** The bot cannot message a user who has not written to it first (403). The
+  exception is a join request: a bot that receives it may message its `user_chat_id` for five
+  minutes, until the request is approved or declined, as
+  [ChatJoinRequest](https://core.telegram.org/bots/api#chatjoinrequest) documents. The five
+  minutes follow the server's clock, so `advanceTime` can end them.
 - **Ephemeral messages** ([Bot API](https://core.telegram.org/bots/api#ephemeral-messages-and-commands)).
   A send with `ephemeral_message_parameters` is shown to one member. It returns `message_id` 0,
   `receiver_user` and an `ephemeral_message_id` of its own, and takes no message id from the chat.
@@ -266,10 +273,19 @@ The details a moderation bot depends on, each covered by a test:
   rights in each chat. A bot posts only where it is a member (a channel needs `can_post_messages`),
   edits and stops only its own messages and polls (in a channel, others' too with
   `can_edit_messages`), pins only with `can_pin_messages` (a channel's `can_edit_messages`), and
-  deletes others' messages only with `can_delete_messages`. Being added,
-  promoted or removed reaches that bot as `my_chat_member` and the chat's other bots as
-  `chat_member`; only the bot that sent a message hears its buttons pressed. Users write privately
-  only to the first bot, so no other bot can message them (403).
+  deletes others' messages only with `can_delete_messages`. A bot hears of its own status changing
+  as `my_chat_member`, whether the owner or another bot changed it; the chat's administrator bots
+  hear of it as `chat_member`. `can_be_edited` is true only for the bot that promoted that
+  administrator, and `getChatAdministrators` leaves out other bots unless `return_bots` is set. Only
+  the bot that sent a message hears its buttons pressed. Users write privately only to the first
+  bot, so no other bot can message them (403).
+- **Which chats a bot may use.** Checked before any method runs, as Telegram's Bot API server
+  does. A chat the bot was never in is `400 Bad Request: chat not found`. A bot kicked from a
+  supergroup or channel gets `403 Forbidden: bot was kicked from the supergroup chat` (or
+  `channel chat`) for every call, reads like `getChat` included, and one that left or was removed
+  gets `403 Forbidden: bot is not a member of the supergroup chat`. In a basic group, a bot that
+  left or was removed can still call `getChat`, `leaveChat` and `getChatMember` about itself; every
+  other call gets the `group chat` form of the same errors.
 - **Polls.** `sendPoll` needs a question and 1 to 12 options of up to 100 characters each. It
   keeps `is_anonymous`, `allows_multiple_answers`, `allows_revoting` (on by default for regular
   polls, off for quizzes), `members_only` (channels only), `is_closed`, `description` and an
@@ -277,12 +293,13 @@ The details a moderation bot depends on, each covered by a test:
   the older `correct_option_id`), and the bot that sent it sees them in the poll. `stopPoll` closes
   a poll once, and the bot then gets the closed poll as a `poll` update. Members do not vote.
 - **Forwards and copies.** A forward carries `forward_origin`; a copy does not. A forward of a
-  forward keeps the first origin and its date. A bot cannot forward from a chat it is not in.
-  Service messages can't be forwarded or copied (`the message can't be forwarded` / `copied`). A
-  send with `protect_content` has `has_protected_content`; it can't be forwarded, but the bot can
-  still copy it. One item of an album is forwarded or copied without its `media_group_id`. A copy's
-  `caption` replaces the original on media that takes one, formatted with `parse_mode` or
-  `caption_entities`, and an empty one removes it; a text message gets no caption.
+  forward keeps the first origin and its date. A bot cannot forward from a chat it is not in; the
+  source chat gets the same checks as above. Service messages can't be forwarded or copied
+  (`the message can't be forwarded` / `copied`). A send with `protect_content` has
+  `has_protected_content`; it can't be forwarded, but the bot can still copy it. One item of an
+  album is forwarded or copied without its `media_group_id`. A copy's `caption` replaces the
+  original on media that takes one, formatted with `parse_mode` or `caption_entities`, and an empty
+  one removes it; a text message gets no caption.
 - **Pins** ([unpinChatMessage](https://core.telegram.org/bots/api#unpinchatmessage)). Pinned
   messages are kept newest first by sending date. `getChat` returns the most recent one as
   `pinned_message`, in groups, channels and private chats, and `unpinChatMessage` without
@@ -303,13 +320,20 @@ The details a moderation bot depends on, each covered by a test:
   with `deleteMessageReaction` and `can_delete_messages`; `actor_chat_id` may stand in for
   `user_id`, though members here never react as a chat.
 - **Administrators and chat settings.** `promoteChatMember` needs `can_promote_members` and grants
-  only rights the bot holds; the bot can then edit and title the administrators it promoted.
+  only rights the bot holds; any one right makes an administrator, `can_send_welcome_messages`,
+  `can_manage_tags` and `can_manage_direct_messages` included, and a channel promotion grants
+  `can_restrict_members` unless the call says otherwise. The bot can then edit and title the
+  administrators it promoted. An administrator carries the rights its kind of chat has, as
+  Telegram writes them: `can_post_messages`, `can_edit_messages` and `can_manage_direct_messages`
+  in channels, `can_pin_messages` and `can_manage_tags` in groups, and `can_manage_topics` in
+  supergroups.
   `setChatTitle`, `setChatDescription`, `setChatPhoto` and `deleteChatPhoto` need `can_change_info`,
   refuse a change that changes nothing, and post Telegram's service messages to every bot in the
   chat, the bot that made the change included.
-- **Join request queries (Bot API 10.x).** A guard bot (`supportsJoinRequestQueries`) gets each join
-  request with a `query_id`, which it answers with `answerChatJoinRequestQuery`
-  (`chat_join_request_query_id`, `result`: `approve`, `decline` or `queue`).
+- **Join request queries (Bot API 10.x).** A guard bot (`supportsJoinRequestQueries`) with
+  `can_invite_users` gets each join request with a `query_id`, which it answers with
+  `answerChatJoinRequestQuery` (`chat_join_request_query_id`, `result`: `approve`, `decline` or
+  `queue`, in any case).
 - **Business connections** ([Bot API](https://core.telegram.org/bots/api#businessconnection),
   [connected business bots](https://core.telegram.org/api/bots/connected-business-bots)). An owner
   connects the bot to their account; the bot gets `business_connection` on every change, and
@@ -333,8 +357,8 @@ The details a moderation bot depends on, each covered by a test:
   [deep linking](https://core.telegram.org/bots/features#deep-linking)). With admin rights
   requested, only the creator or an administrator with `can_promote_members` may add it; without,
   anyone who can add members (`can_invite_users`). Otherwise the person gets `CHAT_ADMIN_REQUIRED`.
-  The bot gets `my_chat_member` from the person, the chat's other bots `chat_member`, all bots the
-  `new_chat_members` message, and then the person's `/start@<bot> <parameter>` with a
+  The bot gets `my_chat_member` from the person, the chat's administrator bots `chat_member`, all
+  bots the `new_chat_members` message, and then the person's `/start@<bot> <parameter>` with a
   `bot_command` entity, as `messages.startBot` posts. An administrator's existing rights are
   combined with the requested ones, and `/start` is still posted. Unverified: Telegram does not
   document whether `my_chat_member` or the `/start` message arrives first; this server sends
@@ -349,10 +373,15 @@ The details a moderation bot depends on, each covered by a test:
 - **Basic groups and the upgrade** ([migration](https://core.telegram.org/api/channel#migration)).
   A basic group has a negative id without the `-100` prefix. The creator or an administrator can
   upgrade it: a new supergroup takes its members, administrators and bots, the old chat posts
-  `migrate_to_chat_id` and the new one `migrate_from_chat_id`, and every later Bot API call to the
-  old id fails with `400 Bad Request: group chat was upgraded to a supergroup chat` and
-  `parameters.migrate_to_chat_id` ([ResponseParameters](https://core.telegram.org/bots/api#responseparameters)).
-  Unverified: whether bots also get `my_chat_member` on the upgrade; this server sends none.
+  `migrate_to_chat_id` and the new one `migrate_from_chat_id`. Later Bot API calls to the old id
+  fail with `400 Bad Request: group chat was upgraded to a supergroup chat` and
+  `parameters.migrate_to_chat_id` ([ResponseParameters](https://core.telegram.org/bots/api#responseparameters)),
+  except two: `getChat` still returns the old group, and `leaveChat` fails with
+  `400 Bad Request: chat is deactivated`. Unverified: Telegram's server raises the upgrade error
+  only for calls that write or read the member list, and what its other reads of the old id
+  (`getChatMember` about the bot itself, `setMessageReaction`, edits) answer is not documented, so
+  this server keeps the upgrade error for them. Also unverified: whether bots get
+  `my_chat_member` on the upgrade; this server sends none.
 - **People changing the chat.** A person with `can_change_info` renames the chat or sets its photo,
   with the same `new_chat_title` and `new_chat_photo` service messages as `setChatTitle` and
   `setChatPhoto`; `getChat` returns the title and a `ChatPhoto`, and `getFile` serves the photo.
@@ -580,10 +609,17 @@ field named like a session, token, hash, key, secret, password or phone is recor
 - `allowed_updates`, from `setWebhook` or `getUpdates`, is respected. As on Telegram,
   `chat_member`, `message_reaction` and `message_reaction_count` updates are only sent when
   explicitly requested.
+- Rights decide who hears what, as the [Update](https://core.telegram.org/bots/api#update) docs
+  say: `chat_member` and `message_reaction` reach only bots that are administrators in the chat,
+  and `chat_join_request` only bots with `can_invite_users`. A bot gets `my_chat_member` whenever
+  its own status changes, whoever changed it.
 - When the bot restricts, bans, unbans or approves a member, the server sends the resulting
   `chat_member` update back to the bot, as Telegram does. Nothing is sent when nothing changed.
 - Joining, leaving and an approved join request produce both a `chat_member` update and the
-  `new_chat_members` / `left_chat_member` service message.
+  `new_chat_members` / `left_chat_member` service message. A ban in a basic group also posts
+  `left_chat_member` from the bot that banned, which that bot receives too, as
+  [messages.deleteChatUser](https://core.telegram.org/method/messages.deleteChatUser) "sends a
+  service message". Unverified: whether a supergroup ban posts one; this server posts none.
 
 The fake delivers resulting updates asynchronously. Tests should wait for the exact update
 rather than depend on response/update ordering; the Bot API does not promise that ordering.
@@ -708,12 +744,17 @@ Uploaded documents preserve their original filename and MIME type when reused by
 
 ## Moderation fidelity and operation receipts
 
-Bans revoke only the target author's messages in the addressed chat. Revocation is
-mandatory in supergroups/channels; basic groups honor `revoke_messages`, including
-form-encoded `"true"`. `restrictChatMember` accepts supergroups only.
+A ban deletes no messages, as on Telegram: `revoke_messages` only decides what the
+removed user can still see, which this server does not model. A bot that wants a
+banned user's messages gone deletes them with `deleteMessage` or `deleteMessages`.
+`restrictChatMember` works only in supergroups, and `promoteChatMember` and
+`unbanChatMember` only in supergroups and channels.
 Restrict/ban/unban require `can_restrict_members` and protect
 administrators; approval/decline require `can_invite_users` before touching pending
-requests. Pending requests are not members. Unban leaves a banned user outside;
+requests. Refusals carry Telegram's own texts, such as `not enough rights to
+restrict/unrestrict chat member`, `method is available only in supergroups` or, for a
+basic group that only an administrator may remove members from, `CHAT_ADMIN_REQUIRED`.
+Pending requests are not members. Unban leaves a banned user outside;
 `only_if_banned` keeps an admitted user unchanged. Bulk deletion validates permissions
 before changing any existing target and skips missing message IDs. Deletion enforces
 the 48-hour limit, private dice minimum age, and undeletable creation service messages.
@@ -910,8 +951,9 @@ Existing `calls` retains its authenticated, parsed-request scope. New
 `afterSeq` is local to each journal; `requestId` is unique across both. A call
 wait without an outcome/stage can resolve at receipt, before execution.
 Unauthorized URL tokens are not journaled; malformed bodies
-are retained as `raw_body` and suppressed in diagnostics. Migrated-chat failures
-receive the same identity/timeline as other parsed calls. Owner RPCs retain their
+are retained as `raw_body` and suppressed in diagnostics. Calls refused for chat
+access (including an upgraded basic group) receive the same identity/timeline as
+other parsed calls. Owner RPCs retain their
 existing owner ledger and duration fields. Owner receipts now use fake time,
 start as `pending`, and become `cancelled` if shutdown interrupts a delay before
 execution. `getOwnerCalls()` is detached too. These are diagnostic outcomes of
@@ -938,8 +980,8 @@ that cost at first use; this is deferred work, not cheaper cryptography.
 
 The retained suites cover stored plain text versus original HTML/`parse_mode`,
 UTF-16 entities, literal user markup, emoji/nested/link/mention formatting,
-permissions and membership, join decisions, edit/delete, callbacks, mandatory
-supergroup ban revocation, mute history preservation, response-loss faults,
+permissions and membership, join decisions, edit/delete, callbacks, bans that
+leave messages in place, mute history preservation, response-loss faults,
 replay and bot/chat isolation. Contracts:
 [MessageEntity](https://core.telegram.org/bots/api#messageentity),
 [formatting](https://core.telegram.org/bots/api#formatting-options),

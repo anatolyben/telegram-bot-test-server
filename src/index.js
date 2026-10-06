@@ -77,9 +77,12 @@ const NO_GIFTS = Object.freeze({
 });
 
 /**
- * A ChatPermissions object as Telegram applies it: unspecified fields are
- * false, and unless use_independent_chat_permissions is set, the broader
- * permissions imply the narrower ones.
+ * A ChatPermissions object as Telegram's Bot API server reads it
+ * (get_chat_permissions): unspecified fields are false, except that
+ * can_manage_topics and can_edit_tag follow can_pin_messages and
+ * can_react_to_messages follows can_send_messages as passed; then, unless
+ * use_independent_chat_permissions is set, the broader permissions imply the
+ * narrower ones.
  */
 function normalizePermissions(input = {}, independent = false) {
   if (input === null || typeof input !== "object" || Array.isArray(input)) {
@@ -92,16 +95,19 @@ function normalizePermissions(input = {}, independent = false) {
   const result = Object.fromEntries(
     PERMISSION_KEYS.map((key) => [key, given(key)]),
   );
+  if (!("can_manage_topics" in input)) {
+    result.can_manage_topics = result.can_pin_messages;
+  }
+  if (!("can_edit_tag" in input)) result.can_edit_tag = result.can_pin_messages;
+  if (!("can_react_to_messages" in input)) {
+    result.can_react_to_messages = result.can_send_messages;
+  }
   if (!(independent === true || independent === "true")) {
     if (result.can_send_other_messages || result.can_add_web_page_previews) {
       for (const key of MEDIA_PERMISSIONS) result[key] = true;
     }
     if (result.can_send_polls) result.can_send_messages = true;
   }
-  if (!("can_react_to_messages" in input)) {
-    result.can_react_to_messages = result.can_send_messages;
-  }
-  if (!("can_edit_tag" in input)) result.can_edit_tag = result.can_pin_messages;
   return result;
 }
 // How long a webhook may take to answer before the update is given up on.
@@ -128,24 +134,49 @@ const OBJECT_PARAMS = new Set([
   "reaction",
 ]);
 
-// The administrator rights promoteChatMember sets.
+// The administrator rights promoteChatMember sets, in the order Telegram's
+// Bot API server writes them (json_store_administrator_rights).
 const ADMIN_RIGHTS = Object.freeze([
-  "is_anonymous",
   "can_manage_chat",
-  "can_delete_messages",
-  "can_manage_video_chats",
-  "can_restrict_members",
-  "can_promote_members",
   "can_change_info",
+  "can_post_messages",
+  "can_edit_messages",
+  "can_delete_messages",
   "can_invite_users",
+  "can_restrict_members",
+  "can_pin_messages",
+  "can_manage_topics",
+  "can_promote_members",
+  "can_manage_video_chats",
   "can_post_stories",
   "can_edit_stories",
   "can_delete_stories",
+  "can_manage_direct_messages",
+  "can_manage_tags",
+  "can_send_welcome_messages",
+  "is_anonymous",
+]);
+// Rights an administrator object has only in some kinds of chat.
+const CHANNEL_ONLY_RIGHTS = Object.freeze([
   "can_post_messages",
   "can_edit_messages",
-  "can_pin_messages",
-  "can_manage_topics",
+  "can_manage_direct_messages",
 ]);
+const GROUP_ONLY_RIGHTS = Object.freeze([
+  "can_pin_messages",
+  "can_manage_tags",
+]);
+// What an administrator the owner appointed may do unless told otherwise.
+const OWNER_ADMIN_RIGHTS = Object.freeze({
+  can_manage_chat: true,
+  can_change_info: true,
+  can_post_messages: true,
+  can_edit_messages: true,
+  can_delete_messages: true,
+  can_invite_users: true,
+  can_restrict_members: true,
+  can_pin_messages: true,
+});
 
 const CHAT_ACTIONS = new Set([
   "typing",
@@ -831,25 +862,50 @@ export async function startTestServer({
         nextMessageId: 1,
       });
     }
-    return privateChats.get(id);
+    const chat = privateChats.get(id);
+    // The user opened it, so it no longer depends on a join request.
+    delete chat.contactOnly;
+    return chat;
   }
 
   /**
    * The chat a Bot API call addresses. A bot cannot open a private chat: it
-   * can only write to users who have messaged it first, as on Telegram.
+   * can only write to users who have messaged it first, as on Telegram, or,
+   * for a send (`sender`), to someone whose join request it may answer.
    */
-  function botChat(chatId) {
+  function botChat(chatId, sender = null) {
     const id = Number(chatId);
     if (chats.has(id)) return chats.get(id);
     if (privateChats.has(id)) return privateChats.get(id);
     const user = users.get(id);
     if (user && !user.is_bot) {
+      if (sender && joinRequestContact(id, sender)) {
+        const chat = messageChat(id);
+        chat.contactOnly = true;
+        return chat;
+      }
       throw new TelegramError(
         403,
         "Forbidden: bot can't initiate conversation with a user",
       );
     }
     throw new TelegramError(400, "Bad Request: chat not found");
+  }
+
+  /**
+   * Whether the bot may message a user through ChatJoinRequest.user_chat_id:
+   * "for 5 minutes ... until the join request is processed", in a chat where
+   * it receives join requests.
+   */
+  function joinRequestContact(userId, record) {
+    return [...chats.values()].some((chat) => {
+      const request = chat.joinRequests.get(Number(userId));
+      return (
+        request != null &&
+        now() < request.date + 300 &&
+        receives(chat, record, "chat_join_request")
+      );
+    });
   }
 
   function requireUser(userId) {
@@ -895,51 +951,34 @@ export async function startTestServer({
     return member;
   }
 
-  function chatMemberObject(chat, userId) {
+  /** The member's ChatMember object, as the given bot sees it. */
+  function chatMemberObject(chat, userId, viewer = null) {
+    return memberObject(chat, userId, memberStatus(chat, userId), viewer);
+  }
+
+  /**
+   * A ChatMember object for one state of a member. can_be_edited belongs to
+   * the bot that asks: only the bot that promoted an administrator may edit it.
+   */
+  function memberObject(chat, userId, member, viewer = null) {
     const user = requireUser(userId);
-    const member = memberStatus(chat, userId);
     const base = { user: userObject(user), status: member.status };
     if (member.status === "administrator") {
-      // A channel administrator posts and edits; a group administrator pins.
-      const rights =
+      // A channel administrator posts and edits; a group administrator pins,
+      // and only a supergroup has topics.
+      const granted = { ...OWNER_ADMIN_RIGHTS, ...(member.rights ?? {}) };
+      const rights = ADMIN_RIGHTS.filter((right) =>
         chat.type === "channel"
-          ? {
-              can_manage_chat: true,
-              can_delete_messages: true,
-              can_restrict_members: true,
-              can_promote_members: false,
-              can_change_info: true,
-              can_invite_users: true,
-              can_post_messages: true,
-              can_edit_messages: true,
-              can_post_stories: false,
-              can_edit_stories: false,
-              can_delete_stories: false,
-              can_manage_video_chats: false,
-            }
-          : {
-              can_manage_chat: true,
-              can_delete_messages: true,
-              can_restrict_members: true,
-              can_promote_members: false,
-              can_change_info: true,
-              can_invite_users: true,
-              can_pin_messages: true,
-              can_post_stories: false,
-              can_edit_stories: false,
-              can_delete_stories: false,
-              can_manage_video_chats: false,
-              can_manage_topics: false,
-              can_send_welcome_messages: false,
-            };
+          ? !GROUP_ONLY_RIGHTS.includes(right) && right !== "can_manage_topics"
+          : !CHANNEL_ONLY_RIGHTS.includes(right) &&
+            (right !== "can_manage_topics" || chat.type === "supergroup"),
+      );
       return {
         ...base,
-        // A bot can edit the administrators it promoted.
-        can_be_edited: member.promotedBy != null,
-        is_anonymous: false,
-        ...rights,
-        // Rights the owner granted or withheld when promoting.
-        ...(member.rights ?? {}),
+        can_be_edited: viewer != null && member.promotedBy === viewer.id,
+        ...Object.fromEntries(
+          rights.map((right) => [right, granted[right] === true]),
+        ),
         ...(member.customTitle ? { custom_title: member.customTitle } : {}),
       };
     }
@@ -980,23 +1019,28 @@ export async function startTestServer({
       : "supergroup";
   }
 
-  /** Refuse a bot's send the way Telegram does when it may not post there. */
-  function requireCanSend(chat, caller) {
-    // A private chat here is with the first bot: users write only to it, and
-    // no other bot may message someone who never wrote to that bot.
-    if (chat.type === "private") {
-      // A business connection gives its bot the owner's private chat
-      // (BusinessConnection.user_chat_id).
-      if (caller.id !== bot.id && !chat.openTo?.has(caller.id)) {
-        throw new TelegramError(
-          403,
-          "Forbidden: bot can't initiate conversation with a user",
-        );
-      }
-      return;
+  /**
+   * Refuse a call to a group or channel the way Telegram's Bot API server does
+   * before any method runs (Client.cpp check_chat_access): a chat the bot was
+   * never in is not found; a bot kicked from or no longer in a supergroup or
+   * channel is refused even reads; in a basic group a bot that left or was
+   * removed may still read the chat and its own status (`readOnly`), but
+   * nothing else. An upgraded basic group answers with the new chat id; only
+   * getChat and leaveChat get past that (`readsUpgraded`).
+   */
+  function checkChatAccess(chat, caller, { readOnly, readsUpgraded }) {
+    if (!chat.members.has(caller.id)) {
+      throw new TelegramError(400, "Bad Request: chat not found");
     }
-    const member = memberStatus(chat, caller.id);
-    if (member.status === "kicked") {
+    if (chat.migratedTo != null && !readsUpgraded) {
+      throw new TelegramError(
+        400,
+        "Bad Request: group chat was upgraded to a supergroup chat",
+        { migrate_to_chat_id: chat.migratedTo },
+      );
+    }
+    if (chat.type === "group" && readOnly) return;
+    if (memberStatus(chat, caller.id).status === "kicked") {
       throw new TelegramError(
         403,
         `Forbidden: bot was kicked from the ${chatKind(chat)} chat`,
@@ -1008,6 +1052,27 @@ export async function startTestServer({
         `Forbidden: bot is not a member of the ${chatKind(chat)} chat`,
       );
     }
+  }
+
+  /** Refuse a bot's send the way Telegram does when it may not post there. */
+  function requireCanSend(chat, caller) {
+    // A private chat here is with the first bot: users write only to it, and
+    // no other bot may message someone who never wrote to that bot.
+    if (chat.type === "private") {
+      if (joinRequestContact(chat.id, caller)) return;
+      // A business connection gives its bot the owner's private chat
+      // (BusinessConnection.user_chat_id).
+      if (
+        caller.id === bot.id ? chat.contactOnly : !chat.openTo?.has(caller.id)
+      ) {
+        throw new TelegramError(
+          403,
+          "Forbidden: bot can't initiate conversation with a user",
+        );
+      }
+      return;
+    }
+    const member = memberStatus(chat, caller.id);
     if (
       chat.type === "channel" &&
       !hasRight(chat, caller.id, "can_post_messages")
@@ -1039,12 +1104,6 @@ export async function startTestServer({
   /** A group pins with can_pin_messages, a channel with can_edit_messages. */
   function requirePinRights(chat, caller) {
     if (chat.type === "private") return;
-    if (!isInChat(chat, caller.id)) {
-      throw new TelegramError(
-        403,
-        `Forbidden: bot is not a member of the ${chatKind(chat)} chat`,
-      );
-    }
     const right =
       chat.type === "channel" ? "can_edit_messages" : "can_pin_messages";
     if (!hasRight(chat, caller.id, right)) {
@@ -1086,9 +1145,20 @@ export async function startTestServer({
     return chat.permissions[permission] === true;
   }
 
-  function requireRight(chat, caller, right) {
+  /** promoteChatMember and unbanChatMember work only there. */
+  function requireSupergroupOrChannel(chat) {
+    if (chat.type === "group") {
+      throw new TelegramError(
+        400,
+        "Bad Request: method is available only in supergroup and channel chats",
+      );
+    }
+  }
+
+  /** Refuse a bot without the right, with the text TDLib gives for the call. */
+  function requireRight(chat, caller, right, description) {
     if (!hasRight(chat, caller.id, right)) {
-      throw new TelegramError(400, "Bad Request: not enough rights");
+      throw new TelegramError(400, `Bad Request: ${description}`);
     }
   }
 
@@ -1110,12 +1180,6 @@ export async function startTestServer({
       throw new TelegramError(400, "Bad Request: message can't be deleted");
     }
     if (chat.type === "private") return;
-    if (!isInChat(chat, caller.id)) {
-      throw new TelegramError(
-        403,
-        `Forbidden: bot is not a member of the ${chatKind(chat)} chat`,
-      );
-    }
     const own = entry.author === caller.id;
     const allowed =
       hasRight(chat, caller.id, "can_delete_messages") ||
@@ -1136,7 +1200,16 @@ export async function startTestServer({
     if (Number(userId) === caller.id && self) {
       throw new TelegramError(400, `Bad Request: ${self}`);
     }
-    requireRight(chat, caller, "can_restrict_members");
+    // A basic group removes members through messages.deleteChatUser, which
+    // answers a non-administrator with CHAT_ADMIN_REQUIRED.
+    requireRight(
+      chat,
+      caller,
+      "can_restrict_members",
+      chat.type === "group"
+        ? "CHAT_ADMIN_REQUIRED"
+        : "not enough rights to restrict/unrestrict chat member",
+    );
     const status = memberStatus(chat, userId).status;
     if (status === "creator") {
       throw new TelegramError(400, "Bad Request: can't remove chat owner");
@@ -1250,10 +1323,16 @@ export async function startTestServer({
     };
   }
 
-  /** Send a chat_member update only when the member actually changed. */
+  /**
+   * Send a chat_member update only when the member actually changed. `before`
+   * is the member's state from memberStatus; a change stores a new state.
+   */
   function memberChanged(chat, userId, before, actor, extra) {
     const after = chatMemberObject(chat, userId);
-    if (JSON.stringify(before) === JSON.stringify(after))
+    if (
+      JSON.stringify(memberObject(chat, userId, before)) ===
+      JSON.stringify(after)
+    )
       return Promise.resolve();
     scheduleExpiry(chat, userId);
     appliedCheckpoint();
@@ -1289,16 +1368,35 @@ export async function startTestServer({
     const chat = chatId == null ? null : chats.get(Number(chatId));
     const kind =
       chat?.type === "channel" ? (CHANNEL_UPDATES[type] ?? type) : type;
-    const recipients =
+    const recipients = (
       to ??
       (chat
         ? [...bots.values()].filter(
             (record) => record.id !== except && isInChat(chat, record.id),
           )
-        : [bot]);
+        : [bot])
+    ).filter((record) => !chat || receives(chat, record, type));
     return Promise.all(
       recipients.map((record) => emitTo(record, kind, payload)),
     );
+  }
+
+  /**
+   * Whether a bot's rights in the chat let it receive this update type: only
+   * administrators get chat_member and message_reaction, and only bots with
+   * can_invite_users get chat_join_request
+   * (https://core.telegram.org/bots/api#update).
+   */
+  function receives(chat, record, type) {
+    if (type === "chat_member" || type === "message_reaction") {
+      return ["administrator", "creator"].includes(
+        memberStatus(chat, record.id).status,
+      );
+    }
+    if (type === "chat_join_request") {
+      return hasRight(chat, record.id, "can_invite_users");
+    }
+    return true;
   }
 
   /**
@@ -1408,45 +1506,50 @@ export async function startTestServer({
     return record.delivery;
   }
 
+  /**
+   * Tell the bots that a member changed from `before` (a memberStatus state):
+   * a bot hears of its own membership through my_chat_member, whoever changed
+   * it, and the chat's other bots through chat_member, each with its own
+   * can_be_edited.
+   */
   function emitMemberChange(chat, userId, before, actor, extra = {}) {
-    return emit(
-      "chat_member",
-      {
-        chat: chatObject(chat),
-        from: userObject(actor),
-        date: now(),
-        old_chat_member: before,
-        new_chat_member: chatMemberObject(chat, userId),
-        ...extra,
-      },
-      // A bot hears of its own membership through my_chat_member alone.
-      { except: users.get(Number(userId))?.is_bot ? Number(userId) : null },
+    waits.notify();
+    const change = (viewer) => ({
+      chat: chatObject(chat),
+      from: userObject(actor),
+      date: now(),
+      old_chat_member: memberObject(chat, userId, before, viewer),
+      new_chat_member: chatMemberObject(chat, userId, viewer),
+      ...extra,
+    });
+    const target = [...bots.values()].find(
+      (record) => record.id === Number(userId),
     );
+    const others = [...bots.values()].filter(
+      (record) =>
+        record !== target &&
+        isInChat(chat, record.id) &&
+        receives(chat, record, "chat_member"),
+    );
+    return Promise.all([
+      ...(target ? [emitTo(target, "my_chat_member", change(target))] : []),
+      ...others.map((record) => emitTo(record, "chat_member", change(record))),
+    ]);
   }
 
   /**
    * Someone adds, promotes, demotes or removes a bot. Telegram tells that bot
-   * through my_chat_member, the chat's other bots through chat_member, and a
-   * group's members through a service message.
+   * through my_chat_member, the chat's administrator bots through chat_member,
+   * and a group's members through a service message.
    */
   async function setBotMembership(chat, record, { status, rights, actor }) {
-    const before = chatMemberObject(chat, record.id);
+    const before = memberStatus(chat, record.id);
     const wasIn = isInChat(chat, record.id);
     const botsBefore = botsIn(chat);
-    if (status === "left") chat.members.delete(record.id);
-    else chat.members.set(record.id, { status, ...(rights ? { rights } : {}) });
+    chat.members.set(record.id, { status, ...(rights ? { rights } : {}) });
     const after = chatMemberObject(chat, record.id);
     appliedCheckpoint();
-    waits.notify();
-    const change = {
-      chat: chatObject(chat),
-      from: userObject(actor),
-      date: now(),
-      old_chat_member: before,
-      new_chat_member: after,
-    };
-    await emitTo(record, "my_chat_member", change);
-    await emit("chat_member", change, { except: record.id });
+    await emitMemberChange(chat, record.id, before, actor);
     const isIn = isInChat(chat, record.id);
     if (chat.type !== "channel" && wasIn !== isIn) {
       const service = addMessage(
@@ -1979,7 +2082,10 @@ export async function startTestServer({
         return {
           ...chatObject(chat),
           ...(pinned ? { pinned_message: pinnedMessage(pinned.message) } : {}),
-          permissions: { ...chat.permissions },
+          // Default member permissions are for groups and supergroups only.
+          ...(chat.type !== "channel"
+            ? { permissions: { ...chat.permissions } }
+            : {}),
           ...(chat.description ? { description: chat.description } : {}),
           // The bot's own primary link, while it may manage invite links.
           ...(hasRight(chat, caller.id, "can_invite_users")
@@ -2031,12 +2137,18 @@ export async function startTestServer({
         accepted_gift_types: { ...NO_GIFTS },
       };
     },
-    getChatMember: (p) => chatMemberObject(requireChat(p.chat_id), p.user_id),
-    getChatAdministrators: (p) => {
+    getChatMember: (p, caller) =>
+      chatMemberObject(requireChat(p.chat_id), p.user_id, caller),
+    // Other bots are left out unless return_bots is set.
+    getChatAdministrators: (p, caller) => {
       const chat = requireChat(p.chat_id);
       return [...chat.members.entries()]
         .filter(([, m]) => ["creator", "administrator"].includes(m.status))
-        .map(([id]) => chatMemberObject(chat, id));
+        .filter(
+          ([id]) =>
+            isTrue(p.return_bots) || id === caller.id || !users.get(id)?.is_bot,
+        )
+        .map(([id]) => chatMemberObject(chat, id, caller));
     },
     getChatMemberCount: (p) => {
       const chat = requireChat(p.chat_id);
@@ -2362,13 +2474,18 @@ export async function startTestServer({
     },
     setChatPermissions: (p, caller) => {
       const chat = requireChat(p.chat_id);
-      if (!["group", "supergroup"].includes(chat.type)) {
+      if (chat.type === "channel") {
         throw new TelegramError(
           400,
-          "Bad Request: setChatPermissions requires a group or supergroup",
+          "Bad Request: can't change channel chat permissions",
         );
       }
-      requireRight(chat, caller, "can_restrict_members");
+      requireRight(
+        chat,
+        caller,
+        "can_restrict_members",
+        "not enough rights to change chat permissions",
+      );
       chat.permissions = normalizePermissions(
         p.permissions,
         p.use_independent_chat_permissions,
@@ -2377,6 +2494,10 @@ export async function startTestServer({
     },
     leaveChat: async (p, caller) => {
       const chat = requireChat(p.chat_id);
+      // TDLib refuses to leave a basic group that was upgraded.
+      if (chat.migratedTo != null) {
+        throw new TelegramError(400, "Bad Request: chat is deactivated");
+      }
       if (isInChat(chat, caller.id)) {
         await setBotMembership(chat, caller, { status: "left", actor: caller });
       }
@@ -2426,14 +2547,13 @@ export async function startTestServer({
       if (chat.type !== "supergroup") {
         throw new TelegramError(
           400,
-          "Bad Request: restrictChatMember requires a supergroup",
+          "Bad Request: method is available only in supergroups",
         );
       }
       const userId = Number(p.user_id);
       requireUser(userId);
       assertCanModerate(chat, userId, { self: "can't restrict self", caller });
-      const before = chatMemberObject(chat, userId);
-      const current = memberStatus(chat, userId);
+      const before = memberStatus(chat, userId);
       const permissions = normalizePermissions(
         p.permissions,
         p.use_independent_chat_permissions,
@@ -2441,7 +2561,7 @@ export async function startTestServer({
       const inChat = isInChat(chat, userId);
       // Passing every permission as true lifts the restriction.
       if (PERMISSION_KEYS.every((key) => permissions[key])) {
-        if (current.status === "restricted") {
+        if (before.status === "restricted") {
           chat.members.set(userId, { status: inChat ? "member" : "left" });
         }
       } else {
@@ -2460,32 +2580,44 @@ export async function startTestServer({
       const userId = Number(p.user_id);
       requireUser(userId);
       assertCanModerate(chat, userId, { caller });
-      const before = chatMemberObject(chat, userId);
+      const before = memberStatus(chat, userId);
+      const wasIn = isInChat(chat, userId);
+      const botsBefore = botsIn(chat);
       chat.members.set(userId, {
         status: "kicked",
         until_date: ["supergroup", "channel"].includes(chat.type)
           ? restrictionUntil(p.until_date)
           : 0,
       });
-      if (
-        ["supergroup", "channel"].includes(chat.type) ||
-        isTrue(p.revoke_messages)
-      ) {
-        for (const entry of chat.messages.values()) {
-          if (Number(entry.message.from?.id) === userId) entry.deleted = true;
-        }
-      }
+      // revoke_messages decides what the removed user can still see; a ban
+      // deletes nothing for the chat's other members (only deleteMessage does).
       memberChanged(chat, userId, before, caller);
+      // A basic group removes the member with messages.deleteChatUser, which
+      // "sends a service message on it"; a removed bot hears of it too.
+      if (chat.type === "group" && wasIn) {
+        emit(
+          "message",
+          addMessage(chat, caller, {
+            left_chat_member: userObject(requireUser(userId)),
+          }),
+          { to: [...new Set([...botsBefore, ...botsIn(chat)])] },
+        );
+      }
       return true;
     },
     unbanChatMember: (p, caller) => {
       const chat = requireChat(p.chat_id);
-      requireRight(chat, caller, "can_restrict_members");
+      requireSupergroupOrChannel(chat);
+      requireRight(
+        chat,
+        caller,
+        "can_restrict_members",
+        "not enough rights to restrict/unrestrict chat member",
+      );
       const userId = Number(p.user_id);
       requireUser(userId);
-      const current = memberStatus(chat, userId);
-      const before = chatMemberObject(chat, userId);
-      if (current.status === "kicked") {
+      const before = memberStatus(chat, userId);
+      if (before.status === "kicked") {
         chat.members.set(userId, { status: "left" });
       } else if (isTrue(p.only_if_banned)) {
         return true;
@@ -2493,9 +2625,9 @@ export async function startTestServer({
         // Without only_if_banned, Telegram guarantees the user is not a member
         // afterwards: a current member is removed, keeping any restriction.
         assertCanModerate(chat, userId, { caller });
-        if (current.status === "restricted") {
-          chat.members.set(userId, { ...current, is_member: false });
-        } else if (current.status === "member") {
+        if (before.status === "restricted") {
+          chat.members.set(userId, { ...before, is_member: false });
+        } else if (before.status === "member") {
           chat.members.set(userId, { status: "left" });
         }
       }
@@ -2504,7 +2636,12 @@ export async function startTestServer({
     },
     approveChatJoinRequest: (p, caller) => {
       const chat = requireChat(p.chat_id);
-      requireRight(chat, caller, "can_invite_users");
+      requireRight(
+        chat,
+        caller,
+        "can_invite_users",
+        "not enough rights to manage chat join requests",
+      );
       const userId = Number(p.user_id);
       if (!chat.joinRequests.has(userId)) {
         throw new TelegramError(400, "Bad Request: HIDE_REQUESTER_MISSING");
@@ -2515,7 +2652,7 @@ export async function startTestServer({
         state: "approved",
         botId: caller.id,
       });
-      const before = chatMemberObject(chat, userId);
+      const before = memberStatus(chat, userId);
       admit(chat, userId);
       // via_join_request is only for requests made without an invite link;
       // every request here came through one, so the link is reported instead.
@@ -2533,7 +2670,12 @@ export async function startTestServer({
     },
     declineChatJoinRequest: (p, caller) => {
       const chat = requireChat(p.chat_id);
-      requireRight(chat, caller, "can_invite_users");
+      requireRight(
+        chat,
+        caller,
+        "can_invite_users",
+        "not enough rights to manage chat join requests",
+      );
       const userId = Number(p.user_id);
       if (!chat.joinRequests.delete(userId)) {
         throw new TelegramError(400, "Bad Request: HIDE_REQUESTER_MISSING");
@@ -2615,7 +2757,7 @@ export async function startTestServer({
       });
     },
     sendChatAction: (p, caller) => {
-      const chat = botChat(p.chat_id);
+      const chat = botChat(p.chat_id, caller);
       if (!CHAT_ACTIONS.has(p.action)) {
         throw new TelegramError(
           400,
@@ -2650,7 +2792,7 @@ export async function startTestServer({
           );
         }
       }
-      const chat = botChat(p.chat_id);
+      const chat = botChat(p.chat_id, caller);
       requireCanSend(chat, caller);
       // Telegram parses every InputMedia caption before issuing an album send.
       const prepared = items.map((item) => {
@@ -2709,6 +2851,7 @@ export async function startTestServer({
     },
     promoteChatMember: async (p, caller) => {
       const chat = requireChat(p.chat_id);
+      requireSupergroupOrChannel(chat);
       const userId = Number(p.user_id);
       requireUser(userId);
       if (!hasRight(chat, caller.id, "can_promote_members")) {
@@ -2730,6 +2873,15 @@ export async function startTestServer({
       const rights = Object.fromEntries(
         ADMIN_RIGHTS.map((right) => [right, isTrue(p[right])]),
       );
+      // "For backward compatibility, defaults to True for promotions of
+      // channel administrators."
+      if (
+        chat.type === "channel" &&
+        Object.values(rights).some(Boolean) &&
+        p.can_restrict_members === undefined
+      ) {
+        rights.can_restrict_members = true;
+      }
       for (const [right, granted] of Object.entries(rights)) {
         if (
           granted &&
@@ -2740,7 +2892,6 @@ export async function startTestServer({
           throw new TelegramError(400, "Bad Request: RIGHT_FORBIDDEN");
         }
       }
-      const before = chatMemberObject(chat, userId);
       if (Object.values(rights).some(Boolean)) {
         // Any right implies can_manage_chat, as on Telegram.
         chat.members.set(userId, {
@@ -2751,40 +2902,55 @@ export async function startTestServer({
       } else {
         chat.members.set(userId, { status: "member" });
       }
-      await memberChanged(chat, userId, before, caller);
+      await memberChanged(chat, userId, current, caller);
       return true;
     },
     setChatAdministratorCustomTitle: async (p, caller) => {
       const chat = requireChat(p.chat_id);
+      if (chat.type === "channel") {
+        throw new TelegramError(
+          400,
+          "Bad Request: method is available only in groups and supergroups",
+        );
+      }
       const userId = Number(p.user_id);
       const member = memberStatus(chat, userId);
-      if (
-        member.status !== "administrator" ||
-        member.promotedBy !== caller.id
-      ) {
+      if (member.status === "creator") {
+        throw new TelegramError(
+          400,
+          "Bad Request: only the owner can edit their custom title",
+        );
+      }
+      if (member.status !== "administrator") {
+        throw new TelegramError(
+          400,
+          "Bad Request: user is not an administrator",
+        );
+      }
+      if (member.promotedBy !== caller.id) {
         throw new TelegramError(
           400,
           "Bad Request: not enough rights to change custom title of the user",
         );
       }
+      // Telegram's server renames the RANK_* errors for this method.
       const title = String(p.custom_title ?? "");
       if (/\p{Extended_Pictographic}/u.test(title)) {
         throw new TelegramError(
           400,
-          "Bad Request: ADMIN_RANK_EMOJI_NOT_ALLOWED",
+          "Bad Request: CUSTOM_TITLE_EMOJI_NOT_ALLOWED",
         );
       }
       if ([...title].length > 16) {
-        throw new TelegramError(400, "Bad Request: ADMIN_RANK_INVALID");
+        throw new TelegramError(400, "Bad Request: CUSTOM_TITLE_INVALID");
       }
-      const before = chatMemberObject(chat, userId);
       chat.members.set(userId, { ...member, customTitle: title || undefined });
-      await memberChanged(chat, userId, before, caller);
+      await memberChanged(chat, userId, member, caller);
       return true;
     },
     setChatTitle: (p, caller) => {
       const chat = requireChat(p.chat_id);
-      requireInfoRight(chat, caller, "title");
+      requireInfoRight(chat, caller, "change chat title");
       const title = String(p.title ?? "").trim();
       if (!title || title.length > 128) {
         throw new TelegramError(400, "Bad Request: chat title can't be empty");
@@ -2801,7 +2967,7 @@ export async function startTestServer({
     },
     setChatDescription: (p, caller) => {
       const chat = requireChat(p.chat_id);
-      requireInfoRight(chat, caller, "description");
+      requireInfoRight(chat, caller, "set chat description");
       const description = String(p.description ?? "");
       if (description.length > 255) {
         throw new TelegramError(
@@ -2820,7 +2986,7 @@ export async function startTestServer({
     },
     setChatPhoto: (p, caller) => {
       const chat = requireChat(p.chat_id);
-      requireInfoRight(chat, caller, "photo");
+      requireInfoRight(chat, caller, "change chat photo");
       if (!Buffer.isBuffer(p.photo)) {
         throw new TelegramError(
           400,
@@ -2836,7 +3002,7 @@ export async function startTestServer({
     },
     deleteChatPhoto: (p, caller) => {
       const chat = requireChat(p.chat_id);
-      requireInfoRight(chat, caller, "photo");
+      requireInfoRight(chat, caller, "change chat photo");
       if (!chat.photo) {
         throw new TelegramError(400, "Bad Request: CHAT_NOT_MODIFIED");
       }
@@ -2968,6 +3134,16 @@ export async function startTestServer({
     // A guard bot answers a join request query: approve, decline, or leave it
     // to the other administrators.
     answerChatJoinRequestQuery: (p, caller) => {
+      // The result is read trimmed and lower-cased, before the query id.
+      const result = String(p.result ?? "")
+        .trim()
+        .toLowerCase();
+      if (!["approve", "decline", "queue"].includes(result)) {
+        throw new TelegramError(
+          400,
+          "Bad Request: invalid query result specified",
+        );
+      }
       const id = String(p.chat_join_request_query_id ?? "");
       const query = joinQueries.get(id);
       if (!query || query.botId !== caller.id) {
@@ -2976,18 +3152,10 @@ export async function startTestServer({
           "Bad Request: query is too old and response timeout expired or query ID is invalid",
         );
       }
-      if (!["approve", "decline", "queue"].includes(p.result)) {
-        throw new TelegramError(
-          400,
-          'Bad Request: result must be "approve", "decline" or "queue"',
-        );
-      }
       joinQueries.delete(id);
       const target = { chat_id: query.chatId, user_id: query.userId };
-      if (p.result === "approve")
-        methods.approveChatJoinRequest(target, caller);
-      if (p.result === "decline")
-        methods.declineChatJoinRequest(target, caller);
+      if (result === "approve") methods.approveChatJoinRequest(target, caller);
+      if (result === "decline") methods.declineChatJoinRequest(target, caller);
       return true;
     },
     // Revokes a link the bot created; a revoked primary link is replaced by
@@ -3009,6 +3177,14 @@ export async function startTestServer({
       return { ...invite };
     },
   };
+
+  // Methods that only read the chat they name (Client.cpp AccessRights::Read),
+  // besides getChatMember about the bot itself.
+  const READ_ONLY_METHODS = new Set([
+    "getchat",
+    "leavechat",
+    "setmessagereaction",
+  ]);
 
   const methodsByLowerName = new Map(
     Object.entries(methods).map(([name, handler]) => [
@@ -3083,7 +3259,7 @@ export async function startTestServer({
     const keyboard = isReplyKeyboard(p.reply_markup);
     const markup = keyboard ? undefined : inlineMarkup(p.reply_markup);
     const ephemeral = p.ephemeral_message_parameters;
-    const chat = botChat(p.chat_id);
+    const chat = botChat(p.chat_id, caller);
     requireCanSend(chat, caller);
     requireTopic(chat, p.message_thread_id);
     const receiver =
@@ -3523,13 +3699,14 @@ export async function startTestServer({
   }
 
   /** Changing a chat's title, description or photo needs can_change_info. */
-  function requireInfoRight(chat, caller, what) {
-    if (!hasRight(chat, caller.id, "can_change_info")) {
-      throw new TelegramError(
-        400,
-        `Bad Request: not enough rights to change chat ${what}`,
-      );
-    }
+  /** `change` names the call in TDLib's text, e.g. "change chat title". */
+  function requireInfoRight(chat, caller, change) {
+    requireRight(
+      chat,
+      caller,
+      "can_change_info",
+      `not enough rights to ${change}`,
+    );
   }
 
   // ── Business connections ────────────────────────────────────────────────
@@ -3796,6 +3973,9 @@ export async function startTestServer({
    */
   function forwardable(p, caller, copy) {
     const sourceChat = botChat(p.from_chat_id);
+    if (sourceChat.type !== "private") {
+      checkChatAccess(sourceChat, caller, { readOnly: true });
+    }
     const entry = sourceChat.messages.get(Number(p.message_id));
     if (
       !entry ||
@@ -4248,7 +4428,7 @@ export async function startTestServer({
           .map((entry) => ({ exists: true, ...entry })),
       };
     }
-    const member = chatMemberObject(chat, condition.userId);
+    const member = chatMemberObject(chat, condition.userId, bot);
     if (condition.kind === "member") {
       const matched =
         member.status === condition.status &&
@@ -4850,7 +5030,7 @@ export async function startTestServer({
           : { exists: false, deleted: false };
       }
       if (sub === "members" && method === "GET" && subId) {
-        return chatMemberObject(chat, subId);
+        return chatMemberObject(chat, subId, bot);
       }
       if (sub === "topics") {
         if (!chat.topics) {
@@ -5165,9 +5345,13 @@ export async function startTestServer({
         ...(user.bio ? { bio: user.bio } : {}),
         invite_link: { ...invite },
       };
-      // A guard bot in the chat gets the request as a query to answer.
+      // A guard bot in the chat gets the request as a query to answer. Only
+      // bots with can_invite_users receive join requests at all.
       const guard = [...bots.values()].find(
-        (record) => record.joinRequestQueries && isInChat(chat, record.id),
+        (record) =>
+          record.joinRequestQueries &&
+          isInChat(chat, record.id) &&
+          receives(chat, record, "chat_join_request"),
       );
       const others = [...bots.values()].filter(
         (record) => record !== guard && isInChat(chat, record.id),
@@ -5188,7 +5372,7 @@ export async function startTestServer({
       await emit("chat_join_request", request, { to: others });
       return { status: "requested" };
     }
-    const before = chatMemberObject(chat, user.id);
+    const before = memberStatus(chat, user.id);
     admit(chat, user.id, invite?.invite_link);
     await emitMemberChange(chat, user.id, before, user, {
       ...(invite ? { invite_link: { ...invite } } : {}),
@@ -5204,12 +5388,11 @@ export async function startTestServer({
     const user = requireUser(userId);
     if (!isInChat(chat, userId))
       return { status: memberStatus(chat, userId).status };
-    const before = chatMemberObject(chat, userId);
-    const current = memberStatus(chat, userId);
+    const before = memberStatus(chat, userId);
     chat.members.set(
       user.id,
-      current.status === "restricted"
-        ? { ...current, is_member: false }
+      before.status === "restricted"
+        ? { ...before, is_member: false }
         : { status: "left" },
     );
     await emitMemberChange(chat, user.id, before, user);
@@ -5352,23 +5535,14 @@ export async function startTestServer({
     const before = entry.reactions.get(user.id) ?? [];
     if (emojis.length) entry.reactions.set(user.id, emojis);
     else entry.reactions.delete(user.id);
-    const admins = [...bots.values()].filter((record) =>
-      ["administrator", "creator"].includes(
-        memberStatus(chat, record.id).status,
-      ),
-    );
-    await emit(
-      "message_reaction",
-      {
-        chat: chatObject(chat),
-        message_id: entry.message.message_id,
-        user: userObject(user),
-        date: now(),
-        old_reaction: reactionList(before),
-        new_reaction: reactionList(emojis),
-      },
-      { to: admins },
-    );
+    await emit("message_reaction", {
+      chat: chatObject(chat),
+      message_id: entry.message.message_id,
+      user: userObject(user),
+      date: now(),
+      old_reaction: reactionList(before),
+      new_reaction: reactionList(emojis),
+    });
     return { reactions: Object.fromEntries(entry.reactions) };
   }
 
@@ -5981,33 +6155,48 @@ ${buttons}
         });
         return;
       }
-      // A basic group upgraded to a supergroup answers every call with the new
-      // id in ResponseParameters.migrate_to_chat_id.
+      // Bot API method names are case-insensitive.
+      const lowerMethod = method.toLowerCase();
+      const handler = methodsByLowerName.get(lowerMethod);
+      // The chat a method names must be one the bot may use, as Telegram's
+      // server checks first; an upgraded basic group answers with the new id
+      // in ResponseParameters.migrate_to_chat_id.
       // https://core.telegram.org/bots/api#responseparameters
       const addressed = chats.get(Number(params.chat_id));
-      if (addressed?.migratedTo != null) {
-        recordCall(
-          {
-            applied: false,
-            outcome: "rejected",
-            status: 400,
-            completed_at: clock.now(),
-            method,
-            bot_id: caller.id,
-            params: summarize(params),
-            at: receivedAt,
-            failed: 400,
-          },
-          response,
-        );
-        send(response, 400, {
-          ok: false,
-          error_code: 400,
-          description:
-            "Bad Request: group chat was upgraded to a supergroup chat",
-          parameters: { migrate_to_chat_id: addressed.migratedTo },
-        });
-        return;
+      if (addressed && handler) {
+        try {
+          checkChatAccess(addressed, caller, {
+            readOnly:
+              READ_ONLY_METHODS.has(lowerMethod) ||
+              (lowerMethod === "getchatmember" &&
+                Number(params.user_id) === caller.id),
+            readsUpgraded:
+              lowerMethod === "getchat" || lowerMethod === "leavechat",
+          });
+        } catch (error) {
+          if (!(error instanceof TelegramError)) throw error;
+          recordCall(
+            {
+              applied: false,
+              outcome: "rejected",
+              status: error.code,
+              completed_at: clock.now(),
+              method,
+              bot_id: caller.id,
+              params: summarize(params),
+              at: receivedAt,
+              failed: error.code,
+            },
+            response,
+          );
+          send(response, error.code, {
+            ok: false,
+            error_code: error.code,
+            description: error.message,
+            ...(error.parameters ? { parameters: error.parameters } : {}),
+          });
+          return;
+        }
       }
       const faultTrace = {};
       const failure = takeFailure(method, caller, params, faultTrace);
@@ -6048,8 +6237,6 @@ ${buttons}
         });
         return;
       }
-      // Bot API method names are case-insensitive.
-      const handler = methodsByLowerName.get(method.toLowerCase());
       if (!handler) {
         Object.assign(receipt, {
           outcome: unimplementedMode === "ok" ? "unimplemented_ok" : "rejected",

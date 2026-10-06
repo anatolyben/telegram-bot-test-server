@@ -408,8 +408,8 @@ export interface TelegramBotTestServer {
   }>;
   /**
    * Add, promote, demote or remove a bot, as the chat's owner would. The bot
-   * gets my_chat_member, the chat's other bots chat_member, and a group a
-   * service message when the bot joins or leaves.
+   * gets my_chat_member, the chat's administrator bots chat_member, and a
+   * group a service message when the bot joins or leaves.
    */
   setBotMembership(
     chatId: number,
@@ -642,7 +642,7 @@ export interface TelegramBotTestServer {
   ): Promise<{ exists: boolean; deleted: boolean; message?: Message }>;
   /** The private chat's messages, newest first. */
   getDirectMessages(userId: number): Promise<Message[]>;
-  /** The member as getChatMember would return them. */
+  /** The member as getChatMember would return them to the first bot. */
   getMember(chatId: number, userId: number): Promise<ChatMember>;
   /** User ids with a pending join request. */
   getJoinRequests(chatId: number): Promise<number[]>;

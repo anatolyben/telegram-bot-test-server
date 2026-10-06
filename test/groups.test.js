@@ -319,6 +319,47 @@ describe("basic groups and the upgrade to a supergroup", () => {
     ).toBe(true);
     expect(hook.ofType("my_chat_member")).toHaveLength(1);
   });
+
+  it("posts left_chat_member from the bot that bans a member of a basic group", async () => {
+    const { fake, api, hook, me } = await setup();
+    const group = await fake.createChat({ type: "group", ownerId: OWNER });
+    await fake.setBotMembership(group, me.id, { status: "administrator" });
+    const member = await fake.createUser();
+    await fake.join(group, member);
+
+    await api("banChatMember", { chat_id: group, user_id: member });
+
+    await expect
+      .poll(() =>
+        hook
+          .ofType("message")
+          .filter((message) => message.left_chat_member)
+          .map((message) => [message.from.id, message.left_chat_member.id]),
+      )
+      .toEqual([[me.id, member]]);
+  });
+
+  it("still reads the old id with getChat, and refuses leaveChat there as deactivated", async () => {
+    const { fake, api, me } = await setup();
+    const group = await fake.createChat({ type: "group", ownerId: OWNER });
+    await fake.setBotMembership(group, me.id, { status: "administrator" });
+    const supergroup = await fake.migrateToSupergroup(group, { by: OWNER });
+
+    expect((await api("getChat", { chat_id: group })).result).toMatchObject({
+      id: group,
+      type: "group",
+    });
+    expect(await api("leaveChat", { chat_id: group })).toMatchObject({
+      status: 400,
+      description: "Bad Request: chat is deactivated",
+    });
+    expect(
+      await api("getChatMember", { chat_id: group, user_id: OWNER }),
+    ).toMatchObject({
+      status: 400,
+      parameters: { migrate_to_chat_id: supergroup },
+    });
+  });
 });
 
 describe("people changing the chat", () => {
