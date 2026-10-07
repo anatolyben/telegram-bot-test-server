@@ -76,6 +76,15 @@ export interface TelegramBotTestServerOptions {
 
 /** A message as the server stores it, in the Bot API's Message shape. */
 export type Message = { message_id: number; [field: string]: unknown };
+
+/** A MessageEntity in the Bot API's shape, such as { type: "bold", offset: 0, length: 4 }. */
+export type MessageEntity = {
+  type: string;
+  offset: number;
+  length: number;
+  [field: string]: unknown;
+};
+
 /** A Bot API Poll: id, question, options with voter_count, total_voter_count, ... */
 export type Poll = { id: string; [field: string]: unknown };
 
@@ -155,13 +164,61 @@ export interface PostedMessage {
     fileName?: string;
     mimeType?: string;
   };
-  /** Where a forwarded message came from: a user, a hidden user's name, or a channel post. */
+  /**
+   * Where a forwarded message came from: a user, a hidden user's name, a
+   * channel post, or a supergroup's own post (its chatId, no messageId).
+   * authorSignature goes with a channel or supergroup origin.
+   */
   forwardFrom?: {
     userId?: number;
     senderName?: string;
     chatId?: number;
     messageId?: number;
+    authorSignature?: string;
   };
+  /**
+   * Entities for the text, in the Bot API's shape, checked as Telegram checks
+   * a user's. Types Telegram finds by itself are ignored, but phone_number
+   * and bank_card_number.
+   */
+  entities?: MessageEntity[];
+  /** Entities for the caption, read like entities. */
+  captionEntities?: MessageEntity[];
+  /**
+   * In a supergroup, post on behalf of a chat: the group itself (an anonymous
+   * administrator, who posts so anyway) or a channel the user created, which
+   * needs Telegram Premium (PREMIUM_ACCOUNT_REQUIRED). A member who is not
+   * anonymous may name themselves. Anything else fails with
+   * SEND_AS_PEER_INVALID.
+   */
+  sendAs?: number;
+  /** A contact, as a message of its own; needs can_send_messages. */
+  contact?: {
+    phoneNumber: string;
+    firstName: string;
+    lastName?: string;
+    vcard?: string;
+    /** The Telegram user the number belongs to. */
+    userId?: number;
+  };
+  /**
+   * A location, as a message of its own; needs can_send_messages. A
+   * livePeriod other than 0 makes it a live location. horizontalAccuracy is
+   * kept in whole meters, rounded up, at most 1500.
+   */
+  location?: {
+    latitude: number;
+    longitude: number;
+    horizontalAccuracy?: number;
+    livePeriod?: number;
+    heading?: number;
+    proximityAlertRadius?: number;
+  };
+  /**
+   * Post an earlier file again, by a file_id read from a message: it keeps
+   * its kind and file_unique_id. A caption may go with it.
+   */
+  fileId?: string;
   /**
    * A poll, as a message of its own (no text or media), with sendPoll's
    * fields and checks. Needs can_send_polls in a group.
@@ -618,6 +675,11 @@ export interface TelegramBotTestServer {
     /** Its Telegram Login client secret; default random. */
     loginClientSecret?: string;
   }): Promise<{ id: number; is_bot: true; username: string }>;
+  /**
+   * Delete a bot added with addBot: it leaves every chat it is in, and its
+   * token gets 401 Unauthorized from then on. The first bot can't be deleted.
+   */
+  deleteBot(botId: number): Promise<{ deleted: true }>;
   /** A group, forum or channel owned by `ownerId`, with no bot in it; returns its id. */
   createChat(chat: NewChat): Promise<number>;
   /**
@@ -669,6 +731,25 @@ export interface TelegramBotTestServer {
     chatId: number,
     botId: number,
     membership?: BotMembership,
+  ): Promise<ChatMember>;
+  /**
+   * A person (`by`, default the creator) makes a member an administrator with
+   * the rights given, e.g. { can_delete_messages: true }. Rights left out are
+   * not granted, and no right at all makes them a member; an edit keeps the
+   * custom title. The chat's administrator bots get chat_member. Fails as
+   * Telegram refuses the person; in a basic group only the creator promotes,
+   * with the group's fixed rights.
+   */
+  promoteMember(
+    chatId: number,
+    userId: number,
+    promotion: { by?: number; rights: Record<string, boolean> },
+  ): Promise<ChatMember>;
+  /** A person (`by`, default the creator) makes an administrator a member again. */
+  demoteMember(
+    chatId: number,
+    userId: number,
+    options?: { by?: number },
   ): Promise<ChatMember>;
   /** Create a forum topic, with its service message; returns its message_thread_id. */
   createTopic(
@@ -815,7 +896,8 @@ export interface TelegramBotTestServer {
    * channel, only the creator and administrators with can_post_messages may,
    * and bots get the post as channel_post. Fails with MESSAGE_EMPTY when the
    * text shows nothing once trimmed (only spaces or blank characters such as
-   * zero-width spaces); such a caption is dropped.
+   * zero-width spaces); such a caption is dropped. In a supergroup, an
+   * anonymous administrator's post comes from the group (sender_chat).
    */
   post(
     chatId: number,
@@ -898,12 +980,13 @@ export interface TelegramBotTestServer {
   ): Promise<number>;
   /**
    * The user sends the bot a direct message: text, or anything post() takes
-   * (a photo, media, a caption, a reply, a forward or a poll); returns the
-   * message_id. Text that shows nothing once trimmed fails with MESSAGE_EMPTY.
+   * but threadId and sendAs (a photo, media, a caption, a reply, a forward, a
+   * poll, a contact, a location or an earlier file); returns the message_id.
+   * Text that shows nothing once trimmed fails with MESSAGE_EMPTY.
    */
   sendDirectMessage(
     userId: number,
-    message: string | Omit<PostedMessage, "threadId">,
+    message: string | Omit<PostedMessage, "threadId" | "sendAs">,
   ): Promise<number>;
   /**
    * The user votes in a poll: option indexes, or an empty list to retract.

@@ -30,6 +30,7 @@ import {
   findEntities,
   formatText,
   FormattingError,
+  givenEntities,
   isEmptyText,
 } from "./formatting.js";
 import { lookup } from "node:dns/promises";
@@ -280,6 +281,46 @@ const OWNER_ADMIN_RIGHTS = Object.freeze({
   can_restrict_members: true,
   can_pin_messages: true,
 });
+// A basic group's administrators all have the same rights: Telegram keeps only
+// whether someone is one (messages.editChatAdmin), and TDLib reads each with
+// these (DialogParticipant.cpp GroupAdministrator).
+const BASIC_GROUP_ADMIN_RIGHTS = Object.freeze({
+  can_manage_chat: true,
+  can_change_info: true,
+  can_delete_messages: true,
+  can_invite_users: true,
+  can_restrict_members: true,
+  can_pin_messages: true,
+  can_manage_video_chats: true,
+  can_manage_tags: true,
+  can_send_welcome_messages: true,
+});
+
+// The users the Bot API writes as `from` of a message sent on behalf of a
+// chat in a group: the group itself (an anonymous administrator) or a channel
+// (Client.cpp, from TDLib's group_anonymous_bot_user_id and
+// channel_bot_user_id options; TDLib UserManager.cpp names them). UNVERIFIED:
+// what a bot's call naming one answers, such as banChatMember on such a
+// post's from; here they are unknown users ("user not found").
+const GROUP_ANONYMOUS_BOT = Object.freeze({
+  id: 1087968824,
+  is_bot: true,
+  first_name: "Group",
+  username: "GroupAnonymousBot",
+});
+const CHANNEL_BOT = Object.freeze({
+  id: 136817688,
+  is_bot: true,
+  first_name: "Channel",
+  username: "Channel_Bot",
+});
+// The entity types a member's message keeps from those the test gives,
+// though Telegram finds them itself. A user's app sends Telegram only the
+// entities the user made (TDLib get_input_message_entities), and Telegram's
+// server marks phone numbers and bank card numbers by rules it does not
+// publish (TDLib's find_entities leaves phone numbers a TODO), so this server
+// finds neither and takes them from the test.
+const MEMBER_FOUND_ENTITIES = new Set(["phone_number", "bank_card_number"]);
 
 const CHAT_ACTIONS = new Set([
   "typing",
@@ -1297,6 +1338,107 @@ function httpUrl(value) {
   }
 }
 
+/**
+ * The parts of an HTTP URL TDLib's parse_url reads (tdutils HttpUrl.cpp),
+ * for a URL unparsableUrl accepts: the protocol (http without one), user
+ * info, the host in ASCII lower case, the port given, and the rest, which
+ * starts with "/", loses trailing spaces and has bytes up to 0x20
+ * percent-encoded.
+ */
+function urlParts(url) {
+  const protocol = /^([^:/?#@[\]]*):\/\//.exec(url);
+  const rest = url.slice(protocol ? protocol[0].length : 0);
+  const end = rest.search(/[/?#]/);
+  const authority = end === -1 ? rest : rest.slice(0, end);
+  let colon = authority.length - 1;
+  while (colon > 0 && !":]@".includes(authority[colon])) colon -= 1;
+  const hasPort = colon > 0 && authority[colon] === ":";
+  const userinfoHost = hasPort ? authority.slice(0, colon) : authority;
+  const at = userinfoHost.lastIndexOf("@");
+  const host = userinfoHost
+    .slice(at + 1)
+    .replace(/[A-Z]/g, (char) => char.toLowerCase());
+  const query = (end === -1 ? "" : rest.slice(end)).replace(
+    /[ \t\r\n\0\v]+$/,
+    "",
+  );
+  return {
+    protocol: protocol ? protocol[1].toLowerCase() : "http",
+    userinfo: at === -1 ? "" : userinfoHost.slice(0, at),
+    host,
+    ipv6: host.startsWith("["),
+    port: hasPort ? Number(authority.slice(colon + 1)) : 0,
+    query: `${query.startsWith("/") ? "" : "/"}${query}`.replace(
+      /[\0-\x20]/g,
+      (char) =>
+        `%${char.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`,
+    ),
+  };
+}
+
+/**
+ * A text link's URL as TDLib checks and rewrites it (LinkManager::check_link):
+ * a tg:, ton: or tonsite: link keeps its scheme and needs a host of letters,
+ * digits, "-" and "_"; any other must be an HTTP URL whose host has a dot,
+ * and comes back as HttpUrl::get_url writes it. Returns { url } or { error }.
+ */
+function checkLink(link) {
+  const scheme = ["tg", "ton", "tonsite"].find(
+    (name) => link.slice(0, name.length + 1).toLowerCase() === `${name}:`,
+  );
+  let rest = scheme ? link.slice(scheme.length + 1) : link;
+  if (scheme && rest.startsWith("//")) rest = rest.slice(2);
+  const unparsable = unparsableUrl(rest);
+  if (unparsable) return { error: unparsable };
+  const url = urlParts(rest);
+  if (scheme) {
+    if (
+      rest.slice(0, 7).toLowerCase() === "http://" ||
+      url.protocol === "https" ||
+      url.userinfo ||
+      url.port ||
+      url.ipv6
+    ) {
+      return { error: scheme === "tg" ? "Wrong tg URL" : "Wrong ton URL" };
+    }
+    if (
+      /[^a-z0-9_.-]/.test(url.host) ||
+      (scheme !== "tonsite" && url.host.includes("."))
+    ) {
+      return { error: "Unallowed characters in URL host" };
+    }
+    const query = url.query[1] === "?" ? url.query.slice(1) : url.query;
+    return { url: `${scheme}://${url.host}${query}` };
+  }
+  if (!url.host.includes(".") && !url.ipv6) return { error: "Wrong HTTP URL" };
+  return {
+    url: `${url.protocol}://${url.userinfo ? `${url.userinfo}@` : ""}${url.host}${url.port ? `:${url.port}` : ""}${url.query}`,
+  };
+}
+
+/**
+ * The user a tg://user?id= link names, as TDLib's
+ * LinkManager::get_link_user_id reads it, or null.
+ */
+function linkUserId(url) {
+  const link = /^tg:(?:\/\/)?user(?=[/?#]|$)\/?\?([^#]*)/.exec(
+    url.replace(/[A-Z]/g, (char) => char.toLowerCase()),
+  );
+  if (!link) return null;
+  for (const parameter of link[1].split("&")) {
+    const equals = parameter.indexOf("=");
+    if ((equals === -1 ? parameter : parameter.slice(0, equals)) !== "id") {
+      continue;
+    }
+    const value = equals === -1 ? "" : parameter.slice(equals + 1);
+    if (!/^-?\d+$/.test(value)) return null;
+    const id = BigInt(value);
+    // UserId::is_valid: from 1 to 2^40 - 1.
+    return id > 0n && id < 2n ** 40n ? Number(id) : null;
+  }
+  return null;
+}
+
 function readBody(request) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -1952,6 +2094,45 @@ export async function startTestServer({
     if (member.status === "creator") return true;
     if (member.status !== "administrator") return false;
     return chatMemberObject(chat, userId)[right] === true;
+  }
+
+  /**
+   * TDLib drops the rights this kind of chat does not have before the server
+   * checks the rest; with none left, the user stays a member
+   * (DialogParticipant.cpp AdministratorRights and Administrator). A channel
+   * has no anonymous administrators: is_anonymous is dropped there too,
+   * though the Bot API still writes it (json_store_administrator_rights).
+   */
+  function dropRightsChatLacks(chat, rights) {
+    const kept = chatAdminRights(chat);
+    for (const right of ADMIN_RIGHTS) {
+      if (!kept.includes(right)) rights[right] = false;
+    }
+    if (chat.type === "channel") rights.is_anonymous = false;
+    return rights;
+  }
+
+  /**
+   * The custom title an administrator keeps when their rights are edited:
+   * TDLib's channels.editAdmin leaves the rank out (EditChannelAdminQuery,
+   * flags 0), and the title changes only through
+   * messages.editChatParticipantRank (set_dialog_participant_rank).
+   */
+  function keptTitle(current) {
+    return current.status === "administrator" && current.customTitle
+      ? { customTitle: current.customTitle }
+      : {};
+  }
+
+  /** Whether a promotion grants a right the promoter does not hold. */
+  function grantsRightNotHeld(chat, rights, promoterId) {
+    return Object.entries(rights).some(
+      ([right, granted]) =>
+        granted &&
+        right !== "is_anonymous" &&
+        right !== "can_manage_chat" &&
+        !hasRight(chat, promoterId, right),
+    );
   }
 
   function chatKind(chat) {
@@ -3129,6 +3310,160 @@ export async function startTestServer({
   }
 
   /**
+   * A person makes a member an administrator with the rights given, or a
+   * member again when no right is given, as Telegram's apps do through TDLib's
+   * setChatMemberStatus (DialogParticipantManager.cpp). In a supergroup or
+   * channel a change to nothing new succeeds at once
+   * (set_channel_participant_status_impl); demoting someone who is not an
+   * administrator changes nothing. There the owner can't be changed, nobody
+   * promotes themselves, and the promoter needs can_promote_members
+   * (promote_channel_participant); then channels.editAdmin checks what
+   * promoteChatMember checks. In a basic group only the creator promotes,
+   * never themselves, checked before anything else
+   * (set_chat_participant_status), and messages.editChatAdmin says only
+   * whether someone is an administrator. An edit keeps the custom title. The
+   * chat's administrator bots get chat_member from the person.
+   */
+  function promoteByPerson(chat, userId, { by, rights }) {
+    const actor = requireUser(by ?? creatorOf(chat));
+    const target = requireUser(userId);
+    if (!isObject(rights)) {
+      throw new TelegramError(
+        400,
+        "rights must be an object of administrator rights",
+      );
+    }
+    for (const [right, value] of Object.entries(rights)) {
+      if (!ADMIN_RIGHTS.includes(right)) {
+        throw new TelegramError(400, `unknown administrator right "${right}"`);
+      }
+      if (value !== undefined && typeof value !== "boolean") {
+        throw new TelegramError(400, `rights.${right} must be true or false`);
+      }
+    }
+    if (chat.migratedTo != null) {
+      throw new TelegramError(400, "Chat is deactivated");
+    }
+    const granted = dropRightsChatLacks(
+      chat,
+      Object.fromEntries(
+        ADMIN_RIGHTS.map((right) => [right, rights[right] === true]),
+      ),
+    );
+    const promote = Object.values(granted).some(Boolean);
+    const current = memberStatus(chat, target.id);
+    const next = promote
+      ? {
+          status: "administrator",
+          rights:
+            chat.type === "group"
+              ? { ...BASIC_GROUP_ADMIN_RIGHTS }
+              : { ...granted, can_manage_chat: true },
+          promotedBy: actor.id,
+          ...keptTitle(current),
+        }
+      : { status: "member" };
+    const unchanged = promote
+      ? current.status === "administrator" &&
+        JSON.stringify(memberObject(chat, target.id, current)) ===
+          JSON.stringify(memberObject(chat, target.id, next))
+      : !["administrator", "creator"].includes(current.status);
+    const isCreator = memberStatus(chat, actor.id).status === "creator";
+    if (chat.type === "group") {
+      if (!isCreator) {
+        throw new TelegramError(400, "Need owner rights in the group chat");
+      }
+      if (actor.id === target.id) {
+        throw new TelegramError(400, "Can't promote or demote self");
+      }
+    }
+    // A change to nothing new succeeds without an update. UNVERIFIED for a
+    // basic group, where TDLib sends messages.editChatAdmin all the same:
+    // what Telegram answers.
+    if (unchanged) return chatMemberObject(chat, target.id);
+    if (chat.type !== "group") {
+      if (current.status === "creator") {
+        throw new TelegramError(400, "Can't remove chat owner");
+      }
+      if (actor.id === target.id && promote) {
+        throw new TelegramError(400, "Can't promote self");
+      }
+      // TDLib lets an administrator demote themselves. UNVERIFIED: that
+      // Telegram's server accepts it from one someone else promoted.
+      if (
+        actor.id !== target.id &&
+        !hasRight(chat, actor.id, "can_promote_members")
+      ) {
+        throw new TelegramError(400, "Not enough rights");
+      }
+    }
+    if (!isInChat(chat, target.id)) {
+      // TDLib adds someone outside a basic group first, then makes them an
+      // administrator (add_chat_participant); this server does not.
+      if (chat.type === "group") {
+        throw new TelegramError(
+          400,
+          "the user is not in the chat; add them first",
+        );
+      }
+      // TDLib sends channels.editAdmin directly. UNVERIFIED: what Telegram's
+      // server does for someone outside the chat; here USER_NOT_PARTICIPANT,
+      // as for promoteChatMember.
+      throw new TelegramError(400, "USER_NOT_PARTICIPANT");
+    }
+    if (chat.type !== "group") {
+      if (
+        current.status === "administrator" &&
+        current.promotedBy !== actor.id &&
+        actor.id !== target.id &&
+        !isCreator
+      ) {
+        throw new TelegramError(400, "CHAT_ADMIN_REQUIRED");
+      }
+      if (grantsRightNotHeld(chat, granted, actor.id)) {
+        throw new TelegramError(400, "RIGHT_FORBIDDEN");
+      }
+    }
+    chat.members.set(target.id, next);
+    const after = chatMemberObject(chat, target.id);
+    return memberChanged(chat, target.id, current, actor).then(() => after);
+  }
+
+  /**
+   * The test deletes a bot it added. Its token stops working at once: every
+   * call gets 401 Unauthorized, the Bot API server's answer once Telegram no
+   * longer accepts a token (Client.cpp get_closing_error). Its webhook goes,
+   * and a waiting getUpdates answers with what is pending, as the server does
+   * when it closes a bot (on_closed). UNVERIFIED: what Telegram does to a
+   * deleted bot's chats; here it leaves each one as leaveChat does, so the
+   * other bots get chat_member and a group the left_chat_member message, and
+   * it stays a user, whom earlier messages and member lists name.
+   */
+  function deleteBot(record) {
+    if (record.token === botToken) {
+      throw new TelegramError(400, "the first bot can't be deleted");
+    }
+    bots.delete(record.token);
+    users.set(record.id, {
+      ...userObject(record),
+      photos: record.photos,
+      deleted: true,
+    });
+    closeAttempts(record, "cancelled");
+    record.webhook = null;
+    wakePollers(record);
+    for (const key of [...sentUpdates.keys()]) {
+      if (key.startsWith(`${record.id}:`)) sentUpdates.delete(key);
+    }
+    const left = [...chats.values()]
+      .filter((chat) => chat.migratedTo == null && isInChat(chat, record.id))
+      .map((chat) =>
+        setBotMembership(chat, record, { status: "left", actor: record }),
+      );
+    return Promise.all(left).then(() => ({ deleted: true }));
+  }
+
+  /**
    * Whether a person may add members: the creator, an administrator with
    * can_invite_users, or a member when the chat's permissions allow it.
    */
@@ -3348,14 +3683,16 @@ export async function startTestServer({
   /**
    * Store a new message. A channel's messages are sent by the channel itself,
    * with sender_chat and no from (Bot API server Client.cpp); who posted it is
-   * kept as the entry's author for the rules that depend on it.
+   * kept as the entry's author for the rules that depend on it. `sender` is
+   * the from, author_signature and sender_chat of a message a member sent on
+   * behalf of a chat (memberSender).
    */
-  function addMessage(chat, from, fields) {
+  function addMessage(chat, from, fields, sender = null) {
     const message = {
       message_id: chat.nextMessageId++,
       ...(chat.type === "channel"
         ? { sender_chat: chatObject(chat) }
-        : { from: userObject(from) }),
+        : (sender ?? { from: userObject(from) })),
       chat: chatObject(chat),
       date: now(),
       ...fields,
@@ -4728,22 +5065,9 @@ export async function startTestServer({
       ) {
         rights.can_restrict_members = true;
       }
-      // TDLib drops the rights this kind of chat does not have before the
-      // server checks the rest; with none left, the user stays a member
-      // (DialogParticipant.cpp AdministratorRights and Administrator).
-      const kept = chatAdminRights(chat);
-      for (const right of ADMIN_RIGHTS) {
-        if (!kept.includes(right)) rights[right] = false;
-      }
-      for (const [right, granted] of Object.entries(rights)) {
-        if (
-          granted &&
-          right !== "is_anonymous" &&
-          right !== "can_manage_chat" &&
-          !hasRight(chat, caller.id, right)
-        ) {
-          throw new TelegramError(400, "Bad Request: RIGHT_FORBIDDEN");
-        }
+      dropRightsChatLacks(chat, rights);
+      if (grantsRightNotHeld(chat, rights, caller.id)) {
+        throw new TelegramError(400, "Bad Request: RIGHT_FORBIDDEN");
       }
       if (Object.values(rights).some(Boolean)) {
         // Any right implies can_manage_chat, as on Telegram.
@@ -4751,6 +5075,7 @@ export async function startTestServer({
           status: "administrator",
           rights: { ...rights, can_manage_chat: true },
           promotedBy: caller.id,
+          ...keptTitle(current),
         });
       } else {
         chat.members.set(userId, { status: "member" });
@@ -5537,11 +5862,24 @@ export async function startTestServer({
    */
   function messageOrigin(chat, message) {
     if (message.forward_origin) return structuredClone(message.forward_origin);
-    return chat.type === "channel"
+    if (chat.type === "channel") {
+      return {
+        type: "channel",
+        chat: message.chat,
+        message_id: message.message_id,
+        date: message.date,
+      };
+    }
+    // Sent on behalf of a chat in a group: the chat, and an anonymous
+    // administrator's signature, as Telegram's forward header has them
+    // (TDLib MessageOrigin::get_message_origin_object).
+    return message.sender_chat
       ? {
-          type: "channel",
-          chat: message.chat,
-          message_id: message.message_id,
+          type: "chat",
+          sender_chat: message.sender_chat,
+          ...(message.author_signature
+            ? { author_signature: message.author_signature }
+            : {}),
           date: message.date,
         }
       : { type: "user", sender_user: message.from, date: message.date };
@@ -5723,8 +6061,8 @@ export async function startTestServer({
    * nothing with MESSAGE_EMPTY
    * (https://core.telegram.org/method/messages.sendMessage).
    */
-  function memberText(text) {
-    const formatted = formatText(String(text ?? ""));
+  function memberText(text, entities) {
+    const formatted = memberFormatted(String(text ?? ""), entities);
     if (isEmptyText(formatted.text)) {
       throw new TelegramError(400, "MESSAGE_EMPTY");
     }
@@ -5741,14 +6079,297 @@ export async function startTestServer({
    * their text; one that shows nothing is none (TDLib fix_formatted_text
    * clears it for a user).
    */
-  function memberCaption(caption) {
-    const formatted = formatText(String(caption ?? ""));
+  function memberCaption(caption, entities) {
+    const formatted = memberFormatted(String(caption ?? ""), entities);
     if (isEmptyText(formatted.text)) return {};
     return {
       caption: formatted.text,
       ...(formatted.entities.length > 0
         ? { caption_entities: formatted.entities }
         : {}),
+    };
+  }
+
+  /**
+   * A member's text with the entities the test gives, as Telegram's app and
+   * server make it. They are read as the Bot API reads MessageEntity objects,
+   * then checked as TDLib checks a user's input entities
+   * (MessageEntity.cpp get_message_entities): a text link's URL must pass
+   * LinkManager::check_link and is kept as it rewrites it, a tg://user?id=
+   * link becomes a text_mention, and a mentioned user must exist. The types
+   * Telegram finds by itself are found here and ignored when given, but for
+   * phone_number and bank_card_number (MEMBER_FOUND_ENTITIES). Errors carry
+   * the Bot API's texts for reading a MessageEntity, and TDLib's as it gives
+   * them to an app (fix_formatted_text), without the Bot API's
+   * "Bad Request: " and "can't parse entities: ".
+   */
+  function memberFormatted(text, entities) {
+    if (entities == null) return formatText(text);
+    if (!Array.isArray(entities)) {
+      throw new TelegramError(
+        400,
+        "entities must be a list of MessageEntity objects",
+      );
+    }
+    try {
+      return formatText(text, {
+        entities: givenEntities(entities, MEMBER_FOUND_ENTITIES).map(
+          memberEntity,
+        ),
+        user: entityUser,
+        keep: MEMBER_FOUND_ENTITIES,
+      });
+    } catch (error) {
+      if (error instanceof FormattingError) {
+        throw new TelegramError(
+          400,
+          error.message.replace(/^Bad Request: (can't parse entities: )?/, ""),
+        );
+      }
+      throw error;
+    }
+  }
+
+  /** One entity a member's app sends, as TDLib checks it, with only its fields. */
+  function memberEntity(entity) {
+    const { type, offset, length } = entity;
+    const field = (name, kind) => {
+      const value = entity[name];
+      if (value === undefined) {
+        throw new FormattingError(
+          `can't parse MessageEntity: Can't find field "${name}"`,
+        );
+      }
+      if (
+        kind === "object"
+          ? !isObject(value)
+          : !/^(string|number)$/.test(typeof value)
+      ) {
+        throw new FormattingError(
+          `can't parse MessageEntity: Field "${name}" must be of type ${kind === "object" ? "Object" : "String"}`,
+        );
+      }
+      return value;
+    };
+    const mention = (id) => {
+      if (!users.has(id)) throw new TelegramError(400, "User not found");
+      return { type: "text_mention", offset, length, user: { id } };
+    };
+    switch (type) {
+      case "text_link": {
+        const url = cleanInput(String(field("url")));
+        const userId = linkUserId(url);
+        if (userId !== null) return mention(userId);
+        const checked = checkLink(url);
+        if (checked.error) {
+          throw new TelegramError(
+            400,
+            `Entity URL '${url}' is invalid: ${checked.error}`,
+          );
+        }
+        return { type, offset, length, url: checked.url };
+      }
+      case "text_mention": {
+        const { id } = field("user", "object");
+        if (id === undefined) {
+          throw new FormattingError(
+            `can't parse MessageEntity: Can't find field "id"`,
+          );
+        }
+        return mention(Number(id));
+      }
+      case "custom_emoji": {
+        // A 64-bit number (get_required_long_field), then not 0
+        // (CustomEmojiId::is_valid).
+        const id = String(field("custom_emoji_id"));
+        if (!/^-?\d+$/.test(id)) {
+          throw new FormattingError(
+            `can't parse MessageEntity: Field "custom_emoji_id" must be a valid Number`,
+          );
+        }
+        if (BigInt(id) === 0n) {
+          throw new TelegramError(
+            400,
+            "Invalid custom emoji identifier specified",
+          );
+        }
+        return { type, offset, length, custom_emoji_id: id };
+      }
+      case "pre":
+        return entity.language
+          ? {
+              type,
+              offset,
+              length,
+              language: cleanInput(String(entity.language)),
+            }
+          : { type, offset, length };
+      default:
+        // date_time comes from givenEntities with just its own fields.
+        return type === "date_time" ? entity : { type, offset, length };
+    }
+  }
+
+  /**
+   * A contact a member shares, as TDLib's get_contact reads it: its strings
+   * cleaned, and a user_id the app knows ("User not found" otherwise).
+   * Telegram's server fills user_id when the number belongs to an account;
+   * test users have no phone numbers, so the test names the user. UNVERIFIED:
+   * what Telegram answers an empty phone_number or first_name, which TDLib
+   * does not check; here they are refused as incomplete test input.
+   */
+  function memberContact(contact) {
+    if (!isObject(contact)) {
+      throw new TelegramError(400, "contact must be an object");
+    }
+    const text = (name) =>
+      contact[name] == null ? "" : cleanInput(String(contact[name]));
+    if (!text("phone_number") || !text("first_name")) {
+      throw new TelegramError(
+        400,
+        "a contact needs phone_number and first_name",
+      );
+    }
+    const userId = contact.user_id == null ? 0 : Number(contact.user_id);
+    if (userId !== 0 && !users.has(userId)) {
+      throw new TelegramError(400, "User not found");
+    }
+    // The Bot API writes vcard before user_id (Client.cpp JsonContact).
+    return {
+      phone_number: text("phone_number"),
+      first_name: text("first_name"),
+      ...(text("last_name") ? { last_name: text("last_name") } : {}),
+      ...(text("vcard") ? { vcard: text("vcard") } : {}),
+      ...(userId ? { user_id: userId } : {}),
+    };
+  }
+
+  /**
+   * A location a member sends, checked as TDLib checks it, with its texts
+   * (Location.cpp process_input_message_location, process_live_location): a
+   * point off the map is refused, a live_period other than 0 makes it live,
+   * from 60 seconds to a day or 0x7FFFFFFF for ever, with a heading of 1 to
+   * 360 and an alert radius up to 100000 meters, and the accuracy is held to
+   * 0 to 1500 meters (fix_accuracy) and sent in whole meters, rounded up
+   * (get_input_geo_point). It is written as the Bot API writes it
+   * (Client.cpp JsonLocation, JsonLiveLocation).
+   */
+  function memberLocation(location) {
+    if (!isObject(location)) {
+      throw new TelegramError(400, "location must be an object");
+    }
+    if (location.latitude == null || location.longitude == null) {
+      throw new TelegramError(400, "a location needs latitude and longitude");
+    }
+    const number = (name) => {
+      const value = location[name] ?? 0;
+      if (typeof value !== "number" || Number.isNaN(value)) {
+        throw new TelegramError(400, `location.${name} must be a number`);
+      }
+      return value;
+    };
+    const [latitude, longitude, accuracy] = [
+      "latitude",
+      "longitude",
+      "horizontal_accuracy",
+    ].map(number);
+    const [period, heading, radius] = [
+      "live_period",
+      "heading",
+      "proximity_alert_radius",
+    ].map((name) => Math.trunc(number(name)));
+    const live = period !== 0;
+    if (
+      !(Number.isFinite(latitude) && Number.isFinite(longitude)) ||
+      Math.abs(latitude) > 90 ||
+      Math.abs(longitude) > 180
+    ) {
+      throw new TelegramError(
+        400,
+        live ? "Invalid live location specified" : "Invalid location specified",
+      );
+    }
+    if (live && period !== 0x7fffffff && (period < 60 || period > 86400)) {
+      throw new TelegramError(400, "Wrong live location period specified");
+    }
+    if (live && heading !== 0 && (heading < 1 || heading > 360)) {
+      throw new TelegramError(400, "Wrong live location heading specified");
+    }
+    if (live && (radius < 0 || radius > 100000)) {
+      throw new TelegramError(
+        400,
+        "Wrong live location proximity alert radius specified",
+      );
+    }
+    const held = Number.isFinite(accuracy)
+      ? Math.ceil(Math.min(Math.max(accuracy, 0), 1500))
+      : 0;
+    return {
+      latitude,
+      longitude,
+      ...(live
+        ? {
+            live_period: period,
+            ...(heading > 0 ? { heading } : {}),
+            ...(radius > 0 ? { proximity_alert_radius: radius } : {}),
+          }
+        : {}),
+      ...(held > 0 ? { horizontal_accuracy: held } : {}),
+    };
+  }
+
+  /**
+   * The from, author_signature and sender_chat of a member's message sent on
+   * behalf of a chat, or null for one sent as themselves. In a supergroup an
+   * anonymous administrator always posts as the group, with their custom
+   * title as the signature, and may instead post as a channel they created
+   * (TDLib MessagesManager create_message_to_send,
+   * get_dialog_send_message_as_dialog_ids; DialogManager
+   * is_anonymous_administrator). A member who is not anonymous may name
+   * themselves, as TDLib lists their own account. Any other chat to send as,
+   * and any outside a supergroup, is SEND_AS_PEER_INVALID
+   * (https://core.telegram.org/method/messages.sendMessage). Telegram offers
+   * only public channels the user created; chats made in a test have no
+   * public username, so here any channel the member created counts. A
+   * channel needs Telegram Premium, unless it is verified or the group's
+   * linked channel, neither of which this server models
+   * (get_dialog_send_message_as_dialog_ids, needs_premium). UNVERIFIED: what
+   * Telegram answers without it; here PREMIUM_ACCOUNT_REQUIRED, which
+   * messages.sendMessage lists.
+   */
+  function memberSender(chat, user, sendAs) {
+    if (chat.type !== "supergroup") {
+      if (sendAs != null) throw new TelegramError(400, "SEND_AS_PEER_INVALID");
+      return null;
+    }
+    const member = memberStatus(chat, user.id);
+    const anonymous =
+      member.status === "administrator" &&
+      hasRight(chat, user.id, "is_anonymous");
+    if (!anonymous && sendAs != null && Number(sendAs) === user.id) {
+      return null;
+    }
+    const target =
+      sendAs == null ? (anonymous ? chat : null) : chats.get(Number(sendAs));
+    if (target === null) return null;
+    if (
+      !target ||
+      (target === chat
+        ? !anonymous
+        : target.type !== "channel" ||
+          memberStatus(target, user.id).status !== "creator")
+    ) {
+      throw new TelegramError(400, "SEND_AS_PEER_INVALID");
+    }
+    if (target !== chat && user.is_premium !== true) {
+      throw new TelegramError(403, "PREMIUM_ACCOUNT_REQUIRED");
+    }
+    return {
+      from: { ...(target === chat ? GROUP_ANONYMOUS_BOT : CHANNEL_BOT) },
+      ...(target === chat && member.customTitle
+        ? { author_signature: member.customTitle }
+        : {}),
+      sender_chat: chatObject(target),
     };
   }
 
@@ -6212,10 +6833,15 @@ export async function startTestServer({
           : "Bad Request: the message can't be forwarded",
       );
     }
+    // A forward or copy is the bot's own message, so the signature of the
+    // post stays in forward_origin: TDLib's create_message_to_send signs only
+    // an anonymous administrator's message or a post in a channel that signs
+    // posts, which this server does not model.
     const {
       message_id: _id,
       from: _from,
       sender_chat: _senderChat,
+      author_signature: _signature,
       chat: _chat,
       date: _date,
       edit_date: _edited,
@@ -7722,6 +8348,9 @@ export async function startTestServer({
         login_client_secret: record.loginClientSecret,
       }));
     }
+    if (resource === "bots" && id && !sub && method === "DELETE") {
+      return deleteBot(requireBot(id));
+    }
     if (resource === "chats" && !id && method === "POST") {
       return chatObject(createChat(body));
     }
@@ -7999,6 +8628,15 @@ export async function startTestServer({
       if (sub === "members" && method === "GET" && subId) {
         return chatMemberObject(chat, subId, bot);
       }
+      if (sub === "members" && method === "POST" && subId) {
+        // A person (`by`, default the creator) promotes or demotes a member.
+        if (parts[4] === "promote") {
+          return promoteByPerson(chat, subId, body);
+        }
+        if (parts[4] === "demote") {
+          return promoteByPerson(chat, subId, { by: body.by, rights: {} });
+        }
+      }
       if (sub === "topics") {
         if (!chat.topics) {
           throw new TelegramError(400, "Bad Request: the chat is not a forum");
@@ -8275,6 +8913,11 @@ export async function startTestServer({
     const sender = [...bots.values()].find(
       (record) => record.id === (entry.keyboardBot ?? entry.author),
     );
+    // A deleted bot hears no press. UNVERIFIED: what Telegram's app then
+    // shows; here the press is unanswered at once.
+    if (!sender && users.get(entry.keyboardBot ?? entry.author)?.deleted) {
+      return { answered: false };
+    }
     openQueries.set(queryId, (sender ?? bot).id);
     for (const [id, query] of recentQueries) {
       if (clock.now() - query.at > EPHEMERAL_REPLY_MS) recentQueries.delete(id);
@@ -8408,14 +9051,41 @@ export async function startTestServer({
 
   /**
    * Where a member's forwarded message came from: a user, a user who hides
-   * their account (a name only), or a channel post.
+   * their account (a name only), a channel post, or a post a supergroup's
+   * anonymous administrator made on its behalf (MessageOriginChat, which has
+   * no message id). Only a supergroup or channel posts on its own behalf:
+   * TDLib refuses any other chat in a forward header ("Forward from a
+   * non-channel", MessageOrigin::get_message_origin). A channel's or
+   * supergroup's origin may carry the post's author_signature
+   * (https://core.telegram.org/bots/api#messageorigin).
    */
   function forwardOrigin(from) {
     const date = now();
+    const signature =
+      from.author_signature == null || from.author_signature === ""
+        ? {}
+        : { author_signature: String(from.author_signature) };
     if (from.chat_id != null) {
       const source = requireChat(from.chat_id);
       if (source.type !== "channel") {
-        throw new TelegramError(400, "forward_from.chat_id must be a channel");
+        if (source.type !== "supergroup") {
+          throw new TelegramError(
+            400,
+            "forward_from.chat_id must be a channel or supergroup",
+          );
+        }
+        if (from.message_id != null) {
+          throw new TelegramError(
+            400,
+            "forward_from.message_id is for a channel post; a supergroup's origin has none",
+          );
+        }
+        return {
+          type: "chat",
+          sender_chat: chatObject(source),
+          ...signature,
+          date,
+        };
       }
       const original =
         from.message_id != null
@@ -8425,8 +9095,15 @@ export async function startTestServer({
         type: "channel",
         chat: chatObject(source),
         message_id: Number(from.message_id ?? 1),
+        ...signature,
         date: original?.message.date ?? date,
       };
+    }
+    if (from.author_signature != null) {
+      throw new TelegramError(
+        400,
+        "forward_from.author_signature is for a channel or supergroup origin",
+      );
     }
     if (from.user_id != null) {
       return {
@@ -8444,7 +9121,7 @@ export async function startTestServer({
     }
     throw new TelegramError(
       400,
-      "forward_from needs user_id, sender_name, or a channel chat_id",
+      "forward_from needs user_id, sender_name, or a channel or supergroup chat_id",
     );
   }
 
@@ -8564,12 +9241,35 @@ export async function startTestServer({
       message_thread_id: threadId,
       forward_from: forwardFrom,
       poll,
+      send_as: sendAs,
+      contact,
+      location,
+      entities,
+      caption_entities: captionEntities,
+      file_id: fileId,
     },
     { mediaGroupId = null } = {},
   ) {
     const user = requireUser(userId);
     requireTopic(chat, threadId);
-    const type = photoBase64 ? "photo" : (media?.type ?? null);
+    // A contact, a location or a file posted again is a message of its own.
+    const given = [
+      text !== undefined,
+      photoBase64 != null,
+      media != null,
+      poll != null,
+      contact != null,
+      location != null,
+      fileId != null,
+    ].filter(Boolean).length;
+    if ((contact ?? location ?? fileId) != null && given > 1) {
+      throw new TelegramError(
+        400,
+        "a message has one kind of content: text, photo, media, file_id, poll, contact or location",
+      );
+    }
+    const reused = fileId == null ? null : reusedFile(fileId);
+    const type = photoBase64 ? "photo" : (media?.type ?? reused?.kind ?? null);
     if (poll != null && (type || text != null)) {
       throw new TelegramError(400, "a poll is sent without text or media");
     }
@@ -8579,6 +9279,8 @@ export async function startTestServer({
         `media type must be photo or one of ${Object.keys(MEMBER_MEDIA).join(", ")}`,
       );
     }
+    // Contacts and locations need can_send_messages (TDLib
+    // can_send_message_content).
     const permission =
       poll != null
         ? "can_send_polls"
@@ -8599,8 +9301,18 @@ export async function startTestServer({
     ) {
       throw new TelegramError(403, "CHAT_WRITE_FORBIDDEN");
     }
+    const sender = memberSender(chat, user, sendAs);
     const fields = {};
-    if (type) {
+    if (reused) {
+      Object.assign(fields, mediaFields(type, reused));
+      if (caption && (type === "photo" || MEMBER_MEDIA[type].caption)) {
+        Object.assign(fields, memberCaption(caption, captionEntities));
+      }
+    } else if (contact != null) {
+      fields.contact = memberContact(contact);
+    } else if (location != null) {
+      fields.location = memberLocation(location);
+    } else if (type) {
       const base64 = photoBase64 ?? media.base64 ?? "";
       if (typeof base64 !== "string") {
         throw new TelegramError(
@@ -8616,7 +9328,7 @@ export async function startTestServer({
       });
       Object.assign(fields, mediaFields(type, file));
       if (caption && (type === "photo" || MEMBER_MEDIA[type].caption)) {
-        Object.assign(fields, memberCaption(caption));
+        Object.assign(fields, memberCaption(caption, captionEntities));
       }
     } else if (poll != null) {
       // Users send polls to groups, channels and a bot's private chat, but
@@ -8626,7 +9338,7 @@ export async function startTestServer({
         () => chat,
       ).poll;
     } else {
-      Object.assign(fields, memberText(text));
+      Object.assign(fields, memberText(text, entities));
     }
     if (mediaGroupId) fields.media_group_id = mediaGroupId;
     if (forwardFrom) fields.forward_origin = forwardOrigin(forwardFrom);
@@ -8646,14 +9358,37 @@ export async function startTestServer({
       fields.message_thread_id = Number(threadId);
       fields.is_topic_message = true;
     }
-    const message = addMessage(chat, user, fields);
+    const message = addMessage(chat, user, fields, sender);
     await emit("message", message);
     return { message_id: message.message_id };
   }
 
   /**
+   * The stored file a member posts again by a file_id the test read from an
+   * earlier message: any bot's id for it. It keeps its file_unique_id and
+   * what was said about it, as a file sent again on Telegram does; a live
+   * photo's video is posted as a video (Client.cpp JsonLivePhoto). A chat
+   * photo is no message's file.
+   */
+  function reusedFile(fileId) {
+    const held = files.get(String(fileId));
+    if (!held) {
+      throw new TelegramError(400, "file_id names no file on this server");
+    }
+    if (held.file.kind === "chat_photo") {
+      throw new TelegramError(
+        400,
+        "file_id names a chat photo, which no message carries",
+      );
+    }
+    const view = fileView(held.file);
+    return view.kind === "live_photo" ? { ...view, kind: "video" } : view;
+  }
+
+  /**
    * A test action's message (text, or an object with a photo, media, poll,
-   * caption, reply or forward) as the control API's request body.
+   * contact, location, file_id, caption, entities, reply, forward or chat to
+   * send as) as the control API's request body.
    */
   function memberBody(message) {
     return typeof message === "string"
@@ -8696,6 +9431,11 @@ export async function startTestServer({
                   ...(message.forwardFrom.senderName
                     ? { sender_name: message.forwardFrom.senderName }
                     : {}),
+                  ...(message.forwardFrom.authorSignature != null
+                    ? {
+                        author_signature: message.forwardFrom.authorSignature,
+                      }
+                    : {}),
                 },
               }
             : {}),
@@ -8705,6 +9445,35 @@ export async function startTestServer({
           ...(message.threadId != null
             ? { message_thread_id: message.threadId }
             : {}),
+          ...(message.sendAs != null ? { send_as: message.sendAs } : {}),
+          ...(message.contact != null
+            ? {
+                contact: {
+                  phone_number: message.contact.phoneNumber,
+                  first_name: message.contact.firstName,
+                  last_name: message.contact.lastName,
+                  vcard: message.contact.vcard,
+                  user_id: message.contact.userId,
+                },
+              }
+            : {}),
+          ...(message.location != null
+            ? {
+                location: {
+                  latitude: message.location.latitude,
+                  longitude: message.location.longitude,
+                  horizontal_accuracy: message.location.horizontalAccuracy,
+                  live_period: message.location.livePeriod,
+                  heading: message.location.heading,
+                  proximity_alert_radius: message.location.proximityAlertRadius,
+                },
+              }
+            : {}),
+          ...(message.entities != null ? { entities: message.entities } : {}),
+          ...(message.captionEntities != null
+            ? { caption_entities: message.captionEntities }
+            : {}),
+          ...(message.fileId != null ? { file_id: message.fileId } : {}),
         };
   }
 
@@ -9897,6 +10666,7 @@ ${buttons}
         first_name: firstName,
         supports_join_request_queries: supportsJoinRequestQueries === true,
       }),
+    deleteBot: (botId) => act("DELETE", `bots/${botId}`),
     createChat: async ({ title, type, ownerId, ownerName, isForum } = {}) =>
       (
         await act("POST", "chats", {
@@ -9932,6 +10702,10 @@ ${buttons}
         rights,
         by,
       }),
+    promoteMember: (chatId, userId, { by, rights } = {}) =>
+      act("POST", `chats/${chatId}/members/${userId}/promote`, { by, rights }),
+    demoteMember: (chatId, userId, { by } = {}) =>
+      act("POST", `chats/${chatId}/members/${userId}/demote`, { by }),
     createTopic: async (chatId, name, { by } = {}) =>
       (await act("POST", `chats/${chatId}/topics`, { name, by }))
         .message_thread_id,

@@ -764,11 +764,11 @@ const GIVEN_TYPES = new Set([
 /**
  * An explicit entity as the Bot API reads it (Client.cpp get_text_entity,
  * get_text_entity_type): null for a type Telegram finds by itself, which it
- * ignores, and an unknown type refused. A date_time needs a positive
- * unix_time (TDLib FormattedDate::get_formatted_date) and comes back with its
- * format in Telegram's order.
+ * ignores, unless `keep` names it, and an unknown type refused. A date_time
+ * needs a positive unix_time (TDLib FormattedDate::get_formatted_date) and
+ * comes back with its format in Telegram's order.
  */
-function givenEntity(entity) {
+function givenEntity(entity, keep) {
   const refuse = (reason) => {
     throw new FormattingError(
       `Bad Request: can't parse MessageEntity: ${reason}`,
@@ -786,7 +786,11 @@ function givenEntity(entity) {
   const type = string("type");
   if (type === undefined) refuse(`Can't find field "type"`);
   if (type === "") refuse("Type is not specified");
-  if (FOUND_TYPES.has(type)) return null;
+  if (FOUND_TYPES.has(type)) {
+    return keep?.has(type)
+      ? { type, offset: entity.offset, length: entity.length }
+      : null;
+  }
   if (!GIVEN_TYPES.has(type)) refuse("Unsupported type specified");
   if (type !== "date_time") return { ...entity };
   const time = entity.unix_time;
@@ -810,15 +814,24 @@ function givenEntity(entity) {
 }
 
 /**
+ * Explicit entities as the Bot API reads them (givenEntity), without the
+ * ones it ignores; `keep` names found types to keep all the same.
+ */
+export function givenEntities(entities, keep) {
+  return entities.map((entity) => givenEntity(entity, keep)).filter(Boolean);
+}
+
+/**
  * The text and entities a message ends up with, as the Bot API server and
  * TDLib make them. A parse_mode other than "none" wins over explicit entities
  * (Client.cpp get_formatted_text); then the text is cleaned and trimmed, and
  * the links, mentions, commands, hashtags and cashtags Telegram finds by
  * itself are added outside code, pre and explicit links. `ltrim` is how many
  * characters were cut from the start. `user` gives the User a text_mention
- * shows for a user id.
+ * shows for a user id. `keep` names the found types kept from `entities`
+ * instead of ignored.
  */
-export function formatText(text, { parseMode, entities, user } = {}) {
+export function formatText(text, { parseMode, entities, user, keep } = {}) {
   const mode = typeof parseMode === "string" ? parseMode.toLowerCase() : "";
   let parsed;
   if (text && mode && mode !== "none") {
@@ -829,9 +842,7 @@ export function formatText(text, { parseMode, entities, user } = {}) {
   } else {
     parsed = {
       text,
-      entities: Array.isArray(entities)
-        ? entities.map(givenEntity).filter(Boolean)
-        : [],
+      entities: Array.isArray(entities) ? givenEntities(entities, keep) : [],
     };
   }
   validateRanges(parsed.text, parsed.entities);

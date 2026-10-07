@@ -252,6 +252,35 @@ await server.waitFor({
 });
 ```
 
+Members also share contacts and locations, post an earlier file again (it keeps its
+`file_unique_id`), give their text entities such as `phone_number` or `text_link`, and post on
+behalf of a chat. An administrator with `is_anonymous` posts as the group, as on Telegram:
+
+```js
+// Ann is an administrator with is_anonymous (your bot promoted her).
+await server.post(GROUP, ann, "Read the rules"); // sender_chat is the group
+// Bob has Telegram Premium (createUser with is_premium: true), which posting as a channel needs.
+const news = await server.createChat({ type: "channel", title: "News", ownerId: bob });
+await server.post(GROUP, bob, { text: "Follow us", sendAs: news }); // sender_chat is News
+await server.post(GROUP, bob, { contact: { phoneNumber: "+15550100", firstName: "Bob" } });
+await server.post(GROUP, bob, { location: { latitude: 51.5, longitude: -0.12 } });
+await server.post(GROUP, bob, {
+  text: "Call +1 212 555 0123",
+  entities: [{ type: "phone_number", offset: 5, length: 15 }],
+});
+const first = await server.post(GROUP, bob, { photo });
+const [size] = (await server.getMessage(GROUP, first)).message.photo;
+await server.post(GROUP, ann, { fileId: size.file_id }); // the same file_unique_id
+```
+
+The owner, or an administrator with `can_promote_members`, promotes members with the rights they
+choose and demotes them. The chat's administrator bots get `chat_member`:
+
+```js
+await server.promoteMember(GROUP, ann, { rights: { can_delete_messages: true } });
+await server.demoteMember(GROUP, ann);
+```
+
 Users can also post photos, media, albums and forwards, edit their messages, react, pin, press
 buttons in private chats and on ephemeral messages, change their profile, and rename the chat or
 change its photo. [Test actions](#test-actions) lists them all.
@@ -516,6 +545,10 @@ const secondBot = new Bot("654321:SECOND", { client: { apiRoot: server.origin } 
 `status` the bot becomes an administrator; `rights` grants or withholds rights, such as
 `{ can_post_messages: false }`. The bot gets `my_chat_member`, the chat's administrator bots
 `chat_member`, and a group a service message when the bot joins or leaves.
+
+`deleteBot(second.id)` deletes a bot that `addBot` added. It leaves every chat it is in, so the
+other bots hear of it as when a bot leaves, and its token then gets 401 `Unauthorized`. The first
+bot can't be deleted.
 
 Each bot has its own membership and rights in each chat, its own `update_id` sequence, its own
 `file_id`s, and hears only the button presses on keyboards it put on messages. Users write
@@ -1381,12 +1414,29 @@ handed to the bot ([Make users act](#make-users-act)). The owner account actions
   with `type` `video`, `animation`, `sticker`, `voice`, `audio`, `video_note` or `document`; a
   caption goes with every kind but stickers and video notes; `replyTo` is the `message_id` it
   replies to; `threadId` is a forum topic; `forwardFrom` is `{ userId }`, `{ senderName }` (a hidden
-  user) or `{ chatId, messageId? }` (a channel post); `poll` is a poll of the user's own, a message
-  by itself, with `sendPoll`'s fields (`question`, `options`, `type`, `is_anonymous`,
-  `allows_multiple_answers`, `allows_revoting`, `correct_option_ids`, `explanation`) and checks,
-  and needs `can_send_polls`. Fails if the user is not allowed to post. Text and captions are
-  trimmed as Telegram's apps send them, and text that then shows nothing fails with
-  `MESSAGE_EMPTY`.
+  user), `{ chatId, messageId? }` (a channel post) or `{ chatId }` of a supergroup (a post made on
+  its behalf), with `authorSignature?` for a channel or supergroup; `poll` is a poll of the
+  user's own, a message by itself, with `sendPoll`'s fields (`question`, `options`, `type`,
+  `is_anonymous`, `allows_multiple_answers`, `allows_revoting`, `correct_option_ids`,
+  `explanation`) and checks, and needs `can_send_polls`. Fails if the user is not allowed to post.
+  Text and captions are trimmed as Telegram's apps send them, and text that then shows nothing
+  fails with `MESSAGE_EMPTY`. It also takes:
+  - `contact`: `{ phoneNumber, firstName, lastName?, vcard?, userId? }`, and `location`:
+    `{ latitude, longitude, horizontalAccuracy?, livePeriod?, heading?, proximityAlertRadius? }`
+    (live when `livePeriod` is not 0). Each is a message by itself and needs `can_send_messages`.
+    `horizontalAccuracy` is kept in whole meters, rounded up, at most 1500. A contact without a
+    phone number or first name fails as incomplete; what Telegram answers is unverified.
+  - `fileId`: a file from an earlier message, by any bot's `file_id` for it. The message keeps the
+    file's kind and `file_unique_id`; a caption may go with it.
+  - `entities` and `captionEntities`: `MessageEntity` objects for the text and the caption,
+    checked as Telegram checks a user's. Types Telegram finds by itself are ignored, except
+    `phone_number` and `bank_card_number`, which this server does not find.
+  - `sendAs`: in a supergroup, the chat to post on behalf of: the group itself, for an anonymous
+    administrator, or a channel the user created. Others fail with `SEND_AS_PEER_INVALID`. An
+    administrator with `is_anonymous` posts as the group even without it, and anyone else may
+    name themselves. A channel needs Telegram Premium (`is_premium`), or the post fails with
+    `PREMIUM_ACCOUNT_REQUIRED` (unverified). Telegram offers only public channels; chats made in
+    a test have no public username, so here any channel the user created counts.
 - `vote(chatId, messageId, userId, optionIds)`: the user votes in a poll: option indexes, or `[]` to
   take the vote back. Fails as Telegram's app refuses: `Can't answer closed poll`,
   `Can't choose more than 1 option in the poll`, `Invalid option identifier specified`,
@@ -1425,9 +1475,9 @@ handed to the bot ([Make users act](#make-users-act)). The owner account actions
 **Private chats**
 
 - `sendDirectMessage(userId, message)`: the user messages the bot privately; returns the
-  `message_id`. `message` is text, or anything `post` takes but `threadId`: a photo, other media
-  with a caption, a reply to one of the bot's messages, a forward or a poll. Empty text fails with
-  `MESSAGE_EMPTY`.
+  `message_id`. `message` is text, or anything `post` takes but `threadId` and `sendAs`: a photo,
+  other media with a caption, a reply to one of the bot's messages, a forward, a poll, a contact,
+  a location or an earlier file. Empty text fails with `MESSAGE_EMPTY`.
 - `voteDirect(userId, messageId, optionIds)`: the user votes in a poll the bot sent to their private
   chat; works like `vote`.
 - `getDirectMessages(userId)`: an array of the messages in the private chat between the user and
@@ -1461,11 +1511,29 @@ handed to the bot ([Make users act](#make-users-act)). The owner account actions
 - `addBot({ token, username, firstName, loginClientSecret, supportsJoinRequestQueries })`: another
   bot, with its own webhook or update queue; it is in no chat yet. Returns the bot's user, with
   its `id`.
+- `deleteBot(botId)`: a bot `addBot` added is deleted. Its token gets 401 `Unauthorized` from then
+  on, and a waiting `getUpdates` answers at once. It leaves every chat it is in, as with
+  `leaveChat`; Telegram does not document what a deleted bot's chats see, so this is unverified.
+  It stays a user that earlier messages name, and a press on its buttons goes unanswered. The
+  first bot can't be deleted. Returns `{ deleted: true }`.
 - `createChat({ ownerId, title, type, ownerName, isForum })`: a new supergroup, forum (`isForum`),
   basic group (`type: "group"`) or channel (`type: "channel"`) with no bot in it; returns its id.
 - `setBotMembership(chatId, botId, { status, rights, by })`: the owner (or `by`) adds, promotes,
   demotes or removes a bot; `status` is `administrator` (default), `member`, `left` or `kicked`.
   The bot gets `my_chat_member`. Returns its membership.
+- `promoteMember(chatId, userId, { by, rights })`: a person (`by`, default the creator) makes a
+  member an administrator with `rights`, such as `{ can_delete_messages: true }`. Rights left out
+  are not granted, and no right at all makes them a member. The person must be the creator or an
+  administrator with `can_promote_members`, who grants only rights they hold and edits only
+  administrators they promoted. Refusals carry Telegram's texts, such as `Not enough rights`,
+  `RIGHT_FORBIDDEN` or `CHAT_ADMIN_REQUIRED`. An edit keeps the custom title. In a basic group only
+  the creator promotes, with the group's fixed rights. The chat's administrator bots get
+  `chat_member`. Returns the member. Unverified: someone outside a supergroup or channel is
+  refused (`USER_NOT_PARTICIPANT`). Telegram's apps add someone outside a basic group first; this
+  server refuses them, so add them first.
+- `demoteMember(chatId, userId, { by })`: a person makes an administrator a member again, under
+  the same rules; an administrator may also step down, which is unverified. Demoting someone who
+  is not an administrator changes nothing.
 - `addBotViaLink(chatId, botId, { by, startParameter, rights })`: a person adds the bot through its
   `startgroup` link (as an administrator with `rights`), then `/start@<bot> <startParameter>` is
   posted; or its `startchannel` link. Returns the bot's membership.
@@ -1605,8 +1673,11 @@ API routes do; only the viewer (`/_fake/ui`) answers this computer alone. Keep t
 - `POST chats/:id/messages`: the user posts `{ user_id, text }`, `{ user_id, photo_base64,
   caption? }` or `{ user_id, media: { type, base64, file_name?, mime_type? }, caption? }`,
   optionally `reply_to`, `message_thread_id` or
-  `forward_from: { user_id | sender_name | chat_id, message_id? }`, or a poll
-  `{ user_id, poll: { question, options, ... } }`; returns `{ message_id }`.
+  `forward_from: { user_id | sender_name | chat_id, message_id?, author_signature? }`, or a poll
+  `{ user_id, poll: { question, options, ... } }`; returns `{ message_id }`. It also takes
+  `contact: { phone_number, first_name, last_name?, vcard?, user_id? }`, `location: { latitude,
+  longitude, horizontal_accuracy?, live_period?, heading?, proximity_alert_radius? }`, `file_id`,
+  `entities`, `caption_entities` and `send_as`, as `post` does.
 - `POST chats/:id/messages/:messageId/vote`: the user `{ user_id, option_ids }` votes in a poll
   (`option_ids: []` takes the vote back); returns the poll.
 - `POST chats/:id/albums`: the user posts an album
@@ -1650,8 +1721,9 @@ count.
 **Private chats**
 
 - `POST users/:id/dm`: the user sends the bot a direct message, with the same body as
-  `POST chats/:id/messages` without `user_id` and `message_thread_id`: `{ text }`,
-  `{ photo_base64, caption? }`, `{ media, caption? }`, `reply_to`, `forward_from` or `poll`.
+  `POST chats/:id/messages` without `user_id`, `message_thread_id` and `send_as`: `{ text }`,
+  `{ photo_base64, caption? }`, `{ media, caption? }`, `reply_to`, `forward_from`, `poll`,
+  `contact`, `location`, `file_id`, `entities` or `caption_entities`.
 - `POST users/:id/dm/:messageId/vote`: the user `{ option_ids }` votes in a poll the bot sent
   privately.
 - `GET users/:id/dm`: an array of the private chat's messages, newest first.
@@ -1666,6 +1738,8 @@ count.
   `{ token, username, first_name?, login_client_secret?, supports_join_request_queries? }`; it is
   in no chat yet.
 - `GET bots`: every bot, with its webhook URL and `login_client_secret`.
+- `DELETE bots/:id`: delete a bot added with `POST bots`, as `deleteBot` does; returns
+  `{ deleted: true }`.
 - `POST chats`: create
   `{ owner_id, title?, type?: "supergroup" | "group" | "channel", owner_name?, is_forum? }`;
   returns the chat.
@@ -1675,6 +1749,10 @@ count.
 - `POST chats/:id/bots` with `start_parameter`: a person `{ by?, bot_id, start_parameter, rights? }`
   adds the bot through its `startgroup` link, or, with `rights` and an empty `start_parameter`, a
   channel's `startchannel` link.
+- `POST chats/:id/members/:userId/promote`: a person `{ by?, rights }` makes the member an
+  administrator, as `promoteMember` does; returns the member.
+- `POST chats/:id/members/:userId/demote`: a person `{ by? }` makes the administrator a member
+  again; returns the member.
 - `POST chats/:id/migrate`: upgrade a basic group `{ by? }`; returns the new supergroup.
 - `POST chats/:id/title`: a person renames the chat `{ by?, title }`.
 - `POST chats/:id/photo`: a person sets the chat photo `{ by?, base64 }`.
@@ -1855,12 +1933,17 @@ messages, text formatting and replies, and request parsing and update delivery.
 ## What it does not do
 
 - Inline mode, payments, games, sticker sets, reaction counts, options added to a poll after it was
-  sent, votes on behalf of a channel (`voter_chat`), or Telegram's exact
+  sent, reactions and votes on behalf of a chat (`actor_chat`, `voter_chat`: an anonymous
+  administrator reacts and votes as themselves), or Telegram's exact
   rate limits: `floodControl` applies only its published numbers (a test can also make any call
   fail with a 429 through `POST failures`). Channel signatures are not modeled, and forum topics
   cannot be closed or deleted.
 - Updates when a restriction or ban runs out: the member's status changes on time, and no update is
   sent.
+- The older fields the Bot API server still writes beside newer ones: `forward_from`,
+  `forward_from_chat`, `forward_from_message_id`, `forward_signature`, `forward_sender_name` and
+  `forward_date` beside `forward_origin`, and `can_manage_voice_chats` beside
+  `can_manage_video_chats`.
 - Privacy mode. Every bot in a group gets all its messages, as a bot with privacy mode off does,
   and `getMe` says `can_read_all_group_messages: true`.
 - In Telegram Login: the `phone` scope's `phone_number` (test users have no phone numbers), the
@@ -2011,8 +2094,9 @@ fields below.
 
 ## Changes
 
-- **0.12.0**: watch and record what happens in the chats, observe a run more closely, and let the
-  app under test follow the manual clock.
+- **0.12.0**: watch and record what happens in the chats, observe a run more closely, let the app
+  under test follow the manual clock, and let members and people do more of what they do on
+  Telegram.
   - New: the `ui` option (`--ui`) serves a live chat viewer at `server.viewerUrl`
     ([Watch the chats in a browser](#watch-the-chats-in-a-browser)), with the bots' calls beside
     the chats they acted on ([Call timeline](#call-timeline)).
@@ -2030,6 +2114,17 @@ fields below.
     ([Testing time-based app logic](#testing-time-based-app-logic)).
   - New: call receipts have `description`, the text the answer carried
     ([Call receipts](#call-receipts)).
+  - New: members post on behalf of a chat (a channel they created, with Premium), forward a
+    supergroup's own post (`MessageOriginChat`), share contacts and locations, give their text
+    entities such as `phone_number` and `text_link`, and post an earlier file again with its
+    `file_unique_id` ([Make users act](#make-users-act)).
+  - New: people promote and demote members (`promoteMember`, `demoteMember`), and a test deletes a
+    bot it added (`deleteBot`) ([Test actions](#test-actions)).
+  - Changed: a supergroup administrator with `is_anonymous` now posts as the group, as on Telegram
+    (`from` is `@GroupAnonymousBot`, with `sender_chat` and `author_signature`), where 0.11.0
+    posted as the user, and a bot's forward of such a post has a `chat` origin.
+  - Changed: `promoteChatMember` now keeps the custom title when it edits an administrator, and
+    drops `is_anonymous` in a channel, as Telegram does.
 - **0.11.0**: the server answers as Telegram does wherever 0.10.0 did not, checked against the Bot
   API docs and the source of Telegram's Bot API server and TDLib: channel posts, who receives which
   update, webhook retries and concurrency, per-bot updates and file ids, ephemeral messages, invite

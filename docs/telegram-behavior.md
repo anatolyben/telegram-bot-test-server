@@ -28,7 +28,8 @@ byte identical.
   [service messages about the bot itself](#service-messages-about-the-bot-itself),
   [forum topics](#forum-topics), [business connections](#business-connections),
   [command menus](#command-menus)
-- [Messages](#messages): [what members send](#what-members-send), [entities](#entities),
+- [Messages](#messages): [what members send](#what-members-send),
+  [posts on behalf of a chat](#posts-on-behalf-of-a-chat), [entities](#entities),
   [deleting](#deleting-messages), [editing](#editing), [editing media](#editing-media),
   [forwards and copies](#forwards-and-copies), [pins](#pins), [polls](#polls),
   [reactions](#reactions), [media](#media), [files](#files)
@@ -103,13 +104,35 @@ current member, as the docs guarantee; with it, a user who is not banned stays a
 ### Administrators and chat settings
 
 `promoteChatMember` needs `can_promote_members` and grants only rights the bot holds. Rights the
-kind of chat does not have (below) are dropped first, as TDLib drops them; any one right left makes
-an administrator, `can_send_welcome_messages`, `can_manage_tags` and `can_manage_direct_messages`
-included, and none leaves a member. A channel promotion that names any right also grants
-`can_restrict_members` unless the call says otherwise. The bot can then edit and title the
-administrators it promoted. An administrator carries the rights its kind of chat has, as Telegram
-writes them: `can_post_messages`, `can_edit_messages` and `can_manage_direct_messages` in channels,
-`can_pin_messages` and `can_manage_tags` in groups, and `can_manage_topics` in supergroups.
+kind of chat does not have (below) are dropped first, as TDLib drops them, and so is `is_anonymous`
+in a channel, which has no anonymous administrators; any one right left makes an administrator,
+`can_send_welcome_messages`, `can_manage_tags` and `can_manage_direct_messages` included, and none
+leaves a member. A channel promotion that names any right also grants `can_restrict_members`
+unless the call says otherwise. The bot can then edit and title the administrators it promoted. An
+edit keeps the custom title: TDLib's `channels.editAdmin` leaves the title out, which changes only
+through `messages.editChatParticipantRank`. An administrator carries the rights its kind of chat
+has, as Telegram writes them: `can_post_messages`, `can_edit_messages` and
+`can_manage_direct_messages` in channels, `can_pin_messages` and `can_manage_tags` in groups, and
+`can_manage_topics` in supergroups.
+
+People promote and demote members too (`promoteMember`, `demoteMember`), as Telegram's apps do
+through TDLib's `setChatMemberStatus`. In a supergroup or channel, the creator or an administrator
+with `can_promote_members` chooses the rights, which are dropped and checked as for
+`promoteChatMember`. The person grants only rights they hold (`RIGHT_FORBIDDEN`), and only the
+creator edits administrators someone else promoted (`CHAT_ADMIN_REQUIRED`). Nobody changes the
+owner (`Can't remove chat owner`) or promotes themselves (`Can't promote self`), and anyone else
+gets `Not enough rights`. In a basic group only the creator promotes
+(`Need owner rights in the group chat`), never themselves (`Can't promote or demote self`), checked
+before anything else. There every administrator has the group's fixed rights, as TDLib reads them,
+since Telegram keeps only whether someone is one. A change to what the member already has succeeds
+without an update, and demoting someone who is not an administrator changes nothing. Otherwise the
+chat's administrator bots get `chat_member` from the person, and no bot may edit the new
+administrator (`can_be_edited` is false). An edit keeps the custom title. In a basic group,
+Telegram's apps add someone outside it first; this server does not, and refuses them
+(`the user is not in the chat; add them first`). Unverified: that an administrator may demote
+themselves, as TDLib allows; that someone outside a supergroup or channel is refused
+(`USER_NOT_PARTICIPANT`), where TDLib asks Telegram to promote them directly; and that a change to
+nothing new succeeds in a basic group, where TDLib asks Telegram all the same.
 
 `setChatTitle`, `setChatDescription`, `setChatPhoto` and `deleteChatPhoto` need `can_change_info`
 and post Telegram's service messages to every bot in the chat, the bot that made the change
@@ -174,6 +197,14 @@ keyboard on a message, by sending the message or by the last edit that set the k
 buttons pressed. Users write privately only to the first bot, so no other bot can message them
 (403), except a join requester: any bot that receives the request may message them for five
 minutes, as under [Private chats](#private-chats).
+
+A test may delete a bot it added (`deleteBot`). Every call with its token then gets
+`401 Unauthorized`, the Bot API server's answer once Telegram no longer accepts a token. Its webhook
+goes, and a waiting `getUpdates` answers at once with what is pending, as the server does when it
+closes a bot. Unverified, because Telegram does not document it: what a deleted bot's chats see.
+Here it leaves each chat it is in, as with `leaveChat`, so the chat's administrator bots get
+`chat_member` from it and a group gets `left_chat_member`. It stays a user that earlier messages and
+member lists name, and a press on its buttons reaches no bot and goes unanswered at once.
 
 ### Private chats
 
@@ -301,11 +332,48 @@ here.
 Besides text and photos, members post videos, animations (which carry a `document` too), stickers,
 voice notes, audio, video notes and documents, each needing its own permission (`can_send_videos`,
 `can_send_voice_notes`, ...), plus albums sharing a `media_group_id` and forwards with
-`forward_origin` (a user, a hidden user or a channel post). An edit by the author reaches bots as
-`edited_message` (in a channel, `edited_channel_post`) with `edit_date`. A member's text and
-captions, in posts and in edits, are trimmed of spaces and newlines at both ends, as Telegram's apps
-send them. A post, private message or edit whose text then shows nothing (only spaces, zero-width or
-other blank characters) fails with `MESSAGE_EMPTY`; such a caption is dropped.
+`forward_origin` (a user, a hidden user, a channel post, or a post made on behalf of a supergroup,
+with `type: "chat"` and an optional `author_signature`). Only a supergroup or a channel posts on its
+own behalf, so TDLib refuses a forward header from any other chat. An edit by the author reaches
+bots as `edited_message` (in a channel, `edited_channel_post`) with `edit_date`. A member's text
+and captions, in posts and in edits, are trimmed of spaces and newlines at both ends, as Telegram's
+apps send them. A post, private message or edit whose text then shows nothing (only spaces,
+zero-width or other blank characters) fails with `MESSAGE_EMPTY`; such a caption is dropped.
+
+Contacts and locations need `can_send_messages`, as in TDLib's `can_send_message_content`, in groups
+and in the bot's private chat. A contact keeps `last_name`, `vcard` and `user_id` when given; the
+user must exist (`User not found`). Telegram fills `user_id` when the number belongs to an account;
+test users have no phone numbers, so the test names the user. A location is checked with TDLib's
+texts: a point off the map fails with `Invalid location specified` (`Invalid live location
+specified` for a live one), and a `live_period` other than 0 makes it live, from 60 seconds to a day
+or `0x7FFFFFFF`, with a heading of 1 to 360 and an alert radius up to 100000
+(`Wrong live location period specified` and the like). `horizontal_accuracy` is held to 1500
+meters and rounded up to whole meters, as TDLib sends it. A location without `latitude` or
+`longitude` is refused as incomplete. Unverified: what Telegram answers an empty phone number or
+first name, which TDLib does not check; this server refuses them as incomplete.
+
+### Posts on behalf of a chat
+
+In a supergroup, an administrator with `is_anonymous` posts as the group, as TDLib's
+`create_message_to_send` does: the message has `sender_chat` (the group), `from` the
+`@GroupAnonymousBot` user (id 1087968824) as the Bot API writes it, and the administrator's custom
+title as `author_signature`. An administrator without `is_anonymous` posts as themselves. A member
+may also post as a channel they created (`sendAs`); `from` is then `@Channel_Bot` (id 136817688)
+and `sender_chat` the channel. A member who is not anonymous may name themselves, as TDLib lists
+their own account. Naming any other chat, or any chat outside a supergroup or in a private chat,
+fails with `SEND_AS_PEER_INVALID`. These are real messages of the chat: bots get them, delete them
+with the usual rights, and a forward of one has the `chat` origin with the sender chat and
+signature. Waits and failure rules still name the person who posted. Telegram offers only public
+channels the user created; chats made in a test have no public username, so here any channel the
+member created counts. Posting as a channel needs Telegram Premium, as TDLib's
+`get_dialog_send_message_as_dialog_ids` marks it, unless the channel is verified or linked to the
+group, which this server does not model. Unverified: what Telegram answers a member without it; here
+`PREMIUM_ACCOUNT_REQUIRED` (403), which `messages.sendMessage` lists. Also unverified: what Bot API
+calls answer for the `@GroupAnonymousBot` and `@Channel_Bot` users, such as `banChatMember` on the
+`from` of such a post; here they are unknown users (`Bad Request: user not found`).
+`banChatSenderChat` is not supported. Not modeled: an anonymous administrator's reactions and poll
+votes, which the Bot API reports with `actor_chat` and `voter_chat` for anonymous ones; here they
+react and vote as themselves.
 
 ### Entities
 
@@ -314,7 +382,19 @@ them: `mention`, `bot_command` (anywhere it does not touch a letter, digit, `_`,
 `hashtag`, `cashtag`, `url` and `email`, with UTF-16 offsets, in groups and in private chats. A link
 without a protocol needs a common top-level domain, so `example.com` and `shop.xyz` are links and
 `package.json`, `spam.test` and `evil.local` are not; with a protocol, as in
-`http://spam.invalid/x`, any domain is. Phone numbers are not marked.
+`http://spam.invalid/x`, any domain is. Phone numbers and bank card numbers are not marked.
+
+A test may also give a member's text or caption `entities` in the Bot API's `MessageEntity` shape.
+They are read as the Bot API reads them, then checked as TDLib checks a user's input entities
+(`get_message_entities`, `fix_formatted_text`): ranges must fit the text, a `text_link` URL must
+pass `LinkManager::check_link` and is kept as it rewrites it (`spam.example` becomes
+`http://spam.example/`), a `tg://user?id=` link becomes a `text_mention`, a mentioned user must
+exist, and a custom emoji id must not be 0. Refusals carry those texts, such as
+`Entity URL 'nodot' is invalid: Wrong HTTP URL`, without the Bot API's `Bad Request: ` and
+`can't parse entities: `. The types Telegram finds by itself are found here and ignored when given,
+except `phone_number` and `bank_card_number`: Telegram's server marks them by rules it does not
+publish, so the test marks them. Not modeled: Telegram drops a premium custom emoji from a user
+without Premium.
 
 ### Deleting messages
 
@@ -356,7 +436,11 @@ photo or video, and an audio or document keeps its kind. Other messages' media c
 ### Forwards and copies
 
 A forward carries `forward_origin`; a copy does not. A forward of a forward keeps the first origin
-and its date. A bot cannot forward from a chat it is not in; the source chat gets the checks under
+and its date. A message sent on behalf of a chat in a group (see
+[Posts on behalf of a chat](#posts-on-behalf-of-a-chat)) is forwarded with a `chat` origin, as
+TDLib's `MessageOrigin` reads Telegram's forward header. Its `author_signature` stays in the
+origin: the bot's forward or copy has none of its own. A bot cannot forward from a chat it is
+not in; the source chat gets the checks under
 [Which chats a bot may use](#which-chats-a-bot-may-use) for a call that needs only read access,
 before the chat the message goes to. A missing message fails with `message to forward not found` or
 `message to copy not found`. Service messages can't be forwarded or copied
@@ -469,7 +553,10 @@ a photo cannot stand in for any other kind, nor any other kind for a photo
 (`can't use file of type Photo as Document`), and a document, video or the like sent by another
 method stays what it was; a live photo's video sent on its own is a video. `getFile`'s `file_path`
 starts with the directory TDLib keeps that kind of file in, such as `photos/`, `voice/` or `music/`.
-The control API shows messages with the first bot's file_ids.
+The control API shows messages with the first bot's file_ids. A member posts an earlier file again
+by any bot's file_id for it (`fileId`): the message keeps its kind, `file_unique_id` and what its
+first sender said, and needs the permission for that kind. A new upload of the same bytes is a new
+file with a new `file_unique_id`.
 
 Telegram's docs: [sending files](https://core.telegram.org/bots/api#sending-files).
 
