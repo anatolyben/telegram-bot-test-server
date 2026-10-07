@@ -395,14 +395,16 @@ export function startViewer({ render, interact, views, source, root }) {
           params.topic === undefined
         )
           slot.next = "latest";
+        // The chat's newest item, whichever page this was.
+        const latest = page.chat_latest_seq ?? page.latest_seq;
         const last = slot.items.at(-1)?.seq ?? 0;
         if (effective === "older-calls") {
           // A page of calls says nothing about newer items.
         } else if (
           !slot.attached &&
-          page.latest_seq != null &&
-          page.latest_seq > last &&
-          slot.countedAt !== page.latest_seq
+          latest != null &&
+          latest > last &&
+          slot.countedAt !== latest
         ) {
           const newer = await source.page(slot.ref, {
             ...base,
@@ -412,14 +414,10 @@ export function startViewer({ render, interact, views, source, root }) {
           if (generation !== ui.generation || ui.slots.get(slot.ref) !== slot)
             return;
           slot.newer = newer.items?.length ?? 0;
-          slot.countedAt = page.latest_seq;
-        } else if (
-          slot.attached ||
-          page.latest_seq == null ||
-          page.latest_seq <= last
-        ) {
+          slot.countedAt = latest;
+        } else if (slot.attached || latest == null || latest <= last) {
           slot.newer = 0;
-          slot.countedAt = page.latest_seq;
+          slot.countedAt = latest;
         }
       }
       renderSlot(slot);
@@ -613,35 +611,38 @@ export function startViewer({ render, interact, views, source, root }) {
       }))
       .sort((a, b) => a.name.localeCompare(b.name));
     patchHtml(controls, render.renderToolbar(ui.view, { people: list }));
-    const text = recording?.window
-      ? `items ${recording.window.start_seq}–${recording.window.stop_seq}`
-      : "";
-    patchHtml(statusSlot, render.renderStatus(ui.status, text, recording));
+    patchHtml(statusSlot, render.renderStatus(ui.status, recording));
   }
 
   function renderList() {
     const column = columnElement("list");
     if (!column) return;
     const entries = ui.state ? ui.state.chats : [];
+    const header = column.querySelector("[data-slot='header']");
     patchHtml(
-      column.querySelector("[data-slot='header']"),
+      header,
       render.renderListHeader(
-        entries.length,
-        ui.search,
         render.viewToSearch({ ...ui.view, show: ["list"] }),
       ),
     );
+    // The box keeps what the reader typed; a redrawn one gets it back.
+    const input = header.querySelector("[data-role='chat-search']");
+    if (input && input.value !== ui.search) input.value = ui.search;
     const current = [...ui.slots.values()].map(
       (slot) => slot.page?.chat?.key ?? slot.ref,
     );
-    const users = {};
-    for (const slot of ui.slots.values()) Object.assign(users, slot.users);
     const rows = render.chatListEntries(ui.state ?? { chats: [] }, {
       view: ui.view,
       current,
       search: ui.search,
-      users,
     });
+    const count = header.querySelector("[data-role='chat-count']");
+    if (count)
+      count.textContent = render.renderChatCount(
+        entries.length,
+        rows.filter((row) => !row.hidden).length,
+        ui.search.trim() !== "",
+      );
     patchKeyed(
       column.querySelector("[data-slot='items']"),
       rows.length
@@ -906,9 +907,9 @@ export function startViewer({ render, interact, views, source, root }) {
     setView(next, "none");
   });
   if (typeof ResizeObserver === "function")
-    new ResizeObserver(() => interact.updateDividers(workspace)).observe(
-      workspace,
-    );
+    new ResizeObserver(() =>
+      interact.layoutColumns(workspace, ui.weights),
+    ).observe(workspace);
 
   // ── start ───────────────────────────────────────────────────────────
   applyTheme();
@@ -1090,33 +1091,6 @@ export function liveSource(base = "/_fake/ui") {
 
 // ── recording source ──────────────────────────────────────────────────
 
-function compactItem(item) {
-  if (!item) return null;
-  if (item.kind === "event")
-    return {
-      kind: "event",
-      seq: item.seq,
-      at: item.at,
-      author: item.user_id ?? null,
-      preview: null,
-      media: item.type,
-      deleted: false,
-      ephemeral: false,
-    };
-  const message = item.message ?? {};
-  const text = message.text ?? message.caption ?? null;
-  return {
-    kind: "message",
-    seq: item.seq,
-    at: item.at,
-    author: item.author,
-    preview: text == null ? null : Array.from(text).slice(0, 100).join(""),
-    media: null,
-    deleted: item.deleted === true,
-    ephemeral: item.ephemeral === true,
-  };
-}
-
 /**
  * A recording's twin as a source: the same answers as the live server,
  * computed from the recorded pages by the same views.js windows and filters,
@@ -1169,6 +1143,10 @@ export function staticSource(json, viewsApi) {
       const state = { ...json.state, files };
       if (params.as == null) return state;
       const userId = Number(params.as);
+      // A member's view names whoever posted what they see.
+      const users = { ...state.users };
+      for (const page of Object.values(pages))
+        Object.assign(users, page.users ?? {});
       const chats = (state.chats ?? [])
         .filter((entry) =>
           entry.type === "private"
@@ -1178,17 +1156,16 @@ export function staticSource(json, viewsApi) {
                 (row) => Number(row.user_id) === userId,
               ),
         )
-        .map((entry) =>
-          pages[entry.key]
-            ? {
-                ...entry,
-                last: compactItem(
-                  viewOf(pages[entry.key], userId).items.at(-1),
-                ),
-              }
-            : entry,
-        );
-      return { ...state, chats };
+        .map((entry) => {
+          if (!pages[entry.key]) return entry;
+          const seen = viewOf(pages[entry.key], userId);
+          return {
+            ...entry,
+            last: viewsApi.listPreview(seen.items.at(-1)),
+            access: seen.as.access,
+          };
+        });
+      return { ...state, chats, users };
     },
     async page(ref, params = {}) {
       const full = pages[keyOf(ref)];
@@ -1196,23 +1173,30 @@ export function staticSource(json, viewsApi) {
       let items = full.items ?? [];
       let as = null;
       if (params.as != null) ({ items, as } = viewOf(full, Number(params.as)));
-      if (params.topic != null && full.chat?.is_forum)
+      let calls = full.calls ?? [];
+      if (params.topic != null && full.chat?.is_forum) {
         items = items.filter((item) => viewsApi.inTopic(item, params.topic));
+        calls = viewsApi.callsInTopic(calls, full.items ?? [], params.topic);
+      }
       const callsBefore = params.calls_before ?? null;
       const window =
         callsBefore != null
-          ? { items: [], has_older: false, oldest_seq: null, latest_seq: null }
+          ? {
+              items: [],
+              has_older: false,
+              oldest_seq: null,
+              latest_seq: null,
+              chat_latest_seq: null,
+            }
           : viewsApi.pageWindow(items, {
               limit: params.limit ?? PAGE_SIZE,
               before: params.before ?? null,
               from: params.from ?? null,
               to: params.to ?? null,
             });
-      const calls = as
+      const shown = as
         ? { calls: [], calls_truncated: false, calls_oldest_request: null }
-        : viewsApi.callWindow(items, full.calls ?? [], window, {
-            callsBefore,
-          });
+        : viewsApi.callWindow(items, calls, window, { callsBefore });
       const limit = params.members_limit ?? MEMBERS_SHOWN;
       return {
         ...full,
@@ -1221,7 +1205,7 @@ export function staticSource(json, viewsApi) {
         files,
         members: as || !limit ? [] : (full.members ?? []).slice(0, limit),
         join_requests: as ? [] : (full.join_requests ?? []),
-        ...calls,
+        ...shown,
       };
     },
     subscribe(deliver) {

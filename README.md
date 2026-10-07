@@ -669,14 +669,16 @@ What it shows, only from what the server stores:
 - **Messages**: the sender's name and initial, bots tagged as the first bot, an added bot or a guest
   bot; text with its entities, replies, forwards and captions; photos as the images themselves and
   other media as labelled placeholders; inline keyboards as buttons (hover one for its callback
-  data); edits; and service messages: joins, leaves, pins, title and photo changes, upgrades and
-  topics. Times are UTC.
+  data); edits (not a bot's change of only the keyboard, which Telegram's apps do not mark either);
+  and service messages: joins, leaves, pins, title and photo changes, upgrades and topics. Times
+  are UTC.
 - **Deletions**: a deleted message stays, greyed and marked with the bot that deleted it.
 - **Ephemeral messages**, marked with the member who sees them.
 - **Events** Telegram shows as no message: member changes (restrictions, bans, promotions, their
   expiry), join requests (pending, approved, declined) and unpins.
 - **Members**: each one's status, restrictions and rights, the bots' included, and pending join
-  requests.
+  requests. The count is of those in the chat now; the panel also lists those who left or were
+  banned.
 
 The view lives in the URL, so a link, a test or a Playwright script reproduces it exactly, and
 everything changed on the page (panels, layout, view as, topic, theme, the open chat) updates the
@@ -710,25 +712,25 @@ history from new members (the view marks where that history would start), and me
 created with count as present from the start.
 
 **Long chats.** A chat shows its latest 200 messages and events; "Load older messages" adds 200 at a
-time. At most 600 stay loaded: loading more drops the newest, and "Jump to latest" goes back to the
-end.
+time. At most 600 stay loaded: loading more drops the newest, and "Jump to latest", which says how
+many newer messages are not loaded, goes back to the end.
 
 **Several tabs.** All viewer tabs of one browser share one event stream, so any number of them stay
 live.
 
 **Selecting with Playwright.** Chats, messages, buttons and members carry stable data attributes:
 
-| Element       | Attributes                                                                                                                                                                                                                                                                                                                                                                                                       |
-| ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| the page      | `[data-role="app"]` with `data-instance`, `data-epoch`, `data-version`, and `data-busy="true"` while loading                                                                                                                                                                                                                                                                                                     |
-| chat list row | `data-chat-key`, `data-chat-id`, `data-chat-type` (`supergroup`, `group`, `channel`, `private`, `calls`), `data-forum`; private chats `data-user-id`, `data-bot-id`; `aria-current="true"` when open                                                                                                                                                                                                             |
-| column        | `data-column-id` (`list` or `<panel>:<chat>`), `data-panel`, `data-chat-key`, `data-chat-id`, `data-view-as`                                                                                                                                                                                                                                                                                                     |
-| message       | `data-kind="message"`, `data-chat-key`, `data-seq`, `data-message-id` or, for an ephemeral message, `data-ephemeral-id` and `data-receiver-id`; `data-author-id`, `data-author-kind` (`user`, `first-bot`, `added-bot`, `guest-bot`, `bot`, `channel`), `data-deleted` and `data-deleted-by`, `data-edited`, `data-service`, `data-thread-id`, `data-reply-to`, `data-request-id`                                |
-| inline button | `data-button-text`, `data-button-data`, `data-button-url`, `data-button-row`, `data-button-col`                                                                                                                                                                                                                                                                                                                  |
-| event         | `data-kind="event"`, `data-chat-key`, `data-event-id`, `data-event-type` (`member`, `join_request`, `unpin`), `data-user-id`, `data-request-id`                                                                                                                                                                                                                                                                  |
-| call          | `data-kind="call"`, `data-chat-key` (`calls` for calls without a chat), `data-request-id`, `data-request-number`, `data-call-seq` and `data-call-journal` (the receipt's `seq` and its list: `calls` or `rejected_requests`), `data-call-bot-id`, `data-call-method`, `data-call-outcome`, `data-target-messages` (`<chat id>:<message id>`, space-separated), `data-target-user-id`, `data-target-ephemeral-id` |
-| member        | `data-chat-key`, `data-member-id`, `data-member-status`, `data-member-in-chat`, `data-member-bot`                                                                                                                                                                                                                                                                                                                |
-| join request  | `data-chat-key`, `data-join-request-user-id`                                                                                                                                                                                                                                                                                                                                                                     |
+| Element       | Attributes                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| the page      | `[data-role="app"]` with `data-instance`, `data-epoch`, `data-version`, and `data-busy="true"` while loading                                                                                                                                                                                                                                                                                                                                                                            |
+| chat list row | `data-chat-key`, `data-chat-id`, `data-chat-type` (`supergroup`, `group`, `channel`, `private`, `calls`), `data-forum`; private chats `data-user-id`, `data-bot-id`; `aria-current="true"` when open                                                                                                                                                                                                                                                                                    |
+| column        | `data-column-id` (`list` or `<panel>:<chat>`), `data-panel`, `data-chat-key`, `data-chat-id`, `data-view-as`                                                                                                                                                                                                                                                                                                                                                                            |
+| message       | `data-kind="message"`, `data-chat-key`, `data-seq`, `data-message-id` or, for an ephemeral message, `data-ephemeral-id` and `data-receiver-id`; `data-author-id`, `data-author-kind` (`user`, `first-bot`, `added-bot`, `guest-bot`, `bot`, `channel`), `data-deleted` and `data-deleted-by`, `data-edited` and `data-edit-hidden` (a bot changed only the keyboard), `data-service`, `data-thread-id`, `data-reply-to`, `data-reply-deleted`, `data-pinned-deleted`, `data-request-id` |
+| inline button | `data-button-text`, `data-button-data`, `data-button-url`, `data-button-row`, `data-button-col`                                                                                                                                                                                                                                                                                                                                                                                         |
+| event         | `data-kind="event"`, `data-chat-key`, `data-event-id`, `data-event-type` (`member`, `join_request`, `unpin`), `data-user-id`, `data-request-id`                                                                                                                                                                                                                                                                                                                                         |
+| call          | `data-kind="call"`, `data-chat-key` (`calls` for calls without a chat), `data-request-id`, `data-request-number`, `data-call-seq` and `data-call-journal` (the receipt's `seq` and its list: `calls` or `rejected_requests`), `data-call-bot-id`, `data-call-method`, `data-call-outcome`, `data-target-messages` (`<chat id>:<message id>`, space-separated), `data-target-user-id`, `data-target-ephemeral-id`                                                                        |
+| member        | `data-chat-key`, `data-member-id`, `data-member-status`, `data-member-in-chat`, `data-member-bot`                                                                                                                                                                                                                                                                                                                                                                                       |
+| join request  | `data-chat-key`, `data-join-request-user-id`                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 
 `data-chat-key` tells a user's private chats with two bots apart. View as, the topic filter and the
 call filters leave what is hidden out of the page, so a count of zero means it is not shown.
@@ -737,7 +739,9 @@ stream open, so Playwright's `networkidle` never settles; after acting, read the
 and wait for the page to catch up:
 
 ```js
-const { version } = await (await fetch(`${server.origin}/_fake/ui/api/state`)).json();
+// The viewer's own address: with host "0.0.0.0" or "::", server.origin is not a local one.
+const viewer = new URL(server.viewerUrl).origin;
+const { version } = await (await fetch(`${viewer}/_fake/ui/api/state`)).json();
 await page.waitForFunction(
   (wanted) =>
     Number(document.body.dataset.version) >= wanted &&
@@ -763,8 +767,9 @@ The viewer's routes, all `GET` and all on this computer only:
 
 The viewer draws every Bot API call from the [call receipts](#call-receipts) beside the chat it
 acted on: the bot (first or added), the method, what it asked for in words (the user, the
-messages, `until_date` as a UTC time or "forever", the permissions it turns off or the rights it
-grants, the text), its outcome (`succeeded`, `rejected 400`, `delayed`, `response lost`, ...), and,
+messages, `until_date` as a UTC time or "forever", the permissions as Telegram reads them (a
+permission left out is off; hover for what was sent) or the rights it grants, the text), its
+outcome (`succeeded`, `rejected 400`, `delayed`, `response lost`, ...), and,
 for every answer other than 200, Telegram's description exactly as the bot got it. A call a failure
 rule failed, delayed or dropped is tagged `injected`, and a method this server lacks
 `unimplemented`.
@@ -779,6 +784,8 @@ rule failed, delayed or dropped is tagged `injected`, and a method this server l
   and `show=calls` shows the timeline alone.
 - **Filter calls**, or `bots=` and `methods=` in the URL, keeps only some bots' calls or some
   methods.
+- In a forum, a topic shows only its calls: those whose message landed in it, or that named it as
+  `message_thread_id`, or that acted on one of its messages. Any other call is under General.
 - Clicking a call marks what it touched: the messages it names (for a forward or a copy, in the chat
   they came from), its ephemeral message, the member it acted on, and what it produced. A message
   that is not loaded gets a note instead.
@@ -1110,6 +1117,12 @@ deliveries routes take camelCase fields, like their JavaScript methods.
   ([Flood control](#flood-control)).
 - `clock` (default real time): `{ now: <Unix ms> }`: a manual clock that only `advanceTime` moves
   ([Time](#time)).
+- `clockWebhook` (default none): an `http(s)` URL. With a manual clock, the server POSTs
+  `{ now, mode }` there after each `advanceTime` and each restore, so the app under test can follow
+  the clock. The bot's own webhook deliveries stay as Telegram sends them.
+- `ui` (default `false`): serve the [chat viewer](#watch-the-chats-in-a-browser) at
+  `server.viewerUrl`, to this computer only. It needs a loopback or wildcard `host`; another throws
+  `ui needs a loopback or wildcard host`.
 - `recordDir` (default none): the directory `stopRecording` writes each recording into
   ([Record a scenario](#record-a-scenario)).
 - `log` (default none): receives one line per notable event: unsupported methods, webhook
@@ -1318,6 +1331,10 @@ same):
 The test actions, over HTTP, for tests written in other languages. All routes live under
 `/_fake/`, a prefix no Bot API path uses, take and return JSON and use snake_case fields. A route
 that fails answers `{ error }` with an HTTP status.
+
+These routes have no authentication and answer anyone who can reach the server's port, as the Bot
+API routes do; only the viewer (`/_fake/ui`) answers this computer alone. Keep the default host,
+`127.0.0.1`.
 
 **Users**
 
@@ -1604,8 +1621,8 @@ messages, text formatting and replies, and request parsing and update delivery.
   `sendLivePhoto` and `editMessageLiveLocation`.
 - Persistence. All state lives in memory and is lost when the server stops; recovering from a
   restart belongs to the application under test.
-- Anything security-related. It is a test tool: bind it to localhost and never expose it to a
-  network you do not control.
+- Anything security-related. It is a test tool: the control API answers anyone who can reach its
+  port, so bind it to localhost and never expose it to a network you do not control.
 
 ## Upgrading from 0.10.0
 
@@ -1743,6 +1760,17 @@ fields below.
 
 ## Changes
 
+- **0.12.0**: watch and record what happens in the chats, and observe a run more closely.
+  - New: the `ui` option serves a live chat viewer at `server.viewerUrl`
+    ([Watch the chats in a browser](#watch-the-chats-in-a-browser)), with the bots' calls beside
+    the chats they acted on ([Call timeline](#call-timeline)).
+  - New: `startRecording` and `stopRecording` keep a scenario as an HTML page that opens offline,
+    and its JSON twin; the `recordDir` option writes them ([Record a scenario](#record-a-scenario)).
+  - New: `waitFor` waits for `{ kind: "quiet", ms }` and `{ kind: "update" }`, and matches messages
+    by `contains`, `matches`, `buttonText` and `buttonData`; `getMessageLog` lists every message
+    stored after a mark, deleted ones flagged; `getBotUpdates` lists the updates each bot was sent.
+  - New: the `clockWebhook` option and `telegram-bot-test-server/clock` (`fakeClockNow`,
+    `refreshFakeClock`, `fakeClockHandler`) let the app under test follow the manual clock.
 - **0.11.0**: the server answers as Telegram does wherever 0.10.0 did not, checked against the Bot
   API docs and the source of Telegram's Bot API server and TDLib: channel posts, who receives which
   update, webhook retries and concurrency, per-bot updates and file ids, ephemeral messages, invite
@@ -1817,8 +1845,8 @@ This is an early-stage project with a deliberately small scope, and the public A
 Pin an exact version:
 
 ```sh
-pnpm add -D --save-exact telegram-bot-test-server@0.11.0
-# or: npm install --save-dev --save-exact telegram-bot-test-server@0.11.0
+pnpm add -D --save-exact telegram-bot-test-server@0.12.0
+# or: npm install --save-dev --save-exact telegram-bot-test-server@0.12.0
 ```
 
 ## License

@@ -14,10 +14,27 @@ export function receiveFakeClock(body: {
   mode: "manual" | "real";
 }): void;
 /**
+ * What fakeClockHandler reads of a request: a Node IncomingMessage, or
+ * anything with its method and body events. Typed here, so the types need
+ * no Node type definitions.
+ */
+export interface FakeClockRequest {
+  method?: string;
+  on(event: "data", listener: (chunk: Uint8Array) => void): unknown;
+  on(event: "end", listener: () => void): unknown;
+}
+/** What fakeClockHandler writes of a response: a Node ServerResponse, or anything with writeHead(...).end(). */
+export interface FakeClockResponse {
+  writeHead(
+    statusCode: number,
+    headers?: Record<string, string>,
+  ): { end(): unknown };
+}
+/**
  * A Node (request, response) handler to mount at the clockWebhook URL: reads
  * the JSON body, receiveFakeClock, answers 204.
  */
 export function fakeClockHandler(
-  request: import("node:http").IncomingMessage,
-  response: import("node:http").ServerResponse,
+  request: FakeClockRequest,
+  response: FakeClockResponse,
 ): void;

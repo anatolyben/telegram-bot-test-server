@@ -276,6 +276,11 @@ it("lists the updates each bot was sent: a bot subscribed to my_chat_member gets
   });
   expect(seen.updates[0].update.update_id).toBe(seen.updates[0].update_id);
 
+  // A type filter leaves the rest out: the second bot got no message.
+  expect(
+    (await fake.getBotUpdates(second.id, { type: "message" })).updates,
+  ).toEqual([]);
+
   const first = await fake.getBotUpdates(BOT, { chatId: CHAT });
   expect(first.updates.map((update) => update.type)).toEqual([
     "message",
@@ -354,6 +359,10 @@ it("matches messages by substring, pattern, button text and callback data, after
       chatId: CHAT,
       matches: /hello\s+w/i,
     }),
+  ).toMatchObject({ message: { text: "Hello World" } });
+  // The g and y flags are dropped: a sticky pattern would match only at 0.
+  expect(
+    await fake.waitFor({ kind: "message", chatId: CHAT, matches: /World/gy }),
   ).toMatchObject({ message: { text: "Hello World" } });
   const overHttp = await fetch(`${fake.origin}/_fake/wait`, {
     method: "POST",
@@ -688,6 +697,15 @@ it("gives the app the server's clock through fakeClockNow", async () => {
   delete process.env.TELEGRAM_FAKE_CLOCK_URL;
   expect(Math.abs(fakeClockNow() - Date.now())).toBeLessThan(1000);
   expect(Math.abs((await refreshFakeClock()) - Date.now())).toBeLessThan(1000);
+
+  // A server on real time: the app reads the wall clock, not the cached read.
+  const real = await startTestServer({ botToken: TOKEN });
+  cleanups.push(() => real.stop());
+  process.env.TELEGRAM_FAKE_CLOCK_URL = real.origin;
+  const read = await refreshFakeClock();
+  await sleep(30);
+  expect(fakeClockNow()).toBeGreaterThanOrEqual(read + 25);
+  delete process.env.TELEGRAM_FAKE_CLOCK_URL;
 
   const app = await listen(fakeClockHandler);
   const { fake } = await setup({ clock: { now: NOW }, clockWebhook: app });

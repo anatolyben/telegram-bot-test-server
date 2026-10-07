@@ -278,7 +278,7 @@ select {
   border-radius: 0 var(--tv-radius-control) var(--tv-radius-control) 0;
 }
 
-.tv-toggle:hover:not(:disabled) {
+.tv-toggle:hover:not(:disabled):not([aria-pressed="true"]) {
   background: var(--tv-surface-subtle);
 }
 
@@ -304,6 +304,7 @@ select {
   line-height: 16px;
   max-width: 220px;
   padding: 0 8px;
+  text-overflow: ellipsis;
 }
 
 .tv-select--small select {
@@ -340,8 +341,12 @@ select {
   background: var(--tv-danger);
 }
 
+/* A recording is not live: a hollow square instead of the dot. */
 .tv-live[data-status="recording"] .tv-live-dot {
-  background: var(--tv-accent);
+  background: transparent;
+  border: 2px solid var(--tv-muted);
+  border-radius: 2px;
+  box-sizing: border-box;
 }
 
 .tv-status-detail {
@@ -550,14 +555,11 @@ select {
     border: 1px solid var(--tv-border-strong);
     border-radius: var(--tv-radius-control);
     cursor: pointer;
-    flex: 1 1 0;
+    flex: 0 0 auto;
     font-size: 12px;
     font-weight: 500;
     min-height: 40px;
-    min-width: 0;
-    overflow: hidden;
-    padding: 0 10px;
-    text-overflow: ellipsis;
+    padding: 0 12px;
     white-space: nowrap;
   }
   .tv-phone-button[aria-current="page"] {
@@ -568,9 +570,9 @@ select {
   .tv-phone-button:disabled {
     opacity: 0.5;
   }
-  .tv-brand,
-  .tv-toolbar-group[aria-label="Layout"],
-  .tv-select:has([data-role="theme"]) {
+  /* Every control stays on the page, in rows: the panels and the status,
+     then layout, view as and theme. */
+  .tv-brand {
     display: none;
   }
   .tv-toolbar {
@@ -578,11 +580,23 @@ select {
     padding: 6px var(--tv-space-2);
   }
   .tv-toolbar-controls {
-    flex-wrap: nowrap;
-    overflow-x: auto;
+    display: contents;
+  }
+  .tv-toolbar [data-slot="status"] {
+    margin-left: auto;
+    order: 1;
+  }
+  .tv-toolbar-group[aria-label="Layout"],
+  .tv-toolbar-controls > .tv-select {
+    order: 2;
+  }
+  .tv-toolbar-controls > .tv-select {
+    flex: 1 1 96px;
+    min-width: 0;
   }
   .tv-select select {
-    max-width: 150px;
+    max-width: none;
+    width: 100%;
   }
 }
 
@@ -690,17 +704,16 @@ select {
   color: var(--tv-danger);
 }
 
-.tv-badge {
-  background: var(--tv-accent);
+.tv-requests {
+  border: 1px solid var(--tv-border-strong);
   border-radius: 999px;
-  color: var(--tv-on-accent);
+  color: var(--tv-text);
   flex: 0 0 auto;
   font-size: 11px;
-  font-weight: 600;
-  line-height: 16px;
-  min-width: 20px;
+  font-weight: 500;
+  line-height: 14px;
   padding: 1px 6px;
-  text-align: center;
+  white-space: nowrap;
 }
 
 .tv-count {
@@ -863,8 +876,8 @@ select {
   background-color: var(--tv-chat-doodle);
   content: "";
   inset: 0;
-  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='144' height='144' viewBox='0 0 144 144'%3E %3Cg fill='none' stroke='%23000' stroke-width='1.35' stroke-linecap='round' stroke-linejoin='round'%3E %3Cpath d='M14 18h18a6 6 0 0 1 6 6v8a6 6 0 0 1-6 6h-7l-6 5v-5h-5a6 6 0 0 1-6-6v-8a6 6 0 0 1 6-6Z'/%3E %3Cpath d='m63 12 20 9-18 7-5 12-4-14-10-5 17-9Z'/%3E %3Cpath d='M104 17a9 9 0 1 0 18 0 9 9 0 0 0-18 0Zm9-9v18M104 17h18'/%3E %3Cpath d='M22 69c7-9 20-2 14 8L22 92 8 77c-7-10 7-17 14-8Z'/%3E %3Cpath d='M57 66h22a5 5 0 0 1 5 5v16a5 5 0 0 1-5 5H57a5 5 0 0 1-5-5V71a5 5 0 0 1 5-5Zm4-5 3-5h9l3 5M68 73a6 6 0 1 0 0 12 6 6 0 0 0 0-12Z'/%3E %3Cpath d='M111 57c8 0 14 6 14 14 0 10-14 23-14 23S97 81 97 71c0-8 6-14 14-14Zm0 8a6 6 0 1 0 0 12 6 6 0 0 0 0-12Z'/%3E %3Cpath d='M15 116h20M25 106v20M46 113l8-7 8 7-8 8-8-8Z'/%3E %3Cpath d='M82 109v18m0-13 13-4v13m-13 4c0 5-9 5-9 0s9-5 9 0Zm13-4c0 5-9 5-9 0s9-5 9 0Z'/%3E %3Cpath d='m120 105 3 8 8 1-6 6 2 8-7-4-8 4 2-8-6-6 9-1 3-8Z'/%3E %3Cpath d='M135 43c-8 4-12 0-9-7 2-5 8-8 13-7 2 5 0 11-4 14Z'/%3E %3C/g%3E %3C/svg%3E");
-  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='144' height='144' viewBox='0 0 144 144'%3E %3Cg fill='none' stroke='%23000' stroke-width='1.35' stroke-linecap='round' stroke-linejoin='round'%3E %3Cpath d='M14 18h18a6 6 0 0 1 6 6v8a6 6 0 0 1-6 6h-7l-6 5v-5h-5a6 6 0 0 1-6-6v-8a6 6 0 0 1 6-6Z'/%3E %3Cpath d='m63 12 20 9-18 7-5 12-4-14-10-5 17-9Z'/%3E %3Cpath d='M104 17a9 9 0 1 0 18 0 9 9 0 0 0-18 0Zm9-9v18M104 17h18'/%3E %3Cpath d='M22 69c7-9 20-2 14 8L22 92 8 77c-7-10 7-17 14-8Z'/%3E %3Cpath d='M57 66h22a5 5 0 0 1 5 5v16a5 5 0 0 1-5 5H57a5 5 0 0 1-5-5V71a5 5 0 0 1 5-5Zm4-5 3-5h9l3 5M68 73a6 6 0 1 0 0 12 6 6 0 0 0 0-12Z'/%3E %3Cpath d='M111 57c8 0 14 6 14 14 0 10-14 23-14 23S97 81 97 71c0-8 6-14 14-14Zm0 8a6 6 0 1 0 0 12 6 6 0 0 0 0-12Z'/%3E %3Cpath d='M15 116h20M25 106v20M46 113l8-7 8 7-8 8-8-8Z'/%3E %3Cpath d='M82 109v18m0-13 13-4v13m-13 4c0 5-9 5-9 0s9-5 9 0Zm13-4c0 5-9 5-9 0s9-5 9 0Z'/%3E %3Cpath d='m120 105 3 8 8 1-6 6 2 8-7-4-8 4 2-8-6-6 9-1 3-8Z'/%3E %3Cpath d='M135 43c-8 4-12 0-9-7 2-5 8-8 13-7 2 5 0 11-4 14Z'/%3E %3C/g%3E %3C/svg%3E");
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='144' height='144' viewBox='0 0 144 144'%3E %3Cg fill='none' stroke='%23000' stroke-width='1.35' stroke-linecap='round' stroke-linejoin='round'%3E %3Cpath d='M14 18h18a6 6 0 0 1 6 6v8a6 6 0 0 1-6 6h-7l-6 5v-5h-5a6 6 0 0 1-6-6v-8a6 6 0 0 1 6-6Z'/%3E %3Cpath d='M48 40c0-15 13-26 33-26 0 17-13 28-33 26Zm0 0 19-17'/%3E %3Cpath d='M104 17a9 9 0 1 0 18 0 9 9 0 0 0-18 0Zm9-9v18M104 17h18'/%3E %3Cpath d='M22 69c7-9 20-2 14 8L22 92 8 77c-7-10 7-17 14-8Z'/%3E %3Cpath d='M57 66h22a5 5 0 0 1 5 5v16a5 5 0 0 1-5 5H57a5 5 0 0 1-5-5V71a5 5 0 0 1 5-5Zm4-5 3-5h9l3 5M68 73a6 6 0 1 0 0 12 6 6 0 0 0 0-12Z'/%3E %3Cpath d='M111 57c8 0 14 6 14 14 0 10-14 23-14 23S97 81 97 71c0-8 6-14 14-14Zm0 8a6 6 0 1 0 0 12 6 6 0 0 0 0-12Z'/%3E %3Cpath d='M15 116h20M25 106v20M46 113l8-7 8 7-8 8-8-8Z'/%3E %3Cpath d='M82 109v18m0-13 13-4v13m-13 4c0 5-9 5-9 0s9-5 9 0Zm13-4c0 5-9 5-9 0s9-5 9 0Z'/%3E %3Cpath d='m120 105 3 8 8 1-6 6 2 8-7-4-8 4 2-8-6-6 9-1 3-8Z'/%3E %3Cpath d='M135 43c-8 4-12 0-9-7 2-5 8-8 13-7 2 5 0 11-4 14Z'/%3E %3C/g%3E %3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='144' height='144' viewBox='0 0 144 144'%3E %3Cg fill='none' stroke='%23000' stroke-width='1.35' stroke-linecap='round' stroke-linejoin='round'%3E %3Cpath d='M14 18h18a6 6 0 0 1 6 6v8a6 6 0 0 1-6 6h-7l-6 5v-5h-5a6 6 0 0 1-6-6v-8a6 6 0 0 1 6-6Z'/%3E %3Cpath d='M48 40c0-15 13-26 33-26 0 17-13 28-33 26Zm0 0 19-17'/%3E %3Cpath d='M104 17a9 9 0 1 0 18 0 9 9 0 0 0-18 0Zm9-9v18M104 17h18'/%3E %3Cpath d='M22 69c7-9 20-2 14 8L22 92 8 77c-7-10 7-17 14-8Z'/%3E %3Cpath d='M57 66h22a5 5 0 0 1 5 5v16a5 5 0 0 1-5 5H57a5 5 0 0 1-5-5V71a5 5 0 0 1 5-5Zm4-5 3-5h9l3 5M68 73a6 6 0 1 0 0 12 6 6 0 0 0 0-12Z'/%3E %3Cpath d='M111 57c8 0 14 6 14 14 0 10-14 23-14 23S97 81 97 71c0-8 6-14 14-14Zm0 8a6 6 0 1 0 0 12 6 6 0 0 0 0-12Z'/%3E %3Cpath d='M15 116h20M25 106v20M46 113l8-7 8 7-8 8-8-8Z'/%3E %3Cpath d='M82 109v18m0-13 13-4v13m-13 4c0 5-9 5-9 0s9-5 9 0Zm13-4c0 5-9 5-9 0s9-5 9 0Z'/%3E %3Cpath d='m120 105 3 8 8 1-6 6 2 8-7-4-8 4 2-8-6-6 9-1 3-8Z'/%3E %3Cpath d='M135 43c-8 4-12 0-9-7 2-5 8-8 13-7 2 5 0 11-4 14Z'/%3E %3C/g%3E %3C/svg%3E");
   -webkit-mask-size: 168px 168px;
   mask-size: 168px 168px;
   pointer-events: none;
@@ -944,9 +957,21 @@ select {
   justify-content: center;
   margin: var(--tv-space-2) 0 var(--tv-space-1);
   pointer-events: none;
-  position: sticky;
-  top: 4px;
-  z-index: 2;
+}
+
+.tv-day--float {
+  left: 0;
+  margin: 0;
+  opacity: 0;
+  position: absolute;
+  right: 0;
+  top: 6px;
+  transition: opacity 0.2s ease;
+  z-index: 3;
+}
+
+.tv-day--float[data-visible] {
+  opacity: 1;
 }
 
 .tv-day span {
@@ -1131,6 +1156,12 @@ select {
   letter-spacing: 0.02em;
   line-height: 16px;
   text-transform: uppercase;
+}
+
+/* The name as it is stored; only the words around it are upper-cased. */
+.tv-ephemeral-name {
+  letter-spacing: normal;
+  text-transform: none;
 }
 
 .tv-context-note {
@@ -1813,6 +1844,12 @@ select {
   font-size: 11px;
   margin-left: 4px;
   padding: 0 6px;
+}
+
+.tv-section-note {
+  font-weight: 500;
+  letter-spacing: normal;
+  text-transform: none;
 }
 
 .tv-permissions p,

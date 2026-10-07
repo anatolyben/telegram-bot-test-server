@@ -7,11 +7,50 @@
  * inline this file, so every export starts a line as `export function`.
  */
 
+// A message's content, as the chat list names it: the first field it has.
+// An animation also carries document, a live photo photo and a venue
+// location, so they come first.
+const PREVIEW_MEDIA = [
+  "live_photo",
+  "animation",
+  "audio",
+  "document",
+  "photo",
+  "sticker",
+  "video",
+  "video_note",
+  "voice",
+  "contact",
+  "dice",
+  "venue",
+  "location",
+  "poll",
+];
+// The fields of a service message, one of which each carries.
+const PREVIEW_SERVICE = [
+  "new_chat_members",
+  "left_chat_member",
+  "new_chat_title",
+  "new_chat_photo",
+  "delete_chat_photo",
+  "group_chat_created",
+  "supergroup_chat_created",
+  "channel_chat_created",
+  "migrate_to_chat_id",
+  "migrate_from_chat_id",
+  "pinned_message",
+  "forum_topic_created",
+  "forum_topic_edited",
+  "forum_topic_closed",
+  "forum_topic_reopened",
+];
+
 /**
  * The page of `items` a viewer asks for: the newest `limit` items, the
  * `limit` items before the seq `before`, or the items from seq `from` to seq
  * `to` (both included; at most 1000, the newest when more). `has_older`,
- * `oldest_seq` and `latest_seq` describe the page within `items`.
+ * `oldest_seq` and `latest_seq` describe the page within `items`, and
+ * `chat_latest_seq` is the newest seq of `items`, whatever the page.
  */
 export function pageWindow(
   items,
@@ -33,6 +72,52 @@ export function pageWindow(
     has_older: start > 0,
     oldest_seq: page.length ? page[0].seq : null,
     latest_seq: page.length ? page[page.length - 1].seq : null,
+    chat_latest_seq: items.length ? items[items.length - 1].seq : null,
+  };
+}
+
+/**
+ * The chat list's short form of a chat's latest item, or null: its seq,
+ * time and author, the first 100 characters of its text or caption, what it
+ * holds (`media`: a content or service field, or an event's type), whether
+ * it is deleted or ephemeral, and for a service message or an event the
+ * message or event itself, so the list words the change as the chat does.
+ */
+export function listPreview(item) {
+  if (!item) return null;
+  if (item.kind === "event") {
+    return {
+      kind: "event",
+      seq: item.seq,
+      at: item.at,
+      author: item.user_id ?? item.bot_id ?? null,
+      preview: null,
+      media: item.type,
+      deleted: false,
+      ephemeral: false,
+      event: item,
+    };
+  }
+  const { message } = item;
+  const text = message.text ?? message.caption;
+  const service = PREVIEW_SERVICE.find(
+    (field) => message[field] != null && message[field] !== false,
+  );
+  return {
+    kind: "message",
+    seq: item.seq,
+    at: item.at,
+    author: item.author,
+    preview: text == null ? null : Array.from(text).slice(0, 100).join(""),
+    media:
+      PREVIEW_MEDIA.find((field) => message[field] !== undefined) ??
+      service ??
+      null,
+    deleted: item.deleted === true,
+    ephemeral: item.ephemeral === true,
+    ...(service
+      ? { message, pinned_deleted: item.pinned_deleted === true }
+      : {}),
   };
 }
 
@@ -174,11 +259,58 @@ export function revokedBy(calls, chatId, userId) {
  */
 export function inTopic(item, topic) {
   if (topic == null) return true;
-  const thread =
-    item.kind === "message" && item.message.is_topic_message
-      ? item.message.message_thread_id
-      : null;
+  return viewTopicIs(viewThread(item), topic);
+}
+
+/** An item's forum topic: a topic message's thread, else null (General). */
+function viewThread(item) {
+  return item.kind === "message" && item.message.is_topic_message
+    ? item.message.message_thread_id
+    : null;
+}
+
+function viewTopicIs(thread, topic) {
   return topic === "general" ? thread == null : thread === Number(topic);
+}
+
+/**
+ * The calls of a forum that belong to a topic, as inTopic places items: a
+ * call is in the topic of the first message it stored, else of its
+ * message_thread_id, else of a message of this chat it names; a call with
+ * none of these is in General. `items` are the chat's items, and
+ * `callOf(entry)` reads an entry's `{ request_id, params }`. No topic: every
+ * call.
+ */
+export function callsInTopic(calls, items, topic, callOf = (entry) => entry) {
+  if (topic == null) return calls;
+  const stored = new Map();
+  const named = new Map();
+  for (const item of items) {
+    if (item.kind !== "message") continue;
+    const thread = viewThread(item);
+    if (item.request_id != null && !stored.has(item.request_id)) {
+      stored.set(item.request_id, thread);
+    }
+    if (!item.ephemeral) named.set(Number(item.message.message_id), thread);
+  }
+  return calls.filter((entry) => {
+    const { request_id: requestId, params = {} } = callOf(entry);
+    let thread = null;
+    if (stored.has(requestId)) {
+      thread = stored.get(requestId);
+    } else if (Number(params.message_thread_id) > 0) {
+      thread = Number(params.message_thread_id);
+    } else if (params.from_chat_id == null) {
+      const id = [
+        params.message_id,
+        ...(Array.isArray(params.message_ids) ? params.message_ids : []),
+      ]
+        .map(Number)
+        .find((each) => named.has(each));
+      if (id !== undefined) thread = named.get(id);
+    }
+    return viewTopicIs(thread, topic);
+  });
 }
 
 /**

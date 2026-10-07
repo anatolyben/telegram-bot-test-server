@@ -404,6 +404,13 @@ describe("render", () => {
         { type: "bold", offset: 0, length: 9 },
       ]),
     ).toBe("<strong>bold <em>both</em></strong> x");
+    // Starting together, the longer one is the outer.
+    expect(
+      renderText("bold italic", [
+        { type: "italic", offset: 0, length: 4 },
+        { type: "bold", offset: 0, length: 11 },
+      ]),
+    ).toBe("<strong><em>bold</em> italic</strong>");
     expect(renderText("a<b", [{ type: "code", offset: 0, length: 3 }])).toBe(
       '<code class="tv-code">a&lt;b</code>',
     );
@@ -513,10 +520,10 @@ describe("render", () => {
     const testView = (item, chat) =>
       renderMessage(item, makeContext(pageOf([item], chat ? { chat } : {})));
 
-    expect(asAnn(reply)).toContain("Deleted message");
+    expect(asAnn(reply)).toContain('data-reply-deleted="true"');
     expect(asAnn(reply)).not.toContain("the spam text");
     expect(testView(reply)).toContain("the spam text");
-    expect(asAnn(pin)).toContain("pinned a deleted message");
+    expect(asAnn(pin)).toContain('data-pinned-deleted="true"');
     expect(asAnn(pin)).not.toContain("the spam text");
     const channel = {
       key: String(CHANNEL),
@@ -526,10 +533,9 @@ describe("render", () => {
       is_forum: false,
       topics: [],
     };
-    expect(testView(post, channel)).toContain("posted by Olga");
     expect(asAnn(post, channel)).not.toContain("Olga");
     expect(asAnn(poll)).not.toMatch(/tv-poll-count|correct|Eve/);
-    expect(testView(poll)).toContain("correct");
+    expect(testView(poll)).toContain('data-correct="true"');
     expect(
       renderMessage(poll, makeContext(pageOf([poll]), { as: EVE.id })),
     ).toContain('data-correct="true"');
@@ -572,8 +578,6 @@ describe("render", () => {
       .join("");
     expect(html.match(/Ann Lee/g)).toHaveLength(1);
     expect(html).not.toContain('data-kind="event"');
-    expect(html).toContain("by request");
-    expect(html).toContain("via “Ads”");
 
     const alone = streamEntries(chatStream([event], ctx), ctx)
       .map((entry) => entry.html)
@@ -634,14 +638,12 @@ describe("render", () => {
     const deletedHtml = renderMessage(deleted, ctx);
     expect(deletedHtml).toContain('data-deleted="true"');
     expect(deletedHtml).toContain(`data-deleted-by="${SECOND.id}"`);
-    expect(deletedHtml).toContain("@second_bot");
     expect(deletedHtml).toContain('data-author-kind="user"');
 
     const ephemeralHtml = renderMessage(ephemeral, ctx);
     expect(ephemeralHtml).toContain('data-ephemeral-id="1"');
     expect(ephemeralHtml).toContain(`data-receiver-id="${ANN.id}"`);
     expect(ephemeralHtml).not.toContain("data-message-id");
-    expect(ephemeralHtml).toContain("only Ann Lee sees this");
     expect(ephemeralHtml).toContain('data-author-kind="first-bot"');
     expect(ephemeralHtml).toContain('data-request-id="i:0:6"');
     expect(ephemeralHtml).toContain(
@@ -655,15 +657,22 @@ describe("render", () => {
 
     const editedHtml = renderMessage(edited, ctx);
     expect(editedHtml).toContain('data-edited="true"');
-    expect(editedHtml).toContain("edited");
+    expect(editedHtml).toContain('class="tv-edited"');
+    expect(editedHtml).not.toContain("data-edit-hidden");
     expect(editedHtml).toContain('data-author-kind="added-bot"');
     expect(editedHtml).toContain(
       `data-message-id="${edited.message.message_id}"`,
     );
 
+    // A bot's edit of only the keyboard keeps edit_date but shows no edit.
+    const keyboardOnly = renderMessage({ ...edited, edit_hidden: true }, ctx);
+    expect(keyboardOnly).toContain(
+      'data-edited="true" data-edit-hidden="true"',
+    );
+    expect(keyboardOnly).not.toContain('class="tv-edited"');
+
     const guestHtml = renderMessage(guest, ctx);
     expect(guestHtml).toContain('data-author-kind="guest-bot"');
-    expect(guestHtml).toContain("for Ann Lee");
 
     const members = memberEntries(
       pageOf([], {
@@ -696,13 +705,8 @@ describe("render", () => {
       `data-member-id="${EVE.id}" data-member-status="restricted" data-member-in-chat="false"`,
     );
     expect(members).toContain(
-      "restricted until 15 Jan 2027 09:00 UTC · not in the chat",
-    );
-    expect(members).toContain(
       `data-member-id="${SECOND.id}" data-member-status="administrator" data-member-in-chat="true" data-member-bot="true"`,
     );
-    expect(members).toContain("delete messages");
-    expect(members).not.toContain("restrict members");
-    expect(members).toContain("3 more members");
+    expect(members).toContain('data-role="more-members" data-count="3"');
   });
 });

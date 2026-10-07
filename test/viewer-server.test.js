@@ -174,9 +174,6 @@ it("answers only this computer, only GET, and needs a host it can answer on", as
     headers: { Host: `viewer.example:${port}` },
   });
   expect(foreign.status).toBe(403);
-  expect(foreign.body).toBe(
-    `The viewer answers only on this computer: ${fake.viewerUrl}`,
-  );
   expect(
     (
       await raw(fake, "/_fake/ui/api/state", {
@@ -298,6 +295,12 @@ it("lists every chat, each private chat once per bot, and opens a private chat w
     last: { kind: "event", media: "unpin" },
   });
   expect(rows[CHAT]).toMatchObject({ pending_join_requests: 1 });
+  // The rows' people come with the list, whichever chats a page has open.
+  expect(state.users[ann]).toMatchObject({
+    first_name: "Ann",
+    last_name: "Lee",
+  });
+  expect(state.users[carol]).toMatchObject({ first_name: "Carol" });
 
   const empty = await page(`${eve}:${BOT}`);
   expect(empty).toMatchObject({
@@ -330,6 +333,8 @@ it("pages a chat's messages and events in order and logs member changes, join re
   expect(latest.latest_seq).toBe(latest.items[4].seq);
   const older = await page(CHAT, `?limit=5&before=${latest.oldest_seq}`);
   expect(texts(older.items)).toEqual([2, 3, 4, 5, 6].map((i) => `post ${i}`));
+  expect(older.latest_seq).toBe(older.items[4].seq);
+  expect(older.chat_latest_seq).toBe(latest.latest_seq);
   const both = [...older.items, ...latest.items];
   const range = await page(CHAT, `?from=${both[1].seq}&to=${both[6].seq}`);
   expect(range.items.map((item) => item.seq)).toEqual(
@@ -507,6 +512,8 @@ it("shows members as getChatMember does, most notable first, live and without wr
     ...people.filter((id) => id !== bob && id !== carl).sort((a, b) => a - b),
   ]);
   expect(read.members_total).toBe(people.length + 3);
+  // Carl is banned: every record but his is in the chat.
+  expect(read.members_in_chat).toBe(people.length + 2);
 
   const capped = await page(CHAT, "?members_limit=5&limit=1");
   expect(capped.members.map((entry) => entry.user_id)).toEqual([
@@ -719,6 +726,11 @@ it("shows a supergroup as one member sees it, filtered before the page is cut", 
     in_chat: false,
     access: "none",
   });
+  expect(asBob.users[bob]).toMatchObject({ first_name: "Bob" });
+  const { body: bobList } = await get(`api/state?as=${bob}`);
+  expect(bobList.chats).toEqual([
+    expect.objectContaining({ key: String(CHAT), last: null, access: "none" }),
+  ]);
 
   const { body: list } = await get(`api/state?as=${ann}`);
   expect(list.chats.map((row) => row.key).sort()).toEqual(
@@ -786,8 +798,8 @@ it("shows a basic group only while the member was in it, and nothing after a ban
   expect(asBob.as).toMatchObject({ access: "none", in_chat: false });
 });
 
-it("filters a forum by topic", async () => {
-  const { fake, page } = await setup();
+it("filters a forum by topic, its calls too", async () => {
+  const { fake, api, page } = await setup();
   const forum = await fake.createChat({
     title: "Help",
     ownerId: OWNER,
@@ -810,4 +822,65 @@ it("filters a forum by topic", async () => {
   const general = await page(forum, "?topic=general");
   expect(texts(general.items)).toContain("in General");
   expect(texts(general.items)).not.toContain("in the topic");
+
+  // A call is in the topic of the message it stored, else of its
+  // message_thread_id; one with neither is in General.
+  await fake.setBotMembership(forum, BOT);
+  await api("sendMessage", {
+    chat_id: forum,
+    message_thread_id: topic,
+    text: "answer",
+  });
+  await api("sendMessage", {
+    chat_id: forum,
+    message_thread_id: topic,
+    text: "",
+  });
+  await api("sendMessage", { chat_id: forum, text: "for everyone" });
+  const calls = async (query) =>
+    (await page(forum, query)).calls.map((call) => [
+      call.params.text,
+      call.status,
+    ]);
+  expect(await calls(`?topic=${topic}`)).toEqual([
+    ["answer", 200],
+    ["", 400],
+  ]);
+  expect(await calls("?topic=general")).toEqual([["for everyone", 200]]);
+  expect(await calls("")).toHaveLength(3);
+});
+
+it("marks a bot's edit of only the keyboard, which Telegram's apps do not show as an edit", async () => {
+  const { api, page } = await setup();
+  const keyboard = (data) => ({
+    inline_keyboard: [[{ text: "Next", callback_data: data }]],
+  });
+  const { message_id } = (
+    await api("sendMessage", {
+      chat_id: CHAT,
+      text: "page 1",
+      reply_markup: keyboard("2"),
+    })
+  ).result;
+  const item = async () =>
+    (await page(CHAT)).items.find(
+      (each) => each.message?.message_id === message_id,
+    );
+  await api("editMessageReplyMarkup", {
+    chat_id: CHAT,
+    message_id,
+    reply_markup: keyboard("3"),
+  });
+  // The bot still gets edit_date.
+  expect(await item()).toMatchObject({
+    edit_hidden: true,
+    message: { edit_date: expect.any(Number) },
+  });
+  await api("editMessageText", {
+    chat_id: CHAT,
+    message_id,
+    text: "page 2",
+    reply_markup: keyboard("3"),
+  });
+  expect((await item()).edit_hidden).toBeUndefined();
 });

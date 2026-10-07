@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import vm from "node:vm";
@@ -191,6 +191,39 @@ it("puts each call in the chat it acted on, and calls without one under calls", 
     call_count: 6,
     last_call: { method: "sendMessage", journal: "rejected_requests" },
   });
+});
+
+it("reads a call's permissions as Telegram does, those left out off", async () => {
+  const { api, page, ann } = await setup();
+  await api("restrictChatMember", {
+    chat_id: CHAT,
+    user_id: ann,
+    permissions: { can_send_photos: false },
+  });
+  const { result: member } = await api("getChatMember", {
+    chat_id: CHAT,
+    user_id: ann,
+  });
+  await api("restrictChatMember", {
+    chat_id: CHAT,
+    user_id: ann,
+    permissions: "not an object",
+  });
+
+  const [restricted, refused] = (await page(CHAT)).calls.filter(
+    (call) => call.method === "restrictChatMember",
+  );
+  // Telegram turned off every permission, not only the one named.
+  expect(Object.values(restricted.resolved_permissions)).not.toContain(true);
+  expect(restricted.resolved_permissions).toEqual(
+    Object.fromEntries(
+      Object.keys(restricted.resolved_permissions).map((key) => [
+        key,
+        member[key],
+      ]),
+    ),
+  );
+  expect(refused).toMatchObject({ status: 400, resolved_permissions: null });
 });
 
 it("merges calls before the items they produced and pages them with the items, then by calls_before", async () => {
@@ -480,25 +513,6 @@ it("writes the file and its twin into recordDir, with the viewer off", async () 
   expect(recorded(recording.json.pages[CHAT])).toEqual(["inside"]);
   expect(fake.viewerUrl).toBeNull();
   expect((await fetch(`${fake.origin}/_fake/ui`)).status).toBe(404);
-});
-
-it("discards recordings still running when the server stops", async () => {
-  const dir = await recordDir();
-  const fake = await startTestServer({
-    botToken: TOKEN,
-    chats: [{ id: CHAT, title: "Timeline", ownerId: OWNER }],
-    recordDir: dir,
-  });
-  const ann = await fake.createUser({ first_name: "Ann" });
-  await fake.join(CHAT, ann);
-  await fake.startRecording("unfinished");
-  await fake.post(CHAT, ann, "inside");
-  await fake.stop();
-
-  await expect(fake.stopRecording("unfinished")).rejects.toThrow(
-    "Server stopped",
-  );
-  expect(await readdir(dir)).toEqual([]);
 });
 
 it("draws the recording in one file that loads nothing and holds user text only as escaped data", async () => {

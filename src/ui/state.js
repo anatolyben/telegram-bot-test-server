@@ -4,48 +4,15 @@
  * the side effects of an expiry, and nothing here changes what it is given.
  */
 import {
+  callsInTopic,
   callWindow,
   inTopic,
+  listPreview,
   pageWindow,
   revokedBy,
   visibleTo,
 } from "./views.js";
 
-// A message's content, as the chat list names it: the first field it has.
-// An animation also carries document, a live photo photo and a venue
-// location, so they come first.
-const MEDIA_FIELDS = [
-  "live_photo",
-  "animation",
-  "audio",
-  "document",
-  "photo",
-  "sticker",
-  "video",
-  "video_note",
-  "voice",
-  "contact",
-  "dice",
-  "venue",
-  "location",
-  "poll",
-];
-// The fields of a service message, one of which each carries.
-const SERVICE_FIELDS = [
-  "new_chat_members",
-  "left_chat_member",
-  "new_chat_title",
-  "new_chat_photo",
-  "delete_chat_photo",
-  "group_chat_created",
-  "supergroup_chat_created",
-  "channel_chat_created",
-  "migrate_to_chat_id",
-  "migrate_from_chat_id",
-  "pinned_message",
-  "forum_topic_created",
-  "forum_topic_edited",
-];
 // The parameters a call shows: what it asked for, never a secret, a raw
 // body or an upload. Every can_* right is kept too.
 const CALL_PARAMS = new Set([
@@ -321,7 +288,11 @@ export function createUiState(model) {
     };
   }
 
-  /** A stored message as a page item. */
+  /**
+   * A stored message as a page item. `edit_hidden`: its last edit was a
+   * bot's change of only its keyboard, which Telegram's apps do not mark as
+   * edited (the message's edit_hide), though the bot gets its edit_date.
+   */
   function messageItem(chat, entry) {
     const { message } = entry;
     const deletedIn = (quoted) =>
@@ -333,6 +304,7 @@ export function createUiState(model) {
       ...model.messageLogEntry(entry),
       reply_deleted: deletedIn(message.reply_to_message),
       pinned_deleted: deletedIn(message.pinned_message),
+      ...(entry.editHidden ? { edit_hidden: true } : {}),
     };
   }
 
@@ -556,7 +528,10 @@ export function createUiState(model) {
    * A call as the timeline shows it: what it asked (CALL_PARAMS), how it
    * ended, Telegram's description, and what it touched — the messages it
    * names (in the chat it copies from, for forwards and copies), its user,
-   * and the messages it stored (`created`, by request id).
+   * and the messages it stored (`created`, by request id). A call with
+   * `permissions` also has them as Telegram reads them
+   * (`resolved_permissions`: every field, those left out off), or null when
+   * Telegram could not read them.
    */
   function callItem({ call, journal, chat, request_number }, created) {
     const raw = call.params ?? {};
@@ -599,6 +574,14 @@ export function createUiState(model) {
       fault_injected: call.fault_injected === true,
       chat_id: chat?.id ?? idOf(raw.chat_id),
       params,
+      ...(raw.permissions != null
+        ? {
+            resolved_permissions: model.permissions(
+              raw.permissions,
+              raw.use_independent_chat_permissions,
+            ),
+          }
+        : {}),
       targets: {
         messages:
           targetChat === null
@@ -654,42 +637,14 @@ export function createUiState(model) {
     };
   }
 
-  /** The chat list's short form of a chat's latest item. */
-  function preview(item) {
-    if (!item) return null;
-    if (item.kind === "event") {
-      return {
-        kind: "event",
-        seq: item.seq,
-        at: item.at,
-        author: item.user_id ?? item.bot_id ?? null,
-        preview: null,
-        media: item.type,
-        deleted: false,
-        ephemeral: false,
-      };
-    }
-    const { message } = item;
-    const text = message.text ?? message.caption;
-    return {
-      kind: "message",
-      seq: item.seq,
-      at: item.at,
-      author: item.author,
-      preview: text == null ? null : Array.from(text).slice(0, 100).join(""),
-      media:
-        MEDIA_FIELDS.find((field) => message[field] !== undefined) ??
-        SERVICE_FIELDS.find((field) => message[field] !== undefined) ??
-        null,
-      deleted: item.deleted,
-      ephemeral: item.ephemeral,
-    };
-  }
-
-  /** One row of the chat list. */
+  /**
+   * One row of the chat list; seen as the member `as`, also what they may
+   * see of it (`access`, as visibleTo says).
+   */
   function row(target, items, as) {
     const chat = chatJson(target);
-    const shown = as === null ? items : seenBy(target, items, as).items;
+    const seen = as === null ? null : seenBy(target, items, as);
+    const shown = seen === null ? items : seen.items;
     const messages = shown.filter((item) => item.kind === "message");
     const group = target.kind === "group" ? target.chat : null;
     return {
@@ -702,7 +657,7 @@ export function createUiState(model) {
       migrated_from: chat.migrated_from,
       user_id: chat.user_id,
       bot_id: chat.bot_id,
-      last: preview(shown[shown.length - 1]),
+      last: listPreview(shown[shown.length - 1]),
       message_count: messages.length,
       deleted_count: messages.filter((item) => item.deleted).length,
       member_count: group
@@ -711,7 +666,30 @@ export function createUiState(model) {
         : 0,
       pending_join_requests: group && as === null ? group.joinRequests.size : 0,
       photo_file_id: chat.photo_file_id,
+      ...(seen === null ? {} : { access: seen.as.access }),
     };
+  }
+
+  /**
+   * The users the chat list's rows name in their latest item (its author,
+   * the people a service message or an event names), and every bot, so a
+   * row reads the same whichever chats a page has open.
+   */
+  function rowUsers(rows) {
+    const ids = [];
+    for (const { last } of rows) {
+      if (!last) continue;
+      ids.push(
+        last.author,
+        last.event?.user_id,
+        last.event?.actor_id,
+        last.event?.bot_id,
+        last.message?.from?.id,
+        last.message?.left_chat_member?.id,
+        ...(last.message?.new_chat_members ?? []).map((user) => user.id),
+      );
+    }
+    return usersOf(ids);
   }
 
   /**
@@ -756,6 +734,7 @@ export function createUiState(model) {
       clock: model.clock(),
       bots: botList(),
       chats: rows,
+      users: rowUsers(rows),
       files: filesTable(rows.map((each) => each.photo_file_id)),
     };
   }
@@ -806,14 +785,29 @@ export function createUiState(model) {
     }
     const window =
       read.callsBefore !== null
-        ? { items: [], has_older: false, oldest_seq: null, latest_seq: null }
+        ? {
+            items: [],
+            has_older: false,
+            oldest_seq: null,
+            latest_seq: null,
+            chat_latest_seq: null,
+          }
         : pageWindow(items, read);
-    // A member sees no calls. Only the calls the page shows are drawn up.
+    // A member sees no calls; a topic shows only its own. Only the calls the
+    // page shows are drawn up.
     const calls =
       as === null
-        ? callWindow(items, callsOf(target.key), window, {
-            callsBefore: read.callsBefore,
-          })
+        ? callWindow(
+            items,
+            callsInTopic(
+              callsOf(target.key),
+              all,
+              read.topic,
+              (entry) => entry.call,
+            ),
+            window,
+            { callsBefore: read.callsBefore },
+          )
         : { calls: [], calls_truncated: false, calls_oldest_request: null };
     if (calls.calls.length) {
       const created = storedBy(all);
@@ -825,13 +819,16 @@ export function createUiState(model) {
   /**
    * A chat's page: `window` (its items and where they sit in the chat), the
    * member it is seen as (`as`), its drawn-up `calls`, and the members (at
-   * most `membersLimit`, plus any its items or calls name), join requests,
-   * users and images it names.
+   * most `membersLimit`, plus any its items or calls name; `members_total`
+   * counts every member record, `members_in_chat` those in the chat now),
+   * join requests, users (the member it is seen as among them) and images
+   * it names.
    */
   function pageJson(target, window, as, calls, membersLimit) {
     const group = target.kind === "group" && as === null ? target.chat : null;
     const named = new Set();
     const ids = new Set(target.kind === "private" ? [target.userId] : []);
+    if (as !== null) ids.add(as.user_id);
     for (const item of window.items) {
       if (item.kind === "message") {
         ids.add(item.author);
@@ -869,9 +866,14 @@ export function createUiState(model) {
       has_older: window.has_older,
       oldest_seq: window.oldest_seq,
       latest_seq: window.latest_seq,
+      chat_latest_seq: window.chat_latest_seq,
       as,
       members,
       members_total: group ? group.members.size : 0,
+      members_in_chat: group
+        ? [...group.members.keys()].filter((id) => model.inChat(group, id))
+            .length
+        : 0,
       join_requests: joinRequests,
       bots: botList(),
       users: usersOf(ids),
@@ -1000,6 +1002,7 @@ export function createUiState(model) {
           has_older: false,
           oldest_seq: kept.length ? kept[0].seq : null,
           latest_seq: kept.length ? kept[kept.length - 1].seq : null,
+          chat_latest_seq: kept.length ? kept[kept.length - 1].seq : null,
         },
         null,
         {
@@ -1030,6 +1033,7 @@ export function createUiState(model) {
         clock: model.clock(),
         bots: botList(),
         chats: rows,
+        users: rowUsers(rows),
         files: {},
       },
       pages,

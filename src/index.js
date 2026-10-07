@@ -4118,7 +4118,7 @@ export async function startTestServer({
         ephemeralTextEdit(textFields(p, "Bad Request: MESSAGE_TOO_LONG")),
       ),
     editEphemeralMessageReplyMarkup: (p, caller) =>
-      editEphemeralMessage(p, caller, () => {}),
+      editEphemeralMessage(p, caller, () => {}, true),
     editEphemeralMessageCaption: (p, caller) => {
       const caption = captionFields(p, "Bad Request: MEDIA_CAPTION_TOO_LONG");
       return editEphemeralMessage(
@@ -6346,6 +6346,9 @@ export async function startTestServer({
       );
     }
     entry.message = edited;
+    // Telegram's apps show no "edited" for a bot's change of only the
+    // keyboard (the message's edit_hide); the bot still gets edit_date.
+    entry.editHidden = kind === "reply_markup";
     // Its buttons' presses now go to this bot (pressButton).
     if (markup) entry.keyboardBot = caller.id;
     appliedCheckpoint();
@@ -6361,14 +6364,16 @@ export async function startTestServer({
    * edit. Its keyboard is checked as a regular edit's: read with the request,
    * after receiver_user_id and before the chat (do_edit_ephemeral_message in
    * telegram-bot-api's Client.cpp), and its callback_data once the message is
-   * found.
+   * found. `markupOnly`: the edit changes only the keyboard (as editMessage
+   * notes).
    */
-  function editEphemeralMessage(p, caller, apply) {
+  function editEphemeralMessage(p, caller, apply, markupOnly = false) {
     const receiverId = userIdParam(p.receiver_user_id, "receiver_user_id");
     const markup = inlineMarkup(p.reply_markup);
     const entry = ownEphemeralMessage(p, caller, receiverId);
     requireButtonData(markup);
     entry.message = editedMessage(entry.message, markup, apply);
+    entry.editHidden = markupOnly;
     appliedCheckpoint();
     waits.notify();
     return true;
@@ -8505,6 +8510,7 @@ export async function startTestServer({
       else delete message[key];
     }
     message.edit_date = now();
+    entry.editHidden = false;
     await emit("edited_message", structuredClone(message));
     return { message_id: message.message_id, edit_date: message.edit_date };
   }
@@ -9831,6 +9837,14 @@ ${buttons}
         memberObject(chat, userId, peekMember(chat, userId), null),
       ),
     inChat: (chat, userId) => peekInChat(chat, userId),
+    // A permissions parameter as Telegram reads it, or null when it cannot.
+    permissions: (input, independent) => {
+      try {
+        return normalizePermissions(input, independent);
+      } catch {
+        return null;
+      }
+    },
     messageLogEntry,
     eventJson,
     fileBytes: (fileId) => files.get(String(fileId))?.file.data ?? null,

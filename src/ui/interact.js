@@ -10,24 +10,51 @@ export const COLUMN_MINIMUMS = Object.freeze({
   events: 280,
   members: 280,
 });
+// How far the minimums shrink, together, so the columns fit the window
+// before it scrolls sideways.
+const LEAST_SCALE = 0.75;
 
 const KEY_STEP = 24;
+// How long the floating day stays after the reader stops scrolling, and how
+// soon after their wheel, touch, key or press a scroll counts as theirs.
+const DAY_FLOAT_MS = 1000;
+const SCROLL_KEYS = new Set([
+  "ArrowUp",
+  "ArrowDown",
+  "PageUp",
+  "PageDown",
+  "Home",
+  "End",
+  " ",
+]);
 
 function panelOfColumn(element) {
   return element?.getAttribute("data-panel") ?? "chat";
 }
 
 function minimumOf(element) {
-  return COLUMN_MINIMUMS[panelOfColumn(element)] ?? 280;
+  return element?.tvMinimum ?? COLUMN_MINIMUMS[panelOfColumn(element)] ?? 280;
 }
 
 /**
  * Lays the columns out as fractions of the workspace: each column a share of
  * the free width, never below its minimum. `weights` maps a column id to its
- * share; dividers are 1 px tracks between them.
+ * share; dividers are 1 px tracks between them. When the minimums add up to
+ * more than the workspace, they shrink in proportion (to LEAST_SCALE at
+ * most), so the default columns fit a common window.
  */
 export function layoutColumns(workspace, weights) {
   const columns = [...workspace.querySelectorAll(":scope > [data-column-id]")];
+  const base = columns.map(
+    (column) => COLUMN_MINIMUMS[panelOfColumn(column)] ?? 280,
+  );
+  const wanted = base.reduce((sum, width) => sum + width, 0);
+  const room = workspace.clientWidth - Math.max(0, columns.length - 1);
+  const scale =
+    room > 0 && wanted > room ? Math.max(LEAST_SCALE, room / wanted) : 1;
+  columns.forEach((column, index) => {
+    column.tvMinimum = Math.floor(base[index] * scale);
+  });
   const shares = columns.map((column) =>
     Math.max(
       0.01,
@@ -244,6 +271,37 @@ export function bindViewer(root, actions) {
   };
   root.addEventListener("pointerup", finish);
   root.addEventListener("pointercancel", finish);
+  // The day floats only while the reader scrolls: not for a scroll the page
+  // makes (a new message, older ones loaded, an image that loaded). Scroll
+  // events do not bubble; a chat's scroller is caught on the way down.
+  let readerAt = -Infinity;
+  const reader = (event) => {
+    if (
+      event.type !== "keydown" ||
+      (SCROLL_KEYS.has(event.key) &&
+        !event.target?.closest?.("input, select, textarea"))
+    )
+      readerAt = Date.now();
+  };
+  for (const type of ["wheel", "touchmove", "keydown", "pointerdown"])
+    root.addEventListener(type, reader, { capture: true, passive: true });
+  root.addEventListener(
+    "scroll",
+    (event) => {
+      const scroller = event.target;
+      if (
+        !(scroller instanceof Element) ||
+        !scroller.matches(".tv-wallpaper > [data-slot='scroll']")
+      )
+        return;
+      const floating = scroller.parentElement?.querySelector(
+        "[data-role='day-float'][data-visible]",
+      );
+      // A fling keeps scrolling after the finger lifts.
+      if (floating || Date.now() - readerAt < DAY_FLOAT_MS) floatDay(scroller);
+    },
+    true,
+  );
   // A details element's toggle does not bubble.
   root.addEventListener(
     "toggle",
@@ -283,7 +341,7 @@ export function bindViewer(root, actions) {
   });
 }
 
-/** On a phone, shows one column (and marks its button in the bottom bar). */
+/** On a phone, shows one column (and marks its button in the bottom bar, scrolled into view). */
 export function showPhonePane(root, columnId) {
   for (const column of root.querySelectorAll(
     "[data-role='workspace'] > [data-column-id]",
@@ -293,15 +351,59 @@ export function showPhonePane(root, columnId) {
       column.getAttribute("data-column-id") === columnId,
     );
   for (const button of root.querySelectorAll("[data-role='phone-pane']")) {
-    if (button.getAttribute("data-pane") === columnId)
+    if (button.getAttribute("data-pane") === columnId) {
       button.setAttribute("aria-current", "page");
-    else button.removeAttribute("aria-current");
+      const nav = button.parentElement;
+      if (nav && nav.scrollWidth > nav.clientWidth) {
+        const left = button.offsetLeft - nav.offsetLeft;
+        if (
+          left < nav.scrollLeft ||
+          left + button.offsetWidth > nav.scrollLeft + nav.clientWidth
+        )
+          nav.scrollLeft = left - (nav.clientWidth - button.offsetWidth) / 2;
+      }
+    } else button.removeAttribute("aria-current");
   }
   const back = root.querySelector("[data-role='phone-back']");
   if (back)
     back.disabled =
       columnId === "list" ||
       !root.querySelector("[data-role='workspace'] > [data-column-id='list']");
+}
+
+/**
+ * While the reader scrolls a chat, shows the day of its top over it, as a
+ * chip that leaves a second after they stop; never when that day's own
+ * separator is in view.
+ */
+function floatDay(scroller) {
+  const chip = scroller.parentElement?.querySelector("[data-role='day-float']");
+  if (!chip) return;
+  const top = scroller.getBoundingClientRect().top;
+  let day = null;
+  let next = null;
+  for (const separator of scroller.querySelectorAll("[data-role='day']")) {
+    if (separator.getBoundingClientRect().bottom <= top) day = separator;
+    else {
+      next = separator;
+      break;
+    }
+  }
+  const room = chip.getBoundingClientRect().height + 8;
+  const shown =
+    day !== null &&
+    (next === null || next.getBoundingClientRect().top - top > room);
+  clearTimeout(scroller.tvDayTimer);
+  if (!shown) {
+    chip.removeAttribute("data-visible");
+    return;
+  }
+  chip.firstElementChild.textContent = day.textContent;
+  chip.setAttribute("data-visible", "true");
+  scroller.tvDayTimer = setTimeout(
+    () => chip.removeAttribute("data-visible"),
+    DAY_FLOAT_MS,
+  );
 }
 
 /** Scrolls to a message of the same chat and marks it briefly. */
