@@ -216,17 +216,17 @@ documents. The five minutes follow the server's clock, so `advanceTime` can end 
 ### Channels
 
 Every message in a channel comes from the channel: `sender_chat` is the channel and there is no
-`from`, both for what bots send and for what people post (channel signatures are not modeled). Bots
-get the channel's messages, service messages such as `new_chat_title` included, as `channel_post`
-and their edits as `edited_channel_post`, never as `message`. Subscribers have no permissions: only
-the creator and administrators with `can_post_messages` post, and only the creator and
-administrators with `can_change_info` change the title or photo; `post()` refuses anyone else with
-`CHAT_WRITE_FORBIDDEN`, and `renameChat` and `changeChatPhoto` with `CHAT_ADMIN_REQUIRED`. A bot
-with `can_edit_messages` edits any post and stops any poll; without it, only its own, and only while
-it has `can_post_messages`. A bot deletes its own posts with `can_post_messages` and anyone's with
-`can_delete_messages`. A press on a post's button goes to the bot that put the keyboard there, also
-when it added the keyboard to someone else's post by an edit (unverified: Telegram does not document
-which bot gets that press).
+`from`, both for what bots send and for what people post (channels that sign posts are not modeled,
+so a post has no `author_signature`). Bots get the channel's messages, service messages such as
+`new_chat_title` included, as `channel_post` and their edits as `edited_channel_post`, never as
+`message`. Subscribers have no permissions: only the creator and administrators with
+`can_post_messages` post, and only the creator and administrators with `can_change_info` change the
+title or photo; `post()` refuses anyone else with `CHAT_WRITE_FORBIDDEN`, and `renameChat` and
+`changeChatPhoto` with `CHAT_ADMIN_REQUIRED`. A bot with `can_edit_messages` edits any post and
+stops any poll; without it, only its own, and only while it has `can_post_messages`. A bot deletes
+its own posts with `can_post_messages` and anyone's with `can_delete_messages`. A press on a post's
+button goes to the bot that put the keyboard there, also when it added the keyboard to someone
+else's post by an edit (unverified: Telegram does not document which bot gets that press).
 
 Telegram's docs: [Update](https://core.telegram.org/bots/api#update),
 [ChatAdministratorRights](https://core.telegram.org/bots/api#chatadministratorrights).

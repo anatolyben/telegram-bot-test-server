@@ -24,8 +24,9 @@ so tests need no real accounts, phone numbers or groups, and can run as often as
 [Supported Bot API methods](#supported-bot-api-methods) · [Call receipts](#call-receipts)
 
 **About:** [How closely it matches Telegram](#how-closely-it-matches-telegram) ·
-[What it does not do](#what-it-does-not-do) · [Upgrading from 0.10.0](#upgrading-from-0100) ·
-[Changes](#changes) · [Development](#development) · [Status](#status)
+[What it does not do](#what-it-does-not-do) · [Upgrading from 0.11.0](#upgrading-from-0110) ·
+[Upgrading from 0.10.0](#upgrading-from-0100) · [Changes](#changes) ·
+[Development](#development) · [Status](#status)
 
 ## Install
 
@@ -252,16 +253,13 @@ await server.waitFor({
 });
 ```
 
-Members also share contacts and locations, post an earlier file again (it keeps its
-`file_unique_id`), give their text entities such as `phone_number` or `text_link`, and post on
-behalf of a chat. An administrator with `is_anonymous` posts as the group, as on Telegram:
+Members also share contacts and locations, and post an earlier file again, which keeps its
+`file_unique_id`. Their text can carry entities the test gives, such as a `text_link`, or a
+`phone_number`, which Telegram's server marks and this server does not find:
 
 ```js
-// Ann is an administrator with is_anonymous (your bot promoted her).
-await server.post(GROUP, ann, "Read the rules"); // sender_chat is the group
-// Bob has Telegram Premium (createUser with is_premium: true), which posting as a channel needs.
-const news = await server.createChat({ type: "channel", title: "News", ownerId: bob });
-await server.post(GROUP, bob, { text: "Follow us", sendAs: news }); // sender_chat is News
+const bob = await server.createUser({ first_name: "Bob" });
+await server.join(GROUP, bob);
 await server.post(GROUP, bob, { contact: { phoneNumber: "+15550100", firstName: "Bob" } });
 await server.post(GROUP, bob, { location: { latitude: 51.5, longitude: -0.12 } });
 await server.post(GROUP, bob, {
@@ -270,20 +268,35 @@ await server.post(GROUP, bob, {
 });
 const first = await server.post(GROUP, bob, { photo });
 const [size] = (await server.getMessage(GROUP, first)).message.photo;
-await server.post(GROUP, ann, { fileId: size.file_id }); // the same file_unique_id
+await server.post(GROUP, bob, { fileId: size.file_id }); // the same file_unique_id
 ```
 
-The owner, or an administrator with `can_promote_members`, promotes members with the rights they
-choose and demotes them. The chat's administrator bots get `chat_member`:
+People promote and demote members as in Telegram's apps: the owner, or an administrator with
+`can_promote_members`, grants the rights they choose (`by` names who acts; the owner by default).
+The chat's administrator bots get `chat_member`. An administrator with `is_anonymous` posts as the
+group, and a member with Telegram Premium may post as a channel they created:
 
 ```js
-await server.promoteMember(GROUP, ann, { rights: { can_delete_messages: true } });
-await server.demoteMember(GROUP, ann);
+await server.promoteMember(GROUP, bob, {
+  rights: { is_anonymous: true, can_delete_messages: true },
+});
+await server.post(GROUP, bob, "Read the rules"); // sender_chat is the group
+await server.demoteMember(GROUP, bob);
+
+const cy = await server.createUser({ first_name: "Cy", is_premium: true });
+await server.join(GROUP, cy);
+const news = await server.createChat({ type: "channel", title: "News", ownerId: cy });
+await server.post(GROUP, cy, { text: "Follow us", sendAs: news }); // sender_chat is News
 ```
 
-Users can also post photos, media, albums and forwards, edit their messages, react, pin, press
-buttons in private chats and on ephemeral messages, change their profile, and rename the chat or
-change its photo. [Test actions](#test-actions) lists them all.
+Such a post's `from` is `@GroupAnonymousBot` or `@Channel_Bot`, as the Bot API writes it. Waits,
+failure rules and the [message log](#message-log-and-delivered-updates) still name the person who
+posted it.
+
+Users can also post photos, media, albums and forwards (of a user, a channel or a supergroup),
+edit their messages, react, pin, press buttons in private chats and on ephemeral messages, change
+their profile, and rename the chat or change its photo. [Test actions](#test-actions) lists them
+all.
 
 ### Check what the bot did
 
@@ -902,13 +915,15 @@ What it shows, only from what the server stores:
   deleted bot's included, most recently active first. The search box filters them by title.
 - **Messages**: the sender's name and initial, bots tagged as the first bot, an added bot, a
   deleted bot or a guest bot; a channel post or a post on behalf of a chat as the chat, with its
-  signature and, in the test's view, who posted it; text with its entities, replies, forwards and
-  captions; photos as the images themselves; a contact as a card with the name and phone; a
-  location as a card with its point, accuracy and how long a live one is shared (no map); other
-  media as labeled placeholders; inline keyboards as buttons (hover one for its callback data);
-  edits (not a bot's change of only the keyboard, which Telegram's apps do not mark either); and
-  service messages: joins, leaves, pins, title and photo changes, upgrades and topics. Times are
-  UTC.
+  signature and, in the test's view, who posted it; text with its entities (hover a text link for
+  its address, a text mention for the user), replies, forwards (from a user, a hidden user, a
+  channel or a supergroup, with the signature) and captions; photos as the images themselves, a
+  file posted again included; a contact as a card with the name, the phone and the account it
+  names; a location as a card with its point and accuracy, and for a live one how long it is
+  shared, its heading and alert radius (no map); other media as labeled placeholders; inline
+  keyboards as buttons (hover one for its callback data); edits (not a bot's change of only the
+  keyboard, which Telegram's apps do not mark either); and service messages: joins, leaves, pins,
+  title and photo changes, upgrades and topics. Times are UTC.
 - **Deletions**: a deleted message stays, grayed and marked with the bot that deleted it.
 - **Ephemeral messages**, marked with the member who sees them.
 - **Events** Telegram shows as no message: member changes by a bot or a person (restrictions,
@@ -1415,29 +1430,32 @@ handed to the bot ([Make users act](#make-users-act)). The owner account actions
 
 **Posting**
 
-- `post(chatId, userId, text)`: the user posts a message; returns its `message_id`. Also takes
-  `{ text, photo, media, caption, replyTo, threadId, forwardFrom, poll }`: `photo` is image bytes
-  (a PNG, GIF or JPEG header gives its size); `media` is `{ type, bytes, fileName?, mimeType? }`
-  with `type` `video`, `animation`, `sticker`, `voice`, `audio`, `video_note` or `document`; a
-  caption goes with every kind but stickers and video notes; `replyTo` is the `message_id` it
-  replies to; `threadId` is a forum topic; `forwardFrom` is `{ userId }`, `{ senderName }` (a hidden
-  user), `{ chatId, messageId? }` (a channel post) or `{ chatId }` of a supergroup (a post made on
-  its behalf), with `authorSignature?` for a channel or supergroup; `poll` is a poll of the
-  user's own, a message by itself, with `sendPoll`'s fields (`question`, `options`, `type`,
-  `is_anonymous`, `allows_multiple_answers`, `allows_revoting`, `correct_option_ids`,
-  `explanation`) and checks, and needs `can_send_polls`. Fails if the user is not allowed to post.
-  Text and captions are trimmed as Telegram's apps send them, and text that then shows nothing
-  fails with `MESSAGE_EMPTY`. It also takes:
+- `post(chatId, userId, text)`: the user posts a message; returns its `message_id`. Fails if the
+  user is not allowed to post. Text and captions are trimmed as Telegram's apps send them, and
+  text that then shows nothing fails with `MESSAGE_EMPTY`. Instead of text, it takes an object
+  with `text` or one other kind of content, and the fields that go with it:
+  - `photo`: image bytes (a PNG, GIF or JPEG header gives its size). `media`:
+    `{ type, bytes, fileName?, mimeType? }` with `type` `video`, `animation`, `sticker`, `voice`,
+    `audio`, `video_note` or `document`. A `caption` goes with every kind but stickers and video
+    notes.
+  - `fileId`: a file from an earlier message, by any bot's `file_id` for it. The message keeps the
+    file's kind and `file_unique_id`, and needs the permission for that kind; a caption may go
+    with it.
+  - `poll`: a poll of the user's own, with `sendPoll`'s fields (`question`, `options`, `type`,
+    `is_anonymous`, `allows_multiple_answers`, `allows_revoting`, `correct_option_ids`,
+    `explanation`) and checks. It needs `can_send_polls`.
   - `contact`: `{ phoneNumber, firstName, lastName?, vcard?, userId? }`, and `location`:
     `{ latitude, longitude, horizontalAccuracy?, livePeriod?, heading?, proximityAlertRadius? }`
-    (live when `livePeriod` is not 0). Each is a message by itself and needs `can_send_messages`.
-    `horizontalAccuracy` is kept in whole meters, rounded up, at most 1500. A contact without a
-    phone number or first name fails as incomplete; what Telegram answers is unverified.
-  - `fileId`: a file from an earlier message, by any bot's `file_id` for it. The message keeps the
-    file's kind and `file_unique_id`; a caption may go with it.
+    (live when `livePeriod` is not 0). Each needs `can_send_messages`. `horizontalAccuracy` is
+    kept in whole meters, rounded up, at most 1500. A contact without a phone number or first
+    name fails as incomplete; what Telegram answers is unverified.
   - `entities` and `captionEntities`: `MessageEntity` objects for the text and the caption,
     checked as Telegram checks a user's. Types Telegram finds by itself are ignored, except
     `phone_number` and `bank_card_number`, which this server does not find.
+  - `replyTo`: the `message_id` it replies to. `threadId`: a forum topic.
+  - `forwardFrom`: where a forward comes from: `{ userId }`, `{ senderName }` (a hidden user),
+    `{ chatId, messageId? }` (a channel post) or `{ chatId }` of a supergroup (a post made on its
+    behalf), with `authorSignature?` for a channel or supergroup.
   - `sendAs`: in a supergroup, the chat to post on behalf of: the group itself, for an anonymous
     administrator, or a channel the user created. Others fail with `SEND_AS_PEER_INVALID`. An
     administrator with `is_anonymous` posts as the group even without it, and anyone else may
@@ -1514,6 +1532,8 @@ handed to the bot ([Make users act](#make-users-act)). The owner account actions
 - `getBotUpdates(botId, { type, chatId, since, epoch })`: the updates the bot was sent after the
   `update_id` `since`, in order, as `{ bot_id, epoch, updates }`, each with its type, chat, state
   and the exact update.
+
+**Bots and chats**
 
 - `addBot({ token, username, firstName, loginClientSecret, supportsJoinRequestQueries })`: another
   bot, with its own webhook or update queue; it is in no chat yet. Returns the bot's user, with
@@ -1613,17 +1633,16 @@ same):
 
 - `{ kind: "message", chatId, ... }` needs `messageId`, or an author (`userId` or `botId`) plus
   exact `text` or `caption`. `deleted` checks whether it was deleted, and author, text and caption
-  can also narrow a `messageId`. `userId` or `botId` identifies the author also in a channel, where
-  the message itself names only the channel. It resolves with
+  can also narrow a `messageId`. `userId` or `botId` identifies the author also in a channel post
+  or a post on behalf of a chat, where the message itself names only the chat. It resolves with
   `{ exists, deleted, message, author }`, where `author` is the author's user id, and finds
   ephemeral messages by author and text too. To tell apart the same ephemeral text sent to two
-  members, read each one with `getEphemeralMessage`.
-  It can instead, with or without an author, match `contains` (a part of the text or caption),
-  `matches` (a `RegExp`, or `{ source, flags }` over HTTP; the `g` and `y` flags are dropped),
-  `buttonText` and `buttonData` (an inline button's exact text and `callback_data`, the same button
-  when both are given). Every field given must hold. With these, it resolves with the oldest
-  match, ephemeral messages included, and `since` (a
-  [message log](#message-log-and-delivered-updates) cursor) skips messages stored up to it.
+  members, read each one with `getEphemeralMessage`. It can instead, with or without an author,
+  match `contains` (a part of the text or caption), `matches` (a `RegExp`, or `{ source, flags }`
+  over HTTP; the `g` and `y` flags are dropped), `buttonText` and `buttonData` (an inline button's
+  exact text and `callback_data`, the same button when both are given). Every field given must
+  hold. With these, it resolves with the oldest match, ephemeral messages included, and `since`
+  (a [message log](#message-log-and-delivered-updates) cursor) skips messages stored up to it.
 - `{ kind: "member", chatId, userId, status }` reads the member's status in the chat, which every
   bot in it shares. `permissions` compares the returned `ChatMember`'s permission fields. It
   resolves with the `ChatMember`.
@@ -1679,14 +1698,15 @@ API routes do; only the viewer (`/_fake/ui`) answers this computer alone. Keep t
 
 **Messages**
 
-- `POST chats/:id/messages`: the user posts `{ user_id, text }`, `{ user_id, photo_base64,
-  caption? }` or `{ user_id, media: { type, base64, file_name?, mime_type? }, caption? }`,
-  optionally `reply_to`, `message_thread_id` or
-  `forward_from: { user_id | sender_name | chat_id, message_id?, author_signature? }`, or a poll
-  `{ user_id, poll: { question, options, ... } }`; returns `{ message_id }`. It also takes
-  `contact: { phone_number, first_name, last_name?, vcard?, user_id? }`, `location: { latitude,
-  longitude, horizontal_accuracy?, live_period?, heading?, proximity_alert_radius? }`, `file_id`,
-  `entities`, `caption_entities` and `send_as`, as `post` does.
+- `POST chats/:id/messages`: the user posts, as `post` does, `{ user_id, text }`,
+  `{ user_id, photo_base64, caption? }`,
+  `{ user_id, media: { type, base64, file_name?, mime_type? }, caption? }`,
+  `{ user_id, file_id, caption? }`, a poll `{ user_id, poll: { question, options, ... } }`,
+  `{ user_id, contact: { phone_number, first_name, last_name?, vcard?, user_id? } }` or
+  `{ user_id, location: { latitude, longitude, horizontal_accuracy?, live_period?, heading?,
+  proximity_alert_radius? } }`; optionally with `entities` or `caption_entities`, `reply_to`,
+  `message_thread_id`, `forward_from: { user_id | sender_name | chat_id, message_id?,
+  author_signature? }` or `send_as`. Returns `{ message_id }`.
 - `POST chats/:id/messages/:messageId/vote`: the user `{ user_id, option_ids }` votes in a poll
   (`option_ids: []` takes the vote back); returns the poll.
 - `POST chats/:id/albums`: the user posts an album
@@ -1935,18 +1955,31 @@ A few points matter in most tests:
 
 [docs/telegram-behavior.md][behavior] lists the rules area by area: members and moderation
 (permissions, restrictions, bans, administrators, invite links), bots and chats (access, several
-bots, private chats, channels, basic groups, business connections, command menus), messages
-(deleting, editing, forwards, pins, polls, reactions, media and files), buttons and ephemeral
-messages, text formatting and replies, and request parsing and update delivery.
+bots, deleting a bot, private chats, channels, basic groups, business connections, command
+menus), messages (what members send, posts on behalf of a chat, entities, deleting, editing,
+forwards, pins, polls, reactions, media and files), buttons and ephemeral messages, text
+formatting and replies, and request parsing and update delivery.
 
 ## What it does not do
 
 - Inline mode, payments, games, sticker sets, reaction counts, options added to a poll after it was
-  sent, reactions and votes on behalf of a chat (`actor_chat`, `voter_chat`: an anonymous
-  administrator reacts and votes as themselves), or Telegram's exact
-  rate limits: `floodControl` applies only its published numbers (a test can also make any call
-  fail with a 429 through `POST failures`). Channel signatures are not modeled, and forum topics
-  cannot be closed or deleted.
+  sent, or Telegram's exact rate limits: `floodControl` applies only its published numbers (a test
+  can also make any call fail with a 429 through `POST failures`). Forum topics cannot be closed or
+  deleted.
+- Around posts on behalf of a chat: channels that sign their posts (a channel post has no
+  `author_signature`), reactions and votes on behalf of a chat (`actor_chat`, `voter_chat`: an
+  anonymous administrator reacts and votes as themselves), `banChatSenderChat`, and the verified or
+  linked channels a member may post as without Premium.
+- Finding phone and bank card numbers in members' text, which Telegram's server does by rules it
+  does not publish: the test marks them with `entities`. Telegram also fills a contact's `user_id`
+  when the number belongs to an account; test users have no phone numbers, so the test names the
+  user.
+- Matching uploads by content: each upload is a new file with its own `file_unique_id`, even of the
+  same bytes. Post an earlier file by `fileId` to keep its `file_unique_id`.
+- Members deleting messages: no test action does it, so every deletion is a bot's.
+- A private chat per bot: a user's private messages with every bot are kept in one chat with one
+  run of message ids, so a bot can delete or pin a message in another bot's private chat with that
+  user. The viewer still shows each bot's private chat apart.
 - Updates when a restriction or ban runs out: the member's status changes on time, and no update is
   sent.
 - The older fields the Bot API server still writes beside newer ones: `forward_from`,
@@ -1962,10 +1995,37 @@ messages, text formatting and replies, and request parsing and update delivery.
   this server.
 - Fetching media from HTTP URLs (a URL stands in as a one-byte file), several sizes per photo,
   `sendLivePhoto` and `editMessageLiveLocation`.
+- In the viewer and recordings: business chats, reactions, the chat description, what an edited
+  message said before, and a map for a location. Only PNG, JPEG, GIF and WebP images are drawn;
+  video, voice, documents and other media are labeled placeholders. View as a member has the
+  limits listed under [Watch the chats in a browser](#watch-the-chats-in-a-browser).
+- Edits in the message log, which lists messages and deletions after a mark. The `quiet` wait
+  cannot see work a bot does after it confirmed an update, such as a background job.
+- A manual clock from the command line, which runs on real time only; a clock push when the server
+  starts (the app calls `refreshFakeClock()` once); and your app's own timers: `advanceTime`
+  changes what `fakeClockNow()` returns, not when a `setTimeout` fires.
 - Persistence. All state lives in memory and is lost when the server stops; recovering from a
   restart belongs to the application under test.
 - Anything security-related. It is a test tool: the control API answers anyone who can reach its
   port, so bind it to localhost and never expose it to a network you do not control.
+
+## Upgrading from 0.11.0
+
+Most of 0.12.0 is new and changes nothing until a test uses it, except that a call receipt now
+has `description` when the answer carried a text. Two behaviors change, to match Telegram:
+
+- **An anonymous administrator posts as the group.** In a supergroup, a member who is an
+  administrator with `is_anonymous` now posts on the group's behalf: the message has
+  `sender_chat` (the group), `from` is `@GroupAnonymousBot` (id 1087968824), and their custom
+  title, if any, is its `author_signature`. 0.11.0 posted as the user. A bot that reads `from` to
+  find who posted now gets `@GroupAnonymousBot`, and Bot API calls about that user, such as
+  `banChatMember`, answer `Bad Request: user not found` here (unverified). Waits, failure rules
+  and the message log still name the person who posted. A bot's forward of such a post has a
+  `chat` origin with the group and the signature, where 0.11.0 gave a `user` origin. To have the
+  member post as themselves, promote them without `is_anonymous`.
+- **`promoteChatMember` keeps the custom title** when it edits an administrator's rights, where
+  0.11.0 dropped it, and in a channel it drops `is_anonymous`, since a channel has no anonymous
+  administrators.
 
 ## Upgrading from 0.10.0
 
@@ -2123,17 +2183,20 @@ fields below.
     ([Testing time-based app logic](#testing-time-based-app-logic)).
   - New: call receipts have `description`, the text the answer carried
     ([Call receipts](#call-receipts)).
-  - New: members post on behalf of a chat (a channel they created, with Premium), forward a
-    supergroup's own post (`MessageOriginChat`), share contacts and locations, give their text
-    entities such as `phone_number` and `text_link`, and post an earlier file again with its
-    `file_unique_id` ([Make users act](#make-users-act)).
+  - New: members post on behalf of a chat (`sendAs`: a channel they created, with Premium),
+    forward a supergroup's own post (`MessageOriginChat`), share contacts and locations, give
+    their text entities such as `phone_number` and `text_link`, and post an earlier file again
+    with its `file_unique_id` (`fileId`) ([Make users act](#make-users-act)).
   - New: people promote and demote members (`promoteMember`, `demoteMember`), and a test deletes a
-    bot it added (`deleteBot`) ([Test actions](#test-actions)).
+    bot it added (`deleteBot`), also over HTTP ([Test actions](#test-actions),
+    [Control API](#control-api)).
   - Changed: a supergroup administrator with `is_anonymous` now posts as the group, as on Telegram
     (`from` is `@GroupAnonymousBot`, with `sender_chat` and `author_signature`), where 0.11.0
     posted as the user, and a bot's forward of such a post has a `chat` origin.
   - Changed: `promoteChatMember` now keeps the custom title when it edits an administrator, and
     drops `is_anonymous` in a channel, as Telegram does.
+  - Tests written for 0.11.0 may need changes where an anonymous administrator posts: see
+    [Upgrading from 0.11.0](#upgrading-from-0110).
 - **0.11.0**: the server answers as Telegram does wherever 0.10.0 did not, checked against the Bot
   API docs and the source of Telegram's Bot API server and TDLib: channel posts, who receives which
   update, webhook retries and concurrency, per-bot updates and file ids, ephemeral messages, invite
