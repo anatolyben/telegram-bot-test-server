@@ -1051,8 +1051,8 @@ export interface TelegramBotTestServer {
    * The chat's messages stored after a mark (`since`, a cursor), oldest first;
    * with includeDeleted also those deleted, and those deleted after the mark.
    * A positive chat id reads the user's private chat, all bots' messages in
-   * it or one bot's (botId). Read the cursor once as the mark; pass its epoch
-   * to refuse a mark from before a restore.
+   * it or one bot's (botId, a deleted bot's too). Read the cursor once as the
+   * mark; pass its epoch to refuse a mark from before a restore.
    */
   getMessageLog(
     chatId: number,

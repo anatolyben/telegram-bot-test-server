@@ -1556,6 +1556,9 @@ export async function startTestServer({
   // Every bot this server answers for, by token. Each keeps its own webhook,
   // update queue and commands, as separate bots do on Telegram.
   const bots = new Map();
+  // The bots a test deleted, by id: the users their earlier messages and
+  // calls still name. Not snapshotted: rebuilt from users on restore.
+  const deletedBots = new Map();
   function addBot({
     token,
     username,
@@ -3444,11 +3447,13 @@ export async function startTestServer({
       throw new TelegramError(400, "the first bot can't be deleted");
     }
     bots.delete(record.token);
-    users.set(record.id, {
+    const user = {
       ...userObject(record),
       photos: record.photos,
       deleted: true,
-    });
+    };
+    users.set(record.id, user);
+    deletedBots.set(record.id, user);
     closeAttempts(record, "cancelled");
     record.webhook = null;
     wakePollers(record);
@@ -7422,11 +7427,13 @@ export async function startTestServer({
   /**
    * The bot whose private chat with the user a stored message or event
    * belongs to. A user's stored private chat holds their messages to the first
-   * bot, which users write to, and any bot's messages to them.
+   * bot, which users write to, and any bot's messages to them, a deleted
+   * bot's included.
    */
   function privatePairOf(chat, item) {
     if (item.message) {
-      return [...bots.values()].some((record) => record.id === item.author)
+      return deletedBots.has(item.author) ||
+        [...bots.values()].some((record) => record.id === item.author)
         ? item.author
         : bot.id;
     }
@@ -8117,6 +8124,10 @@ export async function startTestServer({
       if (sent.queryId != null)
         queryChats.set(String(sent.queryId), sent.chatId);
     }
+    deletedBots.clear();
+    for (const user of users.values()) {
+      if (user.deleted) deletedBots.set(user.id, user);
+    }
     epoch += 1;
     for (const chat of chats.values())
       for (const userId of chat.members.keys()) scheduleExpiry(chat, userId);
@@ -8697,7 +8708,10 @@ export async function startTestServer({
       if (method === "GET" && !subId && isLogQuery(query)) {
         const user = requireUser(id);
         const pair =
-          query.bot_id === undefined ? null : requireBot(query.bot_id);
+          query.bot_id === undefined
+            ? null
+            : (deletedBots.get(Number(query.bot_id)) ??
+              requireBot(query.bot_id));
         return messageLog(existing, user.id, query, pair);
       }
       if (method === "GET" && !subId) {
@@ -10593,7 +10607,8 @@ ${buttons}
     cursor: () => nextSeq,
     clock: () => clock.state(),
     firstBotId: () => bot.id,
-    bots: () => [...bots.values()],
+    // Every bot, then the deleted ones (marked `deleted`).
+    bots: () => [...bots.values(), ...deletedBots.values()],
     user: (id) => users.get(Number(id)),
     chats: () => chats.values(),
     chat: (id) => chats.get(Number(id)),

@@ -884,3 +884,164 @@ it("marks a bot's edit of only the keyboard, which Telegram's apps do not show a
   });
   expect((await item()).edit_hidden).toBeUndefined();
 });
+
+it("names who posted on behalf of a chat, in the message log and the viewer", async () => {
+  const { fake, get, page } = await setup();
+  const ann = await fake.createUser({ first_name: "Ann" });
+  const bob = await fake.createUser({ first_name: "Bob", is_premium: true });
+  for (const id of [ann, bob]) await fake.join(CHAT, id);
+  await fake.promoteMember(CHAT, ann, {
+    rights: { is_anonymous: true, can_delete_messages: true },
+  });
+  const news = await fake.createChat({
+    type: "channel",
+    title: "News",
+    ownerId: bob,
+  });
+  const mark = (await fake.getMessageLog(CHAT)).cursor;
+  await fake.post(CHAT, ann, "Read the rules");
+  await fake.post(CHAT, bob, { text: "Follow us", sendAs: news });
+
+  // The messages name only a chat; the log and the viewer keep who posted.
+  const sent = (entry) => [
+    entry.author,
+    entry.message.from.id,
+    entry.message.sender_chat.id,
+    entry.message.text,
+  ];
+  const posts = [
+    [ann, 1087968824, CHAT, "Read the rules"],
+    [bob, 136817688, news, "Follow us"],
+  ];
+  expect(
+    (await fake.getMessageLog(CHAT, { since: mark })).messages.map(sent),
+  ).toEqual(posts);
+  const read = await page(CHAT);
+  expect(read.items.filter((item) => item.seq > mark).map(sent)).toEqual(posts);
+  expect(read.users[ann]).toMatchObject({ first_name: "Ann" });
+  expect(read.users[bob]).toMatchObject({ first_name: "Bob" });
+  const { body: state } = await get("api/state");
+  const row = state.chats.find((each) => each.key === String(CHAT));
+  expect(row.last).toMatchObject({ author: bob, preview: "Follow us" });
+  expect(state.users[bob]).toMatchObject({ first_name: "Bob" });
+});
+
+it("logs a person's promotion and demotion of a member, with that person as the actor", async () => {
+  const { fake, page } = await setup();
+  const ann = await fake.createUser({ first_name: "Ann" });
+  await fake.join(CHAT, ann);
+  const member = async () =>
+    (await page(CHAT)).members.find((entry) => entry.user_id === ann).member;
+
+  await fake.promoteMember(CHAT, ann, {
+    rights: { can_delete_messages: true },
+  });
+  expect(await member()).toMatchObject({
+    status: "administrator",
+    can_manage_chat: true,
+    can_delete_messages: true,
+    can_restrict_members: false,
+  });
+  await fake.demoteMember(CHAT, ann);
+  expect((await member()).status).toBe("member");
+  // Test actions: no call stored them.
+  expect(
+    (await page(CHAT)).items
+      .filter((item) => item.kind === "event" && item.actor_id === OWNER)
+      .map((event) => [
+        event.user_id,
+        event.request_id,
+        event.old.status,
+        event.new.status,
+        event.new.can_delete_messages ?? null,
+      ]),
+  ).toEqual([
+    [ann, null, "member", "administrator", true],
+    [ann, null, "administrator", "member", null],
+  ]);
+});
+
+it("keeps a deleted bot's private chats, calls and membership, marked deleted until a restore brings it back", async () => {
+  const { fake, api, get, page } = await setup();
+  const second = await fake.addBot({
+    token: SECOND_TOKEN,
+    username: "second_bot",
+    firstName: "Second Bot",
+  });
+  await fake.setBotMembership(CHAT, second.id);
+  const invite = (
+    await api("createChatInviteLink", {
+      chat_id: CHAT,
+      creates_join_request: true,
+    })
+  ).result.invite_link;
+  const carol = await fake.createUser({ first_name: "Carol" });
+  await fake.joinByLink(invite, carol);
+  await api(
+    "sendMessage",
+    { chat_id: carol, text: "answer 2+2 to join" },
+    SECOND_TOKEN,
+  );
+  const before = await fake.snapshot();
+  await fake.deleteBot(second.id);
+  expect((await api("getMe", {}, SECOND_TOKEN)).status).toBe(401);
+
+  const { body: state } = await get("api/state");
+  expect(state.bots.map((bot) => [bot.id, bot.deleted === true])).toEqual([
+    [BOT, false],
+    [second.id, true],
+  ]);
+  // Its message to Carol stays in her chat with it, not with the first bot.
+  const keys = state.chats.map((row) => row.key);
+  expect(keys).toContain(`${carol}:${second.id}`);
+  expect(keys).not.toContain(`${carol}:${BOT}`);
+  const chat = await page(`${carol}:${second.id}`);
+  expect(texts(chat.items)).toEqual(["answer 2+2 to join"]);
+  expect(chat.calls.map((call) => call.method)).toEqual(["sendMessage"]);
+  expect(
+    (await fake.getMessageLog(carol, { botId: second.id })).messages.map(
+      (entry) => entry.message.text,
+    ),
+  ).toEqual(["answer 2+2 to join"]);
+
+  // It left the group as with leaveChat.
+  const group = await page(CHAT);
+  expect(
+    group.members.find((entry) => entry.user_id === second.id).member.status,
+  ).toBe("left");
+  const left = group.items.find(
+    (item) =>
+      item.kind === "event" &&
+      item.user_id === second.id &&
+      item.new.status === "left",
+  );
+  expect(left).toMatchObject({
+    actor_id: second.id,
+    old: { status: "administrator" },
+  });
+  expect(
+    group.items.find((item) => item.seq === left.service_seq).message
+      .left_chat_member.id,
+  ).toBe(second.id);
+
+  // The call its revoked token made is named after it.
+  const calls = await page("calls");
+  expect(calls.calls.at(-1)).toMatchObject({
+    method: "getMe",
+    bot_id: second.id,
+    status: 401,
+  });
+  expect(calls.users[second.id]).toMatchObject({ username: "second_bot" });
+
+  // A restore from before the deletion has the bot back, listed once.
+  await fake.restore(before);
+  expect(
+    (await get("api/state")).body.bots.map((bot) => [
+      bot.id,
+      bot.deleted === true,
+    ]),
+  ).toEqual([
+    [BOT, false],
+    [second.id, false],
+  ]);
+});

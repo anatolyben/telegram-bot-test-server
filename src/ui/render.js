@@ -311,11 +311,12 @@ export function personName(ctx, id) {
   return user ? nameOf(user) : `User ${id}`;
 }
 
-/** How a bot is labelled: the first bot, an added bot, or any other bot user. */
+/** How a bot is labeled: the first bot, an added or deleted bot, or any other bot user. */
 function botTag(ctx, user) {
   if (!user) return null;
   const bot = ctx.bots.get(Number(user.id));
-  if (bot) return bot.first ? "first bot" : "added bot";
+  if (bot)
+    return bot.first ? "first bot" : bot.deleted ? "deleted bot" : "added bot";
   return user.is_bot ? "bot" : null;
 }
 
@@ -1150,7 +1151,7 @@ function senderLine(item, ctx, kind) {
       : kind === "first-bot"
         ? "first bot"
         : kind === "added-bot"
-          ? "added bot"
+          ? (botTag(ctx, from) ?? "added bot")
           : "bot";
   const caller =
     kind === "guest-bot"
@@ -1260,6 +1261,14 @@ function rightsList(member, value) {
     .map(rightName);
 }
 
+/** An administrator's rights in words, with "anonymous" when they post as the chat. */
+function adminRights(member) {
+  return [
+    ...rightsList(member, true),
+    ...(member?.is_anonymous === true ? ["anonymous"] : []),
+  ];
+}
+
 function untilPhrase(member) {
   const until = Number(member?.until_date ?? 0);
   return until > 0 ? `until ${escapeHtml(untilText(until))}` : "forever";
@@ -1314,7 +1323,7 @@ function memberEventText(event, ctx) {
   if (before.status === "restricted" && after.status === "member")
     return `${subject} unrestricted${by}`;
   if (after.status === "administrator" && before.status !== "administrator") {
-    const rights = rightsList(after, true);
+    const rights = adminRights(after);
     return `${subject} promoted${rights.length ? `: ${escapeHtml(rights.join(", "))}` : ""}${by}`;
   }
   if (before.status === "administrator" && after.status !== "administrator")
@@ -1322,11 +1331,11 @@ function memberEventText(event, ctx) {
   if (after.status === "administrator") {
     if (before.custom_title !== after.custom_title)
       return `${users} title set to ${after.custom_title ? quoteText(after.custom_title) : "none"}${by}`;
-    const gained = rightsList(after, true).filter(
-      (right) => !rightsList(before, true).includes(right),
+    const gained = adminRights(after).filter(
+      (right) => !adminRights(before).includes(right),
     );
-    const lost = rightsList(before, true).filter(
-      (right) => !rightsList(after, true).includes(right),
+    const lost = adminRights(before).filter(
+      (right) => !adminRights(after).includes(right),
     );
     const change = [
       gained.length ? `+${gained.join(", +")}` : "",
@@ -2129,7 +2138,7 @@ export function chatListEntries(
             ? el(
                 "span",
                 { class: "tv-list-with" },
-                `with @${escapeHtml(bot.username ?? bot.first_name)}`,
+                `with @${escapeHtml(bot.username ?? bot.first_name)}${bot.deleted ? " (deleted)" : ""}`,
               )
             : "",
           time != null

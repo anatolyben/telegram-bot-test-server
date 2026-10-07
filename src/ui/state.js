@@ -225,6 +225,7 @@ export function createUiState(model) {
     return table;
   }
 
+  /** Every bot the server has had; a deleted one says so. */
   function botList() {
     const first = model.firstBotId();
     return model.bots().map((record, index) => ({
@@ -233,6 +234,7 @@ export function createUiState(model) {
       first_name: record.first_name,
       first: record.id === first,
       index,
+      ...(record.deleted ? { deleted: true } : {}),
     }));
   }
 

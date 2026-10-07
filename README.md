@@ -418,12 +418,15 @@ console.log(messages.map((entry) => [entry.message.text, entry.deleted_by?.bot_i
 - It returns `{ chat_id, epoch, cursor, messages }`, oldest first. Pass `cursor` as the next
   `since` to read on from there.
 - Each entry has the stored `message` (with the first bot's file ids), its `seq`, `at` (server
-  time), `author`, `request_id` (the Bot API call that stored it, or `null` for a test action),
+  time), `author` (who posted it, also when the message names only a chat: a channel post, or a
+  post on behalf of a chat), `request_id` (the Bot API call that stored it, or `null` for a test
+  action),
   `ephemeral`, and `deleted` with `deleted_by`: `{ seq, bot_id, method, request_id, at }` of the
   deletion, or `null`. A poll that has votes has `votes` by user id.
 - Without `includeDeleted`, only messages not deleted are listed. With it, a message stored before
   the mark but deleted after it is listed too. Edits are not reported.
-- A user id instead of a chat id reads the user's private chats; `botId` keeps one bot's.
+- A user id instead of a chat id reads the user's private chats; `botId` keeps one bot's, a
+  deleted bot's too.
 - After a `restore`, the sequence goes back with the state. Pass the mark's `epoch` and a read
   from an older epoch fails instead of mixing the two.
 
@@ -895,18 +898,20 @@ an open viewer does not hold up `snapshot()`, `restore()` or a wait.
 
 What it shows, only from what the server stores:
 
-- **Chats**: groups, supergroups, channels, forums and each user's private chat with each bot,
-  most recently active first. The search box filters them by title.
-- **Messages**: the sender's name and initial, bots tagged as the first bot, an added bot or a guest
-  bot; text with its entities, replies, forwards and captions; photos as the images themselves and
-  other media as labeled placeholders; inline keyboards as buttons (hover one for its callback
-  data); edits (not a bot's change of only the keyboard, which Telegram's apps do not mark either);
-  and service messages: joins, leaves, pins, title and photo changes, upgrades and topics. Times
-  are UTC.
+- **Chats**: groups, supergroups, channels, forums and each user's private chat with each bot, a
+  deleted bot's included, most recently active first. The search box filters them by title.
+- **Messages**: the sender's name and initial, bots tagged as the first bot, an added bot, a
+  deleted bot or a guest bot; a channel post or a post on behalf of a chat as the chat, with its
+  signature and, in the test's view, who posted it; text with its entities, replies, forwards and
+  captions; photos as the images themselves, contacts and locations with their fields, and other
+  media as labeled placeholders; inline keyboards as buttons (hover one for its callback data);
+  edits (not a bot's change of only the keyboard, which Telegram's apps do not mark either); and
+  service messages: joins, leaves, pins, title and photo changes, upgrades and topics. Times are
+  UTC.
 - **Deletions**: a deleted message stays, grayed and marked with the bot that deleted it.
 - **Ephemeral messages**, marked with the member who sees them.
-- **Events** Telegram shows as no message: member changes (restrictions, bans, promotions, their
-  expiry), join requests (pending, approved, declined) and unpins.
+- **Events** Telegram shows as no message: member changes by a bot or a person (restrictions,
+  bans, promotions, their expiry), join requests (pending, approved, declined) and unpins.
 - **Members**: the chat's default permissions, then each member, the bots included, with their
   status (creator, administrator, member, restricted or banned until a UTC time or forever, left),
   what a restricted member cannot do and an administrator's rights; then pending join requests.
@@ -965,7 +970,8 @@ one browser share one event stream, so any number of them stay live.
   `data-chat-id`, `data-view-as`.
 - **Message**: `data-kind="message"`, `data-chat-key`, `data-seq`, `data-message-id` or, for an
   ephemeral message, `data-ephemeral-id` and `data-receiver-id`; `data-author-id`,
-  `data-author-kind` (`user`, `first-bot`, `added-bot`, `guest-bot`, `bot`, `channel`),
+  `data-author-kind` (`user`, `first-bot`, `added-bot` (a deleted one too), `guest-bot`, `bot`,
+  `channel` for a channel post or a post on behalf of a chat),
   `data-deleted` and `data-deleted-by`, `data-edited` and `data-edit-hidden` (a bot changed only
   the keyboard), `data-service`, `data-thread-id`, `data-reply-to`, `data-reply-deleted`,
   `data-pinned-deleted`, `data-request-id`.
@@ -1015,7 +1021,7 @@ The viewer's routes, all `GET` and all on this computer only:
 #### Call timeline
 
 The viewer draws every Bot API call from the [call receipts](#call-receipts) beside the chat it
-acted on: the bot (first or added), the method, what it asked for in words (the user, the
+acted on: the bot (first, added or deleted), the method, what it asked for in words (the user, the
 messages, `until_date` as a UTC time or "forever", the permissions as Telegram reads them (a
 permission left out is off; hover for what was sent) or the rights it grants, the text), its
 outcome (`succeeded`, `rejected 400`, `delayed`, `response lost`, ...), and,
@@ -1515,7 +1521,9 @@ handed to the bot ([Make users act](#make-users-act)). The owner account actions
   on, and a waiting `getUpdates` answers at once. It leaves every chat it is in, as with
   `leaveChat`; Telegram does not document what a deleted bot's chats see, so this is unverified.
   It stays a user that earlier messages name, and a press on its buttons goes unanswered. The
-  first bot can't be deleted. Returns `{ deleted: true }`.
+  message log, the viewer and recordings keep its messages, calls and private chats, and the
+  viewer tags it as a deleted bot; `getBotUpdates` no longer takes its id. The first bot can't be
+  deleted. Returns `{ deleted: true }`.
 - `createChat({ ownerId, title, type, ownerName, isForum })`: a new supergroup, forum (`isForum`),
   basic group (`type: "group"`) or channel (`type: "channel"`) with no bot in it; returns its id.
 - `setBotMembership(chatId, botId, { status, rights, by })`: the owner (or `by`) adds, promotes,
