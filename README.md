@@ -726,9 +726,10 @@ stores nothing, does not count, and gets HTTP 429, a `Retry-After` header and
 ```
 
 `retry_after` is the seconds of its last wait, rounded up to whole seconds as Telegram gives them.
-The limits run on the server clock, so with `clock` a held send is answered only once a test moves
-the clock past its wait with `advanceTime`. While a send is held, `snapshot()` and `restore()`
-refuse, as for a response delay; a snapshot keeps and restores the recent sends.
+The limits run on the server clock, so on a manual clock a held send is answered only once a test
+moves the clock past its wait with `advanceTime`. On a running clock it is also answered when real
+time gets there. While a send is held, `snapshot()` and `restore()` refuse, as for a response delay;
+a snapshot keeps and restores the recent sends.
 
 `floodControl` also applies a limit of the Bot API server itself: a `setWebhook` with a URL less
 than a second after the previous one gets 429 `Too Many Requests: retry after 1` before anything
@@ -754,14 +755,30 @@ await server.waitFor({ kind: "member", chatId: GROUP, userId: ann, status: "memb
 A bot that lifts a mute itself calls `restrictChatMember` with every permission `true`, as the Bot
 API docs say; the member is then a `member` again.
 
+A manual clock stands still between advances. Messages posted a minute apart in real time get the
+same date, and anything that counts by dates, such as a rate window, sees no time pass. A running
+clock keeps moving instead. With `clock: { offset: milliseconds }`, the server's time is real time
+plus the offset; `{ offset: 0 }` starts on real time. `advanceTime(ms)` adds `ms` to the offset, so
+time jumps forward, and it keeps moving between jumps. `getClock()` then returns
+`{ mode: "running", now, offset, scheduled }`:
+
+```js
+// With clock: { offset: 0 } in the options.
+await server.post(GROUP, ann, "first"); // dated now
+await server.advanceTime(24 * 60 * 60 * 1000);
+await server.post(GROUP, ann, "second"); // dated a day later, and the clock keeps moving
+```
+
 Advances run one at a time, and each runs what has come due, in deadline order: restriction and
 ban expiry, response delays (`delayMs`, and owner call delays), sends held by flood control, webhook
-retries and delayed `getUpdates` conflicts. Message, login and business dates, the five minutes a
-bot may message a join requester, and flood control follow this clock too. A restore sets a manual
-clock back to the snapshot's time; real time is never rewound. The global `Date`, timers and your
-app's jobs are untouched. Webhook connections and their one-minute timeout, long polling and
-`waitFor` deadlines use wall time, so an advance does not wait for deliveries or for your bot to
-act. To have your app follow this clock, see
+retries and delayed `getUpdates` conflicts. On a running clock, these also come due as real time
+passes. Message, login and business dates, the five minutes a bot may message a join requester,
+and flood control follow this clock too. A restore sets a manual clock back to the snapshot's time,
+and a running clock's offset back to the snapshot's offset. Real time is never rewound, so after a
+restore a running clock is later than the snapshot by the real time that passed. The global `Date`,
+timers and your app's jobs are untouched. Webhook connections and their one-minute timeout, long
+polling and `waitFor` deadlines use wall time, so an advance does not wait for deliveries or for
+your bot to act. To have your app follow this clock, see
 [Testing time-based app logic](#testing-time-based-app-logic).
 
 ### Testing time-based app logic
@@ -843,14 +860,18 @@ What the app has to do:
   `GET /_fake/clock`, caches the time and returns it. Until the app has the time of the server the
   variable names, from a read or a push, `fakeClockNow()` throws, so a missed setup fails instead
   of mixing clocks. On a server running on real time, `fakeClockNow()` returns `Date.now()`.
-- **Keep the time current**, in one of two ways. With the `clockWebhook` option and a manual
-  clock, the server posts `{ now, mode }` to that URL after each `advanceTime` and each `restore`,
-  and they resolve only once the post has finished, so the app has the new time when the test
-  goes on. Mount `fakeClockHandler` there (a Node `(request, response)` handler that takes a
-  POST on any path), or pass the parsed body to `receiveFakeClock(body)` if your framework has
-  read it already. A push counts as the time of the server the variable names when the push
-  arrives, so set the variable before the first `advanceTime`. Without the option, call
-  `await refreshFakeClock()` before time-dependent work.
+- **A running clock keeps moving in the app too.** For it, the cache holds the server's offset, not
+  a time, and `fakeClockNow()` returns `Date.now()` plus the offset. Its time moves on between
+  reads, and only a jump or a restore needs a new read or push. This assumes the app and the
+  server read the same system clock, as they do on one computer.
+- **Keep the time current**, in one of two ways. With the `clockWebhook` option and a manual or
+  running clock, the server posts `{ now, mode }` to that URL, and `offset` for a running clock,
+  after each `advanceTime` and each `restore`. They resolve only once the post has finished, so the
+  app has the new time when the test goes on. Mount `fakeClockHandler` there (a Node
+  `(request, response)` handler that takes a POST on any path), or pass the parsed body to
+  `receiveFakeClock(body)` if your framework has read it already. A push counts as the time of the
+  server the variable names when the push arrives, so set the variable before the first
+  `advanceTime`. Without the option, call `await refreshFakeClock()` before time-dependent work.
 - **Expect timers to run on wall time.** Moving the clock fires none of them; a scheduler that
   checks `fakeClockNow()` as it runs, as above, sees the new time on its next check. Or have the
   test run the app's job after `advanceTime`.
@@ -867,7 +888,8 @@ origin after. So, in this order:
 With a fixed port for the app's route, start the server first and spawn the app with
 `TELEGRAM_FAKE_CLOCK_URL` in its environment. An app in another language reads
 `GET <origin>/_fake/clock`, which answers `{ mode, now, scheduled }`, and uses `now` while `mode`
-is `manual`. A push that fails, or takes over 2 seconds, goes to the `log` option as
+is `manual`. While `mode` is `running`, the answer also has `offset`, and the app adds it to its
+own clock. A push that fails, or takes over 2 seconds, goes to the `log` option as
 `clock webhook failed: <reason>` and fails nothing. The bot's own webhook deliveries stay as
 Telegram sends them.
 
@@ -1479,11 +1501,13 @@ deliveries routes take camelCase fields, like their JavaScript methods.
   for one that returns True ([Supported Bot API methods](#supported-bot-api-methods)).
 - `floodControl` (default `false`): hold or refuse sends over Telegram's published limits
   ([Flood control](#flood-control)).
-- `clock` (default real time): `{ now: <Unix ms> }`: a manual clock that only `advanceTime` moves
+- `clock` (default real time): `{ now: <Unix ms> }`: a manual clock that only `advanceTime` moves;
+  or `{ offset: <ms> }`: a running clock, real time plus an offset that `advanceTime` adds to
   ([Time](#time)).
-- `clockWebhook` (default none): an `http(s)` URL. With a manual clock, the server POSTs
-  `{ now, mode }` there after each `advanceTime` and each restore, so the app under test can follow
-  the clock ([Testing time-based app logic](#testing-time-based-app-logic)). The bot's own webhook
+- `clockWebhook` (default none): an `http(s)` URL. With a manual or running clock, the server POSTs
+  `{ now, mode }` there, and `offset` for a running clock, after each `advanceTime` and each
+  restore, so the app under test can follow the clock
+  ([Testing time-based app logic](#testing-time-based-app-logic)). The bot's own webhook
   deliveries stay as Telegram sends them.
 - `ui` (default `false`): serve the [chat viewer](#watch-the-chats-in-a-browser) at
   `server.viewerUrl`, to this computer only. It needs a loopback or wildcard `host`; another throws
@@ -1722,7 +1746,8 @@ handed to the bot ([Make users act](#make-users-act)). The owner account actions
   conditions](#wait-conditions)).
 - `snapshot()`, `restore(handle)`, `releaseSnapshot(handle)`: save and restore the server's state
   ([Snapshots](#snapshots)).
-- `getClock()`, `advanceTime(ms)`: read and move a manual clock ([Time](#time)).
+- `getClock()`, `advanceTime(ms)`: read the clock, and move a manual or running one
+  ([Time](#time)).
 
 **Recordings**
 
@@ -1962,13 +1987,13 @@ These controls take camelCase fields:
 | `POST /_fake/snapshots`           | `{}` → JSON string handle                            |
 | `POST /_fake/restore`             | `{ snapshot: handle }` → `{ restored: true, epoch }` |
 | `DELETE /_fake/snapshots/:handle` | release handle                                       |
-| `GET /_fake/clock`                | `{ mode, now, scheduled }`                           |
-| `POST /_fake/clock`               | `{ ms }` → advanced clock; manual mode required      |
+| `GET /_fake/clock`                | `{ mode, now, scheduled }`, and `offset` if running  |
+| `POST /_fake/clock`               | `{ ms }` → advanced clock; manual or running clock   |
 | `GET /_fake/deliveries`           | the deliveries `getDeliveries()` lists               |
 | `POST /_fake/deliveries`          | `{ botId?, timeoutMs? }` → drain deliveries          |
 
 A wait, drain or clock advance that fails answers `{ error }`: 400 for bad input, 408 when the
-deadline passes, and 409 when the wait is canceled or the clock is not manual. A snapshot or
+deadline passes, and 409 when the wait is canceled or the server runs on real time. A snapshot or
 restore while the server is busy answers 409, and an unknown handle 404.
 
 **Owner accounts** have their routes under `/_fake/owners`, listed in the
@@ -2128,9 +2153,9 @@ formatting and replies, and request parsing and update delivery.
   limits listed under [Watch the chats in a browser](#watch-the-chats-in-a-browser).
 - Edits in the message log, which lists messages and deletions after a mark. The `quiet` wait
   cannot see work a bot does after it confirmed an update, such as a background job.
-- A manual clock from the command line, which runs on real time only; a clock push when the server
-  starts (the app calls `refreshFakeClock()` once); and your app's own timers: `advanceTime`
-  changes what `fakeClockNow()` returns, not when a `setTimeout` fires.
+- A manual or running clock from the command line, which runs on real time only; a clock push when
+  the server starts (the app calls `refreshFakeClock()` once); and your app's own timers:
+  `advanceTime` changes what `fakeClockNow()` returns, not when a `setTimeout` fires.
 - Persistence. All state lives in memory and is lost when the server stops; recovering from a
   restart belongs to the application under test.
 - Anything security-related. It is a test tool: the control API answers anyone who can reach its
@@ -2302,6 +2327,9 @@ fields below.
     open a URL button. A `start` link to the bot sends `/start <parameter>` in the user's private
     chat, and a `startgroup` or `startchannel` link adds the bot to the chat the user picks; any
     other URL comes back unchanged ([URL buttons][behavior-url-buttons]).
+  - New: a running clock, `clock: { offset }`: real time plus an offset that `advanceTime` adds
+    to, so time keeps moving between jumps. `getClock()`, `GET /_fake/clock` and `clockWebhook`
+    pushes give its `offset`, and `fakeClockNow()` keeps moving between reads ([Time](#time)).
   - Changed: when a person edits an administrator with `promoteMember`, the administrator keeps
     who promoted them. A bot that promoted them keeps `can_be_edited` and can still edit and
     title them; 0.12.0 made the person their promoter

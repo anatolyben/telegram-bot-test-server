@@ -743,3 +743,54 @@ it("gives the app the server's clock through fakeClockNow", async () => {
   expect(await reading).toBe(NOW + 99);
   expect(fakeClockNow()).toBe(NOW + 99);
 });
+
+it("pushes a running clock's offset, and fakeClockNow keeps moving between reads", async () => {
+  const HOUR = 3_600_000;
+  const saved = process.env.TELEGRAM_FAKE_CLOCK_URL;
+  cleanups.push(() => {
+    if (saved === undefined) delete process.env.TELEGRAM_FAKE_CLOCK_URL;
+    else process.env.TELEGRAM_FAKE_CLOCK_URL = saved;
+  });
+  const pushes = [];
+  const app = await listen(async (request, response) => {
+    const body = await readJson(request);
+    pushes.push(body);
+    receiveFakeClock(body);
+    response.end();
+  });
+  const { fake } = await setup({ clock: { offset: 0 }, clockWebhook: app });
+  process.env.TELEGRAM_FAKE_CLOCK_URL = fake.origin;
+  // The app's time, checked against the wall clock read around it.
+  const appNow = (offset) => {
+    const before = Date.now();
+    const time = fakeClockNow();
+    expect(time).toBeGreaterThanOrEqual(before + offset);
+    expect(time).toBeLessThanOrEqual(Date.now() + offset);
+    return time;
+  };
+
+  const read = await refreshFakeClock();
+  expect(read).toBeLessThanOrEqual(appNow(0));
+  await sleep(30);
+  expect(appNow(0)).toBeGreaterThanOrEqual(read + 25);
+
+  await fake.advanceTime(HOUR);
+  expect(pushes).toEqual([
+    { now: expect.any(Number), mode: "running", offset: HOUR },
+  ]);
+  const jumped = appNow(HOUR);
+  await sleep(30);
+  expect(appNow(HOUR)).toBeGreaterThanOrEqual(jumped + 25);
+
+  const snapshot = await fake.snapshot();
+  await fake.advanceTime(HOUR);
+  appNow(2 * HOUR);
+  await fake.restore(snapshot);
+  expect(pushes.map((push) => push.offset)).toEqual([HOUR, 2 * HOUR, HOUR]);
+  appNow(HOUR);
+  await fake.releaseSnapshot(snapshot);
+
+  expect(() => receiveFakeClock({ now: NOW, mode: "running" })).toThrow(
+    TypeError,
+  );
+});

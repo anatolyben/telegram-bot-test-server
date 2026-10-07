@@ -818,7 +818,7 @@ seconds.
   connection, or a minute without an answer) is sent again: at once after the first failure, then
   after 2, 4, 8 ... seconds up to a random 60 to 120, or after the answer's `Retry-After` (at most
   an hour). An update whose next try would come after it expires is dropped. These waits run on
-  the server's clock, so on a manual clock `advanceTime` moves them.
+  the server's clock, so on a manual or running clock `advanceTime` moves them.
 - **Calls in the webhook's answer.** A webhook may answer an update with a Bot API call (JSON, form
   or multipart with a `method` field), as Telegraf does by default. It runs as that bot and appears
   in `getCalls()`; its result goes nowhere. `setWebhook`, `deleteWebhook`, `close`, `logOut` and

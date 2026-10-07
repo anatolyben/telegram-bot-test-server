@@ -1,16 +1,32 @@
-/** Instance-owned scheduling; network and diagnostic deadlines remain wall-clock. */
+/**
+ * Instance-owned scheduling; network and diagnostic deadlines remain wall-clock.
+ *
+ * Real time with no options; a manual clock with { now }, which only advance
+ * moves; or a running clock with { offset }: real time plus an offset that
+ * advance adds to, so time keeps moving between jumps.
+ */
 export function createClock(options) {
-  const manual = options != null;
+  const mode =
+    options == null
+      ? "real"
+      : options.offset === undefined
+        ? "manual"
+        : "running";
+  if (mode === "running" && options.now !== undefined)
+    throw new TypeError("clock takes now or offset, not both");
   let time = options?.now;
-  if (manual && (!Number.isSafeInteger(time) || time < 0))
+  if (mode === "manual" && (!Number.isSafeInteger(time) || time < 0))
     throw new TypeError(
       "clock.now must be a non-negative millisecond timestamp",
     );
+  let offset = mode === "running" ? options.offset : 0;
+  if (!Number.isSafeInteger(offset) || offset < 0)
+    throw new TypeError("clock.offset must be non-negative milliseconds");
   const tasks = new Set();
   let sequence = 0;
   let advances = 0;
   let advanceQueue = Promise.resolve();
-  const now = () => (manual ? time : Date.now());
+  const now = () => (mode === "manual" ? time : Date.now() + offset);
   function schedule(fn, ms, { passive = false } = {}) {
     const task = { at: now() + ms, sequence: sequence++, fn, passive };
     tasks.add(task);
@@ -18,11 +34,14 @@ export function createClock(options) {
       clearTimeout(task.timer);
       tasks.delete(task);
     };
-    if (!manual) {
-      const arm = () => {
+    if (mode !== "manual") {
+      // Real and running time fire a task by a timer; a running clock's jump
+      // arms it again (advance).
+      task.arm = () => {
+        clearTimeout(task.timer);
         task.timer = setTimeout(
           () => {
-            if (task.at > now()) arm();
+            if (task.at > now()) task.arm();
             else {
               tasks.delete(task);
               fn();
@@ -32,7 +51,7 @@ export function createClock(options) {
         );
         task.timer.unref();
       };
-      arm();
+      task.arm();
     }
     return cancel;
   }
@@ -40,17 +59,19 @@ export function createClock(options) {
     now,
     schedule,
     state: () => ({
-      mode: manual ? "manual" : "real",
+      mode,
       now: now(),
+      ...(mode === "running" ? { offset } : {}),
       scheduled: tasks.size,
     }),
     busy: () => advances > 0 || [...tasks].some((t) => !t.passive),
     async advance(ms) {
-      if (!manual) throw new Error("advanceTime requires a manual clock");
+      if (mode === "real")
+        throw new Error("advanceTime requires a manual clock");
       if (
         !Number.isSafeInteger(ms) ||
         ms < 0 ||
-        !Number.isSafeInteger(time + ms)
+        !Number.isSafeInteger(now() + ms)
       )
         throw new TypeError(
           "advanceTime requires non-negative safe milliseconds",
@@ -58,20 +79,30 @@ export function createClock(options) {
       advances += 1;
       const work = advanceQueue
         .then(async () => {
-          if (!Number.isSafeInteger(time + ms))
+          if (!Number.isSafeInteger(now() + ms))
             throw new TypeError("Clock timestamp overflow");
-          const end = time + ms;
+          // A manual clock ends at a time; a running clock at an offset, so
+          // its end keeps moving with real time while due tasks run.
+          const target = (mode === "manual" ? time : offset) + ms;
+          const end = () => (mode === "manual" ? target : Date.now() + target);
           while (true) {
+            const limit = end();
             const due = [...tasks]
-              .filter((t) => t.at <= end)
+              .filter((t) => t.at <= limit)
               .sort((a, b) => a.at - b.at || a.sequence - b.sequence)[0];
             if (!due) break;
-            time = due.at;
+            // Each task runs at its deadline, and time never goes back.
+            if (mode === "manual") time = due.at;
+            else offset = Math.max(offset, due.at - Date.now());
+            clearTimeout(due.timer);
             tasks.delete(due);
             due.fn();
             await Promise.resolve();
           }
-          time = end;
+          if (mode === "manual") time = target;
+          else offset = target;
+          // A timer armed before a running clock's jump would fire late.
+          for (const task of tasks) task.arm?.();
           return this.state();
         })
         .finally(() => {
@@ -82,8 +113,12 @@ export function createClock(options) {
       advanceQueue = work.catch(() => {});
       return work;
     },
-    restore(value) {
-      if (manual) time = value;
+    /** What a snapshot keeps: a manual clock's time and a running clock's offset. */
+    save: () => ({ time, offset }),
+    /** Set a manual clock's time or a running clock's offset back; real time stays. */
+    restore(saved) {
+      if (mode === "manual") time = saved.time;
+      if (mode === "running") offset = saved.offset;
     },
     clear() {
       for (const t of tasks) clearTimeout(t.timer);

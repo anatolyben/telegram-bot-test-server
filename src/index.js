@@ -7714,20 +7714,20 @@ export async function startTestServer({
   let clockPushes = Promise.resolve();
 
   /**
-   * Tell the app the manual clock's time at clockWebhook, once the pushes
-   * before this one are done. A push that fails is logged and changes
-   * nothing else.
+   * Tell the app a manual or running clock's time at clockWebhook, once the
+   * pushes before this one are done: { now, mode }, and a running clock's
+   * offset. A push that fails is logged and changes nothing else.
    */
   function pushClock() {
     if (clockWebhook === undefined) return Promise.resolve();
     clockPushes = clockPushes.then(async () => {
-      const { mode, now: time } = clock.state();
-      if (mode !== "manual") return;
+      const { mode, now: time, offset } = clock.state();
+      if (mode === "real") return;
       try {
         const response = await fetch(clockWebhook, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ now: time, mode }),
+          body: JSON.stringify({ now: time, mode, offset }),
           signal: AbortSignal.timeout(2000),
         });
         await response.arrayBuffer();
@@ -8371,7 +8371,7 @@ export async function startTestServer({
         nextSeq,
       },
       owner: ownerModel.snapshot(),
-      time: clock.now(),
+      clock: clock.save(),
     });
     const id = `${instanceId}-${randomBytes(12).toString("hex")}`;
     snapshots.set(id, bytes);
@@ -8386,7 +8386,7 @@ export async function startTestServer({
     waits.cancel("Fixture restored");
     clock.clear();
     expiryTasks.clear();
-    clock.restore(state.time);
+    clock.restore(state.clock);
     for (const [target, source] of [
       [users, state.users],
       [bots, state.bots],
@@ -8626,8 +8626,9 @@ export async function startTestServer({
       clockWork += 1;
       try {
         const restored = restore(body.snapshot);
-        // A restore sets a manual clock back: the app hears of it too.
-        if (clock.state().mode === "manual") await pushClock();
+        // A restore sets a manual clock, or a running clock's offset, back:
+        // the app hears of it too.
+        if (clock.state().mode !== "real") await pushClock();
         return restored;
       } finally {
         clockWork -= 1;

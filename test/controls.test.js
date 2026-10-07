@@ -874,6 +874,89 @@ it("serializes concurrent clock advances so a due response cannot move fake time
   expect(await pending).toMatchObject({ ok: true });
 });
 
+/** The running clock's time, checked against the wall clock read around it. */
+async function runningNow(fake, offset) {
+  const before = Date.now();
+  const state = await fake.getClock();
+  const after = Date.now();
+  expect(state).toMatchObject({ mode: "running", offset, scheduled: 0 });
+  expect(state.now).toBeGreaterThanOrEqual(before + offset);
+  expect(state.now).toBeLessThanOrEqual(after + offset);
+  return state.now;
+}
+
+it("keeps a running clock on real time plus the offset advanceTime adds, and dates messages by it", async () => {
+  const HOUR = 3_600_000;
+  const { fake, user } = await setup({ clock: { offset: 0 } });
+  const first = await runningNow(fake, 0);
+  expect(await fake.advanceTime(2 * HOUR)).toMatchObject({
+    mode: "running",
+    offset: 2 * HOUR,
+  });
+  const jumped = await runningNow(fake, 2 * HOUR);
+  expect(jumped - first).toBeGreaterThanOrEqual(2 * HOUR);
+  // Between jumps the clock keeps moving.
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  expect(await runningNow(fake, 2 * HOUR)).toBeGreaterThanOrEqual(jumped + 25);
+  const before = Date.now();
+  const id = await fake.post(CHAT, user, "two hours on");
+  const after = Date.now();
+  const { date } = (await fake.getMessage(CHAT, id)).message;
+  expect(date).toBeGreaterThanOrEqual(Math.floor((before + 2 * HOUR) / 1000));
+  expect(date).toBeLessThanOrEqual(Math.floor((after + 2 * HOUR) / 1000));
+
+  await expect(
+    startTestServer({ botToken: TOKEN, clock: { now: 0, offset: 0 } }),
+  ).rejects.toThrow("clock takes now or offset, not both");
+  await expect(
+    startTestServer({ botToken: TOKEN, clock: { offset: -1 } }),
+  ).rejects.toThrow("clock.offset must be non-negative milliseconds");
+});
+
+it("ends a restriction on a running clock when advanceTime jumps past it, or when real time reaches it", async () => {
+  const { fake, api, user } = await setup({ clock: { offset: 0 } });
+  const other = await fake.createUser();
+  await fake.join(CHAT, other);
+  const restrict = async (userId, seconds) => {
+    const now = Math.floor((await fake.getClock()).now / 1000);
+    expect(
+      await api("restrictChatMember", {
+        chat_id: CHAT,
+        user_id: userId,
+        permissions: { can_send_messages: false },
+        until_date: now + seconds,
+      }),
+    ).toMatchObject({ ok: true });
+  };
+  const unmuted = (userId) =>
+    fake.waitFor(
+      { kind: "member", chatId: CHAT, userId, status: "member" },
+      { timeoutMs: 3000 },
+    );
+
+  await restrict(user, 3600);
+  const userUnmuted = unmuted(user);
+  await fake.advanceTime(3_601_000);
+  expect(await userUnmuted).toMatchObject({ status: "member" });
+
+  // 32 seconds: a jump of 30 leaves one to two, which pass on their own.
+  await restrict(other, 32);
+  const otherUnmuted = unmuted(other);
+  await fake.advanceTime(30_000);
+  expect((await fake.getMember(CHAT, other)).status).toBe("restricted");
+  expect(await otherUnmuted).toMatchObject({ status: "member" });
+});
+
+it("restores a running clock's offset, and not the real time under it", async () => {
+  const { fake } = await setup({ clock: { offset: 0 } });
+  await fake.advanceTime(60_000);
+  const saved = await fake.snapshot();
+  await fake.advanceTime(3_600_000);
+  await fake.restore(saved);
+  await runningNow(fake, 60_000);
+  await fake.releaseSnapshot(saved);
+});
+
 it("does not let an unauthenticated request with the same numeric prefix satisfy a bot call wait", async () => {
   const { fake, api } = await setup();
   const actualBot = fake.waitFor({

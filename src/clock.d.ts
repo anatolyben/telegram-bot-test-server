@@ -2,16 +2,18 @@
  * The time an app under test should use: the test server's clock when
  * TELEGRAM_FAKE_CLOCK_URL names one (its origin or its /_fake/clock URL),
  * Date.now() otherwise. Synchronous: it reads a cache that refreshFakeClock
- * fills and clockWebhook pushes keep current. With the variable set, it
- * throws until refreshFakeClock has read that server's clock once.
+ * fills and clockWebhook pushes keep current. For a running clock the cache
+ * holds the offset, and the time is Date.now() plus it. With the variable
+ * set, it throws until refreshFakeClock has read that server's clock once.
  */
 export function fakeClockNow(): number;
 /** Read GET /_fake/clock now; caches and returns its time (Date.now() when the variable is unset). */
 export function refreshFakeClock(): Promise<number>;
-/** Take a clockWebhook push ({ now, mode }) into the cache. */
+/** Take a clockWebhook push ({ now, mode }, and a running clock's offset) into the cache. */
 export function receiveFakeClock(body: {
   now: number;
-  mode: "manual" | "real";
+  mode: "manual" | "real" | "running";
+  offset?: number;
 }): void;
 /**
  * What fakeClockHandler reads of a request: a Node IncomingMessage, or

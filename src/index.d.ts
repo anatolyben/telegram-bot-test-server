@@ -20,10 +20,12 @@ export interface TelegramBotTestServerOptions {
   /** Default 0 (any free port). */
   port?: number;
   /**
-   * A manual clock starting at this Unix time in milliseconds, moved only by
-   * advanceTime. Omit for real time.
+   * `{ now }`: a manual clock starting at this Unix time in milliseconds,
+   * moved only by advanceTime. `{ offset }`: a running clock, real time plus
+   * this many milliseconds; advanceTime adds to the offset and time keeps
+   * moving between jumps. Omit for real time.
    */
-  clock?: { now: number };
+  clock?: { now: number } | { offset: number };
   /** Default "127.0.0.1". */
   host?: string;
   /** Default "example_bot". */
@@ -63,7 +65,10 @@ export interface TelegramBotTestServerOptions {
   floodControl?: boolean;
   /** Serve the live chat viewer at `${origin}/_fake/ui`, to this computer only. Default false. */
   ui?: boolean;
-  /** POST { now, mode } here whenever the manual clock is set or advanced. Default none. */
+  /**
+   * POST { now, mode } here whenever a manual clock is set or advanced, and
+   * { now, mode, offset } whenever a running clock's offset is. Default none.
+   */
   clockWebhook?: string;
   /**
    * Write each stopped recording here, as `<name>.html` and `<name>.json`
@@ -522,8 +527,10 @@ export interface FakeJoinObservation {
   botId?: number;
 }
 export interface FakeClockState {
-  mode: "real" | "manual";
+  mode: "real" | "manual" | "running";
   now: number;
+  /** A running clock's offset from real time, in milliseconds. */
+  offset?: number;
   scheduled: number;
 }
 /** A chat as the viewer and recordings name it: a group's id, "<user id>:<bot id>", a user id (their chat with the first bot) or "calls". */

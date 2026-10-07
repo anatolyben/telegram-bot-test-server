@@ -7,11 +7,14 @@
  * `fakeClockNow()` wherever the app read Date.now(). The time is cached, so a
  * read costs nothing: refresh it before time-dependent work, or have the
  * server push every change to `fakeClockHandler` (its clockWebhook option).
+ * For a running clock the cache holds the offset, not the time, so the time
+ * keeps moving between reads.
  *
  * No imports and no dependencies, so an app can load it in production too.
  */
 
-// The last time read or pushed, and the server it came from.
+// The last clock read or pushed ({ url, now, mode, offset }), and the server
+// it came from.
 let cache = null;
 // Counts pushes, so a slower read never overwrites a newer push.
 let generation = 0;
@@ -33,8 +36,12 @@ export function fakeClockNow() {
       "fakeClockNow: call await refreshFakeClock() once first (TELEGRAM_FAKE_CLOCK_URL is set)",
     );
   }
+  if (cache.mode === "manual") return cache.now;
+  // A running clock is the wall clock plus the server's offset; the server
+  // reads the same wall clock when it runs on this computer.
+  if (cache.mode === "running") return Date.now() + cache.offset;
   // A server on real time uses the wall clock, as this process does.
-  return cache.mode === "manual" ? cache.now : Date.now();
+  return Date.now();
 }
 
 /** Read GET /_fake/clock now; caches and returns its time (Date.now() when the variable is unset). */
@@ -46,22 +53,30 @@ export async function refreshFakeClock() {
   if (!response.ok) {
     throw new Error(`refreshFakeClock: ${url} answered ${response.status}`);
   }
-  const { now, mode } = await response.json();
+  const { now, mode, offset } = await response.json();
   // A push that arrived meanwhile is newer than this answer.
-  if (generation === before) cache = { url, now, mode };
+  if (generation === before) cache = { url, now, mode, offset };
   return fakeClockNow();
 }
 
-/** Take a clockWebhook push ({ now, mode }) into the cache. */
+/** Take a clockWebhook push ({ now, mode }, and a running clock's offset) into the cache. */
 export function receiveFakeClock(body) {
   if (
     !Number.isSafeInteger(body?.now) ||
-    !["manual", "real"].includes(body?.mode)
+    !["manual", "real", "running"].includes(body?.mode)
   ) {
     throw new TypeError("a clock push is { now, mode }");
   }
+  if (body.mode === "running" && !Number.isSafeInteger(body.offset)) {
+    throw new TypeError("a running clock push is { now, mode, offset }");
+  }
   generation += 1;
-  cache = { url: clockUrl(), now: body.now, mode: body.mode };
+  cache = {
+    url: clockUrl(),
+    now: body.now,
+    mode: body.mode,
+    offset: body.offset,
+  };
 }
 
 /**
