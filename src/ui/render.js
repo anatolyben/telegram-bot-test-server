@@ -2235,7 +2235,7 @@ export function renderStatus(status, recording = null) {
   if (recording) {
     const when = recording.window ?? {};
     const marks = `items ${when.start_seq ?? "?"}–${when.stop_seq ?? "?"} · requests ${when.start_request ?? "?"}–${when.stop_request ?? "?"}`;
-    return `<span class="tv-live" data-role="status" data-status="recording" role="status" title="${escapeAttr(marks)}"><span class="tv-live-dot" aria-hidden="true"></span>${escapeHtml(`Recording ${recording.name ?? ""}`.trim())}<span class="tv-status-detail">${escapeHtml(recordingSpan(when.started_at, when.stopped_at))}</span></span>`;
+    return `<span class="tv-live" data-role="status" data-status="recording" role="status" title="${escapeAttr(marks)}"><span class="tv-live-dot" aria-hidden="true"></span><span class="tv-live-label">${escapeHtml(`Recording ${recording.name ?? ""}`.trim())} <span class="tv-status-detail">${escapeHtml(recordingSpan(when.started_at, when.stopped_at))}</span></span></span>`;
   }
   const labels = {
     live: "Live",

@@ -139,6 +139,7 @@ export function startViewer({ render, interact, views, source, root }) {
     defaultResolved: false,
     slots: new Map(),
     weights: new Map(),
+    widths: new Map(),
     phonePane: null,
     search: "",
     status: recording ? "recording" : "reconnecting",
@@ -581,7 +582,7 @@ export function startViewer({ render, interact, views, source, root }) {
     if (!columns.length)
       workspace.innerHTML =
         '<p class="tv-empty tv-empty--page" data-role="no-panels">No chats yet.</p>';
-    interact.layoutColumns(workspace, ui.weights);
+    interact.layoutColumns(workspace, ui.weights, ui.widths);
     if (!columns.some((column) => column.id === ui.phonePane))
       ui.phonePane =
         (
@@ -893,11 +894,10 @@ export function startViewer({ render, interact, views, source, root }) {
       ui.phonePane = columnId;
       interact.showPhonePane(root, columnId);
     },
-    weights: () => ui.weights,
-    resize(leftId, leftWeight, rightId, rightWeight) {
-      ui.weights.set(leftId, leftWeight);
-      ui.weights.set(rightId, rightWeight);
-      interact.layoutColumns(workspace, ui.weights);
+    resize(weights, widths) {
+      for (const [id, weight] of weights) ui.weights.set(id, weight);
+      for (const [id, width] of widths) ui.widths.set(id, width);
+      interact.layoutColumns(workspace, ui.weights, ui.widths);
     },
   };
   interact.bindViewer(root, actions);
@@ -908,7 +908,7 @@ export function startViewer({ render, interact, views, source, root }) {
   });
   if (typeof ResizeObserver === "function")
     new ResizeObserver(() =>
-      interact.layoutColumns(workspace, ui.weights),
+      interact.layoutColumns(workspace, ui.weights, ui.widths),
     ).observe(workspace);
 
   // ── start ───────────────────────────────────────────────────────────

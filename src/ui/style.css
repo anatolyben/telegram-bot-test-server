@@ -329,6 +329,7 @@ select {
 .tv-live-dot {
   background: var(--tv-warning);
   border-radius: 50%;
+  flex: 0 0 auto;
   height: 8px;
   width: 8px;
 }
@@ -352,6 +353,7 @@ select {
 .tv-status-detail {
   color: var(--tv-muted);
   font-weight: 400;
+  white-space: nowrap;
 }
 
 .tv-workspace {
@@ -535,7 +537,14 @@ select {
   .tv-workspace {
     grid-template-columns: minmax(0, 1fr);
   }
-  .tv-workspace > .tv-column:not([data-phone-active]),
+  /* The panes stack in one cell and the hidden ones keep their layout, so
+     each keeps its scroll place (a chat its latest message) while hidden. */
+  .tv-workspace > .tv-column {
+    grid-area: 1 / 1;
+  }
+  .tv-workspace > .tv-column:not([data-phone-active]) {
+    visibility: hidden;
+  }
   .tv-workspace > .tv-divider {
     display: none;
   }
@@ -584,7 +593,16 @@ select {
   }
   .tv-toolbar [data-slot="status"] {
     margin-left: auto;
+    min-width: 0;
     order: 1;
+  }
+  /* A recording's name and window wrap inside the toolbar. */
+  .tv-live {
+    border-radius: 13px;
+    white-space: normal;
+  }
+  .tv-live-label {
+    overflow-wrap: anywhere;
   }
   .tv-toolbar-group[aria-label="Layout"],
   .tv-toolbar-controls > .tv-select {
