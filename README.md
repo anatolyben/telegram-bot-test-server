@@ -2357,12 +2357,21 @@ fields below.
   - New: the viewer and recordings draw each message's reactions, with who chose them
     ([Watch the chats in a browser](#watch-the-chats-in-a-browser)).
   - Fixed: `getMessage`, `getMessages`, `getEphemeralMessage` and `getDirectMessages` return
-    copies, as `getCalls` does. Changing what they returned used to change the stored message.
+    copies, as `getCalls` does. Changing what they returned used to change the stored message,
+    and with it what bots later read, forward or reply to. A test that relied on that now changes
+    the message as Telegram would, with `editMessage`, `react` or a Bot API call. Over HTTP
+    nothing changes.
   - Fixed: a bot's custom emoji reaction keeps its id. `getMessage` lists it as `#` and its
     `custom_emoji_id`, where it listed an empty string.
   - Fixed: `react` refuses what a member cannot react with, as Telegram's apps do: anything but an
     emoji from the Bot API's list of reactions fails with
     `The reaction isn't available for the message`. It used to take any text.
+  - Checked: when a person edits an administrator a bot promoted, the bot can no longer edit them
+    (`can_be_edited` is false), as in 0.12.0. Telegram's server decides this, and its code is not
+    published. TDLib and Telegram Desktop keep the earlier promoter in their own copies, so the
+    behavior stays, marked unverified ([Administrators][behavior-admins]).
+  - Docs: two screenshots of the viewer, and `scripts/screenshots.mjs`, which makes them again
+    ([Development](#development)). Neither is in the package.
 - **0.12.0**: watch and record what happens in the chats, observe a run more closely, let the app
   under test follow the manual clock, and let members and people do more of what they do on
   Telegram.
@@ -2494,6 +2503,7 @@ pnpm add -D --save-exact telegram-bot-test-server@0.13.0
 MIT
 
 [behavior]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md
+[behavior-admins]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#administrators-and-chat-settings
 [behavior-bots]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#more-than-one-bot
 [behavior-channels]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#channels
 [behavior-delivery]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#update-delivery
