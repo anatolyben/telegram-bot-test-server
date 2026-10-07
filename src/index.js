@@ -1266,6 +1266,28 @@ function unparsableUrl(url) {
   );
 }
 
+/**
+ * Whether the viewer can answer on a server listening there: a loopback
+ * address, or a wildcard one, which loopback reaches too.
+ */
+function viewerHost(host) {
+  return (
+    host === "localhost" ||
+    host === "::1" ||
+    host === "0.0.0.0" ||
+    host === "::" ||
+    (net.isIPv4(host) && host.startsWith("127."))
+  );
+}
+
+function httpUrl(value) {
+  try {
+    return ["http:", "https:"].includes(new URL(String(value)).protocol);
+  } catch {
+    return false;
+  }
+}
+
 function readBody(request) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -1286,6 +1308,8 @@ function readBody(request) {
  *   publicChats?: Array<{ username: string, type: "channel"|"supergroup"|"bot", title?: string }>,
  *   unimplemented?: "error" | "ok",
  *   floodControl?: boolean,
+ *   ui?: boolean,
+ *   clockWebhook?: string,
  *   log?: (line: string) => void,
  * }} options
  */
@@ -1302,16 +1326,36 @@ export async function startTestServer({
   loginClientSecret,
   clock: clockOptions,
   floodControl = false,
+  ui = false,
+  clockWebhook,
   log = () => {},
 }) {
   if (unimplementedMode !== "error" && unimplementedMode !== "ok") {
     throw new TypeError('unimplemented must be "error" or "ok"');
   }
+  // The viewer answers only on a loopback address, so the server must listen
+  // on one: a specific other address would leave it unreachable.
+  if (ui === true && !viewerHost(host)) {
+    throw new TypeError("ui needs a loopback or wildcard host");
+  }
+  if (clockWebhook !== undefined && !httpUrl(clockWebhook)) {
+    throw new TypeError("clockWebhook must be an http(s) URL");
+  }
+  // The live viewer, created once the server listens; null with ui off.
+  let viewer = null;
+  // Moves with every change the waits are told of: the viewer's version.
+  let uiVersion = 0;
   const clock = createClock(clockOptions);
-  const waits = createWaits();
+  const waits = createWaits({
+    onNotify: () => {
+      uiVersion += 1;
+      viewer?.changed();
+    },
+  });
   const execution = new AsyncLocalStorage();
   const now = () => Math.floor(clock.now() / 1000);
   const instanceId = randomBytes(12).toString("hex");
+  const startedAt = Date.now();
   let epoch = 0;
   let stopped = false;
   let stopPromise;
@@ -1330,6 +1374,15 @@ export async function startTestServer({
   let activeOwners = 0;
   let activeHttp = 0;
   let deliveryCount = 0;
+  // Live work the quiet wait looks at, by bot id; none of it is state, so
+  // snapshots leave it out and a restore leaves it alone: Bot API calls
+  // answered or not yet (getUpdates aside), when each bot's last one was
+  // received or answered (wall time), and webhook attempts not yet settled.
+  const callsInProgress = new Map();
+  const lastCallAt = new Map();
+  const attemptsInProgress = new Map();
+  // Clock advances and restores in progress, their clockWebhook push included.
+  let clockWork = 0;
   const deliveryJournal = [];
   const deliveryAttempts = new Map();
   const snapshots = new Map();
@@ -1354,6 +1407,8 @@ export async function startTestServer({
     }
     if (bots.has(token)) return bots.get(token);
     if (users.has(id)) throw new TypeError(`User ${id} already exists`);
+    // One clock read: a second one could cross a second and skip the first id.
+    const lastUpdateId = Math.floor(clock.now() / 1000);
     const record = {
       id,
       is_bot: true,
@@ -1368,7 +1423,10 @@ export async function startTestServer({
       // Updates not yet confirmed, by getUpdates or by the webhook, in order:
       // Telegram's update queue for the bot. Ids continue from the last one.
       queue: [],
-      lastUpdateId: Math.floor(clock.now() / 1000),
+      lastUpdateId,
+      // The first update_id the bot gets: its sent updates are numbered from
+      // here to lastUpdateId without gaps.
+      firstUpdateId: lastUpdateId + 1,
       // The waiting getUpdates call and webhook attempts, by update_id.
       pollWaiters: new Set(),
       sending: new Map(),
@@ -1440,8 +1498,12 @@ export async function startTestServer({
   // https://core.telegram.org/bots/api#businessconnection
   const businessConnections = new Map();
   // Every update sent, by update_id, with the bot it went to and its exact
-  // bytes, so a test can have Telegram deliver it again.
+  // bytes, so a test can have Telegram deliver it again. Each also says what
+  // it was (type, chat, when) and whether the bot was handed it (received) or
+  // Telegram gave up on it (dropped).
   const sentUpdates = new Map();
+  // The chat of each callback query and join request query sent, by query id.
+  const queryChats = new Map();
   // Counts the moments updates become ready for a webhook, so updates ready
   // at the same server time still go in the order that happened.
   let readyOrder = 0;
@@ -1479,6 +1541,9 @@ export async function startTestServer({
   let nextBasicGroupId = 4_000_000_000 + (startSeconds % 100_000_000);
   let nextMediaGroupId = BigInt(startSeconds) * 1_000_000n;
   let nextPollId = BigInt(startSeconds) * 1_000_000n;
+  // The order of everything stored in any chat: messages, chat events and
+  // deletions each take the next number.
+  let nextSeq = 0;
 
   for (const config of chatConfigs) {
     const owner = {
@@ -1735,20 +1800,47 @@ export async function startTestServer({
     };
   }
 
-  function memberStatus(chat, userId) {
-    const id = Number(userId);
-    let member = chat.members.get(id) ?? { status: "left" };
+  /**
+   * The member's state now: a restriction or ban whose until_date has passed
+   * has ended. Writes nothing; memberStatus stores what this returns.
+   */
+  function peekMember(chat, userId) {
+    const member = chat.members.get(Number(userId)) ?? { status: "left" };
     if (
       ["restricted", "kicked"].includes(member.status) &&
       member.until_date > 0 &&
       member.until_date <= Math.floor(clock.now() / 1000)
     ) {
-      member = {
+      return {
         status:
           member.status === "restricted" && member.is_member !== false
             ? "member"
             : "left",
       };
+    }
+    return member;
+  }
+
+  /** The member's state, storing (and logging) a restriction or ban that ended. */
+  function memberStatus(chat, userId) {
+    const id = Number(userId);
+    const stored = chat.members.get(id);
+    const member = peekMember(chat, id);
+    if (stored && member !== stored) {
+      // Ended at its until_date, by no call: the timer that ends it runs
+      // inside the call that restricted, so it names no request on purpose.
+      logEvent(
+        chat,
+        {
+          type: "member",
+          userId: id,
+          actorId: null,
+          reason: "expired",
+          old: memberWithoutUser(memberObject(chat, id, stored)),
+          new: memberWithoutUser(memberObject(chat, id, member)),
+        },
+        { requestId: null, at: stored.until_date * 1000 },
+      );
       chat.members.set(id, member);
     }
     return member;
@@ -1807,12 +1899,29 @@ export async function startTestServer({
     return base;
   }
 
-  function isInChat(chat, userId) {
-    const member = memberStatus(chat, userId);
+  /**
+   * A ChatMember without its user and can_be_edited, which belongs to the bot
+   * that asks: a member's state as the event log and the viewer show it.
+   */
+  function memberWithoutUser({ user: _user, can_be_edited: _edited, ...rest }) {
+    return rest;
+  }
+
+  /** Whether a member state is in the chat. */
+  function inChatState(member) {
     return (
       ["member", "administrator", "creator"].includes(member.status) ||
       (member.status === "restricted" && member.is_member !== false)
     );
+  }
+
+  function isInChat(chat, userId) {
+    return inChatState(memberStatus(chat, userId));
+  }
+
+  /** isInChat with nothing written (peekMember). */
+  function peekInChat(chat, userId) {
+    return inChatState(peekMember(chat, userId));
   }
 
   /** Whether a member holds an administrator right (a creator holds all). */
@@ -2303,11 +2412,27 @@ export async function startTestServer({
       type === "business_connection"
         ? now()
         : (payload.edit_date ?? payload.date ?? now());
+    const chatId = payload?.chat?.id ?? payload?.message?.chat?.id ?? null;
+    const queryId =
+      type === "callback_query"
+        ? payload.id
+        : type === "chat_join_request"
+          ? (payload.query_id ?? null)
+          : null;
+    if (queryId != null) queryChats.set(String(queryId), chatId);
     sentUpdates.set(updateKey(record.id, updateId), {
       record,
       body,
       expiresAt: type === "callback_query" ? now() + 150 : happened + 86_400,
       queue: webhookQueue(type, payload, updateId),
+      type,
+      chatId,
+      at: clock.now(),
+      queryId,
+      // Handed to the bot: returned by getUpdates or posted to its webhook.
+      received: false,
+      // Given up by Telegram without the bot confirming it.
+      dropped: false,
     });
     record.queue.push(JSON.parse(body));
     if (!record.webhook || stopped) {
@@ -2394,6 +2519,10 @@ export async function startTestServer({
     };
     deliveryJournal.push(receipt);
     deliveryCount += 1;
+    attemptsInProgress.set(
+      record.id,
+      (attemptsInProgress.get(record.id) ?? 0) + 1,
+    );
     return receipt;
   }
 
@@ -2401,6 +2530,10 @@ export async function startTestServer({
     receipt.outcome = outcome;
     receipt.completed_at = clock.now();
     deliveryCount -= 1;
+    attemptsInProgress.set(
+      receipt.bot_id,
+      attemptsInProgress.get(receipt.bot_id) - 1,
+    );
     waits.notify();
   }
 
@@ -2478,6 +2611,7 @@ export async function startTestServer({
     const sent = sentUpdates.get(updateKey(record.id, updateId));
     const { receipt } = state;
     receipt.started_at = clock.now();
+    sent.received = true;
     state.request = new AbortController();
     const answer = await postUpdate(webhook, sent.body, state.request);
     // A webhook removed or replaced meanwhile has already settled this attempt.
@@ -2507,7 +2641,10 @@ export async function startTestServer({
     }
     const expired = now() + wait > sent.expiresAt;
     if (expired) {
+      sent.dropped = true;
       forget(record, updateId);
+      // Waits on the update's state learn of it now: nothing else may follow.
+      waits.notify();
     } else {
       state.delay = delay;
       state.fails += 1;
@@ -2538,6 +2675,7 @@ export async function startTestServer({
     const { record } = sent;
     const receipt = newAttempt(record, JSON.parse(sent.body).update_id);
     receipt.started_at = clock.now();
+    sent.received = true;
     const abort = new AbortController();
     const resent = (async () => {
       const answer = await postUpdate(record.webhook, sent.body, abort);
@@ -2772,7 +2910,12 @@ export async function startTestServer({
       closeAttempts(record, url ? "cancelled" : "poll_queue");
       record.webhook = null;
     }
-    if (drop) record.queue.length = 0;
+    if (drop) {
+      for (const update of record.queue) {
+        sentUpdates.get(updateKey(record.id, update.update_id)).dropped = true;
+      }
+      record.queue.length = 0;
+    }
     if (!url) {
       return new Described(
         true,
@@ -2851,8 +2994,11 @@ export async function startTestServer({
   function dropExpired(record) {
     const time = now();
     for (let i = record.queue.length - 1; i >= 0; i -= 1) {
-      const { update_id: id } = record.queue[i];
-      if (sentUpdates.get(updateKey(record.id, id)).expiresAt < time) {
+      const sent = sentUpdates.get(
+        updateKey(record.id, record.queue[i].update_id),
+      );
+      if (sent.expiresAt < time) {
+        sent.dropped = true;
         record.queue.splice(i, 1);
       }
     }
@@ -2882,6 +3028,24 @@ export async function startTestServer({
    * can_be_edited.
    */
   function emitMemberChange(chat, userId, before, actor, extra = {}) {
+    const link = extra.invite_link;
+    logEvent(chat, {
+      type: "member",
+      userId: Number(userId),
+      actorId: actor?.id ?? null,
+      reason: "change",
+      old: memberWithoutUser(memberObject(chat, userId, before)),
+      new: memberWithoutUser(
+        memberObject(chat, userId, peekMember(chat, userId)),
+      ),
+      ...(link
+        ? {
+            inviteLink: link.invite_link,
+            ...(link.name ? { inviteLinkName: link.name } : {}),
+          }
+        : {}),
+      ...(extra.via_join_request ? { viaJoinRequest: true } : {}),
+    });
     waits.notify();
     const change = (viewer) => ({
       chat: chatObject(chat),
@@ -2919,6 +3083,7 @@ export async function startTestServer({
     chat.members.set(record.id, { status, ...(rights ? { rights } : {}) });
     const after = chatMemberObject(chat, record.id);
     appliedCheckpoint();
+    const logged = (chat.events ??= []).length;
     const handed = [emitMemberChange(chat, record.id, before, actor)];
     const isIn = isInChat(chat, record.id);
     if (chat.type !== "channel" && wasIn !== isIn) {
@@ -2929,6 +3094,7 @@ export async function startTestServer({
           ? { new_chat_members: [userObject(record)] }
           : { left_chat_member: userObject(record) },
       );
+      linkService(loggedChange(chat, logged, record.id), chat, service);
       // The bot itself gets it too: new_chat_members and left_chat_member
       // "may be the bot itself" (https://core.telegram.org/bots/api#message).
       handed.push(
@@ -3069,6 +3235,7 @@ export async function startTestServer({
       ),
       messages: new Map(),
       ephemeral: new Map(),
+      events: [],
       inviteLinks: new Map(),
       joinedVia: new Map(),
       joinRequests: new Map(),
@@ -3175,10 +3342,94 @@ export async function startTestServer({
       message,
       deleted: false,
       author: from.id,
+      ...entryMarks(),
     });
     appliedCheckpoint();
     waits.notify();
     return message;
+  }
+
+  /**
+   * Where a stored message stands: its place among everything stored (seq),
+   * when (server clock), how many Bot API requests had come in by then, and
+   * the call that stored it, if a call did. Never part of the message.
+   */
+  function entryMarks() {
+    return {
+      seq: ++nextSeq,
+      at: clock.now(),
+      afterRequest: requestSequence,
+      requestId: execution.getStore()?.request_id ?? null,
+    };
+  }
+
+  /** Record a chat event that Telegram shows as no message, for the viewer. */
+  function logEvent(
+    chat,
+    fields,
+    {
+      requestId = execution.getStore()?.request_id ?? null,
+      at = clock.now(),
+    } = {},
+  ) {
+    const event = {
+      seq: ++nextSeq,
+      at,
+      afterRequest: requestSequence,
+      requestId,
+      ...fields,
+    };
+    (chat.events ??= []).push(event);
+    return event;
+  }
+
+  /** A join request's state, for the viewer: asked, approved or declined. */
+  function logJoinRequest(chat, userId, state, botId, invite) {
+    logEvent(chat, {
+      type: "join_request",
+      userId: Number(userId),
+      state,
+      botId,
+      inviteLink: invite?.invite_link ?? null,
+      inviteLinkName: invite?.name ?? null,
+    });
+  }
+
+  /**
+   * The member event a change of the user logged since the chat's log held
+   * `from` events: found by what it is, since a check run meanwhile may log
+   * another member's expiry.
+   */
+  function loggedChange(chat, from, userId) {
+    return (
+      chat.events
+        .slice(from)
+        .find(
+          (event) =>
+            event.type === "member" &&
+            event.reason === "change" &&
+            event.userId === Number(userId),
+        ) ?? null
+    );
+  }
+
+  /** A member event shows as this service message: it links to it by seq. */
+  function linkService(event, chat, message) {
+    if (event) event.serviceSeq = chat.messages.get(message.message_id).seq;
+  }
+
+  /**
+   * Who deleted a message and when. Only bots delete messages here; the seq
+   * puts the deletion in the same order as everything stored.
+   */
+  function deletionMark(caller, method) {
+    return {
+      seq: ++nextSeq,
+      botId: caller.id,
+      method,
+      requestId: execution.getStore()?.request_id ?? null,
+      at: clock.now(),
+    };
   }
 
   /**
@@ -3205,6 +3456,7 @@ export async function startTestServer({
       deleted: false,
       author: from.id,
       after: chat.nextMessageId - 1,
+      ...entryMarks(),
     });
     appliedCheckpoint();
     waits.notify();
@@ -3588,6 +3840,7 @@ export async function startTestServer({
       }
       subscribe(caller, p.allowed_updates);
       const offset = numberParam(p.offset, 0);
+      const pending = queue.length;
       // An offset confirms every update before it: they are gone for good.
       if (offset > 0) {
         while (queue.length && queue[0].update_id < offset) queue.shift();
@@ -3595,6 +3848,9 @@ export async function startTestServer({
         queue.splice(0, Math.max(0, queue.length + offset));
       }
       dropExpired(caller);
+      // Waits learn of updates leaving the queue now, not once a long poll
+      // ends.
+      if (queue.length !== pending) waits.notify();
       const limit = Math.min(100, Math.max(1, numberParam(p.limit, 100)));
       const timeoutMs = Math.max(0, numberParam(p.timeout, 0)) * 1000;
       if (queue.length === 0 && timeoutMs > 0) {
@@ -3630,7 +3886,11 @@ export async function startTestServer({
           else hangup?.addEventListener("abort", waiter.wake, { once: true });
         });
       }
-      return queue.slice(0, limit);
+      const updates = queue.slice(0, limit);
+      for (const update of updates) {
+        sentUpdates.get(updateKey(caller.id, update.update_id)).received = true;
+      }
+      return updates;
     },
     // The commands are read before the scope (process_set_my_commands_query)
     // and checked after it.
@@ -3855,8 +4115,11 @@ export async function startTestServer({
       editEphemeralMessage(p, caller, mediaEdit(p, caller)),
     deleteEphemeralMessage: (p, caller) => {
       const receiverId = userIdParam(p.receiver_user_id, "receiver_user_id");
-      ownEphemeralMessage(p, caller, receiverId, { readOnly: true }).deleted =
-        true;
+      const entry = ownEphemeralMessage(p, caller, receiverId, {
+        readOnly: true,
+      });
+      entry.deleted = true;
+      entry.deletion = deletionMark(caller, "deleteEphemeralMessage");
       appliedCheckpoint();
       waits.notify();
       return true;
@@ -3984,12 +4247,24 @@ export async function startTestServer({
       requirePinRights(chat, caller);
       const id = entry.message.message_id;
       chat.pinned = (chat.pinned ?? []).filter((each) => each !== id);
+      logEvent(chat, {
+        type: "unpin",
+        messageId: id,
+        all: false,
+        botId: caller.id,
+      });
       return true;
     },
     unpinAllChatMessages: (p, caller) => {
       const chat = botChat(p.chat_id, caller);
       requirePinRights(chat, caller);
       chat.pinned = [];
+      logEvent(chat, {
+        type: "unpin",
+        messageId: null,
+        all: true,
+        botId: caller.id,
+      });
       return true;
     },
     // The permissions are read before the chat (get_chat_permissions).
@@ -4041,6 +4316,7 @@ export async function startTestServer({
       }
       requireDeleteRights(chat, entry, caller);
       entry.deleted = true;
+      entry.deletion = deletionMark(caller, "deleteMessage");
       appliedCheckpoint();
       waits.notify();
       return true;
@@ -4052,7 +4328,10 @@ export async function startTestServer({
         .map((id) => chat.messages.get(id))
         .filter((entry) => entry && !entry.deleted);
       for (const entry of entries) requireDeleteRights(chat, entry, caller);
-      for (const entry of entries) entry.deleted = true;
+      for (const entry of entries) {
+        entry.deleted = true;
+        entry.deletion = deletionMark(caller, "deleteMessages");
+      }
       appliedCheckpoint();
       waits.notify();
       return true;
@@ -4111,17 +4390,18 @@ export async function startTestServer({
       );
       // revoke_messages decides what the removed user can still see; a ban
       // deletes nothing for the chat's other members (only deleteMessage does).
+      const logged = (chat.events ??= []).length;
       memberChanged(chat, userId, before, caller);
       // A basic group removes the member with messages.deleteChatUser, which
       // "sends a service message on it"; a removed bot hears of it too.
       if (chat.type === "group" && wasIn) {
-        emit(
-          "message",
-          addMessage(chat, caller, {
-            left_chat_member: userObject(user),
-          }),
-          { to: [...new Set([...botsBefore, ...botsIn(chat)])] },
-        );
+        const service = addMessage(chat, caller, {
+          left_chat_member: userObject(user),
+        });
+        linkService(loggedChange(chat, logged, userId), chat, service);
+        emit("message", service, {
+          to: [...new Set([...botsBefore, ...botsIn(chat)])],
+        });
       }
       return true;
     },
@@ -4174,8 +4454,10 @@ export async function startTestServer({
         state: "approved",
         botId: caller.id,
       });
+      logJoinRequest(chat, userId, "approved", caller.id, request.invite_link);
       const before = memberStatus(chat, userId);
       admit(chat, userId);
+      const logged = chat.events.length;
       // via_join_request is only for requests made without an invite link;
       // every request here came through one, so the link is reported instead.
       emitMemberChange(chat, userId, before, caller, {
@@ -4184,10 +4466,11 @@ export async function startTestServer({
           : { via_join_request: true }),
       });
       const user = requireUser(userId);
-      emit(
-        "message",
-        addMessage(chat, user, { new_chat_members: [userObject(user)] }),
-      );
+      const service = addMessage(chat, user, {
+        new_chat_members: [userObject(user)],
+      });
+      linkService(loggedChange(chat, logged, userId), chat, service);
+      emit("message", service);
       return true;
     },
     declineChatJoinRequest: (p, caller, { query = false } = {}) => {
@@ -4199,6 +4482,7 @@ export async function startTestServer({
         "can_invite_users",
         "not enough rights to manage chat join requests",
       );
+      const request = chat.joinRequests.get(userId);
       if (!chat.joinRequests.delete(userId)) {
         throw new TelegramError(400, "Bad Request: HIDE_REQUESTER_MISSING");
       }
@@ -4206,6 +4490,7 @@ export async function startTestServer({
         state: "declined",
         botId: caller.id,
       });
+      logJoinRequest(chat, userId, "declined", caller.id, request.invite_link);
       waits.notify();
       return true;
     },
@@ -6379,6 +6664,214 @@ export async function startTestServer({
     expiryTasks.set(key, cancel);
   }
 
+  /**
+   * Whether a messages read asks for the log after a mark rather than the
+   * 0.11.0 list.
+   */
+  function isLogQuery(query) {
+    return ["since", "include_deleted", "bot_id", "epoch"].some(
+      (name) => query[name] !== undefined,
+    );
+  }
+
+  /** A query parameter that must be a whole number of 0 or more, if given. */
+  function countParam(query, name, fallback) {
+    const value = query[name];
+    if (value === undefined) return fallback;
+    if (!/^\d+$/.test(String(value)) || !Number.isSafeInteger(Number(value))) {
+      throw new TelegramError(400, `${name} must be a non-negative integer`);
+    }
+    return Number(value);
+  }
+
+  /**
+   * A mark from before a restore would miss what the restore rewound, so a
+   * read that names another epoch is refused.
+   */
+  function requireEpoch(query) {
+    const mark = countParam(query, "epoch", null);
+    if (mark !== null && mark !== epoch) {
+      throw new TelegramError(
+        409,
+        `the mark is from before a restore (epoch ${epoch}); read a new mark`,
+      );
+    }
+  }
+
+  /**
+   * Every message of a chat stored after the mark `since` (a seq), oldest
+   * first; with include_deleted also the deleted ones, and those stored before
+   * the mark but deleted after it. `pair` keeps one bot's private chat.
+   */
+  function messageLog(chat, chatId, query, pair = null) {
+    const since = countParam(query, "since", 0);
+    requireEpoch(query);
+    const withDeleted = ["true", "1"].includes(String(query.include_deleted));
+    const entries = chat
+      ? [...chat.messages.values(), ...(chat.ephemeral?.values() ?? [])]
+      : [];
+    const messages = entries
+      .filter(
+        (entry) =>
+          (pair === null || privatePairOf(chat, entry) === pair.id) &&
+          (entry.deleted
+            ? withDeleted && (entry.seq > since || entry.deletion?.seq > since)
+            : entry.seq > since),
+      )
+      .sort((left, right) => left.seq - right.seq)
+      .map(messageLogEntry);
+    return structuredClone({
+      chat_id: chatId,
+      epoch,
+      cursor: nextSeq,
+      messages,
+    });
+  }
+
+  /** A stored message as the message log and the viewer show it. */
+  function messageLogEntry(entry) {
+    const { deletion } = entry;
+    return {
+      seq: entry.seq,
+      at: entry.at,
+      after_request: entry.afterRequest,
+      request_id: entry.requestId,
+      author: entry.author,
+      deleted: entry.deleted,
+      deleted_by: deletion
+        ? {
+            seq: deletion.seq,
+            bot_id: deletion.botId,
+            method: deletion.method,
+            request_id: deletion.requestId,
+            at: deletion.at,
+          }
+        : null,
+      ephemeral: entry.message.ephemeral_message_id !== undefined,
+      message: entry.message,
+      ...(entry.votes && Object.keys(entry.votes).length
+        ? { votes: entry.votes }
+        : {}),
+    };
+  }
+
+  /** A chat event as the viewer shows it: its fields in snake_case. */
+  function eventJson(event) {
+    const json = {};
+    for (const [key, value] of Object.entries(event)) {
+      json[key.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`)] =
+        value;
+    }
+    json.service_seq = event.serviceSeq ?? null;
+    return json;
+  }
+
+  /**
+   * The bot whose private chat with the user a stored message or event
+   * belongs to. A user's stored private chat holds their messages to the first
+   * bot, which users write to, and any bot's messages to them.
+   */
+  function privatePairOf(chat, item) {
+    if (item.message) {
+      return [...bots.values()].some((record) => record.id === item.author)
+        ? item.author
+        : bot.id;
+    }
+    return item.botId ?? bot.id;
+  }
+
+  /** One update a bot was sent, as GET bots/:id/updates lists it. */
+  function journalEntry(record, updateId, queued) {
+    const sent = sentUpdates.get(updateKey(record.id, updateId));
+    return {
+      update_id: updateId,
+      type: sent.type,
+      chat_id: sent.chatId,
+      at: sent.at,
+      state: queued.has(updateId)
+        ? "pending"
+        : sent.received && !sent.dropped
+          ? "delivered"
+          : "dropped",
+      received: sent.received,
+      update: JSON.parse(sent.body),
+    };
+  }
+
+  /** The updates a bot was sent, in update_id order, filtered by `keep`. */
+  function sentTo(record, after, keep) {
+    const queued = new Set(record.queue.map((update) => update.update_id));
+    const entries = [];
+    for (
+      let id = Math.max(record.firstUpdateId, after + 1);
+      id <= record.lastUpdateId;
+      id += 1
+    ) {
+      const sent = sentUpdates.get(updateKey(record.id, id));
+      if (sent && keep(sent)) entries.push(journalEntry(record, id, queued));
+    }
+    return entries;
+  }
+
+  /** GET bots/:id/updates: what the bot was sent, by type, chat and mark. */
+  function botUpdates(record, query) {
+    const types =
+      query.type === undefined || query.type === ""
+        ? null
+        : String(query.type).split(",");
+    let chatId = null;
+    if (query.chat_id !== undefined) {
+      if (!/^-?\d+$/.test(String(query.chat_id))) {
+        throw new TelegramError(400, "chat_id must be an integer");
+      }
+      chatId = Number(query.chat_id);
+    }
+    const since = countParam(query, "since", 0);
+    requireEpoch(query);
+    return {
+      bot_id: record.id,
+      epoch,
+      updates: sentTo(
+        record,
+        since,
+        (sent) =>
+          (types === null || types.includes(sent.type)) &&
+          (chatId === null || sent.chatId === chatId),
+      ),
+    };
+  }
+
+  // clockWebhook pushes go out one at a time, in order.
+  let clockPushes = Promise.resolve();
+
+  /**
+   * Tell the app the manual clock's time at clockWebhook, once the pushes
+   * before this one are done. A push that fails is logged and changes
+   * nothing else.
+   */
+  function pushClock() {
+    if (clockWebhook === undefined) return Promise.resolve();
+    clockPushes = clockPushes.then(async () => {
+      const { mode, now: time } = clock.state();
+      if (mode !== "manual") return;
+      try {
+        const response = await fetch(clockWebhook, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ now: time, mode }),
+          signal: AbortSignal.timeout(2000),
+        });
+        await response.arrayBuffer();
+        if (!response.ok) {
+          log(`clock webhook failed: HTTP ${response.status}`);
+        }
+      } catch (error) {
+        log(`clock webhook failed: ${error.message}`);
+      }
+    });
+    return clockPushes;
+  }
+
   function matchesCall(call, condition) {
     return (
       call.bot_id === condition.botId &&
@@ -6399,7 +6892,96 @@ export async function startTestServer({
     );
   }
 
+  /**
+   * What a quiet wait looks at, for the bots it considers: updates not yet
+   * confirmed, calls and webhook attempts in progress, test-side work, and
+   * how long since the last call (or since the server started).
+   */
+  function quietState(botIds) {
+    const records = [...bots.values()].filter(
+      (record) => botIds == null || botIds.includes(record.id),
+    );
+    const byBot = (read) =>
+      Object.fromEntries(records.map((record) => [record.id, read(record)]));
+    const last = Math.max(
+      startedAt,
+      ...records.map((record) => lastCallAt.get(record.id) ?? 0),
+    );
+    const observed = {
+      pendingUpdates: byBot((record) => record.queue.length),
+      callsInProgress: byBot((record) => callsInProgress.get(record.id) ?? 0),
+      attemptsInProgress: byBot(
+        (record) => attemptsInProgress.get(record.id) ?? 0,
+      ),
+      controls: activeControls,
+      owners: activeOwners,
+      clockWork,
+      idleMs: Date.now() - last,
+    };
+    const busy =
+      records.some(
+        (record) =>
+          record.queue.length > 0 ||
+          (callsInProgress.get(record.id) ?? 0) > 0 ||
+          (attemptsInProgress.get(record.id) ?? 0) > 0,
+      ) ||
+      activeControls > 0 ||
+      activeOwners > 0 ||
+      clockWork > 0;
+    return { busy, observed };
+  }
+
+  /** Whether a stored message matches a message wait's text and buttons. */
+  function matchesContent(message, condition, pattern) {
+    const text = message.text ?? message.caption;
+    if (condition.contains != null && !text?.includes(condition.contains)) {
+      return false;
+    }
+    if (pattern && (text == null || !pattern.test(text))) return false;
+    if (condition.buttonText == null && condition.buttonData == null) {
+      return true;
+    }
+    return (message.reply_markup?.inline_keyboard?.flat() ?? []).some(
+      (button) =>
+        (condition.buttonText == null ||
+          button.text === condition.buttonText) &&
+        (condition.buttonData == null ||
+          button.callback_data === condition.buttonData),
+    );
+  }
+
   function observe(condition, describe = false) {
+    if (condition.kind === "quiet") {
+      const { busy, observed } = quietState(condition.botIds);
+      return {
+        result:
+          !busy && observed.idleMs >= condition.ms
+            ? { quiet: true, idleMs: observed.idleMs }
+            : null,
+        observed,
+      };
+    }
+    if (condition.kind === "update") {
+      const record = requireBot(condition.botId);
+      const types = condition.type == null ? null : [condition.type].flat();
+      const entries = sentTo(
+        record,
+        condition.afterUpdateId ?? 0,
+        (sent) =>
+          (types === null || types.includes(sent.type)) &&
+          (condition.chatId == null || sent.chatId === condition.chatId),
+      );
+      return {
+        result:
+          entries.find(
+            (entry) =>
+              condition.state == null || entry.state === condition.state,
+          ) ?? null,
+        observed: entries
+          .slice(-4)
+          .map(({ update: _update, ...entry }) => entry),
+      };
+    }
     if (condition.kind === "call") {
       const key = `${condition.botId}:${condition.method.toLowerCase()}`;
       let result = null;
@@ -6448,27 +7030,51 @@ export async function startTestServer({
         observed: { chatId: condition.chatId, exists: false },
       };
     if (condition.kind === "message") {
-      const entries =
+      let entries =
         condition.messageId == null
           ? [...chat.messages.values(), ...(chat.ephemeral?.values() ?? [])]
           : [chat.messages.get(condition.messageId)].filter(Boolean);
+      // The newer matchers find the oldest match in the order things were
+      // stored, ephemeral messages included.
+      const newer =
+        condition.since != null ||
+        condition.contains != null ||
+        condition.matches != null ||
+        condition.buttonText != null ||
+        condition.buttonData != null;
+      if (newer) {
+        entries = entries
+          .filter((entry) => entry.seq > (condition.since ?? 0))
+          .sort((left, right) => left.seq - right.seq);
+      }
+      const pattern = condition.matches
+        ? new RegExp(condition.matches.source, condition.matches.flags)
+        : null;
       const matching = entries.filter(
         (entry) =>
           (condition.userId == null || entry.author === condition.userId) &&
           (condition.botId == null || entry.author === condition.botId) &&
           (condition.text == null || entry.message.text === condition.text) &&
           (condition.caption == null ||
-            entry.message.caption === condition.caption),
+            entry.message.caption === condition.caption) &&
+          (!newer || matchesContent(entry.message, condition, pattern)),
       );
       const entry = matching.find(
         (entry) =>
           condition.deleted == null || entry.deleted === condition.deleted,
       );
+      // The 0.11.0 shape: what places an entry stays out of it.
+      const view = ({
+        seq: _seq,
+        at: _at,
+        afterRequest: _after,
+        requestId: _request,
+        deletion: _deletion,
+        ...stored
+      }) => ({ exists: true, ...stored });
       return {
-        result: entry ? { exists: true, ...entry } : null,
-        observed: matching
-          .slice(-4)
-          .map((entry) => ({ exists: true, ...entry })),
+        result: entry ? view(entry) : null,
+        observed: matching.slice(-4).map(view),
       };
     }
     const member = chatMemberObject(chat, condition.userId, bot);
@@ -6504,10 +7110,14 @@ export async function startTestServer({
   async function waitFor(condition, { timeoutMs = 1000 } = {}) {
     if (
       !condition ||
-      !["message", "member", "joinRequest", "call"].includes(condition.kind)
+      !["message", "member", "joinRequest", "call", "quiet", "update"].includes(
+        condition.kind,
+      )
     )
       throw new TypeError("Unknown wait kind");
-    if (condition.kind === "call") {
+    if (condition.kind === "quiet" || condition.kind === "update") {
+      condition = activityCondition(condition, timeoutMs);
+    } else if (condition.kind === "call") {
       if (
         !Number.isSafeInteger(condition.botId) ||
         typeof condition.method !== "string" ||
@@ -6522,13 +7132,20 @@ export async function startTestServer({
         !Number.isSafeInteger(condition.userId)
       )
         throw new TypeError("Membership/join waits require exact userId");
+      if (condition.kind === "message") {
+        condition = messageMatchers(condition);
+      }
       if (
         condition.kind === "message" &&
         condition.messageId == null &&
         !(
           (condition.userId != null || condition.botId != null) &&
           (condition.text != null || condition.caption != null)
-        )
+        ) &&
+        condition.contains == null &&
+        condition.matches == null &&
+        condition.buttonText == null &&
+        condition.buttonData == null
       )
         throw new TypeError(
           "Message waits require messageId or author plus exact text/caption",
@@ -6558,19 +7175,128 @@ export async function startTestServer({
         record.loginClientSecret,
         record.webhook?.secret_token,
       ]);
-    return waits.wait(
-      () => observe(condition).result,
-      timeoutMs,
-      () =>
-        diagnostic(
-          {
-            expected: condition,
-            observed: observe(condition, true).observed,
-            outstanding: outstanding(),
-          },
-          secrets(),
-        ),
-    );
+    // Waits check again only when told of a change, and time passing is
+    // none: a quiet wait that only needs more silence sets a timer for it.
+    let silence = null;
+    const quiet = () => {
+      clearTimeout(silence);
+      silence = null;
+      const { busy, observed } = quietState(condition.botIds);
+      if (busy) return null;
+      if (observed.idleMs >= condition.ms) {
+        return { quiet: true, idleMs: observed.idleMs };
+      }
+      silence = setTimeout(
+        () => waits.notify(),
+        condition.ms - observed.idleMs,
+      );
+      silence.unref();
+      return null;
+    };
+    return waits
+      .wait(
+        condition.kind === "quiet" ? quiet : () => observe(condition).result,
+        timeoutMs,
+        () =>
+          diagnostic(
+            {
+              expected: condition,
+              observed: observe(condition, true).observed,
+              outstanding: outstanding(),
+            },
+            secrets(),
+          ),
+      )
+      .finally(() => clearTimeout(silence));
+  }
+
+  /**
+   * A message wait's newer matchers, checked: `since` a cursor, `contains`
+   * text, `matches` a pattern (a RegExp, or { source, flags } over HTTP, kept
+   * as { source, flags } without the flags that make a test stateful), and an
+   * inline button's text and callback data.
+   */
+  function messageMatchers(condition) {
+    const checked = { ...condition };
+    if (
+      checked.since != null &&
+      (!Number.isSafeInteger(checked.since) || checked.since < 0)
+    ) {
+      throw new TypeError("since must be a non-negative integer");
+    }
+    if (
+      checked.contains != null &&
+      (typeof checked.contains !== "string" || checked.contains === "")
+    ) {
+      throw new TypeError("contains must be a non-empty string");
+    }
+    for (const field of ["buttonText", "buttonData"]) {
+      if (checked[field] != null && typeof checked[field] !== "string") {
+        throw new TypeError(`${field} must be a string`);
+      }
+    }
+    if (checked.matches != null) {
+      const { source, flags = "" } = checked.matches;
+      if (typeof source !== "string" || typeof flags !== "string") {
+        throw new TypeError("matches must be a RegExp or { source, flags }");
+      }
+      const kept = flags.replace(/[gy]/g, "");
+      // An invalid pattern fails here, with the engine's message.
+      try {
+        new RegExp(source, kept);
+      } catch (error) {
+        throw new TypeError(error.message);
+      }
+      checked.matches = { source, flags: kept };
+    }
+    return checked;
+  }
+
+  /** A quiet or update wait, checked. */
+  function activityCondition(condition, timeoutMs) {
+    const known = (id) => [...bots.values()].some((record) => record.id === id);
+    if (condition.kind === "quiet") {
+      if (
+        !Number.isInteger(condition.ms) ||
+        condition.ms < 1 ||
+        condition.ms > 30000
+      )
+        throw new TypeError("Quiet waits require ms of 1-30000");
+      if (Number.isInteger(timeoutMs) && condition.ms >= timeoutMs)
+        throw new TypeError("Quiet waits require timeoutMs above ms");
+      if (
+        condition.botIds != null &&
+        (!Array.isArray(condition.botIds) || !condition.botIds.every(known))
+      )
+        throw new TypeError("Unknown botId");
+      return condition;
+    }
+    if (!known(condition.botId)) throw new TypeError("Unknown botId");
+    if (
+      condition.type != null &&
+      ![condition.type]
+        .flat()
+        .every((type) => typeof type === "string" && type !== "")
+    )
+      throw new TypeError(
+        "Update waits take type as a string or a list of them",
+      );
+    if (condition.chatId != null && !Number.isSafeInteger(condition.chatId))
+      throw new TypeError("Update waits take chatId as an integer");
+    if (
+      condition.afterUpdateId != null &&
+      (!Number.isSafeInteger(condition.afterUpdateId) ||
+        condition.afterUpdateId < 0)
+    )
+      throw new TypeError("afterUpdateId must be a non-negative integer");
+    if (
+      condition.state != null &&
+      !["pending", "delivered", "dropped"].includes(condition.state)
+    )
+      throw new TypeError(
+        "Update waits take state pending, delivered or dropped",
+      );
+    return condition;
   }
 
   function outstanding() {
@@ -6656,6 +7382,7 @@ export async function startTestServer({
         nextBasicGroupId,
         nextMediaGroupId,
         nextPollId,
+        nextSeq,
       },
       owner: ownerModel.snapshot(),
       time: clock.now(),
@@ -6729,8 +7456,14 @@ export async function startTestServer({
       nextBasicGroupId,
       nextMediaGroupId,
       nextPollId,
+      nextSeq,
     } = state.counters);
     ownerModel.restore(state.owner);
+    queryChats.clear();
+    for (const sent of sentUpdates.values()) {
+      if (sent.queryId != null)
+        queryChats.set(String(sent.queryId), sent.chatId);
+    }
     epoch += 1;
     for (const chat of chats.values())
       for (const userId of chat.members.keys()) scheduleExpiry(chat, userId);
@@ -6765,7 +7498,7 @@ export async function startTestServer({
     );
   }
 
-  async function control(method, parts, body) {
+  async function control(method, parts, body, query = {}) {
     const managed = [
       "wait",
       "snapshots",
@@ -6777,7 +7510,7 @@ export async function startTestServer({
       throw new TelegramError(409, "Server stopped");
     if (!managed) activeControls += 1;
     try {
-      return await controlInner(method, parts, body);
+      return await controlInner(method, parts, body, query);
     } finally {
       if (!managed) activeControls -= 1;
       waits.notify();
@@ -6797,7 +7530,7 @@ export async function startTestServer({
     );
   }
 
-  async function controlInner(method, parts, body) {
+  async function controlInner(method, parts, body, query) {
     const [resource, id, sub, subId] = parts;
     if (resource === "wait" && method === "POST")
       return waitFor(body.condition, { timeoutMs: body.timeoutMs }).catch(
@@ -6809,13 +7542,28 @@ export async function startTestServer({
         throw new TelegramError(404, "Unknown snapshot for this server");
       return { ok: true };
     }
-    if (resource === "restore" && method === "POST")
-      return restore(body.snapshot);
+    if (resource === "restore" && method === "POST") {
+      clockWork += 1;
+      try {
+        const restored = restore(body.snapshot);
+        // A restore sets a manual clock back: the app hears of it too.
+        if (clock.state().mode === "manual") await pushClock();
+        return restored;
+      } finally {
+        clockWork -= 1;
+      }
+    }
     if (resource === "clock" && method === "GET") return clock.state();
     if (resource === "clock" && method === "POST") {
-      const state = await clock.advance(body.ms).catch(controlFailure);
-      waits.notify();
-      return state;
+      clockWork += 1;
+      try {
+        const state = await clock.advance(body.ms).catch(controlFailure);
+        waits.notify();
+        await pushClock();
+        return state;
+      } finally {
+        clockWork -= 1;
+      }
     }
     if (resource === "deliveries" && method === "GET")
       return structuredClone(deliveryJournal);
@@ -6830,6 +7578,9 @@ export async function startTestServer({
         }
         throw error;
       }
+    }
+    if (resource === "bots" && id && sub === "updates" && method === "GET") {
+      return botUpdates(requireBot(id), query);
     }
     if (resource === "bots" && !id && method === "POST") {
       try {
@@ -7071,6 +7822,17 @@ export async function startTestServer({
       if (sub === "leave" && method === "POST") return leave(chat, body);
       if (sub === "messages" && method === "POST" && !subId)
         return post(chat, body);
+      if (
+        sub === "messages" &&
+        method === "GET" &&
+        !subId &&
+        isLogQuery(query)
+      ) {
+        if (query.bot_id !== undefined) {
+          throw new TelegramError(400, "bot_id applies only to users/:id/dm");
+        }
+        return messageLog(chat, chat.id, query);
+      }
       if (sub === "messages" && method === "GET" && !subId) {
         // Ephemeral messages have message_id 0; each takes its place from the
         // message sent just before it.
@@ -7176,6 +7938,12 @@ export async function startTestServer({
       // Only the user writing to the bot opens their private chat; reading it
       // must not, or the bot could then message a user who never wrote.
       const existing = privateChats.get(Number(id));
+      if (method === "GET" && !subId && isLogQuery(query)) {
+        const user = requireUser(id);
+        const pair =
+          query.bot_id === undefined ? null : requireBot(query.bot_id);
+        return messageLog(existing, user.id, query, pair);
+      }
       if (method === "GET" && !subId) {
         requireUser(id);
         return existing
@@ -7449,6 +8217,7 @@ export async function startTestServer({
         invite_link: { ...invite },
         date: now(),
       });
+      logJoinRequest(chat, user.id, "pending", null, invite);
       const request = {
         chat: chatObject(chat),
         from: userObject(user),
@@ -7486,12 +8255,14 @@ export async function startTestServer({
     }
     const before = memberStatus(chat, user.id);
     admit(chat, user.id, invite?.invite_link);
+    const logged = (chat.events ??= []).length;
     await emitMemberChange(chat, user.id, before, user, {
       ...(invite ? { invite_link: { ...invite } } : {}),
     });
     const service = addMessage(chat, user, {
       new_chat_members: [userObject(user)],
     });
+    linkService(loggedChange(chat, logged, user.id), chat, service);
     await emit("message", service);
     return { status: "member" };
   }
@@ -7507,10 +8278,12 @@ export async function startTestServer({
         ? { ...before, is_member: false }
         : { status: "left" },
     );
+    const logged = (chat.events ??= []).length;
     await emitMemberChange(chat, user.id, before, user);
     const service = addMessage(chat, user, {
       left_chat_member: userObject(user),
     });
+    linkService(loggedChange(chat, logged, user.id), chat, service);
     await emit("message", service);
     return { status: "left" };
   }
@@ -8442,6 +9215,12 @@ ${buttons}
   }
 
   const server = http.createServer(async (request, response) => {
+    // The viewer's pages, data and event stream are no work of the server's:
+    // they block no snapshot and count in no wait.
+    if (viewer && /^\/_fake\/ui(?:[/?]|$)/.test(request.url)) {
+      viewer.handle(request, response);
+      return;
+    }
     let closed;
     const closure = new Promise((resolve) => {
       closed = resolve;
@@ -8473,7 +9252,16 @@ ${buttons}
           .filter(Boolean);
         try {
           const payload = body.length ? parseJsonObject(body) : {};
-          send(response, 200, await control(request.method, parts, payload));
+          send(
+            response,
+            200,
+            await control(
+              request.method,
+              parts,
+              payload,
+              Object.fromEntries(url.searchParams),
+            ),
+          );
         } catch (error) {
           if (!(error instanceof TelegramError)) throw error;
           send(response, error.code, { error: error.message });
@@ -8537,6 +9325,7 @@ ${buttons}
       }
       const caller = bots.get(call[1]);
       if (!caller) {
+        lastCallAt.set(Number(call[1].split(":")[0]) || 0, Date.now());
         recordCall(
           {
             method: call[2],
@@ -8564,6 +9353,7 @@ ${buttons}
         params = await readRequestParams(request, body);
       } catch (error) {
         if (!(error instanceof TelegramError)) throw error;
+        lastCallAt.set(caller.id, Date.now());
         recordCall(
           {
             method,
@@ -8604,6 +9394,20 @@ ${buttons}
             }
           : {}),
       };
+      // A call is in progress until its response closes: through injected
+      // delays, flood control holds and drops. A long poll is not.
+      if (method.toLowerCase() !== "getupdates") {
+        callsInProgress.set(
+          caller.id,
+          (callsInProgress.get(caller.id) ?? 0) + 1,
+        );
+        lastCallAt.set(caller.id, Date.now());
+        response.once("close", () => {
+          callsInProgress.set(caller.id, callsInProgress.get(caller.id) - 1);
+          lastCallAt.set(caller.id, Date.now());
+          waits.notify();
+        });
+      }
       recordCall(receipt, response);
       const gone = new AbortController();
       response.once("close", () => {
@@ -8860,16 +9664,70 @@ ${buttons}
     return out;
   }
 
+  // Loaded only with the viewer on, and before listening, so the viewer is
+  // there for the first request.
+  const viewerModule = ui === true ? await import("./ui/server.js") : null;
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, host, resolve);
   });
   const address = server.address();
   const origin = `http://${host.includes(":") ? `[${host}]` : host}:${address.port}`;
+  // The viewer's address: loopback, also when the server listens on every
+  // address.
+  const viewerUrl = viewerModule
+    ? `http://${
+        address.family === "IPv6" || address.family === 6
+          ? address.address === "::"
+            ? "127.0.0.1"
+            : `[${address.address}]`
+          : address.address === "0.0.0.0"
+            ? "127.0.0.1"
+            : address.address
+      }:${address.port}/_fake/ui`
+    : null;
+  // What the viewer reads, as plain accessors: it never writes, and never
+  // sees a token.
+  const uiModel = {
+    instance: () => instanceId,
+    epoch: () => epoch,
+    version: () => uiVersion,
+    cursor: () => nextSeq,
+    clock: () => clock.state(),
+    firstBotId: () => bot.id,
+    bots: () => [...bots.values()],
+    user: (id) => users.get(Number(id)),
+    chats: () => chats.values(),
+    chat: (id) => chats.get(Number(id)),
+    privateChats: () => privateChats.values(),
+    privateChat: (id) => privateChats.get(Number(id)),
+    privatePairOf,
+    member: (chat, userId) => peekMember(chat, userId),
+    memberJson: (chat, userId) =>
+      memberWithoutUser(
+        memberObject(chat, userId, peekMember(chat, userId), null),
+      ),
+    inChat: (chat, userId) => peekInChat(chat, userId),
+    messageLogEntry,
+    eventJson,
+    fileBytes: (fileId) => files.get(String(fileId))?.file.data ?? null,
+    calls: () => calls,
+    rejectedRequests: () => rejectedRequests,
+    sentUpdates: () => sentUpdates,
+    chatOfQuery: (queryId) => queryChats.get(String(queryId)) ?? null,
+    knownMethod: (name) => methodsByLowerName.has(String(name).toLowerCase()),
+  };
+  viewer =
+    viewerModule?.createViewer({
+      port: address.port,
+      url: viewerUrl,
+      model: uiModel,
+      log,
+    }) ?? null;
   /** Run a control action in-process, with the same checks as /_fake/*. */
-  async function act(method, path, body = {}) {
+  async function act(method, path, body = {}, query = {}) {
     try {
-      return await control(method, path.split("/"), body);
+      return await control(method, path.split("/"), body, query);
     } catch (error) {
       if (error instanceof TelegramError) throw new Error(error.message);
       throw error;
@@ -8880,6 +9738,7 @@ ${buttons}
 
   return {
     origin,
+    viewerUrl,
     waitFor,
     snapshot: () => act("POST", "snapshots"),
     restore: (snapshot) => act("POST", "restore", { snapshot }),
@@ -9178,9 +10037,37 @@ ${buttons}
       act("GET", `chats/${chatId}/members/${userId}`),
     getJoinRequests: (chatId) => act("GET", `chats/${chatId}/join-requests`),
     getCalls: () => act("GET", "calls"),
+    getMessageLog: (
+      chatId,
+      { since = 0, includeDeleted = false, botId, epoch: mark } = {},
+    ) =>
+      act(
+        "GET",
+        Number(chatId) > 0 ? `users/${chatId}/dm` : `chats/${chatId}/messages`,
+        {},
+        {
+          since: String(since),
+          include_deleted: includeDeleted ? "true" : "false",
+          ...(botId != null ? { bot_id: String(botId) } : {}),
+          ...(mark != null ? { epoch: String(mark) } : {}),
+        },
+      ),
+    getBotUpdates: (botId, { type, chatId, since, epoch: mark } = {}) =>
+      act(
+        "GET",
+        `bots/${botId}/updates`,
+        {},
+        {
+          ...(type != null ? { type: [type].flat().join(",") } : {}),
+          ...(chatId != null ? { chat_id: String(chatId) } : {}),
+          ...(since != null ? { since: String(since) } : {}),
+          ...(mark != null ? { epoch: String(mark) } : {}),
+        },
+      ),
     stop: () =>
       (stopPromise ??= (async () => {
         stopped = true;
+        viewer?.close();
         waits.cancel("Server stopped", true);
         for (const record of bots.values()) {
           wakePollers(record);

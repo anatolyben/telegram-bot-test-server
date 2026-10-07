@@ -61,6 +61,10 @@ export interface TelegramBotTestServerOptions {
    * after 1", as Telegram's Bot API server does. Default false.
    */
   floodControl?: boolean;
+  /** Serve the live chat viewer at `${origin}/_fake/ui`, to this computer only. Default false. */
+  ui?: boolean;
+  /** POST { now, mode } here whenever the manual clock is set or advanced. Default none. */
+  clockWebhook?: string;
   log?: (line: string) => void;
 }
 
@@ -269,6 +273,9 @@ export interface RecordedCall {
   }>;
 }
 
+/** A pattern: a RegExp, or its source and flags (over HTTP). */
+export type PatternSource = RegExp | { source: string; flags?: string };
+
 export type FakeWaitCondition =
   | {
       kind: "message";
@@ -279,6 +286,16 @@ export type FakeWaitCondition =
       text?: string;
       caption?: string;
       deleted?: boolean;
+      /** Only messages stored after this cursor (MessageLog.cursor). */
+      since?: number;
+      /** The text or caption includes this. */
+      contains?: string;
+      /** The text or caption matches this; the g and y flags are dropped. */
+      matches?: PatternSource;
+      /** An inline button with exactly this text. */
+      buttonText?: string;
+      /** An inline button with exactly this callback_data (the same button as buttonText). */
+      buttonData?: string;
     }
   | {
       kind: "member";
@@ -308,6 +325,89 @@ export type FakeWaitCondition =
       outcome?: RecordedCall["outcome"];
       stage?: RecordedCall["timeline"][number]["stage"];
     };
+/**
+ * Nothing left to do: no update a bot has not confirmed, no Bot API call
+ * (getUpdates aside) or webhook attempt in progress, no test action, owner
+ * call or clock advance under way, and no call for `ms` milliseconds. `ms`
+ * is 1-30000 and below the wait's timeoutMs.
+ */
+export interface FakeQuietCondition {
+  kind: "quiet";
+  ms: number;
+  /** The bots to consider; default every bot. */
+  botIds?: number[];
+}
+/** An update a bot was sent, after `afterUpdateId`. */
+export interface FakeUpdateCondition {
+  kind: "update";
+  botId: number;
+  type?: string | string[];
+  chatId?: number;
+  afterUpdateId?: number;
+  state?: DeliveredUpdate["state"];
+}
+export type FakeAnyWaitCondition =
+  | FakeWaitCondition
+  | FakeQuietCondition
+  | FakeUpdateCondition;
+export interface FakeQuietObservation {
+  quiet: true;
+  /** Milliseconds since the last call. */
+  idleMs: number;
+}
+/** One update a bot was sent. */
+export interface DeliveredUpdate {
+  update_id: number;
+  type: string;
+  /** null for updates about no chat, such as poll and poll_answer. */
+  chat_id: number | null;
+  /** When it was sent, server clock milliseconds. */
+  at: number;
+  /**
+   * pending: not confirmed yet; delivered: confirmed by a getUpdates offset or
+   * a 2XX webhook answer; dropped: given up, or discarded without being
+   * received.
+   */
+  state: "pending" | "delivered" | "dropped";
+  /** Returned by getUpdates or posted to the webhook at least once. */
+  received: boolean;
+  /** Exactly what the bot was sent, its own file_ids included. */
+  update: Record<string, unknown>;
+}
+/** A stored message in the message log. */
+export interface MessageLogEntry {
+  /** Its place among everything stored in any chat. */
+  seq: number;
+  /** When it was stored, server clock milliseconds. */
+  at: number;
+  /** How many Bot API requests had been received when it was stored. */
+  after_request: number;
+  /** The call that stored it; null for a test action. */
+  request_id: string | null;
+  /** Who posted it (in a channel, the person or bot behind the channel). */
+  author: number;
+  deleted: boolean;
+  deleted_by: {
+    seq: number;
+    bot_id: number;
+    method: "deleteMessage" | "deleteMessages" | "deleteEphemeralMessage";
+    request_id: string | null;
+    at: number;
+  } | null;
+  ephemeral: boolean;
+  message: Message;
+  /** A poll's votes by user id, when anyone voted. */
+  votes?: Record<string, number[]>;
+}
+export interface MessageLog {
+  chat_id: number;
+  /** The number of restores so far; a mark from another epoch is refused. */
+  epoch: number;
+  /** The latest seq: pass it as `since` to read what comes after. */
+  cursor: number;
+  messages: MessageLogEntry[];
+}
+
 export interface FakeWaitOptions {
   /** Wall-clock deadline, 1-30000ms; default 1000. */ timeoutMs?: number;
 }
@@ -370,10 +470,29 @@ export interface TelegramBotTestServer {
     options?: FakeWaitOptions,
   ): Promise<RecordedCall>;
   waitFor(
+    condition: FakeQuietCondition,
+    options?: FakeWaitOptions,
+  ): Promise<FakeQuietObservation>;
+  waitFor(
+    condition: FakeUpdateCondition,
+    options?: FakeWaitOptions,
+  ): Promise<DeliveredUpdate>;
+  waitFor(
     condition: FakeWaitCondition,
     options?: FakeWaitOptions,
   ): Promise<
     FakeMessageObservation | ChatMember | FakeJoinObservation | RecordedCall
+  >;
+  waitFor(
+    condition: FakeAnyWaitCondition,
+    options?: FakeWaitOptions,
+  ): Promise<
+    | FakeMessageObservation
+    | ChatMember
+    | FakeJoinObservation
+    | RecordedCall
+    | FakeQuietObservation
+    | DeliveredUpdate
   >;
   /**
    * An opaque handle only this server accepts; the server must be idle.
@@ -395,6 +514,8 @@ export interface TelegramBotTestServer {
   getDeliveries(): Promise<FakeDelivery[]>;
   /** Base URL to use as the bot's Bot API root, e.g. "http://127.0.0.1:53211". */
   origin: string;
+  /** The live chat viewer's address with `ui: true`, else null. */
+  viewerUrl: string | null;
   /**
    * Another bot this server answers for, with its own webhook or update queue.
    * It is in no chat until added with setBotMembership.
@@ -757,6 +878,32 @@ export interface TelegramBotTestServer {
     rejected_requests: RecordedCall[];
     unimplemented: string[];
   }>;
+  /**
+   * The chat's messages stored after a mark (`since`, a cursor), oldest first;
+   * with includeDeleted also those deleted, and those deleted after the mark.
+   * A positive chat id reads the user's private chat, all bots' messages in
+   * it or one bot's (botId). Read the cursor once as the mark; pass its epoch
+   * to refuse a mark from before a restore.
+   */
+  getMessageLog(
+    chatId: number,
+    options?: {
+      since?: number;
+      includeDeleted?: boolean;
+      botId?: number;
+      epoch?: number;
+    },
+  ): Promise<MessageLog>;
+  /** The updates a bot was sent, in update_id order, after `since`. */
+  getBotUpdates(
+    botId: number,
+    options?: {
+      type?: string | string[];
+      chatId?: number;
+      since?: number;
+      epoch?: number;
+    },
+  ): Promise<{ bot_id: number; epoch: number; updates: DeliveredUpdate[] }>;
   stop(): Promise<void>;
 }
 

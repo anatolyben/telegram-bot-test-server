@@ -92,8 +92,11 @@ export function createClock(options) {
   };
 }
 
-/** No polling: evaluate at registration and when this instance changes state. */
-export function createWaits() {
+/**
+ * No polling: evaluate at registration and when this instance changes state.
+ * `onNotify` hears of every change, after the waits have checked it.
+ */
+export function createWaits({ onNotify } = {}) {
   const pending = new Set();
   let stopped = false;
   return {
@@ -102,6 +105,7 @@ export function createWaits() {
     },
     notify() {
       for (const waiter of [...pending]) waiter.check();
+      onNotify?.();
     },
     cancel(reason, stop = false) {
       stopped ||= stop;

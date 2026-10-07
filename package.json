@@ -12,6 +12,10 @@
     ".": {
       "types": "./src/index.d.ts",
       "default": "./src/index.js"
+    },
+    "./clock": {
+      "types": "./src/clock.d.ts",
+      "default": "./src/clock.js"
     }
   },
   "types": "./src/index.d.ts",

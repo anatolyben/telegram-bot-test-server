@@ -2,7 +2,7 @@
 /**
  * Run the fake as a standalone server.
  *
- *   telegram-bot-test-server --token 123456:TEST --port 8081 [--host 127.0.0.1] [--config chats.json]
+ *   telegram-bot-test-server --token 123456:TEST --port 8081 [--host 127.0.0.1] [--config chats.json] [--ui]
  *
  * The optional config file holds { "chats": [...], "publicChats": [...] }, in the
  * shape startTestServer() takes. Point the bot's Bot API base URL at the
@@ -20,12 +20,13 @@ const { values } = parseArgs({
     username: { type: "string" },
     config: { type: "string" },
     "unimplemented-ok": { type: "boolean", default: false },
+    ui: { type: "boolean", default: false },
   },
 });
 
 if (!values.token) {
   console.error(
-    "Usage: telegram-bot-test-server --token <id>:<secret> [--port 8081] [--host 127.0.0.1] [--username name] [--config chats.json] [--unimplemented-ok]",
+    "Usage: telegram-bot-test-server --token <id>:<secret> [--port 8081] [--host 127.0.0.1] [--username name] [--config chats.json] [--unimplemented-ok] [--ui]",
   );
   process.exit(2);
 }
@@ -42,9 +43,13 @@ const fake = await startTestServer({
   chats: config.chats ?? [],
   publicChats: config.publicChats ?? [],
   unimplemented: values["unimplemented-ok"] ? "ok" : "error",
+  ui: values.ui,
   log: (line) => console.log(`[telegram-bot-test-server] ${line}`),
 });
 console.log(`[telegram-bot-test-server] listening at ${fake.origin}`);
+if (fake.viewerUrl) {
+  console.log(`[telegram-bot-test-server] viewer at ${fake.viewerUrl}`);
+}
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, async () => {
