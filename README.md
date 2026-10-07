@@ -9,9 +9,11 @@ so tests need no real accounts, phone numbers or groups, and can run as often as
 
 **Guide:** [Write a test](#write-a-test) · [Make users act](#make-users-act) ·
 [Check what the bot did](#check-what-the-bot-did) ·
+[Message log and delivered updates](#message-log-and-delivered-updates) ·
 [Webhooks and polling](#webhooks-and-polling) · [More than one bot](#more-than-one-bot) ·
 [Channels, basic groups and forums](#channels-basic-groups-and-forums) ·
-[Failures, flood control and time](#failures-flood-control-and-time) · [Snapshots](#snapshots) ·
+[Failures, flood control and time](#failures-flood-control-and-time) ·
+[Testing time-based app logic](#testing-time-based-app-logic) · [Snapshots](#snapshots) ·
 [Watch the chats in a browser](#watch-the-chats-in-a-browser) ·
 [Record a scenario](#record-a-scenario) · [Telegram Login](#telegram-login) ·
 [Owner accounts (GramJS)](#owner-accounts-gramjs) ·
@@ -279,6 +281,26 @@ const ban = await server.waitFor({
 expect(ban.params.user_id).toBe(String(ann));
 ```
 
+A message can also be found by part of its text or caption, by a pattern, or by one of its inline
+buttons, with or without its author:
+
+```js
+// Your bot answers /menu with "Pick a topic" and a "Rules" button (callback_data "rules").
+await server.post(GROUP, ann, "/menu");
+await server.waitFor({ kind: "message", chatId: GROUP, contains: "Pick" });
+await server.waitFor({ kind: "message", chatId: GROUP, matches: /pick a topic/i });
+await server.waitFor({
+  kind: "message",
+  chatId: GROUP,
+  buttonText: "Rules",
+  buttonData: "rules",
+});
+```
+
+These find the oldest message that matches every field given, ephemeral messages included. To
+skip messages from earlier in the test, add `since`, a cursor from the
+[message log](#message-log-and-delivered-updates).
+
 A wait fails after 1000 ms by default; `{ timeoutMs }` sets 1 to 30000 ms of wall time. Its error
 names the exact expectation, what was observed (or up to eight matching requests) and the work
 still outstanding, in at most 8000 characters with credentials redacted. The outstanding work
@@ -323,6 +345,85 @@ time: grammY's `bot.start()`, or any webhook that answers after its handler has 
 and Telegraf's do. Telegraf's polling handles each batch of updates at once, so there the marker
 is not enough. A webhook bot can instead `await server.drainDeliveries()`, which returns once the
 webhook has answered every update sent so far.
+
+Or wait until there is nothing left to do: every update confirmed by the bots, no Bot API call,
+webhook attempt or test action in progress, and no call for `ms` milliseconds of wall time:
+
+```js
+const hello = await server.post(GROUP, ann, "Hello, no links here");
+await server.waitFor({ kind: "quiet", ms: 200 }, { timeoutMs: 2000 });
+expect((await server.getMessage(GROUP, hello)).deleted).toBe(false);
+```
+
+grammY's `bot.start()` and Telegraf's polling confirm an update with their next `getUpdates`, after
+handling it, and their webhooks answer after their handlers, so the wait holds while such a bot
+works on an update. The server sees only what reaches it: work a bot does after it confirmed an
+update, such as a job started in the background, looks quiet once `ms` has passed without a call.
+`botIds` limits the wait to some bots; leave out a bot that is not running, since it never
+confirms its updates.
+
+### Message log and delivered updates
+
+Every message the server stores, in any chat, gets the next number of one server-wide sequence,
+its `seq`; so do events and deletions. `getMessageLog` reads a chat's messages after a mark on that
+sequence, deleted ones too when asked, so "everything since my mark" stays exact when the bot
+deletes messages:
+
+```js
+// Your bot deletes links, as in the quick start.
+const ann = await server.createUser({ first_name: "Ann" });
+await server.join(GROUP, ann);
+const mark = await server.getMessageLog(GROUP); // mark.cursor: the latest seq
+await server.post(GROUP, ann, "hello");
+const spam = await server.post(GROUP, ann, "cheap followers at example.com");
+await server.waitFor({ kind: "message", chatId: GROUP, messageId: spam, deleted: true });
+
+const { messages } = await server.getMessageLog(GROUP, {
+  since: mark.cursor,
+  includeDeleted: true,
+});
+console.log(messages.map((entry) => [entry.message.text, entry.deleted_by?.bot_id ?? null]));
+// [["hello", null], ["cheap followers at example.com", 123456]]
+```
+
+- It returns `{ chat_id, epoch, cursor, messages }`, oldest first. Pass `cursor` as the next
+  `since` to read on from there.
+- Each entry has the stored `message` (with the first bot's file ids), its `seq`, `at` (server
+  time), `author`, `request_id` (the Bot API call that stored it, or `null` for a test action),
+  `ephemeral`, and `deleted` with `deleted_by`: `{ seq, bot_id, method, request_id, at }` of the
+  deletion, or `null`. A poll that has votes has `votes` by user id.
+- Without `includeDeleted`, only messages not deleted are listed. With it, a message stored before
+  the mark but deleted after it is listed too. Edits are not reported.
+- A user id instead of a chat id reads the user's private chats; `botId` keeps one bot's.
+- After a `restore`, the sequence goes back with the state. Pass the mark's `epoch` and a read
+  from an older epoch fails instead of mixing the two.
+
+`getBotUpdates` lists the updates the server sent a bot, as the bot got them, so a test can prove
+what a bot did **not** receive. Here a second bot asks only for `my_chat_member` updates:
+
+```js
+const notifier = await server.addBot({ token: "654321:NOTIFY", username: "notify_bot" });
+// Your notifier bot runs with that token and polls with allowed_updates: ["my_chat_member"].
+await server.setBotMembership(GROUP, notifier.id);
+const ann = await server.createUser({ first_name: "Ann" });
+await server.join(GROUP, ann);
+await server.post(GROUP, ann, "hello");
+
+const { updates } = await server.getBotUpdates(notifier.id, { chatId: GROUP });
+expect(updates.map((update) => update.type)).toEqual(["my_chat_member"]);
+```
+
+- Each test action resolves once the updates it causes are handed to the bots, so a read right
+  after it already lists them.
+- `type` (one type or a list), `chatId` and `since` (an `update_id`) narrow the list.
+- Each entry has `update_id`, `type`, `chat_id` (`null` for updates about no chat, such as `poll`),
+  `at`, `state`, `received` and `update`, the exact JSON the bot was sent. `state` is `pending`
+  until the bot confirms the update, then `delivered`, or `dropped` when it expired or was
+  discarded, such as by `drop_pending_updates`. `received` says whether `getUpdates` returned it
+  or a webhook was sent it.
+
+`waitFor({ kind: "update", botId, type, chatId, afterUpdateId, state })` waits for such an update,
+for example `state: "delivered"` once the bot has confirmed it.
 
 ### Webhooks and polling
 
@@ -560,7 +661,104 @@ bot may message a join requester, and flood control follow this clock too. A res
 clock back to the snapshot's time; real time is never rewound. The global `Date`, timers and your
 app's jobs are untouched. Webhook connections and their one-minute timeout, long polling and
 `waitFor` deadlines use wall time, so an advance does not wait for deliveries or for your bot to
-act.
+act. To have your app follow this clock, see
+[Testing time-based app logic](#testing-time-based-app-logic).
+
+### Testing time-based app logic
+
+`advanceTime` moves only the server's clock. Your app still reads its own `Date.now()`, so a
+nightly job, a "three strikes in 30 days" rule or a mute the app lifts itself cannot be tested by
+moving time, unless the app reads the server's clock in tests. The package ships a helper for
+that, `fakeClockNow()`: the server's time when the `TELEGRAM_FAKE_CLOCK_URL` environment variable
+names a server, and `Date.now()` otherwise. The app calls it wherever it read `Date.now()`.
+
+This bot reminds the chat an hour after `/remind`, and the test moves time instead of waiting:
+
+```js
+import http from "node:http";
+import { Bot } from "grammy";
+import { startTestServer } from "telegram-bot-test-server";
+import {
+  fakeClockHandler,
+  fakeClockNow,
+  refreshFakeClock,
+} from "telegram-bot-test-server/clock";
+
+const GROUP = -1001000000001;
+const HOUR = 60 * 60 * 1000;
+
+// The app takes the server's clock pushes here.
+const receiver = http.createServer(fakeClockHandler);
+await new Promise((resolve) => receiver.listen(0, "127.0.0.1", resolve));
+const server = await startTestServer({
+  botToken: "123456:TEST",
+  chats: [{ id: GROUP, title: "Test Group", ownerId: 5000000001 }],
+  clock: { now: Date.now() },
+  clockWebhook: `http://127.0.0.1:${receiver.address().port}/`,
+});
+process.env.TELEGRAM_FAKE_CLOCK_URL = server.origin;
+await refreshFakeClock(); // once, before the app reads the clock
+
+// The app: it reads fakeClockNow() where it read Date.now().
+const bot = new Bot("123456:TEST", { client: { apiRoot: server.origin } });
+const reminders = [];
+bot.command("remind", async (ctx) => {
+  reminders.push({ chatId: ctx.chat.id, at: fakeClockNow() + HOUR });
+  await ctx.reply("I will remind you in an hour.");
+});
+// Its scheduler looks for due reminders every second.
+const scheduler = setInterval(async () => {
+  const due = reminders.filter((reminder) => reminder.at <= fakeClockNow());
+  for (const reminder of due) {
+    reminders.splice(reminders.indexOf(reminder), 1);
+    await bot.api.sendMessage(reminder.chatId, "Reminder!");
+  }
+}, 1000);
+await new Promise((resolve) => bot.start({ onStart: resolve }));
+
+// The test.
+const ann = await server.createUser({ first_name: "Ann" });
+await server.join(GROUP, ann);
+await server.post(GROUP, ann, "/remind");
+await server.waitFor({ kind: "message", chatId: GROUP, botId: 123456, contains: "an hour" });
+await server.advanceTime(HOUR); // resolves once the app has the new time
+await server.waitFor(
+  { kind: "message", chatId: GROUP, botId: 123456, text: "Reminder!" },
+  { timeoutMs: 2000 },
+);
+
+clearInterval(scheduler);
+await bot.stop();
+await server.stop();
+receiver.close();
+```
+
+What the app has to do:
+
+- **Read the clock with `fakeClockNow()`.** It is synchronous and reads a cached time, so a call is
+  cheap. With `TELEGRAM_FAKE_CLOCK_URL` unset it returns `Date.now()`, so production code can call
+  it too. The variable takes the server's origin or its `/_fake/clock` URL, and is read on every
+  call.
+- **Call `await refreshFakeClock()` once** at start, after setting the variable. It reads
+  `GET /_fake/clock`, caches the time and returns it. Until the app has the time of the server the
+  variable names, from a read or a push, `fakeClockNow()` throws, so a missed setup fails instead
+  of mixing clocks. On a server running on real time, `fakeClockNow()` returns `Date.now()`.
+- **Keep the time current**, in one of two ways. With the `clockWebhook` option and a manual
+  clock, the server posts `{ now, mode }` to that URL after each `advanceTime` and each `restore`,
+  and they resolve only once the post has finished, so the app has the new time when the test
+  goes on. Mount `fakeClockHandler` there (a Node `(request, response)` handler), or pass the
+  parsed body to `receiveFakeClock(body)` if your framework has read it already. Without the
+  option, call `await refreshFakeClock()` before time-dependent work.
+- **Expect timers to run on wall time.** Moving the clock fires none of them; a scheduler that
+  checks `fakeClockNow()` as it runs, as above, sees the new time on its next check. Or have the
+  test run the app's job after `advanceTime`.
+
+An app in another process gets `TELEGRAM_FAKE_CLOCK_URL` in its environment and the
+`fakeClockHandler` route in its own HTTP server. An app in another language reads
+`GET <origin>/_fake/clock`, which answers `{ mode, now, scheduled }`, and uses `now` while `mode`
+is `manual`. A push that fails, or takes over 2 seconds, goes to the `log` option as
+`clock webhook failed: <reason>` and fails nothing. The bot's own webhook deliveries stay as
+Telegram sends them.
 
 ### Snapshots
 
@@ -665,41 +863,43 @@ an open viewer does not hold up `snapshot()`, `restore()` or a wait.
 What it shows, only from what the server stores:
 
 - **Chats**: groups, supergroups, channels, forums and each user's private chat with each bot,
-  most recently active first.
+  most recently active first. The search box filters them by title.
 - **Messages**: the sender's name and initial, bots tagged as the first bot, an added bot or a guest
   bot; text with its entities, replies, forwards and captions; photos as the images themselves and
-  other media as labelled placeholders; inline keyboards as buttons (hover one for its callback
+  other media as labeled placeholders; inline keyboards as buttons (hover one for its callback
   data); edits (not a bot's change of only the keyboard, which Telegram's apps do not mark either);
   and service messages: joins, leaves, pins, title and photo changes, upgrades and topics. Times
   are UTC.
-- **Deletions**: a deleted message stays, greyed and marked with the bot that deleted it.
+- **Deletions**: a deleted message stays, grayed and marked with the bot that deleted it.
 - **Ephemeral messages**, marked with the member who sees them.
 - **Events** Telegram shows as no message: member changes (restrictions, bans, promotions, their
   expiry), join requests (pending, approved, declined) and unpins.
-- **Members**: each one's status, restrictions and rights, the bots' included, and pending join
-  requests. The count is of those in the chat now; the panel also lists those who left or were
-  banned.
+- **Members**: the chat's default permissions, then each member, the bots included, with their
+  status (creator, administrator, member, restricted or banned until a UTC time or forever, left),
+  what a restricted member cannot do and an administrator's rights; then pending join requests.
+  The count is of those in the chat now; the panel also lists those who left or were banned, up to
+  200 members in all.
 
 The view lives in the URL, so a link, a test or a Playwright script reproduces it exactly, and
 everything changed on the page (panels, layout, view as, topic, theme, the open chat) updates the
 URL:
 
-| Parameter         | Values                                                                                              | Default                       |
-| ----------------- | --------------------------------------------------------------------------------------------------- | ----------------------------- |
-| `chat`            | a group id, `<user id>:<bot id>` for a private chat, or a user id for their chat with the first bot | the most recently active chat |
-| `chats`           | up to four chats, comma-separated, shown side by side                                               |                               |
-| `show`            | panels, comma-separated: `list`, `chat`, `calls`, `events`, `members`                               | all of them                   |
-| `layout`          | `combined` (calls and events inline in the chat) or `split` (each in its own panel)                 | `combined`                    |
-| `as`              | a user id: the chats as that member sees them                                                       | the test view                 |
-| `bots`, `methods` | comma-separated: calls from these bots or of these methods only                                     | all                           |
-| `topic`           | a forum topic's `message_thread_id`, or `general`                                                   | all topics                    |
-| `theme`           | `light` or `dark`                                                                                   | the system's                  |
+- `chat`: a group id, `<user id>:<bot id>` for a private chat, or a user id for their chat with the
+  first bot. Without it, the most recently active chat.
+- `chats`: up to four chats, comma-separated, shown side by side.
+- `show`: the panels, comma-separated: `list`, `chat`, `calls`, `events`, `members`. Default: all.
+- `layout`: `combined` (calls and events inline in the chat; the default) or `split` (each in its
+  own panel).
+- `as`: a user id: the chats as that member sees them. Default: the test's view of everything.
+- `bots`, `methods`: comma-separated: calls from these bots or of these methods only. Default: all.
+- `topic`: a forum topic's `message_thread_id`, or `general`. Default: all topics.
+- `theme`: `light` or `dark`. Default: the system's.
 
 For example, `/_fake/ui?chats=-1001000000001,-1001000000002&show=chat` shows a group beside its log
 chat, and `?chat=-1001000000001&show=members` only the members. A page opened without `chat` shows
-the most recently active chat and writes it into the URL. Each panel's ↗ opens it alone in a new tab,
-and × hides it. The dividers between columns resize them, with the mouse or the arrow keys. In a
-narrow window one panel shows at a time, with a bar to switch.
+the most recently active chat and writes it into the URL. Each panel's ↗ opens it alone in a new
+tab, and × hides it. The dividers between columns resize them, with the mouse or the arrow keys.
+In a narrow window one panel shows at a time, with a bar to switch.
 
 **View as a member.** `as=<user id>`, or the select in the toolbar, shows each chat as that member
 sees it: no deleted messages, no other member's ephemeral messages (their own read "only you see
@@ -715,22 +915,39 @@ created with count as present from the start.
 time. At most 600 stay loaded: loading more drops the newest, and "Jump to latest", which says how
 many newer messages are not loaded, goes back to the end.
 
-**Several tabs.** All viewer tabs of one browser share one event stream, so any number of them stay
-live.
+**Live updates.** The page follows the server over a server-sent event stream: every change shows
+within a moment, without a reload, and after a `restore`, or with a new server on the same port,
+the page loads everything again. The status in the toolbar reads Live, Connecting… or Server
+stopped; a stopped page connects again once a server answers at its address. All viewer tabs of
+one browser share one event stream, so any number of them stay live.
 
 **Selecting with Playwright.** Chats, messages, buttons and members carry stable data attributes:
 
-| Element       | Attributes                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| the page      | `[data-role="app"]` with `data-instance`, `data-epoch`, `data-version`, and `data-busy="true"` while loading                                                                                                                                                                                                                                                                                                                                                                            |
-| chat list row | `data-chat-key`, `data-chat-id`, `data-chat-type` (`supergroup`, `group`, `channel`, `private`, `calls`), `data-forum`; private chats `data-user-id`, `data-bot-id`; `aria-current="true"` when open                                                                                                                                                                                                                                                                                    |
-| column        | `data-column-id` (`list` or `<panel>:<chat>`), `data-panel`, `data-chat-key`, `data-chat-id`, `data-view-as`                                                                                                                                                                                                                                                                                                                                                                            |
-| message       | `data-kind="message"`, `data-chat-key`, `data-seq`, `data-message-id` or, for an ephemeral message, `data-ephemeral-id` and `data-receiver-id`; `data-author-id`, `data-author-kind` (`user`, `first-bot`, `added-bot`, `guest-bot`, `bot`, `channel`), `data-deleted` and `data-deleted-by`, `data-edited` and `data-edit-hidden` (a bot changed only the keyboard), `data-service`, `data-thread-id`, `data-reply-to`, `data-reply-deleted`, `data-pinned-deleted`, `data-request-id` |
-| inline button | `data-button-text`, `data-button-data`, `data-button-url`, `data-button-row`, `data-button-col`                                                                                                                                                                                                                                                                                                                                                                                         |
-| event         | `data-kind="event"`, `data-chat-key`, `data-event-id`, `data-event-type` (`member`, `join_request`, `unpin`), `data-user-id`, `data-request-id`                                                                                                                                                                                                                                                                                                                                         |
-| call          | `data-kind="call"`, `data-chat-key` (`calls` for calls without a chat), `data-request-id`, `data-request-number`, `data-call-seq` and `data-call-journal` (the receipt's `seq` and its list: `calls` or `rejected_requests`), `data-call-bot-id`, `data-call-method`, `data-call-outcome`, `data-target-messages` (`<chat id>:<message id>`, space-separated), `data-target-user-id`, `data-target-ephemeral-id`                                                                        |
-| member        | `data-chat-key`, `data-member-id`, `data-member-status`, `data-member-in-chat`, `data-member-bot`                                                                                                                                                                                                                                                                                                                                                                                       |
-| join request  | `data-chat-key`, `data-join-request-user-id`                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+- **The page**: `[data-role="app"]` with `data-instance`, `data-epoch`, `data-version`, and
+  `data-busy="true"` while loading.
+- **Chat list row**: `data-chat-key`, `data-chat-id`, `data-chat-type` (`supergroup`, `group`,
+  `channel`, `private`, `calls`), `data-forum`; for a private chat `data-user-id` and
+  `data-bot-id`; `aria-current="true"` when open.
+- **Column**: `data-column-id` (`list` or `<panel>:<chat>`), `data-panel`, `data-chat-key`,
+  `data-chat-id`, `data-view-as`.
+- **Message**: `data-kind="message"`, `data-chat-key`, `data-seq`, `data-message-id` or, for an
+  ephemeral message, `data-ephemeral-id` and `data-receiver-id`; `data-author-id`,
+  `data-author-kind` (`user`, `first-bot`, `added-bot`, `guest-bot`, `bot`, `channel`),
+  `data-deleted` and `data-deleted-by`, `data-edited` and `data-edit-hidden` (a bot changed only
+  the keyboard), `data-service`, `data-thread-id`, `data-reply-to`, `data-reply-deleted`,
+  `data-pinned-deleted`, `data-request-id`.
+- **Inline button**: `data-button-text`, `data-button-data`, `data-button-url`, `data-button-row`,
+  `data-button-col`.
+- **Event**: `data-kind="event"`, `data-chat-key`, `data-event-id`, `data-event-type` (`member`,
+  `join_request`, `unpin`), `data-user-id`, `data-request-id`.
+- **Call**: `data-kind="call"`, `data-chat-key` (`calls` for calls without a chat),
+  `data-request-id`, `data-request-number`, `data-call-seq` and `data-call-journal` (the receipt's
+  `seq` and its list: `calls` or `rejected_requests`), `data-call-bot-id`, `data-call-method`,
+  `data-call-outcome`, `data-target-messages` (`<chat id>:<message id>`, space-separated),
+  `data-target-user-id`, `data-target-ephemeral-id`.
+- **Member**: `data-chat-key`, `data-member-id`, `data-member-status`, `data-member-in-chat`,
+  `data-member-bot`.
+- **Join request**: `data-chat-key`, `data-join-request-user-id`.
 
 `data-chat-key` tells a user's private chats with two bots apart. View as, the topic filter and the
 call filters leave what is hidden out of the page, so a count of zero means it is not shown.
@@ -754,14 +971,13 @@ console.log(await spam.getAttribute("data-deleted-by")); // the bot that deleted
 
 The viewer's routes, all `GET` and all on this computer only:
 
-| Route                        | Answer                                                                                                                            |
-| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `/_fake/ui`                  | the page                                                                                                                          |
-| `/_fake/ui/assets/<file>`    | its scripts and stylesheet                                                                                                        |
-| `/_fake/ui/api/state`        | the chat list (`?as=<user id>` for a member's)                                                                                    |
-| `/_fake/ui/api/chats/<chat>` | a chat's messages and events, members and calls (`limit`, `before`, `from`, `to`, `as`, `topic`, `members_limit`, `calls_before`) |
-| `/_fake/ui/files/<file_id>`  | a stored image's bytes                                                                                                            |
-| `/_fake/ui/events`           | the live event stream (server-sent events)                                                                                        |
+- `/_fake/ui`: the page.
+- `/_fake/ui/assets/<file>`: its scripts and stylesheet.
+- `/_fake/ui/api/state`: the chat list (`?as=<user id>` for a member's).
+- `/_fake/ui/api/chats/<chat>`: a chat's messages and events, members and calls (`limit`,
+  `before`, `from`, `to`, `as`, `topic`, `members_limit`, `calls_before`).
+- `/_fake/ui/files/<file_id>`: a stored image's bytes.
+- `/_fake/ui/events`: the live event stream (server-sent events).
 
 #### Call timeline
 
@@ -992,16 +1208,19 @@ Once it listens, it prints its origin as its first line, then any log lines:
 [telegram-bot-test-server] listening at http://127.0.0.1:52428
 ```
 
-Read the origin from that line. SIGTERM or Ctrl-C stops the server.
+Read the origin from that line. With `--ui`, the next line gives the viewer's address:
+`[telegram-bot-test-server] viewer at http://127.0.0.1:52428/_fake/ui`. SIGTERM or Ctrl-C stops
+the server.
 
-| Flag                 | Default         | Meaning                                                |
-| -------------------- | --------------- | ------------------------------------------------------ |
-| `--token`            | required        | The bot's token.                                       |
-| `--port`, `--host`   | 8081, 127.0.0.1 | Where to listen. `--port 0` picks a free port.         |
-| `--username`         | `example_bot`   | The bot's username.                                    |
-| `--config`           | none            | A JSON file with `chats` and `publicChats`.            |
-| `--unimplemented-ok` | off             | Answer `true` to unsupported methods that return True. |
-| `--record-dir`       | none            | Where recordings are written.                          |
+| Flag                 | Default         | Meaning                                                 |
+| -------------------- | --------------- | ------------------------------------------------------- |
+| `--token`            | required        | The bot's token.                                        |
+| `--port`, `--host`   | 8081, 127.0.0.1 | Where to listen. `--port 0` picks a free port.          |
+| `--username`         | `example_bot`   | The bot's username.                                     |
+| `--config`           | none            | A JSON file with `chats` and `publicChats`.             |
+| `--unimplemented-ok` | off             | Answer `true` to unsupported methods that return True.  |
+| `--ui`               | off             | Serve the [chat viewer](#watch-the-chats-in-a-browser). |
+| `--record-dir`       | none            | Where [recordings](#record-a-scenario) are written.     |
 
 These are all the flags; there is no `--help`. Without `--token` it prints its usage line, and an
 unknown flag stops it with an error.
@@ -1119,7 +1338,8 @@ deliveries routes take camelCase fields, like their JavaScript methods.
   ([Time](#time)).
 - `clockWebhook` (default none): an `http(s)` URL. With a manual clock, the server POSTs
   `{ now, mode }` there after each `advanceTime` and each restore, so the app under test can follow
-  the clock. The bot's own webhook deliveries stay as Telegram sends them.
+  the clock ([Testing time-based app logic](#testing-time-based-app-logic)). The bot's own webhook
+  deliveries stay as Telegram sends them.
 - `ui` (default `false`): serve the [chat viewer](#watch-the-chats-in-a-browser) at
   `server.viewerUrl`, to this computer only. It needs a loopback or wildcard `host`; another throws
   `ui needs a loopback or wildcard host`.
@@ -1131,8 +1351,9 @@ deliveries routes take camelCase fields, like their JavaScript methods.
 ### Test actions
 
 `startTestServer()` returns the server with these methods; `server.origin` is its base URL, for
-the bot's Bot API root. Each action resolves once the update it causes has been handed to the bot
-([Make users act](#make-users-act)). The owner account actions are in the
+the bot's Bot API root, and `server.viewerUrl` the [chat viewer](#watch-the-chats-in-a-browser)'s
+address (`null` without `ui: true`). Each action resolves once the update it causes has been
+handed to the bot ([Make users act](#make-users-act)). The owner account actions are in the
 [owner accounts reference][owner-docs].
 
 **Users**
@@ -1228,8 +1449,14 @@ the bot's Bot API root. Each action resolves once the update it causes has been 
   members.
 - `getCalls()`: every Bot API call received, with the bot that made it, and any unsupported
   methods called ([Call receipts](#call-receipts)).
-
-**Bots and chats**
+- `getMessageLog(chatId, { since, includeDeleted, botId, epoch })`: the chat's messages stored
+  after the cursor `since` (default 0), oldest first, as `{ chat_id, epoch, cursor, messages }`;
+  with `includeDeleted`, deleted ones too, with who deleted them. A user id reads their private
+  chats, and `botId` keeps one bot's. An `epoch` other than the server's fails
+  ([Message log and delivered updates](#message-log-and-delivered-updates)).
+- `getBotUpdates(botId, { type, chatId, since, epoch })`: the updates the bot was sent after the
+  `update_id` `since`, in order, as `{ bot_id, epoch, updates }`, each with its type, chat, state
+  and the exact update.
 
 - `addBot({ token, username, firstName, loginClientSecret, supportsJoinRequestQueries })`: another
   bot, with its own webhook or update queue; it is in no chat yet. Returns the bot's user, with
@@ -1314,6 +1541,12 @@ same):
   `{ exists, deleted, message, author }`, where `author` is the author's user id, and finds
   ephemeral messages by author and text too. To tell apart the same ephemeral text sent to two
   members, read each one with `getEphemeralMessage`.
+  It can instead, with or without an author, match `contains` (a part of the text or caption),
+  `matches` (a `RegExp`, or `{ source, flags }` over HTTP; the `g` and `y` flags are dropped),
+  `buttonText` and `buttonData` (an inline button's exact text and `callback_data`, the same button
+  when both are given). Every field given must hold. With these, it resolves with the oldest
+  match, ephemeral messages included, and `since` (a
+  [message log](#message-log-and-delivered-updates) cursor) skips messages stored up to it.
 - `{ kind: "member", chatId, userId, status }` reads the member's status in the chat, which every
   bot in it shares. `permissions` compares the returned `ChatMember`'s permission fields. It
   resolves with the `ChatMember`.
@@ -1325,6 +1558,17 @@ same):
   (as text: [Call receipts](#call-receipts)), `afterSeq` (which counts within each list),
   `requestId`, `outcome` and `stage`. Without `outcome` or `stage`, it can resolve as soon as the
   call is received, before it runs. It resolves with the receipt.
+- `{ kind: "quiet", ms, botIds }` holds when no bot has an update it has not confirmed, a Bot API
+  call in progress (a long poll aside, a delayed or held call included) or a webhook attempt
+  running; no test action, owner client call, clock advance or restore is under way; and `ms`
+  milliseconds of wall time have passed since a bot's last call arrived or was answered. `ms` is 1
+  to 30000 and below the wait's `timeoutMs`. `botIds` limits it to those bots (`[]`: test-side
+  work only). It resolves with `{ quiet: true, idleMs }`; a timeout reports what was still in
+  progress.
+- `{ kind: "update", botId, type, chatId, afterUpdateId, state }` looks at the updates the bot was
+  sent ([getBotUpdates](#message-log-and-delivered-updates)) after `afterUpdateId`: `type` is one
+  type or a list, and `state` is `pending`, `delivered` or `dropped`. It resolves with the first
+  match.
 
 ### Control API
 
@@ -1379,6 +1623,9 @@ API routes do; only the viewer (`/_fake/ui`) answers this computer alone. Keep t
   `{ caller_user_id, bot_username, text }` in the group; returns `{ message_id }`.
 - `GET chats/:id/messages`: an array of the messages not deleted, newest first, as
   `getMessages` returns it.
+- `GET chats/:id/messages?since=&include_deleted=&epoch=`: with any of these, the message log as
+  `getMessageLog` returns it: `{ chat_id, epoch, cursor, messages }`. `include_deleted` is `true`
+  or `1`. A bad `since` answers 400, and an `epoch` other than the server's 409.
 - `GET chats/:id/messages/:messageId`: `{ exists, deleted, message, reactions }`, reactions by user
   id.
 - `GET chats/:id/ephemeral-messages/:eid`: `{ exists, deleted, message }` for the ephemeral message
@@ -1408,6 +1655,8 @@ count.
 - `POST users/:id/dm/:messageId/vote`: the user `{ option_ids }` votes in a poll the bot sent
   privately.
 - `GET users/:id/dm`: an array of the private chat's messages, newest first.
+- `GET users/:id/dm?since=&include_deleted=&bot_id=&epoch=`: with any of these, the user's
+  private chats as a message log, like `GET chats/:id/messages?since=`; `bot_id` keeps one bot's.
 
 **Bots and chats**
 
@@ -1458,6 +1707,8 @@ count.
 - `GET failures`, `DELETE failures`: the failure rules still waiting, or clear them.
 - `GET calls`: every Bot API call received, with the bot that made it, and the unsupported methods
   called.
+- `GET bots/:id/updates?type=&chat_id=&since=&epoch=`: the updates the bot was sent, as
+  `getBotUpdates` returns them; `type` is comma-separated. An unknown bot answers 400.
 - `POST updates/:updateId/redeliver`: deliver that update again to its bot's webhook
   `{ bot_id? }`; 404 for an unknown update, 409 when the bot has no webhook or `bot_id` must name
   one of several bots that got it. Returns `{ update_id }`.
@@ -1760,17 +2011,25 @@ fields below.
 
 ## Changes
 
-- **0.12.0**: watch and record what happens in the chats, and observe a run more closely.
-  - New: the `ui` option serves a live chat viewer at `server.viewerUrl`
+- **0.12.0**: watch and record what happens in the chats, observe a run more closely, and let the
+  app under test follow the manual clock.
+  - New: the `ui` option (`--ui`) serves a live chat viewer at `server.viewerUrl`
     ([Watch the chats in a browser](#watch-the-chats-in-a-browser)), with the bots' calls beside
     the chats they acted on ([Call timeline](#call-timeline)).
-  - New: `startRecording` and `stopRecording` keep a scenario as an HTML page that opens offline,
-    and its JSON twin; the `recordDir` option writes them ([Record a scenario](#record-a-scenario)).
-  - New: `waitFor` waits for `{ kind: "quiet", ms }` and `{ kind: "update" }`, and matches messages
-    by `contains`, `matches`, `buttonText` and `buttonData`; `getMessageLog` lists every message
-    stored after a mark, deleted ones flagged; `getBotUpdates` lists the updates each bot was sent.
+  - New: `startRecording` and `stopRecording` (`POST /_fake/record/start` and `/stop`) keep a
+    scenario as an HTML page that opens offline, and its JSON twin; the `recordDir` option
+    (`--record-dir`) writes them ([Record a scenario](#record-a-scenario)).
+  - New: `waitFor` waits for `{ kind: "quiet", ms }` and `{ kind: "update" }`, and finds messages
+    by `contains`, `matches`, `buttonText`, `buttonData` and `since`
+    ([Check what the bot did](#check-what-the-bot-did)).
+  - New: `getMessageLog` lists every message stored after a mark, deleted ones flagged with the
+    bot that deleted them, and `getBotUpdates` lists the updates each bot was sent
+    ([Message log and delivered updates](#message-log-and-delivered-updates)).
   - New: the `clockWebhook` option and `telegram-bot-test-server/clock` (`fakeClockNow`,
-    `refreshFakeClock`, `fakeClockHandler`) let the app under test follow the manual clock.
+    `refreshFakeClock`, `fakeClockHandler`, `receiveFakeClock`)
+    ([Testing time-based app logic](#testing-time-based-app-logic)).
+  - New: call receipts have `description`, the text the answer carried
+    ([Call receipts](#call-receipts)).
 - **0.11.0**: the server answers as Telegram does wherever 0.10.0 did not, checked against the Bot
   API docs and the source of Telegram's Bot API server and TDLib: channel posts, who receives which
   update, webhook retries and concurrency, per-bot updates and file ids, ephemeral messages, invite
