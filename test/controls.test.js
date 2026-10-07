@@ -936,7 +936,11 @@ it("ends a restriction on a running clock when advanceTime jumps past it, or whe
 
   await restrict(user, 3600);
   const userUnmuted = unmuted(user);
+  // The advance itself runs the restriction's end, before any timer could:
+  // nothing is left scheduled.
+  expect((await fake.getClock()).scheduled).toBe(1);
   await fake.advanceTime(3_601_000);
+  expect((await fake.getClock()).scheduled).toBe(0);
   expect(await userUnmuted).toMatchObject({ status: "member" });
 
   // 32 seconds: a jump of 30 leaves one to two, which pass on their own.

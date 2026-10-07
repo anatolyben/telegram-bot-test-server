@@ -940,7 +940,8 @@ function renderKeyboard(markup) {
  * it, in the order the server gives (state.js reactionsOf). In the test's
  * view a chip names who chose it on hover; seen as a member, it marks the
  * member's own (td_api messageReaction.is_chosen) and names nobody. `meta`
- * (the time) ends the row.
+ * (the time) ends the row. A screen reader reads each chip as one image
+ * named by the same: its emoji, how many, and who or "your reaction".
  */
 function renderReactions(item, ctx, meta = "") {
   const reactions = Array.isArray(item.reactions) ? item.reactions : [];
@@ -951,16 +952,20 @@ function renderReactions(item, ctx, meta = "") {
       const custom = reaction.type === "custom_emoji";
       const mine = ctx.as != null && ids.includes(Number(ctx.as));
       const count = String(Number(reaction.total_count) || 0);
+      const what = custom
+        ? `custom emoji ${reaction.custom_emoji_id ?? ""}`
+        : String(reaction.emoji ?? "");
+      const people =
+        ctx.as == null ? ids.map((id) => personName(ctx, id)).join(", ") : "";
       const title = [
-        custom ? `custom emoji ${reaction.custom_emoji_id ?? ""}` : null,
-        ctx.as == null
-          ? ids.map((id) => personName(ctx, id)).join(", ")
-          : mine
-            ? "your reaction"
-            : null,
+        custom ? what : null,
+        people || (mine ? "your reaction" : null),
       ]
         .filter(Boolean)
         .join(" · ");
+      const label = people
+        ? `${what}, ${count}: ${people}`
+        : `${what}, ${count}${mine ? ", your reaction" : ""}`;
       return el(
         "span",
         {
@@ -972,6 +977,8 @@ function renderReactions(item, ctx, meta = "") {
           "data-reaction-user-ids": ctx.as == null ? ids.join(" ") : null,
           "data-reaction-mine": mine,
           title: title || null,
+          role: "img",
+          "aria-label": label,
         },
         custom
           ? '<span class="tv-reaction-emoji tv-reaction-custom" aria-hidden="true">☺</span>'

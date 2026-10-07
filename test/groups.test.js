@@ -282,6 +282,8 @@ describe("opening a URL button", () => {
     const { message_id } = await sendButtons(api, group, [
       { text: "I'm human", url },
       { text: "Start", url: "tg://resolve?domain=ModBot&start=" },
+      { text: "Subdomain", url: "https://modbot.t.me/?start=sub_1" },
+      { text: "Preview", url: "https://t.me/s/modbot?start=s_1" },
     ]);
     // Ann never wrote to the bot, so it cannot write to her yet.
     expect(
@@ -315,22 +317,33 @@ describe("opening a URL button", () => {
     ).toBe(true);
 
     // The chat has messages now, and the link sends /start again. The second
-    // button, by its index, is a tg:// link with an empty parameter.
-    await fake.openUrlButton(group, message_id, ann, 0);
-    await fake.openUrlButton(group, message_id, ann, 1);
+    // button, by its index, is a tg:// link with an empty parameter. TDLib
+    // reads <bot>.t.me as t.me/<bot>, and drops t.me's /s/.
+    for (const index of [0, 1, 2, 3]) {
+      await fake.openUrlButton(group, message_id, ann, index);
+    }
     await expect
       .poll(() => privateMessages(hook).map((message) => message.text))
-      .toEqual(["/start verify_123", "/start verify_123", "/start"]);
+      .toEqual([
+        "/start verify_123",
+        "/start verify_123",
+        "/start",
+        "/start sub_1",
+        "/start s_1",
+      ]);
   });
 
   it("adds the bot to the group the person picks for a startgroup link, with the rights it asks for", async () => {
     const { fake, api, hook, me } = await setup();
     const { group } = await groupWithAnn(fake, me);
     const shop = await fake.createChat({ title: "Shop", ownerId: OWNER });
+    // startgroup comes first, so it decides.
     const url =
-      "https://t.me/modbot?startgroup=ws_1&admin=delete_messages+restrict_members+post_messages";
+      "https://t.me/modbot?startgroup=ws_1&start=other&admin=delete_messages+restrict_members+post_messages";
+    const postOnly = "https://t.me/modbot?startgroup=x&admin=post_messages";
     const { message_id } = await sendButtons(api, group, [
       { text: "Add me", url },
+      { text: "Post only", url: postOnly },
     ]);
     const before = hook.updates.length;
 
@@ -366,6 +379,21 @@ describe("opening a URL button", () => {
         text: "/start@modbot ws_1",
       },
     );
+
+    // A group has no post_messages, so a link that asks only for it asks
+    // for no rights, and the bot joins as a member.
+    const den = await fake.createChat({ title: "Den", ownerId: OWNER });
+    expect(
+      await fake.openUrlButton(group, message_id, OWNER, "Post only", {
+        addToChatId: den,
+      }),
+    ).toEqual({
+      url: postOnly,
+      link: "startgroup",
+      bot_id: me.id,
+      chat_id: den,
+    });
+    expect((await fake.getMember(den, me.id)).status).toBe("member");
   });
 
   it("adds the bot to a channel for a startchannel link with rights", async () => {
@@ -417,6 +445,15 @@ describe("opening a URL button", () => {
       "https://t.me/modbot",
       "https://t.me/modbot?start=not.valid",
       "https://t.me/+AbCdEf",
+      "https://example.com/modbot?start=x",
+      // The first argument TDLib knows decides: a mini app, an affiliate
+      // program, a message, a web app.
+      "https://t.me/modbot?startapp=x&start=y",
+      "https://t.me/modbot?ref=r&start=z",
+      "https://t.me/modbot?start=_tgr_abc",
+      "https://t.me/modbot/42?start=x",
+      "https://t.me/modbot/shop?start=x",
+      "tg://resolve?domain=modbot&post=7&start=x",
     ];
     const { message_id } = await sendButtons(
       api,
@@ -431,15 +468,20 @@ describe("opening a URL button", () => {
       });
     }
 
+    // Someone outside the chat opens a button too, as they press one.
+    const outsider = await fake.createUser();
+    expect(await fake.openUrlButton(group, message_id, outsider, 0)).toEqual({
+      url: urls[0],
+    });
+
     expect((await fake.getBotUpdates(me.id)).updates).toHaveLength(before);
     expect(await fake.getDirectMessages(ann)).toEqual([]);
   });
 
-  it("refuses a button that is not a URL button, and a person who cannot see the message", async () => {
+  it("refuses a button that is not a URL button, a link without the chat it needs, and a start link to another bot", async () => {
     const { fake, api, me } = await setup();
     await fake.addBot({ token: OTHER_TOKEN, username: "otherbot" });
     const { group, ann } = await groupWithAnn(fake, me);
-    const outsider = await fake.createUser();
     const channel = await fake.createChat({ type: "channel", ownerId: OWNER });
     const { message_id } = await sendButtons(api, group, [
       { text: "Vote", callback_data: "vote" },
@@ -452,7 +494,6 @@ describe("opening a URL button", () => {
     await expect(open(ann, "Vote")).rejects.toThrow(/not a URL button/);
     await expect(open(ann, "Nope")).rejects.toThrow(/no button/);
     await expect(open(ann, 3)).rejects.toThrow(/no button/);
-    await expect(open(outsider, 1)).rejects.toThrow(/Can't access the chat/);
     // A startgroup link needs the group the person picks.
     await expect(open(OWNER, "Add me")).rejects.toThrow(/add_to_chat_id/);
     await expect(
@@ -1014,81 +1055,6 @@ describe("people promoting and demoting members", () => {
     expect((await fake.demoteMember(group, bob, { by: carl })).status).toBe(
       "member",
     );
-  });
-
-  it("keeps who promoted an administrator when the owner edits their rights", async () => {
-    const { fake, api, hook, me } = await setup();
-    const group = await fake.createChat({ ownerId: OWNER });
-    await fake.setBotMembership(group, me.id, {
-      status: "administrator",
-      rights: { can_promote_members: true },
-    });
-    const [ann, bob, carl] = [
-      await fake.createUser(),
-      await fake.createUser(),
-      await fake.createUser(),
-    ];
-    for (const user of [ann, bob, carl]) await fake.join(group, user);
-    const promoted = await api("promoteChatMember", {
-      chat_id: group,
-      user_id: ann,
-      can_delete_messages: true,
-    });
-    expect(promoted.ok).toBe(true);
-    await fake.promoteMember(group, bob, {
-      rights: { can_promote_members: true, can_delete_messages: true },
-    });
-    await fake.promoteMember(group, carl, {
-      by: bob,
-      rights: { can_delete_messages: true },
-    });
-
-    // The owner edits both; the bot and Bob still promoted them.
-    await fake.promoteMember(group, ann, {
-      rights: { can_delete_messages: true, can_pin_messages: true },
-    });
-    await fake.promoteMember(group, carl, {
-      rights: { can_delete_messages: true, can_invite_users: true },
-    });
-
-    expect(
-      (await api("getChatMember", { chat_id: group, user_id: ann })).result,
-    ).toMatchObject({ can_be_edited: true, can_pin_messages: true });
-    await expect
-      .poll(
-        () =>
-          hook
-            .ofType("chat_member")
-            .filter((change) => change.new_chat_member.user.id === ann)
-            .at(-1),
-      )
-      .toMatchObject({
-        from: { id: OWNER },
-        new_chat_member: { can_be_edited: true, can_pin_messages: true },
-      });
-    const edited = await api("promoteChatMember", {
-      chat_id: group,
-      user_id: ann,
-      can_delete_messages: true,
-    });
-    expect(edited.ok).toBe(true);
-    const titled = await api("setChatAdministratorCustomTitle", {
-      chat_id: group,
-      user_id: ann,
-      custom_title: "Helper",
-    });
-    expect(titled.ok).toBe(true);
-    expect(
-      await fake.promoteMember(group, carl, {
-        by: bob,
-        rights: { can_delete_messages: true },
-      }),
-    ).toMatchObject({ status: "administrator", can_invite_users: false });
-    // Nobody else became able to edit them.
-    expect(
-      (await api("getChatMember", { chat_id: group, user_id: carl })).result
-        .can_be_edited,
-    ).toBe(false);
   });
 
   it("lets only a basic group's creator promote, with the group's fixed rights", async () => {

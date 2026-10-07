@@ -789,6 +789,10 @@ it("pushes a running clock's offset, and fakeClockNow keeps moving between reads
   expect(pushes.map((push) => push.offset)).toEqual([HOUR, 2 * HOUR, HOUR]);
   appNow(HOUR);
   await fake.releaseSnapshot(snapshot);
+  // A read after a jump keeps the offset too.
+  await fake.advanceTime(HOUR);
+  await refreshFakeClock();
+  appNow(2 * HOUR);
 
   expect(() => receiveFakeClock({ now: NOW, mode: "running" })).toThrow(
     TypeError,

@@ -1550,59 +1550,185 @@ function linkRights(args, kind) {
   );
 }
 
+// The t.me subdomains that name no user (TDLib LinkManager get_link_info).
+const T_ME_RESERVED_SUBDOMAINS = new Set(
+  "addemoji addlist addstickers addstyle addtheme auction auth boost call confirmphone contact giftcode invoice joinchat login m nft proxy setlanguage share socks web a k z".split(
+    " ",
+  ),
+);
+
+/** A username as TDLib's is_valid_username reads it (td/telegram/misc.cpp). */
+function validUsername(name) {
+  return (
+    name.length <= 32 &&
+    /^[A-Za-z][A-Za-z0-9_]*$/.test(name) &&
+    !name.endsWith("_") &&
+    !name.includes("__")
+  );
+}
+
+/** A story, album or gift collection id in a link: a positive 32-bit integer. */
+function linkId(text) {
+  return /^\d{1,10}$/.test(text) && Number(text) > 0 && Number(text) < 2 ** 31;
+}
+
+/**
+ * What TDLib's parse_t_me_link_query or parse_tg_link_query (tg) makes of
+ * one argument of a link to a username: "start", "startgroup",
+ * "startchannel", "other" for a link of another kind (a video chat, a boost,
+ * an affiliate program, a mini app, a game, an attachment menu bot, direct
+ * messages, a story, an album or a gift collection), or null for an argument
+ * it does not know, which it skips. A start parameter has only base64url
+ * characters (is_valid_start_parameter). A start parameter that begins with
+ * "_tgr_", TDLib's default prefix of an affiliate program's referrer, makes
+ * an affiliate program link.
+ */
+function linkArgument([key, value], args, tg) {
+  const valid = /^[\w-]*$/.test(value);
+  const first = (name) => args.find(([other]) => other === name)?.[1] ?? "";
+  switch (key) {
+    case "voicechat":
+    case "videochat":
+    case "livestream":
+      return valid ? "other" : null;
+    case "boost":
+      return tg ? null : "other";
+    case "ref":
+      return valid && value !== "" ? "other" : null;
+    case "start":
+      if (!valid) return null;
+      return value.startsWith("_tgr_") && value.length > 5 ? "other" : "start";
+    case "startgroup":
+      return valid ? "startgroup" : null;
+    case "startchannel":
+      return linkRights(args, "channel") ? "startchannel" : null;
+    case "startapp":
+      return valid && !(tg && args.some(([other]) => other === "appname"))
+        ? "other"
+        : null;
+    case "game":
+      return value.length >= 3 && validUsername(value) ? "other" : null;
+    case "attach":
+      return validUsername(value) ? "other" : null;
+    case "startattach":
+      return first("attach") === "" ? "other" : null;
+    case "direct":
+      return "other";
+    case "appname":
+      return tg && value.length >= 3 && validUsername(value) ? "other" : null;
+    case "story":
+      return tg && (linkId(value) || value === "live") ? "other" : null;
+    case "collection":
+    case "album":
+      return tg && linkId(value) ? "other" : null;
+    default:
+      return null;
+  }
+}
+
 /**
  * What a link to a username asks a bot for, as TDLib's LinkManager reads it
  * (get_link_info, parse_tg_link_query, parse_t_me_link_query). The link is
- * https://t.me/<username> (telegram.me and telegram.dog alike) or
- * tg://resolve?domain=<username>, and the first of these arguments decides:
- * start=<parameter> starts the bot in a private chat, startgroup=<parameter>
- * adds it to a group, and startchannel adds it to a channel, with the rights
- * admin= asks for. A parameter has only base64url characters, maybe none
- * (is_valid_start_parameter), and a startchannel link without rights is not
- * one. Returns { username, kind, parameter, rights }, or null for any other
- * link.
+ * https://t.me/<username> (telegram.me and telegram.dog alike, t.me/s/ the
+ * same), https://<username>.t.me/ or tg://resolve?domain=<username>, and the
+ * first argument TDLib knows decides (linkArgument): start=<parameter>
+ * starts the bot in a private chat, startgroup=<parameter> adds it to a
+ * group, and startchannel adds it to a channel, with the rights admin= asks
+ * for; any other kind of link is not one. So is a link to a message, a
+ * story, an album, a gift collection or a web app, which its path names.
+ * Returns { username, kind, parameter, rights }, or null for any other link.
  */
 function botLink(url) {
   let link = String(url);
   if (link.includes("#")) link = link.slice(0, link.indexOf("#"));
+  const tg = link.slice(0, 3).toLowerCase() === "tg:";
   let username;
   let args;
-  if (link.slice(0, 3).toLowerCase() === "tg:") {
+  if (tg) {
     const rest = link.slice(3);
     const query = urlQuery(rest.startsWith("//") ? rest.slice(2) : rest);
     if (query.path.length !== 1 || query.path[0] !== "resolve") return null;
     username = query.args.find(([key]) => key === "domain")?.[1] ?? "";
     args = query.args;
+    // resolve?domain=<username>&post=<id> is a message link.
+    if (args.find(([key]) => key === "post")?.[1]) return null;
   } else {
     if (unparsableUrl(link)) return null;
     const parts = urlParts(link);
-    const host = parts.host.replace(/^www\./, "");
     if (
       !["http", "https"].includes(parts.protocol) ||
       parts.userinfo ||
-      ![0, 80, 443].includes(parts.port) ||
-      !["t.me", "telegram.me", "telegram.dog"].includes(host)
+      ![0, 80, 443].includes(parts.port)
     ) {
       return null;
     }
-    const query = urlQuery(parts.query);
-    if (query.path.length !== 1) return null;
-    [username] = query.path;
+    let host = parts.host;
+    try {
+      host = decodeURIComponent(host).toLowerCase();
+    } catch {
+      // TDLib's url_decode keeps what it cannot read.
+    }
+    let path = parts.query;
+    const subdomain = /^([^.]{4,})\.t\.me$/.exec(host)?.[1];
+    if (
+      subdomain &&
+      validUsername(subdomain) &&
+      !T_ME_RESERVED_SUBDOMAINS.has(subdomain)
+    ) {
+      path = `/${subdomain}${parts.query}`;
+    } else {
+      if (
+        !["t.me", "telegram.me", "telegram.dog"].includes(
+          host.replace(/^www\./, ""),
+        )
+      ) {
+        return null;
+      }
+      // t.me/s/<username> is the same link (a channel's preview page).
+      while (path.startsWith("/s/") || path.startsWith("/%73/")) {
+        path = path.slice(path.startsWith("/s/") ? 2 : 4);
+      }
+    }
+    const query = urlQuery(path);
+    if (query.path.length === 0 || query.path[0] === "") return null;
+    const [name, second, third] = query.path;
+    if (second !== undefined && Number(/^\d*/.exec(second)[0]) > 0) {
+      return null; // a message: /<username>/<message id>
+    }
+    if (
+      query.path.length === 3 &&
+      ((["s", "c", "a"].includes(second) && linkId(third)) ||
+        (second === "s" && third === "live"))
+    ) {
+      return null; // a story, a gift collection or an album
+    }
+    if (
+      query.path.length === 2 &&
+      second.length >= 3 &&
+      validUsername(second)
+    ) {
+      return null; // a web app: /<username>/<app name>
+    }
+    username = name;
     args = query.args;
   }
-  for (const [key, value] of args) {
-    const parameter = /^[\w-]*$/.test(value) ? value : null;
-    if (key === "start" && parameter != null) {
-      return { username, kind: "start", parameter, rights: null };
+  for (const argument of args) {
+    const kind = linkArgument(argument, args, tg);
+    if (kind === null) continue;
+    if (kind === "other") return null;
+    if (kind === "start") {
+      return { username, kind, parameter: argument[1], rights: null };
     }
-    if (key === "startgroup" && parameter != null) {
+    if (kind === "startgroup") {
       const rights = linkRights(args, "group");
-      return { username, kind: "startgroup", parameter, rights };
+      return { username, kind, parameter: argument[1], rights };
     }
-    const rights = key === "startchannel" ? linkRights(args, "channel") : null;
-    if (rights) {
-      return { username, kind: "startchannel", parameter: "", rights };
-    }
+    return {
+      username,
+      kind,
+      parameter: "",
+      rights: linkRights(args, "channel"),
+    };
   }
   return null;
 }
@@ -3564,15 +3690,13 @@ export async function startTestServer({
             chat.type === "group"
               ? { ...BASIC_GROUP_ADMIN_RIGHTS }
               : { ...granted, can_manage_chat: true },
-          // An edit keeps who promoted them, so the bot that did still edits
-          // them (can_be_edited). TDLib keeps an edited administrator's
-          // promoted_by (update_channel_participant_status_cache), as does
-          // Telegram Desktop (applyAdminLocally). UNVERIFIED: Telegram's
-          // server, which sets promoted_by and can_edit, is not published.
-          promotedBy:
-            current.status === "administrator" && current.promotedBy != null
-              ? current.promotedBy
-              : actor.id,
+          // The person who promotes or edits them is their promoter, so no
+          // bot may edit them (can_be_edited). UNVERIFIED for an edit:
+          // TDLib's member cache (update_channel_participant_status_cache)
+          // and Telegram Desktop (applyAdminLocally) keep the earlier
+          // promoted_by, but Telegram's server, which sets promoted_by and
+          // can_edit, is not published.
+          promotedBy: actor.id,
           ...keptTitle(current),
         }
       : { status: "member" };
@@ -9388,10 +9512,10 @@ export async function startTestServer({
    * - startgroup and startchannel: the person adds the bot to the group or
    *   channel they pick (add_to_chat_id), as addBotViaLink does.
    * A link to a username that is no bot here does nothing either; UNVERIFIED
-   * for a deleted bot's username, which Telegram does not document. The
-   * person must see the message: be in the chat, or be an ephemeral
-   * message's receiver. UNVERIFIED: these refusals are this server's, since
-   * the app asks Telegram nothing.
+   * for a deleted bot's username, which Telegram does not document. Only an
+   * ephemeral message's receiver opens its buttons; anyone else opens a
+   * button as anyone presses one (pressButton). UNVERIFIED: these refusals
+   * are this server's, since the app asks Telegram nothing.
    */
   async function openUrlButton(
     chat,
@@ -9408,9 +9532,6 @@ export async function startTestServer({
         400,
         "Only the receiver of an ephemeral message sees it",
       );
-    }
-    if (!receiver && chat.type !== "private" && !isInChat(chat, user.id)) {
-      throw new TelegramError(400, "Can't access the chat");
     }
     const buttons = entry.message.reply_markup?.inline_keyboard?.flat() ?? [];
     let found;
@@ -9725,6 +9846,12 @@ export async function startTestServer({
    * A member sets their reaction on a message (one emoji, or none to take it
    * back). Telegram tells the chat's administrator bots through
    * message_reaction, when they asked for it in allowed_updates.
+   *
+   * TDLib refuses a reaction that is not available on the message with this
+   * text (MessagesManager::add_message_reaction). It reads an emoji "$" or
+   * "#…" as no reaction (ReactionType.cpp), so those are refused too.
+   * UNVERIFIED: the available reactions are taken to be the Bot API's
+   * ReactionTypeEmoji list; Telegram sends its own list, which can change.
    */
   async function reactByMember(chat, messageId, { user_id: userId, emoji }) {
     const user = requireUser(userId);
@@ -9734,6 +9861,12 @@ export async function startTestServer({
     }
     if (!isInChat(chat, user.id)) {
       throw new TelegramError(403, "CHAT_WRITE_FORBIDDEN");
+    }
+    if (emoji && !REACTION_EMOJI.has(String(emoji))) {
+      throw new TelegramError(
+        400,
+        "The reaction isn't available for the message",
+      );
     }
     return changeReaction(chat, entry, user, emoji ? [String(emoji)] : []);
   }

@@ -126,26 +126,26 @@ gets `Not enough rights`. In a basic group only the creator promotes
 before anything else. There every administrator has the group's fixed rights, as TDLib reads them,
 since Telegram keeps only whether someone is one. A change to what the member already has succeeds
 without an update, and demoting someone who is not an administrator changes nothing. Otherwise the
-chat's administrator bots get `chat_member` from the person, and no bot may edit an administrator
-the person promoted (`can_be_edited` is false). An edit keeps the custom title and who promoted the
-administrator: after the owner edits one a bot promoted, that bot still edits and titles them, and
-its `can_be_edited` stays true. In a basic group, Telegram's apps add someone outside it first;
-this server does not, and refuses them (`the user is not in the chat; add them first`).
+chat's administrator bots get `chat_member` from the person. The person is then the
+administrator's promoter, so no bot may edit them (`can_be_edited` is false), also after an edit of
+an administrator a bot promoted. An edit keeps the custom title. In a basic group, Telegram's apps
+add someone outside it first; this server does not, and refuses them
+(`the user is not in the chat; add them first`).
 Unverified: that an administrator may demote themselves, as TDLib allows; that someone outside a
 supergroup or channel is refused (`USER_NOT_PARTICIPANT`), where TDLib asks Telegram to promote
 them directly; and that a change to nothing new succeeds in a basic group, where TDLib asks
 Telegram all the same.
 
-Telegram's server decides `can_be_edited`, and its code is not published, but Telegram's other
-sources agree. The Bot API's `can_be_edited` says whether "the bot is allowed to edit administrator
-privileges", and `setChatAdministratorCustomTitle` takes an administrator "promoted by the bot";
-the Bot API server refuses it when `can_be_edited` is false. Telegram sends it as
-`channelParticipantAdmin.can_edit`, which TDLib passes on as it is, beside `promoted_by`, the user
-who promoted the administrator. One method, `channels.editAdmin`, both promotes and edits. When
-their own user edits an administrator, [TDLib's member cache][tdlib-participants]
-(`update_channel_participant_status_cache`) and [Telegram Desktop][tdesktop-participants]
-(`applyAdminLocally`) keep the earlier `promoted_by`. Unverified: that Telegram's server keeps it
-too, and with it the promoter's `can_edit`.
+Telegram's server decides `can_be_edited`, and its code is not published. The Bot API's
+`can_be_edited` says whether "the bot is allowed to edit administrator privileges", and
+`setChatAdministratorCustomTitle` takes an administrator "promoted by the bot"; the Bot API server
+refuses it when `can_be_edited` is false. Telegram sends it as `channelParticipantAdmin.can_edit`,
+which TDLib passes on as it is, beside `promoted_by`, the user who promoted the administrator. One
+method, `channels.editAdmin`, both promotes and edits. When their own user edits an administrator,
+[TDLib's member cache][tdlib-participants] (`update_channel_participant_status_cache`) and
+[Telegram Desktop][tdesktop-participants] (`applyAdminLocally`) keep the earlier `promoted_by`.
+These are the apps' own copies, not what Telegram's server answers. Unverified: whether Telegram's
+server also keeps the earlier promoter, and with it the bot's `can_edit`, after a person's edit.
 
 Telegram's docs: [ChatMemberAdministrator][bot-api-chat-member-administrator],
 [channelParticipantAdmin](https://core.telegram.org/constructor/channelParticipantAdmin),
@@ -518,7 +518,12 @@ in private, as TDLib allows; the bot gets the message but none of its votes.
 ### Reactions
 
 A member's reaction reaches the chat's administrator bots as `message_reaction`, only when they list
-it in `allowed_updates`, as on Telegram. A bot sets at most one reaction, and only an emoji from the
+it in `allowed_updates`, as on Telegram. A member reacts only with a reaction the message has
+available, as TDLib's `addMessageReaction` checks; any other fails with
+`The reaction isn't available for the message`, as does an emoji `$` or one starting with `#`,
+which TDLib reads as no reaction. Unverified: the reactions available are taken to be the
+[ReactionTypeEmoji](https://core.telegram.org/bots/api#reactiontypeemoji) list, while Telegram
+sends its apps a list of its own. A bot sets at most one reaction, and only an emoji from the
 [ReactionTypeEmoji](https://core.telegram.org/bots/api#reactiontypeemoji) list (any other emoji
 fails with `REACTION_INVALID`, and a paid reaction is refused) or a custom emoji, whose
 `custom_emoji_id` must be an integer. A custom emoji is accepted without checking that it is already
@@ -612,9 +617,9 @@ answers a second `answerCallbackQuery` for a query already answered; here it fai
 
 Opening a URL button asks Telegram nothing, so no bot hears of it unless the link is to a bot.
 `openUrlButton` and its ephemeral and private-chat forms read the link as TDLib's `LinkManager`
-does. A bot link is `https://t.me/<bot>` (or `telegram.me`, `telegram.dog`) or
-`tg://resolve?domain=<bot>`; the username matches in any case. The first of these arguments
-decides what it does:
+does. A bot link is `https://t.me/<bot>` (or `telegram.me`, `telegram.dog`, `t.me/s/<bot>`),
+`https://<bot>.t.me/` or `tg://resolve?domain=<bot>`; the username matches in any case. The first
+argument TDLib knows decides what the link does, and three of them reach the bot:
 
 - `start=<parameter>`: the user starts the bot in their private chat. The bot gets
   `/start <parameter>` from them, with a `bot_command` entity over `/start`, as
@@ -630,15 +635,23 @@ decides what it does:
   administrator with those rights. Rights a channel cannot have, such as `pin_messages`, are left
   out, and without rights it is not such a link.
 
-A parameter has only `A-Z`, `a-z`, `0-9`, `_` and `-`; with any other character the link only
-opens the bot's chat. Any other URL, or a link to a username that is no bot on this server, changes
-nothing and comes back. Telegram takes a parameter of up to 64 characters; this server does not
-check the length.
+Any other argument TDLib knows, such as `startapp`, `game`, `ref`, `videochat`, `boost` or
+`direct`, makes a link of another kind. So does a `start` parameter that begins with `_tgr_`, an
+affiliate program's referrer, and a path that names a message, a story or a web app, such as
+`t.me/<bot>/42`. Such a link changes nothing and comes back, as does any other URL, or a link to a
+username that is no bot on this server. A parameter has only `A-Z`, `a-z`, `0-9`, `_` and `-`; with
+any other character the argument is skipped. Telegram takes a parameter of up to 64 characters;
+this server does not check the length.
+
+The parameter is hidden from the user. TDLib's `sendBotStartMessage` keeps the user's own copy as
+plain `/start` (`/start@<bot>` in a group), while the bot gets the parameter. This server keeps one
+copy, the bot's, so `getDirectMessages`, `getMessages` and the viewer show the parameter.
 
 A `start` link to a bot other than the first fails, since users write privately only to the first
-bot here. Unverified, since the app asks Telegram nothing: a user who cannot see the message (who
-is not in the chat, or is not the receiver of an ephemeral message) is refused, as is a button that
-is not a URL button. Also unverified: a link to a deleted bot, which does nothing here.
+bot here. Unverified, since the app asks Telegram nothing: only the receiver of an ephemeral
+message opens its buttons, and a button that is not a URL button is refused. Anyone else opens a
+button, someone outside the chat included, as anyone presses one. Also unverified: a link to a
+deleted bot, which does nothing here.
 
 Telegram's docs: [bot links](https://core.telegram.org/api/links#bot-links),
 [group and channel bot links](https://core.telegram.org/api/links#group-channel-bot-links),

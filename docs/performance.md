@@ -1,10 +1,11 @@
 # Package performance and regression evidence
 
-## 0.12.1
+## 0.13.0
 
-0.12.1 makes pending message and update waits, `drainDeliveries` and `snapshot`/`restore` cheaper.
+0.13.0 makes pending message and update waits, `drainDeliveries` and `snapshot`/`restore` cheaper.
 Answers, updates, receipts, their order and the message or update a wait resolves with are the same
-as on 0.12.0, and the 0.12.0 test suite passes unchanged.
+as on 0.12.0, and the 0.12.0 test suite passes unchanged. The numbers below were measured on these
+changes alone, before the rest of 0.13.0 was added.
 
 - A message wait reads the chat once, then only the messages stored since its last read. An edit,
   a deletion or a restore makes it read the whole chat again.
@@ -27,7 +28,7 @@ right result.
 **Message waits.** 1000 `sendMessage` calls in a group of 10,000 stored messages, while one
 `waitFor` message wait is pending:
 
-| Wait pending                                    | 0.12.0 | 0.12.1 |
+| Wait pending                                    | 0.12.0 | 0.13.0 |
 | ----------------------------------------------- | -----: | -----: |
 | none                                            |  56.75 |   57.6 |
 | `botId` and `text`                              |  733.1 |  59.75 |
@@ -43,7 +44,7 @@ right result.
 **Reply loop.** One group; per step a member posts, a long-polling bot calls `getChatMember` and
 replies, and the test waits for the reply with `waitFor`. The chat grows by 2 messages a step.
 
-| Steps, wait                  | 0.12.0 | 0.12.1 | Last 500 steps, ms per step |
+| Steps, wait                  | 0.12.0 | 0.13.0 | Last 500 steps, ms per step |
 | ---------------------------- | -----: | -----: | --------------------------: |
 | 300, `botId` and `text`      |  101.6 |  89.25 |                             |
 | 300, `contains`              |  131.4 |  90.05 |                             |
@@ -55,7 +56,7 @@ replies, and the test waits for the reply with `waitFor`. The chat grows by 2 me
 **Update waits.** `sendMessage` calls while one update wait is pending, the bot having been sent
 and confirmed 10,000 (or 1,000) message updates:
 
-| Update wait pending                                   | 0.12.0 | 0.12.1 |
+| Update wait pending                                   | 0.12.0 | 0.13.0 |
 | ----------------------------------------------------- | -----: | -----: |
 | none, 10k updates, 1000 calls                         |   73.7 |  69.65 |
 | `edited_message`, 10k updates, 1000 calls             | 6688.9 |   72.5 |
@@ -68,7 +69,7 @@ and confirmed 10,000 (or 1,000) message updates:
 `post` and `drainDeliveries()`. The replying handler awaits `getChatMember` and `sendMessage`
 before it answers; an overlapping drain starts while the post's delivery is in flight.
 
-| Drain                                          | 0.12.0 | 0.12.1 |
+| Drain                                          | 0.12.0 | 0.13.0 |
 | ---------------------------------------------- | -----: | -----: |
 | after the post, webhook answers at once, 20k   |  130.0 |  55.15 |
 | after the post, replying handler, 20k          |  254.8 |  179.0 |
@@ -79,7 +80,7 @@ before it answers; an overlapping drain starts while the post's delivery is in f
 
 **Snapshot and restore.**
 
-| Workload                                                      | 0.12.0 | 0.12.1 |
+| Workload                                                      | 0.12.0 | 0.13.0 |
 | ------------------------------------------------------------- | -----: | -----: |
 | 2000 members, 12k messages, 10k receipts: snapshot (7 rounds) |   67.8 |   21.8 |
 | the same: restore                                             |   72.6 |  56.05 |
@@ -107,7 +108,7 @@ What this means in a test suite:
 - A restore runs once per test case: about 0.11 ms less per case in `bench/reuse.mjs`, and 16.5 ms
   less on the large fixture. A snapshot is taken once per fixture, so its gain is one-off.
 
-The last 0.12.1 change, which makes a snapshot of a value that cannot be copied throw the same
+The last of these changes, which makes a snapshot of a value that cannot be copied throw the same
 `DataCloneError` as 0.12.0, was measured separately: snapshot and restore times did not change.
 
 ## 0.10.0

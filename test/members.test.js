@@ -273,6 +273,32 @@ describe("what members post", () => {
     ]);
   });
 
+  it("refuses a reaction a member cannot choose, and stores and sends nothing", async () => {
+    const { fake, api, member } = await setup();
+    const hook = await startReceiver();
+    await api("setWebhook", {
+      url: hook.url,
+      allowed_updates: ["message", "message_reaction"],
+    });
+    const id = (await api("sendMessage", { chat_id: GROUP, text: "poll" }))
+      .result.message_id;
+
+    // A custom emoji's stored form, the paid reaction, text, and an emoji
+    // that is not on the list.
+    for (const emoji of ["#5368324170671202286", "$", "hello", "🙋"]) {
+      await expect(fake.react(GROUP, id, member, emoji)).rejects.toThrow(
+        "The reaction isn't available for the message",
+      );
+    }
+    expect((await fake.getMessage(GROUP, id)).reactions).toEqual({});
+    await fake.react(GROUP, id, member, "👍");
+
+    await expect.poll(() => hook.ofType("message_reaction").length).toBe(1);
+    expect(hook.ofType("message_reaction")[0].new_reaction).toEqual([
+      { type: "emoji", emoji: "👍" },
+    ]);
+  });
+
   it("sends no reaction updates to a bot that did not ask for them", async () => {
     const { fake, api, member } = await setup();
     const hook = await startReceiver();

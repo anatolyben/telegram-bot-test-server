@@ -5,9 +5,9 @@ especially bots that manage groups. Your bot talks to it instead of Telegram, yo
 users, and then checks what the bot did. It keeps everything in memory and never talks to Telegram,
 so tests need no real accounts, phone numbers or groups, and can run as often as they like in CI.
 
-![The chat viewer in a browser: the chat list; a book club group where a bot welcomes a new member,
-removes a spam link and mutes its author, with each Bot API call beside what it did; and the
-group's members][viewer-desktop]
+![The chat viewer in a browser: the chat list, and a book club group where a bot lets a new member
+in and welcomes her, removes a spam link and mutes its author, with each Bot API call beside what it
+did][viewer-desktop]
 
 **Start:** [Install](#install) · [Quick start](#quick-start) · [How it works](#how-it-works)
 
@@ -1024,9 +1024,10 @@ What it shows, only from what the server stores:
 - **Reactions** under each message: a chip for each emoji or custom emoji, with how many chose
   it, the most chosen first, as TDLib sorts them. A custom emoji's image is not stored, so a mark
   stands in for it (hover for its id). In the test's view, hover a chip for who chose it; seen
-  as a member, their own reaction is marked. Unverified: the order of reactions chosen equally
-  often. TDLib orders them by Telegram's list of active reactions, which this server does not
-  have; here they follow the members who chose them, by when each first reacted to the message.
+  as a member, their own reaction is marked. A screen reader reads the same from each chip's
+  label. Unverified: the order of reactions chosen equally often. TDLib orders them by Telegram's
+  list of active reactions, which this server does not have; here they follow the members who
+  chose them, by when each first reacted to the message.
 - **Deletions**: a deleted message stays, grayed and marked with the bot that deleted it.
 - **Ephemeral messages**, marked with the member who sees them.
 - **Events** Telegram shows as no message: member changes by a bot or a person (restrictions,
@@ -1078,7 +1079,7 @@ created with count as present from the start.
 Here a book club group is seen as its member Carol, in a phone-sized window. The link the bot
 deleted is gone, and her own reactions are marked:
 
-<img src="https://raw.githubusercontent.com/anatolyben/telegram-bot-test-server/main/docs/images/viewer-as-member.png"
+<img src="https://raw.githubusercontent.com/anatolyben/telegram-bot-test-server/v0.13.0/docs/images/viewer-as-member.png"
   alt="The book club group on a phone, seen as Carol: the bot's welcome with its Rules button, the
   messages and their reactions, and no deleted link" width="320">
 
@@ -1612,7 +1613,9 @@ handed to the bot ([Make users act](#make-users-act)). The owner account actions
   get `edited_message` (`edited_channel_post` in a channel). Text that shows nothing fails with
   `MESSAGE_EMPTY`. Returns `{ message_id, edit_date }`.
 - `react(chatId, messageId, userId, emoji)`: the user reacts to a message, or takes the reaction
-  back with `null`. Returns `{ reactions }`.
+  back with `null`. The emoji must be one of the Bot API's reactions
+  ([ReactionTypeEmoji](https://core.telegram.org/bots/api#reactiontypeemoji)); any other fails with
+  `The reaction isn't available for the message`. Returns `{ reactions }`.
 - `pinMessage(chatId, messageId, userId)`: a person with `can_pin_messages` (in a channel,
   `can_edit_messages`) pins the message; bots get the `pinned_message` service message, whose
   `{ message_id }` it returns.
@@ -1642,9 +1645,9 @@ handed to the bot ([Make users act](#make-users-act)). The owner account actions
   private chat with the bot. A `startgroup=<parameter>` or `startchannel` link adds the bot, as the
   user, to the group or channel `addToChatId` names, with the rights its `admin=` asks for, as
   `addBotViaLink` does. Resolves with `{ url }`, and for such a link also `link`, `bot_id`,
-  `chat_id` and, for `start`, the message's `message_id`. Any other URL changes nothing. It fails
-  for a button that is not a URL button, for a user not in the chat, and for a `start` link to a
-  bot other than the first, since users write privately only to the first bot.
+  `chat_id` and, for `start`, the message's `message_id`. Any other URL changes nothing
+  ([URL buttons][behavior-url-buttons]). It fails for a button that is not a URL button, and for a
+  `start` link to a bot other than the first, since users write privately only to the first bot.
 - `openEphemeralUrlButton(chatId, ephemeralMessageId, userId, button, { addToChatId })`: the
   receiver opens a URL button on an ephemeral message; works like `openUrlButton`.
 - `openDirectUrlButton(userId, messageId, button, { addToChatId })`: the user opens a URL button
@@ -1709,9 +1712,8 @@ handed to the bot ([Make users act](#make-users-act)). The owner account actions
   are not granted, and no right at all makes them a member. The person must be the creator or an
   administrator with `can_promote_members`, who grants only rights they hold and edits only
   administrators they promoted. Refusals carry Telegram's texts, such as `Not enough rights`,
-  `RIGHT_FORBIDDEN` or `CHAT_ADMIN_REQUIRED`. An edit keeps the custom title and who promoted the
-  administrator, so a bot that promoted them still edits them (`can_be_edited`). In a basic group
-  only the creator promotes, with the group's fixed rights. The chat's administrator bots get
+  `RIGHT_FORBIDDEN` or `CHAT_ADMIN_REQUIRED`. An edit keeps the custom title. In a basic group only
+  the creator promotes, with the group's fixed rights. The chat's administrator bots get
   `chat_member`. Returns the member. Unverified: someone outside a supergroup or channel is
   refused (`USER_NOT_PARTICIPANT`). Telegram's apps add someone outside a basic group first; this
   server refuses them, so add them first.
@@ -1916,8 +1918,8 @@ does; a bot without a webhook answers 409.
 
 `button` is the button's text, or its index counted row by row from 0. Each returns `{ url }`, and
 for a link to one of the server's bots also `link`, `bot_id`, `chat_id` and, for `start`,
-`message_id`. A button that is not a URL button, a user who cannot see the message, and a
-`startgroup` or `startchannel` link without `add_to_chat_id` answer 400.
+`message_id`. A button that is not a URL button, an ephemeral message's button opened by anyone
+but its receiver, and a `startgroup` or `startchannel` link without `add_to_chat_id` answer 400.
 
 **Private chats**
 
@@ -2338,30 +2340,29 @@ fields below.
 
 ## Changes
 
-- **0.13.0**:
-  - New: the viewer and recordings draw each message's reactions, with who chose them
-    ([Watch the chats in a browser](#watch-the-chats-in-a-browser)).
-  - Fixed: a bot's custom emoji reaction keeps its id. `getMessage` lists it as `#` and its
-    `custom_emoji_id`, where it listed an empty string.
-- **0.12.1**: pending message and update waits, `drainDeliveries`, `snapshot` and `restore` are
-  faster on long chats and journals, and work as before ([measurements][performance]).
-  - Fixed: `getMessage`, `getMessages`, `getEphemeralMessage` and `getDirectMessages` return
-    copies, as `getCalls` does. Changing what they returned used to change the stored message.
-  - New: `deliverTwice` on `pressButton`, `pressEphemeralButton` and `pressDirectButton`
-    (`deliver_twice` over HTTP) delivers one press twice, with the same `update_id` and callback
-    query id, so a test can check that the bot ignores the duplicate
-    ([Make users act](#make-users-act)).
+- **0.13.0**: open URL buttons, deliver one button press twice, run a clock that keeps moving, and
+  see reactions in the viewer. Pending message and update waits, `drainDeliveries`, `snapshot` and
+  `restore` are faster on long chats and journals, and work as before ([measurements][performance]).
   - New: `openUrlButton`, `openEphemeralUrlButton` and `openDirectUrlButton` (`POST .../open-url`)
     open a URL button. A `start` link to the bot sends `/start <parameter>` in the user's private
     chat, and a `startgroup` or `startchannel` link adds the bot to the chat the user picks; any
     other URL comes back unchanged ([URL buttons][behavior-url-buttons]).
+  - New: `deliverTwice` on `pressButton`, `pressEphemeralButton` and `pressDirectButton`
+    (`deliver_twice` over HTTP) delivers one press twice, with the same `update_id` and callback
+    query id, so a test can check that the bot ignores the duplicate
+    ([Make users act](#make-users-act)).
   - New: a running clock, `clock: { offset }`: real time plus an offset that `advanceTime` adds
     to, so time keeps moving between jumps. `getClock()`, `GET /_fake/clock` and `clockWebhook`
     pushes give its `offset`, and `fakeClockNow()` keeps moving between reads ([Time](#time)).
-  - Changed: when a person edits an administrator with `promoteMember`, the administrator keeps
-    who promoted them. A bot that promoted them keeps `can_be_edited` and can still edit and
-    title them; 0.12.0 made the person their promoter
-    ([Administrators and chat settings][behavior-admins]).
+  - New: the viewer and recordings draw each message's reactions, with who chose them
+    ([Watch the chats in a browser](#watch-the-chats-in-a-browser)).
+  - Fixed: `getMessage`, `getMessages`, `getEphemeralMessage` and `getDirectMessages` return
+    copies, as `getCalls` does. Changing what they returned used to change the stored message.
+  - Fixed: a bot's custom emoji reaction keeps its id. `getMessage` lists it as `#` and its
+    `custom_emoji_id`, where it listed an empty string.
+  - Fixed: `react` refuses what a member cannot react with, as Telegram's apps do: anything but an
+    emoji from the Bot API's list of reactions fails with
+    `The reaction isn't available for the message`. It used to take any text.
 - **0.12.0**: watch and record what happens in the chats, observe a run more closely, let the app
   under test follow the manual clock, and let members and people do more of what they do on
   Telegram.
@@ -2475,14 +2476,17 @@ npm install --prefix /tmp/shots playwright
 PLAYWRIGHT=/tmp/shots/node_modules/playwright node scripts/screenshots.mjs
 ```
 
+The README links the pictures at a release tag, so each release's README on npm keeps its own.
+Change the tag in those links when the pictures change.
+
 ## Status
 
 This is an early-stage project with a deliberately small scope, and the public API may still change.
 Pin an exact version:
 
 ```sh
-pnpm add -D --save-exact telegram-bot-test-server@0.12.1
-# or: npm install --save-dev --save-exact telegram-bot-test-server@0.12.1
+pnpm add -D --save-exact telegram-bot-test-server@0.13.0
+# or: npm install --save-dev --save-exact telegram-bot-test-server@0.13.0
 ```
 
 ## License
@@ -2490,7 +2494,6 @@ pnpm add -D --save-exact telegram-bot-test-server@0.12.1
 MIT
 
 [behavior]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md
-[behavior-admins]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#administrators-and-chat-settings
 [behavior-bots]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#more-than-one-bot
 [behavior-channels]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#channels
 [behavior-delivery]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#update-delivery
@@ -2500,4 +2503,4 @@ MIT
 [behavior-url-buttons]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#url-buttons
 [owner-docs]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/owner-accounts.md
 [performance]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/performance.md
-[viewer-desktop]: https://raw.githubusercontent.com/anatolyben/telegram-bot-test-server/main/docs/images/viewer-desktop.png
+[viewer-desktop]: https://raw.githubusercontent.com/anatolyben/telegram-bot-test-server/v0.13.0/docs/images/viewer-desktop.png

@@ -1183,6 +1183,8 @@ describe("render", () => {
   });
 
   it("draws a message's reactions as chips, names who chose each, and marks a member's own", () => {
+    // Each chip is one image to a screen reader, named by its emoji (or
+    // custom emoji), its count, and who chose it or that it is the member's.
     const reactions = [
       {
         type: "emoji",
@@ -1232,6 +1234,8 @@ describe("render", () => {
         "data-reaction-count": "2",
         "data-reaction-user-ids": `${OLGA.id} ${EVE.id}`,
         title: escaped(`Olga, ${EVE.first_name}`),
+        role: "img",
+        "aria-label": escaped(`👍, 2: Olga, ${EVE.first_name}`),
       },
       {
         "data-reaction-type": "custom_emoji",
@@ -1239,6 +1243,8 @@ describe("render", () => {
         "data-reaction-count": "1",
         "data-reaction-user-ids": String(BOT.id),
         title: "custom emoji 5368324170671202286 · Example Bot",
+        role: "img",
+        "aria-label": "custom emoji 5368324170671202286, 1: Example Bot",
       },
       {
         "data-reaction-type": "emoji",
@@ -1246,6 +1252,8 @@ describe("render", () => {
         "data-reaction-count": "1",
         "data-reaction-user-ids": String(ANN.id),
         title: "Ann Lee",
+        role: "img",
+        "aria-label": escaped("<b>bad</b>, 1: Ann Lee"),
       },
     ]);
     expect(testView).toContain(
@@ -1264,17 +1272,23 @@ describe("render", () => {
         "data-reaction-count": "2",
         "data-reaction-mine": "true",
         title: "your reaction",
+        role: "img",
+        "aria-label": "👍, 2, your reaction",
       },
       {
         "data-reaction-type": "custom_emoji",
         "data-custom-emoji-id": "5368324170671202286",
         "data-reaction-count": "1",
         title: "custom emoji 5368324170671202286",
+        role: "img",
+        "aria-label": "custom emoji 5368324170671202286, 1",
       },
       {
         "data-reaction-type": "emoji",
         "data-reaction-emoji": escaped("<b>bad</b>"),
         "data-reaction-count": "1",
+        role: "img",
+        "aria-label": escaped("<b>bad</b>, 1"),
       },
     ]);
     expect(chipsOf(draw(post, OLGA.id))[0]["data-reaction-mine"]).toBe("true");

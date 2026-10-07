@@ -775,8 +775,7 @@ export interface TelegramBotTestServer {
    * A person (`by`, default the creator) makes a member an administrator with
    * the rights given, e.g. { can_delete_messages: true }. Rights left out are
    * not granted, and no right at all makes them a member; an edit keeps the
-   * custom title and who promoted them, so a bot that did still edits them.
-   * The chat's administrator bots get chat_member. Fails as
+   * custom title. The chat's administrator bots get chat_member. Fails as
    * Telegram refuses the person; in a basic group only the creator promotes,
    * with the group's fixed rights.
    */
@@ -968,7 +967,8 @@ export interface TelegramBotTestServer {
   ): Promise<{ message_id: number; edit_date: number }>;
   /**
    * The user sets their reaction on a message, or takes it back with null.
-   * Administrator bots that asked for message_reaction are told.
+   * Administrator bots that asked for message_reaction are told. An emoji
+   * outside the Bot API's ReactionTypeEmoji list fails.
    */
   react(
     chatId: number,
@@ -1061,7 +1061,7 @@ export interface TelegramBotTestServer {
    * "/start <parameter>" in the user's private chat; a startgroup or
    * startchannel link to one of the server's bots adds it to addToChatId as
    * addBotViaLink does. Any other URL changes nothing. Refused for a button
-   * that is not a URL button, or a user not in the chat.
+   * that is not a URL button.
    */
   openUrlButton(
     chatId: number,

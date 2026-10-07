@@ -25,9 +25,10 @@ const CLUB = -1001873462190;
 const LOG = -1001873462191;
 const ANN = 418273655;
 const MINUTE = 60 * 1000;
-// Thursday, October 1, 2026, 18:00 UTC: a fixed start, so every run reads
-// alike. Only advanceTime moves this clock.
-const START = Date.UTC(2026, 9, 1, 18, 0);
+// Friday, October 2, 2026, 17:20 UTC: a fixed start, so every run reads
+// alike. Only advanceTime moves this clock, and the story keeps to one
+// evening, so the chat list's times read newest first.
+const START = Date.UTC(2026, 9, 2, 17, 20);
 
 const server = await startTestServer({
   botToken: TOKEN,
@@ -122,8 +123,8 @@ const bob = await server.createUser({ first_name: "Bob" });
 const carol = await server.createUser({ first_name: "Carol" });
 const dave = await server.createUser({ first_name: "Dave" });
 
-// Thursday evening: Ann sets the bot up, Bob and Dave join, and Ann makes
-// Dave the club's librarian.
+// Ann sets the bot up, Bob and Dave join, and Ann makes Dave the club's
+// librarian.
 await server.sendDirectMessage(ANN, "/start");
 await server.setBotMembership(CLUB, bot.botInfo.id, {
   rights: {
@@ -149,8 +150,8 @@ await later(2);
 await server.post(CLUB, ANN, { text: "/promote Librarian", replyTo: hello });
 await quiet();
 
-// Friday evening: Carol asks to join through the website's link.
-await later(23 * 60 + 37);
+// Later that evening Carol asks to join through the website's link.
+await later(17);
 await server.joinByLink(invite.invite_link, carol);
 await quiet();
 const welcome = await server.waitFor({
@@ -176,14 +177,14 @@ await later(2);
 await server.post(
   CLUB,
   bob,
-  "Every bestseller free, no signup 👉 free-ebooks.top",
+  "Every bestseller free, no signup 👉 free-ebooks.example.net",
 );
 await quiet();
 await later(1);
 const schedule = await server.post(
   CLUB,
   dave,
-  "Our reading schedule: https://bookclub.blog/schedule",
+  "Our reading schedule: https://bookclub.example.org/schedule",
 );
 await quiet();
 await server.react(CLUB, pick, carol, "❤");
@@ -200,13 +201,16 @@ await quiet();
 await mkdir(IMAGES, { recursive: true });
 const browser = await chromium.launch();
 try {
-  // A scale below 1 keeps the file small; Chromium draws the text at that
-  // size, sharper than a scaled-down picture.
+  // GitHub and npm show the hero in a column 630 to 815 pixels wide. Drawn
+  // at twice its size it stays sharp on high-density screens, and a window
+  // this narrow keeps its text readable there. The chat list and the chat,
+  // with its calls and events, share it; the members panel is left out, so
+  // their rows have room.
   await shoot({
     file: "viewer-desktop.png",
-    viewport: { width: 1400, height: 860 },
-    scale: 0.7,
-    query: `chat=${CLUB}&theme=light`,
+    viewport: { width: 1180, height: 960 },
+    scale: 2,
+    query: `chat=${CLUB}&show=list,chat,calls,events&theme=light`,
   });
   await shoot({
     file: "viewer-as-member.png",
@@ -235,6 +239,14 @@ async function shoot({ file, viewport, scale, query }) {
     version,
   );
   await showTopWhole(page, viewport);
+  // GitHub and npm draw no frame around an image, and the viewer's white
+  // edges would run into their white page: draw one into the picture.
+  await page.evaluate(() => {
+    const frame = document.createElement("div");
+    frame.style.cssText =
+      "position:fixed;inset:0;border:1px solid #d0d7de;pointer-events:none;z-index:2147483647";
+    document.documentElement.append(frame);
+  });
   const path = `${IMAGES}${file}`;
   await page.screenshot({ path });
   await page.close();
