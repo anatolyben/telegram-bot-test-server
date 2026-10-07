@@ -202,14 +202,15 @@ await mkdir(IMAGES, { recursive: true });
 const browser = await chromium.launch();
 try {
   // GitHub and npm show the hero in a column 630 to 815 pixels wide. Drawn
-  // at twice its size it stays sharp on high-density screens, and a window
-  // this narrow keeps its text readable there. The chat list and the chat,
+  // 1600 pixels wide it stays sharp on high-density screens, and a window
+  // this narrow keeps its text readable there. The chat wallpaper makes a
+  // PNG large, so the hero is a JPEG. The chat list and the chat,
   // with its calls and events, share it; the members panel is left out, so
   // their rows have room.
   await shoot({
-    file: "viewer-desktop.png",
+    file: "viewer-desktop.jpg",
     viewport: { width: 1180, height: 960 },
-    scale: 2,
+    scale: 1600 / 1180,
     query: `chat=${CLUB}&show=list,chat,calls,events&theme=light`,
   });
   await shoot({
@@ -248,7 +249,9 @@ async function shoot({ file, viewport, scale, query }) {
     document.documentElement.append(frame);
   });
   const path = `${IMAGES}${file}`;
-  await page.screenshot({ path });
+  await page.screenshot(
+    file.endsWith(".jpg") ? { path, type: "jpeg", quality: 80 } : { path },
+  );
   await page.close();
   console.log(`${path}: ${Math.round((await stat(path)).size / 1024)} KB`);
 }

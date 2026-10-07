@@ -2513,4 +2513,4 @@ MIT
 [behavior-url-buttons]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#url-buttons
 [owner-docs]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/owner-accounts.md
 [performance]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/performance.md
-[viewer-desktop]: https://raw.githubusercontent.com/anatolyben/telegram-bot-test-server/v0.13.0/docs/images/viewer-desktop.png
+[viewer-desktop]: https://raw.githubusercontent.com/anatolyben/telegram-bot-test-server/v0.13.0/docs/images/viewer-desktop.jpg
