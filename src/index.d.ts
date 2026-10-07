@@ -736,7 +736,8 @@ export interface TelegramBotTestServer {
    * A person (`by`, default the creator) makes a member an administrator with
    * the rights given, e.g. { can_delete_messages: true }. Rights left out are
    * not granted, and no right at all makes them a member; an edit keeps the
-   * custom title. The chat's administrator bots get chat_member. Fails as
+   * custom title and who promoted them, so a bot that did still edits them.
+   * The chat's administrator bots get chat_member. Fails as
    * Telegram refuses the person; in a basic group only the creator promotes,
    * with the group's fixed rights.
    */

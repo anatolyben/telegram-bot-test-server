@@ -126,13 +126,30 @@ gets `Not enough rights`. In a basic group only the creator promotes
 before anything else. There every administrator has the group's fixed rights, as TDLib reads them,
 since Telegram keeps only whether someone is one. A change to what the member already has succeeds
 without an update, and demoting someone who is not an administrator changes nothing. Otherwise the
-chat's administrator bots get `chat_member` from the person, and no bot may edit the new
-administrator (`can_be_edited` is false). An edit keeps the custom title. In a basic group,
-Telegram's apps add someone outside it first; this server does not, and refuses them
-(`the user is not in the chat; add them first`). Unverified: that an administrator may demote
-themselves, as TDLib allows; that someone outside a supergroup or channel is refused
-(`USER_NOT_PARTICIPANT`), where TDLib asks Telegram to promote them directly; and that a change to
-nothing new succeeds in a basic group, where TDLib asks Telegram all the same.
+chat's administrator bots get `chat_member` from the person, and no bot may edit an administrator
+the person promoted (`can_be_edited` is false). An edit keeps the custom title and who promoted the
+administrator: after the owner edits one a bot promoted, that bot still edits and titles them, and
+its `can_be_edited` stays true. In a basic group, Telegram's apps add someone outside it first;
+this server does not, and refuses them (`the user is not in the chat; add them first`).
+Unverified: that an administrator may demote themselves, as TDLib allows; that someone outside a
+supergroup or channel is refused (`USER_NOT_PARTICIPANT`), where TDLib asks Telegram to promote
+them directly; and that a change to nothing new succeeds in a basic group, where TDLib asks
+Telegram all the same.
+
+Telegram's server decides `can_be_edited`, and its code is not published, but Telegram's other
+sources agree. The Bot API's `can_be_edited` says whether "the bot is allowed to edit administrator
+privileges", and `setChatAdministratorCustomTitle` takes an administrator "promoted by the bot";
+the Bot API server refuses it when `can_be_edited` is false. Telegram sends it as
+`channelParticipantAdmin.can_edit`, which TDLib passes on as it is, beside `promoted_by`, the user
+who promoted the administrator. One method, `channels.editAdmin`, both promotes and edits. When
+their own user edits an administrator, [TDLib's member cache][tdlib-participants]
+(`update_channel_participant_status_cache`) and [Telegram Desktop][tdesktop-participants]
+(`applyAdminLocally`) keep the earlier `promoted_by`. Unverified: that Telegram's server keeps it
+too, and with it the promoter's `can_edit`.
+
+Telegram's docs: [ChatMemberAdministrator][bot-api-chat-member-administrator],
+[channelParticipantAdmin](https://core.telegram.org/constructor/channelParticipantAdmin),
+[channels.editAdmin](https://core.telegram.org/method/channels.editAdmin).
 
 `setChatTitle`, `setChatDescription`, `setChatPhoto` and `deleteChatPhoto` need `can_change_info`
 and post Telegram's service messages to every bot in the chat, the bot that made the change
@@ -824,7 +841,10 @@ A test can have Telegram deliver any update again, byte for byte, callback queri
 does when a webhook does not confirm one. It sends the saved update, so do not restore an earlier
 snapshot between the steps of a replay.
 
+[bot-api-chat-member-administrator]: https://core.telegram.org/bots/api#chatmemberadministrator
 [ephemeral-docs]: https://core.telegram.org/bots/api#ephemeral-messages-and-commands
 [tdlib-entities]: https://github.com/tdlib/td/blob/master/td/telegram/MessageEntity.cpp
+[tdlib-participants]: https://github.com/tdlib/td/blob/master/td/telegram/DialogParticipantManager.cpp
 [bot-api-server-client]: https://github.com/tdlib/telegram-bot-api/blob/master/telegram-bot-api/Client.cpp
 [readme-methods]: https://github.com/anatolyben/telegram-bot-test-server#supported-bot-api-methods
+[tdesktop-participants]: https://github.com/telegramdesktop/tdesktop/blob/dev/Telegram/SourceFiles/boxes/peers/edit_participants_box.cpp

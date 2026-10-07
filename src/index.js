@@ -3397,7 +3397,15 @@ export async function startTestServer({
             chat.type === "group"
               ? { ...BASIC_GROUP_ADMIN_RIGHTS }
               : { ...granted, can_manage_chat: true },
-          promotedBy: actor.id,
+          // An edit keeps who promoted them, so the bot that did still edits
+          // them (can_be_edited). TDLib keeps an edited administrator's
+          // promoted_by (update_channel_participant_status_cache), as does
+          // Telegram Desktop (applyAdminLocally). UNVERIFIED: Telegram's
+          // server, which sets promoted_by and can_edit, is not published.
+          promotedBy:
+            current.status === "administrator" && current.promotedBy != null
+              ? current.promotedBy
+              : actor.id,
           ...keptTitle(current),
         }
       : { status: "member" };

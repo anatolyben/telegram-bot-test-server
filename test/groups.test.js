@@ -718,6 +718,81 @@ describe("people promoting and demoting members", () => {
     );
   });
 
+  it("keeps who promoted an administrator when the owner edits their rights", async () => {
+    const { fake, api, hook, me } = await setup();
+    const group = await fake.createChat({ ownerId: OWNER });
+    await fake.setBotMembership(group, me.id, {
+      status: "administrator",
+      rights: { can_promote_members: true },
+    });
+    const [ann, bob, carl] = [
+      await fake.createUser(),
+      await fake.createUser(),
+      await fake.createUser(),
+    ];
+    for (const user of [ann, bob, carl]) await fake.join(group, user);
+    const promoted = await api("promoteChatMember", {
+      chat_id: group,
+      user_id: ann,
+      can_delete_messages: true,
+    });
+    expect(promoted.ok).toBe(true);
+    await fake.promoteMember(group, bob, {
+      rights: { can_promote_members: true, can_delete_messages: true },
+    });
+    await fake.promoteMember(group, carl, {
+      by: bob,
+      rights: { can_delete_messages: true },
+    });
+
+    // The owner edits both; the bot and Bob still promoted them.
+    await fake.promoteMember(group, ann, {
+      rights: { can_delete_messages: true, can_pin_messages: true },
+    });
+    await fake.promoteMember(group, carl, {
+      rights: { can_delete_messages: true, can_invite_users: true },
+    });
+
+    expect(
+      (await api("getChatMember", { chat_id: group, user_id: ann })).result,
+    ).toMatchObject({ can_be_edited: true, can_pin_messages: true });
+    await expect
+      .poll(
+        () =>
+          hook
+            .ofType("chat_member")
+            .filter((change) => change.new_chat_member.user.id === ann)
+            .at(-1),
+      )
+      .toMatchObject({
+        from: { id: OWNER },
+        new_chat_member: { can_be_edited: true, can_pin_messages: true },
+      });
+    const edited = await api("promoteChatMember", {
+      chat_id: group,
+      user_id: ann,
+      can_delete_messages: true,
+    });
+    expect(edited.ok).toBe(true);
+    const titled = await api("setChatAdministratorCustomTitle", {
+      chat_id: group,
+      user_id: ann,
+      custom_title: "Helper",
+    });
+    expect(titled.ok).toBe(true);
+    expect(
+      await fake.promoteMember(group, carl, {
+        by: bob,
+        rights: { can_delete_messages: true },
+      }),
+    ).toMatchObject({ status: "administrator", can_invite_users: false });
+    // Nobody else became able to edit them.
+    expect(
+      (await api("getChatMember", { chat_id: group, user_id: carl })).result
+        .can_be_edited,
+    ).toBe(false);
+  });
+
   it("lets only a basic group's creator promote, with the group's fixed rights", async () => {
     const { fake, api, me } = await setup();
     const group = await fake.createChat({ type: "group", ownerId: OWNER });

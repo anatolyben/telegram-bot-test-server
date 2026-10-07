@@ -1614,8 +1614,9 @@ handed to the bot ([Make users act](#make-users-act)). The owner account actions
   are not granted, and no right at all makes them a member. The person must be the creator or an
   administrator with `can_promote_members`, who grants only rights they hold and edits only
   administrators they promoted. Refusals carry Telegram's texts, such as `Not enough rights`,
-  `RIGHT_FORBIDDEN` or `CHAT_ADMIN_REQUIRED`. An edit keeps the custom title. In a basic group only
-  the creator promotes, with the group's fixed rights. The chat's administrator bots get
+  `RIGHT_FORBIDDEN` or `CHAT_ADMIN_REQUIRED`. An edit keeps the custom title and who promoted the
+  administrator, so a bot that promoted them still edits them (`can_be_edited`). In a basic group
+  only the creator promotes, with the group's fixed rights. The chat's administrator bots get
   `chat_member`. Returns the member. Unverified: someone outside a supergroup or channel is
   refused (`USER_NOT_PARTICIPANT`). Telegram's apps add someone outside a basic group first; this
   server refuses them, so add them first.
@@ -2225,9 +2226,13 @@ fields below.
 ## Changes
 
 - **0.12.1**: pending message and update waits, `drainDeliveries`, `snapshot` and `restore` are
-  faster on long chats and journals; behavior is unchanged ([measurements][performance]).
+  faster on long chats and journals, and work as before ([measurements][performance]).
   - Fixed: `getMessage`, `getMessages`, `getEphemeralMessage` and `getDirectMessages` return
     copies, as `getCalls` does. Changing what they returned used to change the stored message.
+  - Changed: when a person edits an administrator with `promoteMember`, the administrator keeps
+    who promoted them. A bot that promoted them keeps `can_be_edited` and can still edit and
+    title them; 0.12.0 made the person their promoter
+    ([Administrators and chat settings][behavior-admins]).
 - **0.12.0**: watch and record what happens in the chats, observe a run more closely, let the app
   under test follow the manual clock, and let members and people do more of what they do on
   Telegram.
@@ -2345,6 +2350,7 @@ pnpm add -D --save-exact telegram-bot-test-server@0.12.1
 MIT
 
 [behavior]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md
+[behavior-admins]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#administrators-and-chat-settings
 [behavior-bots]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#more-than-one-bot
 [behavior-channels]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#channels
 [behavior-delivery]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#update-delivery
