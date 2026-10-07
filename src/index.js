@@ -8360,14 +8360,13 @@ export async function startTestServer({
       ![...bots.values()].some((record) => record.id === botId)
     )
       throw new TypeError("Unknown botId");
+    // Attempts not yet settled are counted as they start and settle
+    // (newAttempt, settle); only a timeout's text reads the journal.
     return waits.wait(
-      () => {
-        const outstanding = deliveryJournal.filter(
-          (e) =>
-            e.completed_at == null && (botId == null || e.bot_id === botId),
-        );
-        return outstanding.length ? null : { drained: true };
-      },
+      () =>
+        (botId == null ? deliveryCount : (attemptsInProgress.get(botId) ?? 0))
+          ? null
+          : { drained: true },
       timeoutMs,
       () =>
         diagnostic({
