@@ -402,7 +402,7 @@ handling it, and their webhooks answer after their handlers, so the wait holds w
 works on an update. The server sees only what reaches it: work a bot does after it confirmed an
 update, such as a job started in the background, looks quiet once `ms` has passed without a call.
 `botIds` limits the wait to some bots; leave out a bot that is not running, since it never
-confirms its updates.
+confirms its updates. A deleted bot is not counted.
 
 ### Message log and delivered updates
 
@@ -431,11 +431,12 @@ console.log(messages.map((entry) => [entry.message.text, entry.deleted_by?.bot_i
 - It returns `{ chat_id, epoch, cursor, messages }`, oldest first. Pass `cursor` as the next
   `since` to read on from there.
 - Each entry has the stored `message` (with the first bot's file ids), its `seq`, `at` (server
-  time), `author` (who posted it, also when the message names only a chat: a channel post, or a
-  post on behalf of a chat), `request_id` (the Bot API call that stored it, or `null` for a test
-  action),
-  `ephemeral`, and `deleted` with `deleted_by`: `{ seq, bot_id, method, request_id, at }` of the
-  deletion, or `null`. A poll that has votes has `votes` by user id.
+  time), `author` (the user id of who posted it, also when the message names only a chat: a
+  channel post, or a post on behalf of a chat), `request_id` (the Bot API call that stored it, or
+  `null` for a test action), `after_request` (how many Bot API requests had arrived when it was
+  stored; the viewer places calls by it), `ephemeral`, and `deleted` with `deleted_by`:
+  `{ seq, bot_id, method, request_id, at }` of the deletion, or `null`. A poll that has votes has
+  `votes` by user id.
 - Without `includeDeleted`, only messages not deleted are listed. With it, a message stored before
   the mark but deleted after it is listed too. Edits are not reported.
 - A user id instead of a chat id reads the user's private chats; `botId` keeps one bot's, a
@@ -448,7 +449,12 @@ what a bot did **not** receive. Here a second bot asks only for `my_chat_member`
 
 ```js
 const notifier = await server.addBot({ token: "654321:NOTIFY", username: "notify_bot" });
-// Your notifier bot runs with that token and polls with allowed_updates: ["my_chat_member"].
+// The notifier bot under test, polling for my_chat_member updates only.
+const notifierBot = new Bot("654321:NOTIFY", { client: { apiRoot: server.origin } });
+notifierBot.start({ allowed_updates: ["my_chat_member"] });
+// allowed_updates applies from the bot's first getUpdates, so wait for that call.
+await server.waitFor({ kind: "call", botId: notifier.id, method: "getUpdates" });
+
 await server.setBotMembership(GROUP, notifier.id);
 const ann = await server.createUser({ first_name: "Ann" });
 await server.join(GROUP, ann);
@@ -456,8 +462,13 @@ await server.post(GROUP, ann, "hello");
 
 const { updates } = await server.getBotUpdates(notifier.id, { chatId: GROUP });
 expect(updates.map((update) => update.type)).toEqual(["my_chat_member"]);
+await notifierBot.stop();
 ```
 
+- As on Telegram, `allowed_updates` applies from the `getUpdates` call that carries it, and
+  updates made before that call still arrive. grammY's `onStart` runs before its first
+  `getUpdates`, so wait for that call, as above, before users act. A long poll's `offset` and
+  `allowed_updates` apply as soon as it arrives, so a plain call wait is enough.
 - Each test action resolves once the updates it causes are handed to the bots, so a read right
   after it already lists them.
 - `type` (one type or a list), `chatId` and `since` (an `update_id`) narrow the list.
@@ -562,9 +573,12 @@ const secondBot = new Bot("654321:SECOND", { client: { apiRoot: server.origin } 
 `{ can_post_messages: false }`. The bot gets `my_chat_member`, the chat's administrator bots
 `chat_member`, and a group a service message when the bot joins or leaves.
 
-`deleteBot(second.id)` deletes a bot that `addBot` added. It leaves every chat it is in, so the
-other bots hear of it as when a bot leaves, and its token then gets 401 `Unauthorized`. The first
-bot can't be deleted.
+`deleteBot(second.id)` deletes a bot that `addBot` added. It leaves every chat it is in, as when a
+bot leaves: its status there becomes `left`, the chat's administrator bots get `chat_member`, and
+a group gets a `left_chat_member` service message, which `getMessageLog` and `getBotUpdates` list.
+Its token then gets 401 `Unauthorized`. A waiting `getUpdates` answers at once with what is
+pending, and the next call gets the 401, so a polling library stops with an error (grammY's
+`bot.start()` rejects): have the app catch it. The first bot can't be deleted.
 
 Each bot has its own membership and rights in each chat, its own `update_id` sequence, its own
 `file_id`s, and hears only the button presses on keyboards it put on messages. Users write
@@ -703,6 +717,9 @@ await server.advanceTime(2 * 60 * 60 * 1000); // two hours later
 await server.waitFor({ kind: "member", chatId: GROUP, userId: ann, status: "member" });
 ```
 
+A bot that lifts a mute itself calls `restrictChatMember` with every permission `true`, as the Bot
+API docs say; the member is then a `member` again.
+
 Advances run one at a time, and each runs what has come due, in deadline order: restriction and
 ban expiry, response delays (`delayMs`, and owner call delays), sends held by flood control, webhook
 retries and delayed `getUpdates` conflicts. Message, login and business dates, the five minutes a
@@ -795,15 +812,26 @@ What the app has to do:
 - **Keep the time current**, in one of two ways. With the `clockWebhook` option and a manual
   clock, the server posts `{ now, mode }` to that URL after each `advanceTime` and each `restore`,
   and they resolve only once the post has finished, so the app has the new time when the test
-  goes on. Mount `fakeClockHandler` there (a Node `(request, response)` handler), or pass the
-  parsed body to `receiveFakeClock(body)` if your framework has read it already. Without the
-  option, call `await refreshFakeClock()` before time-dependent work.
+  goes on. Mount `fakeClockHandler` there (a Node `(request, response)` handler that takes a
+  POST on any path), or pass the parsed body to `receiveFakeClock(body)` if your framework has
+  read it already. A push counts as the time of the server the variable names when the push
+  arrives, so set the variable before the first `advanceTime`. Without the option, call
+  `await refreshFakeClock()` before time-dependent work.
 - **Expect timers to run on wall time.** Moving the clock fires none of them; a scheduler that
   checks `fakeClockNow()` as it runs, as above, sees the new time on its next check. Or have the
   test run the app's job after `advanceTime`.
 
-An app in another process gets `TELEGRAM_FAKE_CLOCK_URL` in its environment and the
-`fakeClockHandler` route in its own HTTP server. An app in another language reads
+An app in another process needs the route's address before the server starts, and the server's
+origin after. So, in this order:
+
+1. Start the app. It serves `fakeClockHandler` in its own HTTP server, on a free port, and tells
+   the test the port, over IPC or on its output.
+2. Start the server with `clockWebhook` set to that route.
+3. Send the app `server.origin`. The app sets `process.env.TELEGRAM_FAKE_CLOCK_URL` to it, calls
+   `await refreshFakeClock()`, then starts its bot with the origin as its Bot API root.
+
+With a fixed port for the app's route, start the server first and spawn the app with
+`TELEGRAM_FAKE_CLOCK_URL` in its environment. An app in another language reads
 `GET <origin>/_fake/clock`, which answers `{ mode, now, scheduled }`, and uses `now` while `mode`
 is `manual`. A push that fails, or takes over 2 seconds, goes to the `log` option as
 `clock webhook failed: <reason>` and fails nothing. The bot's own webhook deliveries stay as
@@ -909,10 +937,19 @@ on this computer: a request from another machine, through a proxy or tunnel, or 
 name gets 403. It never changes the server's state, adds nothing to Bot API answers or updates, and
 an open viewer does not hold up `snapshot()`, `restore()` or a wait.
 
+To watch a test by eye, give the server a fixed `port` and open `server.viewerUrl` before the test
+runs. Keep the server running until you have looked: pause before `server.stop()`, with a long
+sleep and a test timeout to match, or `await page.pause()` in a Playwright test. A page whose
+server stopped keeps the last state and tries the address again every 2 seconds, so it misses a
+server that starts and stops in between, as a fast test's does. A Playwright script that opens
+`server.viewerUrl` from inside the test needs no fixed port. To look at a fast test afterwards,
+[record it](#record-a-scenario).
+
 What it shows, only from what the server stores:
 
 - **Chats**: groups, supergroups, channels, forums and each user's private chat with each bot, a
-  deleted bot's included, most recently active first. The search box filters them by title.
+  deleted bot's included, most recently active first. The search box hides the chats whose title
+  does not match; their rows stay in the page, so count rows with Playwright's `:visible`.
 - **Messages**: the sender's name and initial, bots tagged as the first bot, an added bot, a
   deleted bot or a guest bot; a channel post or a post on behalf of a chat as the chat, with its
   signature and, in the test's view, who posted it; text with its entities (hover a text link for
@@ -927,7 +964,9 @@ What it shows, only from what the server stores:
 - **Deletions**: a deleted message stays, grayed and marked with the bot that deleted it.
 - **Ephemeral messages**, marked with the member who sees them.
 - **Events** Telegram shows as no message: member changes by a bot or a person (restrictions,
-  bans, promotions, their expiry), join requests (pending, approved, declined) and unpins.
+  bans, promotions, their expiry), join requests (pending, approved, declined) and unpins. When
+  events have a panel of their own, as in the `split` layout, it also lists the chat's service
+  messages, such as joins and leaves, so every change to the chat is in one list there.
 - **Members**: the chat's default permissions, then each member, the bots included, with their
   status (creator, administrator, member, restricted or banned until a UTC time or forever, left),
   what a restricted member cannot do and an administrator's rights; then pending join requests.
@@ -942,6 +981,7 @@ URL:
   first bot. Without it, the most recently active chat.
 - `chats`: up to four chats, comma-separated, shown side by side.
 - `show`: the panels, comma-separated: `list`, `chat`, `calls`, `events`, `members`. Default: all.
+  In the combined layout, `calls` and `events` turn the inline calls and events on or off.
 - `layout`: `combined` (calls and events inline in the chat; the default) or `split` (each in its
   own panel).
 - `as`: a user id: the chats as that member sees them. Default: the test's view of everything.
@@ -949,11 +989,15 @@ URL:
 - `topic`: a forum topic's `message_thread_id`, or `general`. Default: all topics.
 - `theme`: `light` or `dark`. Default: the system's.
 
-For example, `/_fake/ui?chats=-1001000000001,-1001000000002&show=chat` shows a group beside its log
-chat, and `?chat=-1001000000001&show=members` only the members. A page opened without `chat` shows
-the most recently active chat and writes it into the URL. Each panel's ↗ opens it alone in a new
-tab, and × hides it. The dividers between columns resize them, with the mouse or the arrow keys.
-In a narrow window one panel shows at a time, with a bar to switch.
+Unknown parameters and values are ignored, and the page drops them from the URL, so a typo such as
+`show=member` shows the default.
+
+For example, `/_fake/ui?chats=-1001000000001,-1001000000002&show=chat,calls,events` shows a group
+beside its log chat, each with its bot calls and events, and `?chat=-1001000000001&show=members`
+only the members. A page opened without `chat` shows the most recently active chat and writes it
+into the URL. Each panel's ↗ opens it alone in a new tab, and × hides it. The dividers between
+columns resize them, with the mouse or the arrow keys. In a narrow window one panel shows at a
+time, with a bar at the bottom: Back to the chat list, and a button for each panel.
 
 **View as a member.** `as=<user id>`, or the select in the toolbar, shows each chat as that member
 sees it: no deleted messages, no other member's ephemeral messages (their own read "only you see
@@ -972,10 +1016,13 @@ many newer messages are not loaded, goes back to the end.
 **Live updates.** The page follows the server over a server-sent event stream: every change shows
 within a moment, without a reload, and after a `restore`, or with a new server on the same port,
 the page loads everything again. The status in the toolbar reads Live, Connecting… or Server
-stopped; a stopped page connects again once a server answers at its address. All viewer tabs of
-one browser share one event stream, so any number of them stay live.
+stopped; a stopped page tries its address every 2 seconds and connects again once a server
+answers there. All viewer tabs of one browser share one event stream, so any number of them stay
+live.
 
-**Selecting with Playwright.** Chats, messages, buttons and members carry stable data attributes:
+**Selecting with Playwright.** Chats, messages, buttons and members carry stable data attributes.
+A flag, such as `data-deleted` or `data-member-bot`, reads `true` when set and is left out
+otherwise. In a recording, items from before it carry `data-before-window`.
 
 - **The page**: `[data-role="app"]` with `data-instance`, `data-epoch`, `data-version`, and
   `data-busy="true"` while loading.
@@ -988,8 +1035,9 @@ one browser share one event stream, so any number of them stay live.
   ephemeral message, `data-ephemeral-id` and `data-receiver-id`; `data-author-id`,
   `data-author-kind` (`user`, `first-bot`, `added-bot` (a deleted one too), `guest-bot`, `bot`,
   `channel` for a channel post or a post on behalf of a chat),
-  `data-deleted` and `data-deleted-by`, `data-edited` and `data-edit-hidden` (a bot changed only
-  the keyboard), `data-service`, `data-thread-id`, `data-reply-to`, `data-reply-deleted`,
+  `data-deleted` and `data-deleted-by` (the user id of the bot that deleted it), `data-edited` and
+  `data-edit-hidden` (a bot changed only the keyboard), `data-service` (the service message's
+  field, such as `new_chat_members`), `data-thread-id`, `data-reply-to`, `data-reply-deleted`,
   `data-pinned-deleted`, `data-request-id`.
 - **Inline button**: `data-button-text`, `data-button-data`, `data-button-url`, `data-button-row`,
   `data-button-col`.
@@ -998,14 +1046,17 @@ one browser share one event stream, so any number of them stay live.
 - **Call**: `data-kind="call"`, `data-chat-key` (`calls` for calls without a chat),
   `data-request-id`, `data-request-number`, `data-call-seq` and `data-call-journal` (the receipt's
   `seq` and its list: `calls` or `rejected_requests`), `data-call-bot-id`, `data-call-method`,
-  `data-call-outcome`, `data-target-messages` (`<chat id>:<message id>`, space-separated),
+  `data-call-outcome` (the receipt's `outcome`, such as `succeeded` or `rejected`, without the
+  status code), `data-target-messages` (`<chat id>:<message id>`, space-separated),
   `data-target-user-id`, `data-target-ephemeral-id`.
-- **Member**: `data-chat-key`, `data-member-id`, `data-member-status`, `data-member-in-chat`,
-  `data-member-bot`.
+- **Member**: `data-chat-key`, `data-member-id`, `data-member-status` (the Bot API status:
+  `creator`, `administrator`, `member`, `restricted`, `left` or `kicked`, which the panel calls
+  banned), `data-member-in-chat` (always `true` or `false`), `data-member-bot`.
 - **Join request**: `data-chat-key`, `data-join-request-user-id`.
 
 `data-chat-key` tells a user's private chats with two bots apart. View as, the topic filter and the
-call filters leave what is hidden out of the page, so a count of zero means it is not shown.
+call filters leave what is hidden out of the page, so a count of zero means it is not shown; the
+chat search only hides rows.
 Whatever a clicked call touched carries `data-highlighted="true"`. The page keeps its event
 stream open, so Playwright's `networkidle` never settles; after acting, read the server's version
 and wait for the page to catch up:
@@ -1084,6 +1135,8 @@ console.log(files.html); // /…/test-results/recordings/spam-is-removed.html
 Or one recording per test, named after it:
 
 ```js
+// Declare these hooks after the ones that start and stop the server. Vitest runs afterEach
+// hooks in reverse order, so each recording then stops before server.stop().
 const nameOf = (task) =>
   task.name.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[-._]+/, "").slice(0, 100);
 beforeEach(async ({ task }) => {
@@ -1100,13 +1153,15 @@ afterEach(async ({ task }) => {
   bot) or `calls`. Without it, the recording holds every chat something happened in. A chat may be
   named before it exists; one that still does not exist at the stop is listed in `missing_chats`.
   Any number of recordings run at once, each under its own name.
-- `stopRecording(name)` returns `{ name, html, json }`: every message and event stored after the
-  start, deleted ones included, and every Bot API call received after it, with the members as they
-  are at the stop. Older messages that a recorded call names (a forward's in the chat it came from)
-  or that a recorded message replies to are included too, marked "from before the recording".
+- `stopRecording(name)` returns `{ name, html, json, files }`: `html` is the page as text and
+  `json` its twin as an object; `files` comes only with `recordDir`. They hold every message and
+  event stored after the start, deleted ones included, and every Bot API call received after it,
+  with the members as they are at the stop. Older messages that a recorded call names (a
+  forward's in the chat it came from) or that a recorded message replies to are included too,
+  marked "from before the recording".
 - With the `recordDir` option, `stopRecording` also writes `<name>.html` and `<name>.json` there,
   making the directory if needed and replacing earlier files of that name, and returns their paths
-  in `files`. Only the option chooses the directory, never a request.
+  in `files` as `{ html, json }`. Only the option chooses the directory, never a request.
 - The page is the viewer in a single file: the same panels, layouts, call filters, view as and
   highlights, and the same URL parameters (`spam-is-removed.html?chat=-1001234567890&layout=split`).
   Its scripts, styles, data and images are inside it, and its content security policy lets it load
@@ -1451,7 +1506,8 @@ handed to the bot ([Make users act](#make-users-act)). The owner account actions
     name fails as incomplete; what Telegram answers is unverified.
   - `entities` and `captionEntities`: `MessageEntity` objects for the text and the caption,
     checked as Telegram checks a user's. Types Telegram finds by itself are ignored, except
-    `phone_number` and `bank_card_number`, which this server does not find.
+    `phone_number` and `bank_card_number`, which this server does not find. A `text_link` URL is
+    kept as Telegram rewrites it, so `https://example.com` comes back as `https://example.com/`.
   - `replyTo`: the `message_id` it replies to. `threadId`: a forum topic.
   - `forwardFrom`: where a forward comes from: `{ userId }`, `{ senderName }` (a hidden user),
     `{ chatId, messageId? }` (a channel post) or `{ chatId }` of a supergroup (a post made on its
@@ -1539,8 +1595,9 @@ handed to the bot ([Make users act](#make-users-act)). The owner account actions
   bot, with its own webhook or update queue; it is in no chat yet. Returns the bot's user, with
   its `id`.
 - `deleteBot(botId)`: a bot `addBot` added is deleted. Its token gets 401 `Unauthorized` from then
-  on, and a waiting `getUpdates` answers at once. It leaves every chat it is in, as with
-  `leaveChat`; Telegram does not document what a deleted bot's chats see, so this is unverified.
+  on, and a waiting `getUpdates` answers at once with what is pending. It leaves every chat it is
+  in, as with `leaveChat`, and is `left` there; Telegram does not document what a deleted bot's
+  chats see, so this is unverified.
   It stays a user that earlier messages name, and a press on its buttons goes unanswered. The
   message log, the viewer and recordings keep its messages, calls and private chats, and the
   viewer tags it as a deleted bot; `getBotUpdates` no longer takes its id. The first bot can't be
@@ -1653,7 +1710,9 @@ same):
   `rejected_requests` too. It narrows by `chatId`, `userId`, `messageId`, exact `params` fields
   (as text: [Call receipts](#call-receipts)), `afterSeq` (which counts within each list),
   `requestId`, `outcome` and `stage`. Without `outcome` or `stage`, it can resolve as soon as the
-  call is received, before it runs. It resolves with the receipt.
+  call is received, before it runs. A long poll stays `pending`, with only `received` in its
+  timeline, until it answers; its `offset` and `allowed_updates` apply as it arrives. It resolves
+  with the receipt.
 - `{ kind: "quiet", ms, botIds }` holds when no bot has an update it has not confirmed, a Bot API
   call in progress (a long poll aside, a delayed or held call included) or a webhook attempt
   running; no test action, owner client call, clock advance or restore is under way; and `ms`

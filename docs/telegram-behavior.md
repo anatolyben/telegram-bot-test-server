@@ -800,7 +800,8 @@ seconds.
 - **`allowed_updates`**, from `setWebhook` or `getUpdates`, is a list or the same list as a JSON
   string, in any body. Names match in any case and unknown ones are skipped; an empty list, or one
   with no known name, means the default: every update but `chat_member`, `message_reaction` and
-  `message_reaction_count`.
+  `message_reaction_count`. As the `getUpdates` docs say, it does not affect updates made before
+  the call that sets it; a long poll sets it as it arrives.
 - **Rights decide who hears what**, as the [Update](https://core.telegram.org/bots/api#update) docs
   say: `chat_member` and `message_reaction` reach only bots that are administrators in the chat,
   and `chat_join_request` only bots with `can_invite_users`. A bot gets `my_chat_member` whenever
