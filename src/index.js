@@ -40,6 +40,7 @@ import net from "node:net";
 import { domainToASCII } from "node:url";
 import { getSystemErrorName } from "node:util";
 import { unzipSync } from "node:zlib";
+import { Deserializer, Serializer } from "node:v8";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createClock, createWaits, diagnostic } from "./test-controls.js";
 import {
@@ -1446,6 +1447,25 @@ function readBody(request) {
     request.on("end", () => resolve(Buffer.concat(chunks)));
     request.on("error", reject);
   });
+}
+
+/**
+ * A snapshot's state as bytes, written once when it is taken, with the
+ * serialization structuredClone uses; each restore reads them into a new
+ * copy. (Node's v8.serialize would read Buffers back as views of the
+ * snapshot's bytes.)
+ */
+function snapshotBytes(state) {
+  const serializer = new Serializer();
+  serializer.writeHeader();
+  serializer.writeValue(state);
+  return serializer.releaseBuffer();
+}
+
+function snapshotState(bytes) {
+  const deserializer = new Deserializer(bytes);
+  deserializer.readHeader();
+  return deserializer.readValue();
 }
 
 /**
@@ -8146,7 +8166,7 @@ export async function startTestServer({
         { ...sent, record: records.get(sent.record.token) },
       ]),
     );
-    const state = structuredClone({
+    const bytes = snapshotBytes({
       users: fixtureUsers,
       bots: records,
       sentUpdates: fixtureUpdates,
@@ -8182,7 +8202,7 @@ export async function startTestServer({
       time: clock.now(),
     });
     const id = `${instanceId}-${randomBytes(12).toString("hex")}`;
-    snapshots.set(id, state);
+    snapshots.set(id, bytes);
     return id;
   }
 
@@ -8190,7 +8210,7 @@ export async function startTestServer({
     if (!snapshots.has(id))
       throw new TelegramError(404, "Unknown snapshot for this server");
     requireQuiescent();
-    const state = structuredClone(snapshots.get(id));
+    const state = snapshotState(snapshots.get(id));
     waits.cancel("Fixture restored");
     clock.clear();
     expiryTasks.clear();
