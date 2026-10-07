@@ -8762,19 +8762,27 @@ export async function startTestServer({
           entry.message.message_id || entry.after,
           entry.message.ephemeral_message_id ?? 0,
         ];
-        return [...chat.messages.values(), ...(chat.ephemeral?.values() ?? [])]
-          .filter((entry) => !entry.deleted)
-          .sort((left, right) => {
-            const [a, b] = [order(left), order(right)];
-            return b[0] - a[0] || b[1] - a[1];
-          })
-          .map((entry) => entry.message);
+        // Copies, as getCalls and the message log return: a caller that
+        // changes one must not rewrite the server's message.
+        return structuredClone(
+          [...chat.messages.values(), ...(chat.ephemeral?.values() ?? [])]
+            .filter((entry) => !entry.deleted)
+            .sort((left, right) => {
+              const [a, b] = [order(left), order(right)];
+              return b[0] - a[0] || b[1] - a[1];
+            })
+            .map((entry) => entry.message),
+        );
       }
       if (sub === "ephemeral-messages" && subId) {
         const entry = chat.ephemeral?.get(Number(subId));
         if (method === "GET" && !parts[4]) {
           return entry
-            ? { exists: true, deleted: entry.deleted, message: entry.message }
+            ? structuredClone({
+                exists: true,
+                deleted: entry.deleted,
+                message: entry.message,
+              })
             : { exists: false, deleted: false };
         }
         if (method === "POST" && parts[4] === "callback") {
@@ -8792,12 +8800,12 @@ export async function startTestServer({
       if (sub === "messages" && method === "GET" && subId) {
         const entry = chat.messages.get(Number(subId));
         return entry
-          ? {
+          ? structuredClone({
               exists: true,
               deleted: entry.deleted,
               message: entry.message,
               reactions: Object.fromEntries(entry.reactions ?? []),
-            }
+            })
           : { exists: false, deleted: false };
       }
       if (sub === "members" && method === "GET" && subId) {
@@ -8881,10 +8889,12 @@ export async function startTestServer({
       if (method === "GET" && !subId) {
         requireUser(id);
         return existing
-          ? [...existing.messages.values()]
-              .filter((entry) => !entry.deleted)
-              .map((entry) => entry.message)
-              .sort((left, right) => right.message_id - left.message_id)
+          ? structuredClone(
+              [...existing.messages.values()]
+                .filter((entry) => !entry.deleted)
+                .map((entry) => entry.message)
+                .sort((left, right) => right.message_id - left.message_id),
+            )
           : [];
       }
       if (method === "POST" && subId && parts[4] === "callback") {

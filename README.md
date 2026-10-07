@@ -366,7 +366,8 @@ Messages are kept the way Telegram returns them: `parse_mode` formatting becomes
 `getDirectMessages` include service messages, such as `new_chat_members` for each join and
 `pinned_message` for each pin.
 `getCalls()` keeps requests as they came, fixture secrets included, so do not dump it
-indiscriminately.
+indiscriminately. It returns copies, and so do `getMessage`, `getMessages`, `getEphemeralMessage`
+and `getDirectMessages`: changing what they return changes nothing on the server.
 
 To show that the bot did **not** act, without sleeping, give it something it does act on
 afterwards, in the same chat, and wait for that:
@@ -2225,6 +2226,8 @@ fields below.
 
 - **0.12.1**: pending message and update waits, `drainDeliveries`, `snapshot` and `restore` are
   faster on long chats and journals; behavior is unchanged ([measurements][performance]).
+  - Fixed: `getMessage`, `getMessages`, `getEphemeralMessage` and `getDirectMessages` return
+    copies, as `getCalls` does. Changing what they returned used to change the stored message.
 - **0.12.0**: watch and record what happens in the chats, observe a run more closely, let the app
   under test follow the manual clock, and let members and people do more of what they do on
   Telegram.

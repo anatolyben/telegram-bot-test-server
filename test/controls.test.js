@@ -550,6 +550,56 @@ it("keeps returned request journals detached so callers cannot rewrite replay ev
   expect(original.params.reply_markup.inline_keyboard[0][0].text).toBe("ok");
   expect(original.timeline.map((e) => e.stage)).toContain("response_sent");
 });
+it("returns copies of stored messages, so changing one changes nothing on the server", async () => {
+  const { fake, api, user } = await setup();
+  const posted = await fake.post(CHAT, user, "original");
+  await fake.react(CHAT, posted, user, "👍");
+  const ephemeral = await api("sendMessage", {
+    chat_id: CHAT,
+    text: "just for you",
+    ephemeral_message_parameters: { receiver_user_id: user },
+  });
+  const eid = ephemeral.result.ephemeral_message_id;
+  await fake.sendDirectMessage(user, "private");
+  const before = JSON.stringify({
+    one: await fake.getMessage(CHAT, posted),
+    all: await fake.getMessages(CHAT),
+    ephemeral: await fake.getEphemeralMessage(CHAT, eid),
+    direct: await fake.getDirectMessages(user),
+  });
+
+  const one = await fake.getMessage(CHAT, posted);
+  one.message.text = "changed";
+  one.message.from.first_name = "changed";
+  one.reactions[user].push("👎");
+  for (const message of await fake.getMessages(CHAT)) message.text = "changed";
+  (await fake.getEphemeralMessage(CHAT, eid)).message.text = "changed";
+  for (const message of await fake.getDirectMessages(user)) {
+    message.text = "changed";
+  }
+
+  expect(
+    JSON.stringify({
+      one: await fake.getMessage(CHAT, posted),
+      all: await fake.getMessages(CHAT),
+      ephemeral: await fake.getEphemeralMessage(CHAT, eid),
+      direct: await fake.getDirectMessages(user),
+    }),
+  ).toBe(before);
+  // The bot sees the stored message as it was, too.
+  const forward = await api("forwardMessage", {
+    chat_id: CHAT,
+    from_chat_id: CHAT,
+    message_id: posted,
+  });
+  expect(forward.result.text).toBe("original");
+  await expect(
+    fake.waitFor(
+      { kind: "message", chatId: CHAT, userId: user, text: "changed" },
+      { timeoutMs: 15 },
+    ),
+  ).rejects.toThrow(/observed/);
+});
 it("isolates concurrent bot and chat call waits and leaves unmatched faults for their exact attempt", async () => {
   const { fake, api, user } = await setup({ clock: { now: 1800000000000 } });
   const token = "987654:PARALLEL";
