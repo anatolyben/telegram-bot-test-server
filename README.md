@@ -2223,6 +2223,8 @@ fields below.
 
 ## Changes
 
+- **0.12.1**: pending message and update waits, `drainDeliveries`, `snapshot` and `restore` are
+  faster on long chats and journals; behavior is unchanged ([measurements][performance]).
 - **0.12.0**: watch and record what happens in the chats, observe a run more closely, let the app
   under test follow the manual clock, and let members and people do more of what they do on
   Telegram.
@@ -2331,8 +2333,8 @@ This is an early-stage project with a deliberately small scope, and the public A
 Pin an exact version:
 
 ```sh
-pnpm add -D --save-exact telegram-bot-test-server@0.12.0
-# or: npm install --save-dev --save-exact telegram-bot-test-server@0.12.0
+pnpm add -D --save-exact telegram-bot-test-server@0.12.1
+# or: npm install --save-dev --save-exact telegram-bot-test-server@0.12.1
 ```
 
 ## License
