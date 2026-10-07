@@ -415,6 +415,7 @@ function entityTags(entity, covered) {
     case "cashtag":
     case "bot_command":
     case "phone_number":
+    case "bank_card_number":
       return {
         open: `<span class="tv-entity" data-entity="${escapeAttr(entity.type)}">`,
         close: "</span>",

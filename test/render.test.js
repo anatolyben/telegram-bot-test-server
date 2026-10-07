@@ -915,8 +915,8 @@ describe("render", () => {
     expect(foreverHtml).toContain("live until stopped");
   });
 
-  it("draws the phone numbers, text links and text mentions a test gives", () => {
-    const text = "Call +1 212 555 0123, read the docs, ask Zed";
+  it("draws the phone numbers, card numbers, text links and text mentions a test gives", () => {
+    const text = "Call +1 212 555 0123, read the docs, ask Zed, pay 4242424242424242";
     const url = 'https://example.com/docs?a=1&b="2"';
     const zed = { id: 8800000009, is_bot: false, first_name: 'Zed "<b>"' };
     const item = message({
@@ -931,12 +931,20 @@ describe("render", () => {
           length: 3,
           user: zed,
         },
+        {
+          type: "bank_card_number",
+          offset: text.indexOf("4242"),
+          length: 16,
+        },
       ],
     });
     const html = renderMessage(item, makeContext(pageOf([item])));
     expectSafe(html);
     expect(html).toContain(
       '<span class="tv-entity" data-entity="phone_number">+1 212 555 0123</span>',
+    );
+    expect(html).toContain(
+      '<span class="tv-entity" data-entity="bank_card_number">4242424242424242</span>',
     );
     expect(html).toContain(
       `<a class="tv-link" href="${escaped(url)}" target="_blank" rel="noopener noreferrer" title="${escaped(url)}">docs</a>`,
