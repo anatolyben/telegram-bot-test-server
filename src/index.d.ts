@@ -256,6 +256,11 @@ export interface RecordedCall {
   at: number;
   /** Rejected status, including actual permission/validation failures. */
   failed?: number;
+  /**
+   * The description the answer carried: Telegram's error text for a refusal,
+   * or a success's text such as "Webhook was set".
+   */
+  description?: string;
   /** The call took effect and its answer was dropped. */
   dropped?: true;
   /** Target argument, ephemeral recipient, or deleteMessage author captured before execution. */

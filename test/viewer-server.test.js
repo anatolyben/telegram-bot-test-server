@@ -593,6 +593,45 @@ it("serves stored image bytes and nothing else", async () => {
   expect((await get("files/unknown")).status).toBe(404);
 });
 
+it("serves the page under its policy with every file it loads, and no other file", async () => {
+  const { fake, get } = await setup();
+  const response = await fetch(fake.viewerUrl);
+  expect(response.status).toBe(200);
+  expect(response.headers.get("content-type")).toBe("text/html; charset=utf-8");
+  expect(response.headers.get("content-security-policy")).toBe(
+    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+  );
+  const html = await response.text();
+  const loads = [...html.matchAll(/\s(?:src|href)="([^"]+)"/g)]
+    .map((match) => match[1])
+    .filter((url) => !url.startsWith("data:"));
+  const boot = loads.find((url) => url.endsWith(".js"));
+  const bootSource = (await get(boot.slice("/_fake/ui/".length))).body;
+  // boot.js imports the other modules next to it.
+  const modules = [
+    ...String(bootSource).matchAll(/from "\.\/([a-z]+\.js)"/g),
+  ].map((match) => `/_fake/ui/assets/${match[1]}`);
+  expect(modules.length).toBeGreaterThan(0);
+  for (const url of [...loads, ...modules]) {
+    const asset = await get(url.slice("/_fake/ui/".length));
+    expect(asset.status, url).toBe(200);
+    expect(asset.headers.get("content-type"), url).toBe(
+      url.endsWith(".css")
+        ? "text/css; charset=utf-8"
+        : "text/javascript; charset=utf-8",
+    );
+  }
+  // The server's own modules are not the page's.
+  for (const name of [
+    "server.js",
+    "state.js",
+    "..%2Findex.js",
+    "viewer.html",
+  ]) {
+    expect((await get(`assets/${name}`)).status, name).toBe(404);
+  }
+});
+
 it("keeps everything the viewer reads out of the updates bots receive", async () => {
   const { fake, api } = await setup();
   const ann = await fake.createUser({ first_name: "Ann" });

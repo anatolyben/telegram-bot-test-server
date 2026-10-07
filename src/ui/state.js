@@ -3,7 +3,13 @@
  * the server's model (index.js uiModel). Read-only: members are read without
  * the side effects of an expiry, and nothing here changes what it is given.
  */
-import { inTopic, pageWindow, revokedBy, visibleTo } from "./views.js";
+import {
+  callWindow,
+  inTopic,
+  pageWindow,
+  revokedBy,
+  visibleTo,
+} from "./views.js";
 
 // A message's content, as the chat list names it: the first field it has.
 // An animation also carries document, a live photo photo and a venue
@@ -40,6 +46,51 @@ const SERVICE_FIELDS = [
   "forum_topic_created",
   "forum_topic_edited",
 ];
+// The parameters a call shows: what it asked for, never a secret, a raw
+// body or an upload. Every can_* right is kept too.
+const CALL_PARAMS = new Set([
+  "chat_id",
+  "user_id",
+  "receiver_user_id",
+  "ephemeral_message_parameters",
+  "message_id",
+  "message_ids",
+  "ephemeral_message_id",
+  "until_date",
+  "permissions",
+  "use_independent_chat_permissions",
+  "revoke_messages",
+  "only_if_banned",
+  "text",
+  "caption",
+  "parse_mode",
+  "callback_query_id",
+  "show_alert",
+  "url",
+  "invite_link",
+  "name",
+  "creates_join_request",
+  "member_limit",
+  "expire_date",
+  "custom_title",
+  "title",
+  "description",
+  "from_chat_id",
+  "question",
+  "result",
+  "emoji",
+  "message_thread_id",
+  "allowed_updates",
+  "offset",
+  "timeout",
+]);
+// Methods whose message ids are in the chat they copy from (from_chat_id).
+const SOURCE_CHAT_METHODS = new Set([
+  "forwardmessage",
+  "forwardmessages",
+  "copymessage",
+  "copymessages",
+]);
 // Members in the order a test looks for them.
 const MEMBER_ORDER = [
   "creator",
@@ -154,6 +205,21 @@ function imageIds(message) {
     largest(message.reply_to_message?.photo),
     largest(message.external_reply?.photo),
   ].filter(Boolean);
+}
+
+/** A whole number given as a number or as its digits, else null. */
+function idOf(value) {
+  const text = String(value ?? "").trim();
+  return /^-?\d+$/.test(text) && Number.isSafeInteger(Number(text))
+    ? Number(text)
+    : null;
+}
+
+/** A call parameter's text or caption, cut to 200 characters. */
+function shortText(value) {
+  if (typeof value !== "string") return value;
+  const chars = Array.from(value);
+  return chars.length > 200 ? `${chars.slice(0, 200).join("")}…` : value;
 }
 
 /** A person's or bot's name as the chat list shows it. */
@@ -298,7 +364,7 @@ export function createUiState(model) {
         key: "calls",
         id: null,
         type: "calls",
-        title: "Bot calls",
+        title: "Bot calls without a chat",
         is_forum: false,
         topics: [],
         migrated_to: null,
@@ -418,6 +484,163 @@ export function createUiState(model) {
     return users;
   }
 
+  /**
+   * The calls of a chat, or of "calls" (those no chat holds), oldest first,
+   * each with the chat it belongs to: the chat its chat_id names (a private
+   * chat as the user's chat with the calling bot), or the chat of the button
+   * press or join request query it answers. Business calls, calls naming no
+   * chat this server has, and refused requests (an unknown token, a body that
+   * could not be read) belong to "calls".
+   */
+  function callsOf(key) {
+    const botIds = new Set(model.bots().map((record) => record.id));
+    const chatOf = (call) => {
+      const params = call.params ?? {};
+      if (params.business_connection_id != null) return null;
+      const method = String(call.method).toLowerCase();
+      const id = idOf(
+        method === "answercallbackquery"
+          ? model.chatOfQuery(params.callback_query_id)
+          : method === "answerchatjoinrequestquery"
+            ? model.chatOfQuery(params.chat_join_request_query_id)
+            : params.chat_id,
+      );
+      if (id === null) return null;
+      if (id < 0) {
+        const chat = model.chat(id);
+        return chat ? { key: String(chat.id), id: chat.id } : null;
+      }
+      const user = model.user(id);
+      return user && !user.is_bot && botIds.has(call.bot_id)
+        ? { key: `${id}:${call.bot_id}`, id }
+        : null;
+    };
+    const found = [];
+    const keep = (call, journal, chat) =>
+      found.push({
+        call,
+        journal,
+        chat,
+        request_number: requestNumber(call.request_id),
+      });
+    for (const call of model.calls()) {
+      const chat = chatOf(call);
+      if ((chat?.key ?? "calls") === key) keep(call, "calls", chat);
+    }
+    if (key === "calls") {
+      for (const call of model.rejectedRequests()) {
+        keep(call, "rejected_requests", null);
+      }
+    }
+    return found.sort(
+      (left, right) => left.request_number - right.request_number,
+    );
+  }
+
+  function requestNumber(requestId) {
+    return Number(String(requestId).split(":").pop());
+  }
+
+  /**
+   * A call as the timeline shows it: what it asked (CALL_PARAMS), how it
+   * ended, Telegram's description, and what it touched — the messages it
+   * names (in the chat it copies from, for forwards and copies), its user,
+   * and the messages it stored (`created`, by request id).
+   */
+  function callItem({ call, journal, chat, request_number }, created) {
+    const raw = call.params ?? {};
+    const params = {};
+    for (const [name, value] of Object.entries(raw)) {
+      if (CALL_PARAMS.has(name) || name.startsWith("can_")) {
+        params[name] =
+          name === "text" || name === "caption" ? shortText(value) : value;
+      }
+    }
+    const method = String(call.method);
+    const targetChat = idOf(
+      SOURCE_CHAT_METHODS.has(method.toLowerCase())
+        ? raw.from_chat_id
+        : raw.chat_id,
+    );
+    const ids = [
+      raw.message_id,
+      ...(Array.isArray(raw.message_ids) ? raw.message_ids : []),
+    ]
+      .map(idOf)
+      .filter((id) => id !== null);
+    const stored = created.get(call.request_id) ?? [];
+    return {
+      kind: "call",
+      journal,
+      call_seq: call.seq,
+      request_id: call.request_id,
+      request_number,
+      bot_id: call.bot_id ?? null,
+      method,
+      at: call.at,
+      completed_at: call.completed_at ?? null,
+      outcome: call.outcome,
+      status: call.status ?? null,
+      applied: call.applied === true,
+      description: call.description ?? null,
+      unimplemented:
+        !model.knownMethod(method) || call.outcome === "unimplemented_ok",
+      fault_injected: call.fault_injected === true,
+      chat_id: chat?.id ?? idOf(raw.chat_id),
+      params,
+      targets: {
+        messages:
+          targetChat === null
+            ? []
+            : ids.map((id) => ({ chat_id: targetChat, message_id: id })),
+        user_id: call.target_user_id ?? null,
+        ephemeral_message_id: idOf(raw.ephemeral_message_id),
+        created_message_ids: stored
+          .filter((item) => !item.ephemeral)
+          .map((item) => item.message.message_id),
+        created_ephemeral_ids: stored
+          .filter((item) => item.ephemeral)
+          .map((item) => item.message.ephemeral_message_id),
+      },
+    };
+  }
+
+  /** The messages each call stored, by request id. */
+  function storedBy(items) {
+    const created = new Map();
+    for (const item of items) {
+      if (item.kind !== "message" || item.request_id == null) continue;
+      if (!created.has(item.request_id)) created.set(item.request_id, []);
+      created.get(item.request_id).push(item);
+    }
+    return created;
+  }
+
+  /** The chat list's row of the calls no chat holds; null when there are none. */
+  function callsRow() {
+    const found = callsOf("calls");
+    if (!found.length) return null;
+    return {
+      key: "calls",
+      id: null,
+      type: "calls",
+      title: "Bot calls without a chat",
+      is_forum: false,
+      migrated_to: null,
+      migrated_from: null,
+      user_id: null,
+      bot_id: null,
+      last: null,
+      message_count: 0,
+      deleted_count: 0,
+      member_count: 0,
+      pending_join_requests: 0,
+      photo_file_id: null,
+      call_count: found.length,
+      last_call: callItem(found[found.length - 1], new Map()),
+    };
+  }
+
   /** The chat list's short form of a chat's latest item. */
   function preview(item) {
     if (!item) return null;
@@ -509,6 +732,9 @@ export function createUiState(model) {
     rows.sort(
       (left, right) => (right.last?.seq ?? -1) - (left.last?.seq ?? -1),
     );
+    // The calls no chat holds come first; a member sees no calls.
+    const calls = as === null ? callsRow() : null;
+    if (calls) rows.unshift(calls);
     return {
       instance: model.instance(),
       epoch: model.epoch(),
@@ -556,7 +782,8 @@ export function createUiState(model) {
     const target = resolve(ref);
     if (!target) throw refuse(404, "chat not found");
     const read = pageQuery(query);
-    let items = itemsOf(target);
+    const all = itemsOf(target);
+    let items = all;
     let as = null;
     if (read.as !== null) {
       ({ items, as } = seenBy(target, items, read.as));
@@ -568,6 +795,17 @@ export function createUiState(model) {
       read.callsBefore !== null
         ? { items: [], has_older: false, oldest_seq: null, latest_seq: null }
         : pageWindow(items, read);
+    // A member sees no calls. Only the calls the page shows are drawn up.
+    const calls =
+      as === null
+        ? callWindow(items, callsOf(target.key), window, {
+            callsBefore: read.callsBefore,
+          })
+        : { calls: [], calls_truncated: false, calls_oldest_request: null };
+    if (calls.calls.length) {
+      const created = storedBy(all);
+      calls.calls = calls.calls.map((found) => callItem(found, created));
+    }
     const group = target.kind === "group" && as === null ? target.chat : null;
     const named = new Set();
     const ids = new Set(target.kind === "private" ? [target.userId] : []);
@@ -581,6 +819,10 @@ export function createUiState(model) {
         }
         if (item.user_id != null) named.add(item.user_id);
       }
+    }
+    for (const call of calls.calls) {
+      ids.add(call.targets.user_id);
+      if (call.targets.user_id != null) named.add(call.targets.user_id);
     }
     const members = group ? membersOf(group, read.membersLimit, named) : [];
     const joinRequests = group
@@ -616,9 +858,9 @@ export function createUiState(model) {
         ),
         chat.photo_file_id,
       ]),
-      calls: [],
-      calls_truncated: false,
-      calls_oldest_request: null,
+      calls: calls.calls,
+      calls_truncated: calls.calls_truncated,
+      calls_oldest_request: calls.calls_oldest_request,
     };
   }
 

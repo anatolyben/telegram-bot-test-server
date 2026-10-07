@@ -1352,6 +1352,296 @@ export function renderEvent(event, ctx) {
   })}><span class="tv-event-glyph" aria-hidden="true">${EVENT_GLYPHS[event.type] ?? "•"}</span><span class="tv-event-text">${eventText(event, ctx)}</span>${timeTag(event.at)}</div>`;
 }
 
+// ── Calls ──────────────────────────────────────────────────────────────
+
+/**
+ * A chat stream with its bot calls: each call just before the first item
+ * stored after the call arrived (calls by request_number, items by
+ * after_request, then seq), so a call comes right before what it produced.
+ */
+export function mergeStream(items, calls) {
+  if (!calls?.length) return items;
+  const sorted = [...calls].sort(
+    (left, right) => left.request_number - right.request_number,
+  );
+  const out = [];
+  let next = 0;
+  for (const item of items) {
+    while (
+      next < sorted.length &&
+      sorted[next].request_number <= item.after_request
+    )
+      out.push(sorted[next++]);
+    out.push(item);
+  }
+  while (next < sorted.length) out.push(sorted[next++]);
+  return out;
+}
+
+/** Whether the view's `bots` and `methods` filters let a call through. */
+export function callShown(call, view) {
+  const method = String(call.method).toLowerCase();
+  return (
+    (!view?.bots?.length ||
+      view.bots.some((id) => Number(id) === Number(call.bot_id))) &&
+    (!view?.methods?.length ||
+      view.methods.some((name) => String(name).toLowerCase() === method))
+  );
+}
+
+const CALL_OUTCOMES = {
+  pending: "pending",
+  succeeded: "succeeded",
+  delayed: "delayed",
+  response_lost: "response lost",
+  failed_after_apply: "failed after apply",
+  rejected: "rejected",
+  unimplemented_ok: "unimplemented",
+};
+// Methods whose message ids are in the chat they copy from (from_chat_id).
+const CALL_SOURCE_METHODS = new Set([
+  "forwardmessage",
+  "forwardmessages",
+  "copymessage",
+  "copymessages",
+]);
+// Parameters drawn in words by callParams; the rest are listed as they are.
+const CALL_PARAMS_IN_WORDS = new Set([
+  "chat_id",
+  "user_id",
+  "receiver_user_id",
+  "ephemeral_message_parameters",
+  "message_id",
+  "message_ids",
+  "from_chat_id",
+  "ephemeral_message_id",
+  "until_date",
+  "permissions",
+  "use_independent_chat_permissions",
+  "revoke_messages",
+  "only_if_banned",
+  "show_alert",
+  "creates_join_request",
+  "text",
+  "caption",
+  "callback_query_id",
+  "message_thread_id",
+  "expire_date",
+]);
+
+/** A Bot API boolean as Telegram reads it. */
+function callFlag(value) {
+  return ["true", "yes", "1"].includes(
+    String(value ?? "")
+      .trim()
+      .toLowerCase(),
+  );
+}
+
+/**
+ * until_date in words: a UTC date, or "forever" for 0 and for a date under
+ * 30 seconds or over 366 days from the call, which Telegram takes as forever.
+ */
+function callUntil(value, at) {
+  const until = Number.parseInt(String(value ?? "").trim(), 10) || 0;
+  const away = until - Math.floor(Number(at) / 1000);
+  const forever = until === 0 || away < 30 || away > 366 * 86400;
+  return `<span title="until_date ${escapeAttr(value)}">${forever ? "forever" : `until ${escapeHtml(untilText(until))}`}</span>`;
+}
+
+/** The rights a parameter object or the can_* parameters turn off or on. */
+function callRights(entries, offWord, onWord) {
+  const off = entries.filter(([, value]) => !callFlag(value));
+  const on = entries.filter(([, value]) => callFlag(value));
+  const names = (list) =>
+    escapeHtml(list.map(([key]) => rightName(key)).join(", "));
+  if (offWord && off.length) return `${offWord} ${names(off)}`;
+  if (on.length) return `${onWord} ${names(on)}`;
+  return offWord ? "no permissions given" : "no rights";
+}
+
+function callValue(value) {
+  return escapeHtml(
+    oneLine(typeof value === "object" ? JSON.stringify(value) : value, 60),
+  );
+}
+
+/** What a call asked for, in words: who, which messages, until when, which rights, and the rest. */
+function callParams(call, ctx) {
+  const p = call.params ?? {};
+  const parts = [];
+  const person = (id) => `<strong>${nameWithTag(ctx, id)}</strong>`;
+  const ownChat =
+    ctx.chat?.type !== "calls" && String(p.chat_id) === String(ctx.chat?.id);
+  if (p.chat_id != null && !ownChat)
+    parts.push(`chat ${escapeHtml(p.chat_id)}`);
+  if (p.user_id != null) parts.push(`user ${person(p.user_id)}`);
+  const receiver =
+    p.receiver_user_id ?? p.ephemeral_message_parameters?.receiver_user_id;
+  if (receiver != null) parts.push(`only ${person(receiver)} sees it`);
+  const source = CALL_SOURCE_METHODS.has(String(call.method).toLowerCase())
+    ? p.from_chat_id
+    : null;
+  const ids = [
+    ...(p.message_id != null ? [p.message_id] : []),
+    ...(Array.isArray(p.message_ids) ? p.message_ids : []),
+  ];
+  if (ids.length) {
+    const shown = ids.slice(0, 10).map(escapeHtml).join(", ");
+    parts.push(
+      `${ids.length === 1 ? "message" : "messages"} ${shown}${ids.length > 10 ? ` and ${ids.length - 10} more` : ""}${source != null ? ` of chat ${escapeHtml(source)}` : ""}`,
+    );
+  } else if (p.from_chat_id != null) {
+    parts.push(`from chat ${escapeHtml(p.from_chat_id)}`);
+  }
+  if (p.ephemeral_message_id != null)
+    parts.push(`ephemeral message ${escapeHtml(p.ephemeral_message_id)}`);
+  if (p.message_thread_id != null)
+    parts.push(`topic ${escapeHtml(p.message_thread_id)}`);
+  if (p.until_date != null) parts.push(callUntil(p.until_date, call.at));
+  if (p.permissions && typeof p.permissions === "object")
+    parts.push(callRights(Object.entries(p.permissions), "can't", "can"));
+  const rights = Object.entries(p).filter(([key]) => key.startsWith("can_"));
+  if (rights.length) parts.push(callRights(rights, null, "rights:"));
+  for (const [key, label] of [
+    ["revoke_messages", "revoke messages"],
+    ["only_if_banned", "only if banned"],
+    ["use_independent_chat_permissions", "independent permissions"],
+    ["creates_join_request", "needs approval"],
+    ["show_alert", "as an alert"],
+  ])
+    if (callFlag(p[key])) parts.push(label);
+  for (const key of ["text", "caption"])
+    if (p[key] != null && p[key] !== "") parts.push(quoteText(p[key]));
+  if (p.expire_date != null && Number(p.expire_date) > 0)
+    parts.push(`expires ${escapeHtml(untilText(p.expire_date))}`);
+  for (const [key, value] of Object.entries(p))
+    if (
+      !CALL_PARAMS_IN_WORDS.has(key) &&
+      !key.startsWith("can_") &&
+      value != null &&
+      value !== ""
+    )
+      parts.push(`${escapeHtml(key.replace(/_/g, " "))} ${callValue(value)}`);
+  return parts;
+}
+
+/** The outcome pill's words: "rejected 400", "succeeded", "response lost" … */
+function callOutcome(call) {
+  const label = CALL_OUTCOMES[call.outcome] ?? String(call.outcome ?? "");
+  return (call.outcome === "rejected" ||
+    call.outcome === "failed_after_apply") &&
+    call.status != null
+    ? `${label} ${call.status}`
+    : label;
+}
+
+function callBot(call, ctx) {
+  if (userOf(ctx, call.bot_id)) return nameWithTag(ctx, call.bot_id);
+  return `unknown bot ${escapeHtml(call.bot_id ?? "")}`;
+}
+
+/**
+ * One Bot API call: the bot, the method, what it asked in words, how it
+ * ended, and for any answer other than 200 Telegram's text as it was sent.
+ * Clicking it highlights what it touched (interact.highlightCall).
+ */
+export function renderCall(call, ctx) {
+  const tags = [
+    call.unimplemented && call.outcome !== "unimplemented_ok"
+      ? "unimplemented"
+      : null,
+    call.fault_injected ? "injected" : null,
+    call.journal === "rejected_requests" && call.status !== 401
+      ? "unreadable request"
+      : null,
+  ]
+    .filter(Boolean)
+    .map((tag) => ` <span class="tv-tag">${escapeHtml(tag)}</span>`)
+    .join("");
+  const params = callParams(call, ctx);
+  const error =
+    call.status !== 200 && call.description
+      ? `<div class="tv-call-error" title="Telegram's error text">${escapeHtml(call.description)}</div>`
+      : "";
+  return `<div class="tv-call"${attrs({
+    "data-kind": "call",
+    "data-chat-key": ctx.key,
+    "data-chat-id": ctx.chat?.id,
+    "data-call-seq": call.call_seq,
+    "data-call-journal": call.journal,
+    "data-request-id": call.request_id,
+    "data-request-number": call.request_number,
+    "data-call-bot-id": call.bot_id,
+    "data-call-method": call.method,
+    "data-call-outcome": call.outcome,
+    "data-target-messages":
+      (call.targets?.messages ?? [])
+        .map((target) => `${target.chat_id}:${target.message_id}`)
+        .join(" ") || null,
+    "data-target-user-id": call.targets?.user_id,
+    "data-target-ephemeral-id": call.targets?.ephemeral_message_id,
+    "data-before-window": call.before_window === true,
+    tabindex: "0",
+  })}><div class="tv-call-line"><span class="tv-call-glyph" aria-hidden="true">⇢</span><span class="tv-call-bot">${callBot(call, ctx)}</span><code class="tv-call-method">${escapeHtml(call.method)}</code><span class="tv-call-outcome"${attrs({ "data-outcome": call.outcome })}>${escapeHtml(callOutcome(call))}</span>${tags}<span class="tv-call-number" title="${escapeAttr(`request ${call.request_id}`)}">#${escapeHtml(call.request_number)}</span>${timeTag(call.at)}</div>${params.length ? `<div class="tv-call-params">${params.join(" · ")}</div>` : ""}${error}</div>`;
+}
+
+/**
+ * The calls filter: a checkbox for each bot and each method among `calls`
+ * and the view's filters, checked when the filter lets it through. Nothing
+ * when there are no calls and no filter.
+ */
+export function renderCallFilters(calls, view, ctx, { open = false } = {}) {
+  if (!calls.length && !view.bots?.length && !view.methods?.length) return "";
+  const bots = new Map();
+  for (const bot of ctx.bots.values()) bots.set(Number(bot.id), true);
+  for (const call of calls) bots.set(Number(call.bot_id), true);
+  for (const id of view.bots ?? []) bots.set(Number(id), true);
+  const methods = new Map();
+  for (const call of calls) {
+    const name = String(call.method);
+    const entry = methods.get(name.toLowerCase()) ?? { name, count: 0 };
+    entry.count += 1;
+    methods.set(name.toLowerCase(), entry);
+  }
+  for (const name of view.methods ?? [])
+    if (!methods.has(name.toLowerCase()))
+      methods.set(name.toLowerCase(), { name, count: 0 });
+  const box = (value, checked, label) =>
+    `<label class="tv-check"><input type="checkbox" value="${escapeAttr(value)}"${checked ? " checked" : ""}><span>${label}</span></label>`;
+  const botBoxes = [...bots.keys()]
+    .map((id) =>
+      box(
+        id,
+        !view.bots?.length || view.bots.some((bot) => Number(bot) === id),
+        callBot({ bot_id: id }, ctx),
+      ),
+    )
+    .join("");
+  const methodBoxes = [...methods.values()]
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .map(({ name, count }) =>
+      box(
+        name,
+        !view.methods?.length ||
+          view.methods.some(
+            (each) => each.toLowerCase() === name.toLowerCase(),
+          ),
+        `<code>${escapeHtml(name)}</code> <span class="tv-count">${count}</span>`,
+      ),
+    )
+    .join("");
+  const shown = calls.filter((call) => callShown(call, view)).length;
+  const filtered = Boolean(view.bots?.length || view.methods?.length);
+  return `<details class="tv-call-filters" data-role="call-filters"${open ? " open" : ""}><summary>Filter calls <span class="tv-count" data-role="calls-shown">${filtered ? `${shown} of ${calls.length}` : `${calls.length}`}</span></summary><div class="tv-call-filter-sets"><fieldset data-role="call-filter-bot"><legend>Bots</legend>${botBoxes}</fieldset><fieldset data-role="call-filter-method"><legend>Methods</legend>${methodBoxes}</fieldset></div></details>`;
+}
+
+/** The button that loads the calls older than `beforeRequest`. */
+export function renderOlderCalls(beforeRequest) {
+  if (beforeRequest == null) return "";
+  return `<div class="tv-older"><button type="button" class="tv-pill-button" data-role="load-older-calls" data-before-request="${escapeAttr(beforeRequest)}">Load older calls</button></div>`;
+}
+
 // ── Streams (chat column, events panel) ────────────────────────────────
 
 /** Member events by the service message they link (event.service_seq). */
@@ -1361,21 +1651,6 @@ export function serviceLinks(items) {
     if (item.kind === "event" && item.service_seq != null)
       links.set(item.service_seq, item);
   return links;
-}
-
-/** Merges calls into the chat stream by request order (calls are not drawn yet). */
-export function mergeStream(items, calls) {
-  return items;
-}
-
-/** One call of the timeline (calls are not drawn yet). */
-export function renderCall(call, ctx) {
-  return "";
-}
-
-/** The calls panel (calls are not drawn yet). */
-export function renderCallsPanel(ctx, calls, view) {
-  return '<p class="tv-empty" data-role="no-calls">No calls are recorded yet.</p>';
 }
 
 function itemTime(item) {
@@ -1923,7 +2198,7 @@ function columnTitle(column, info) {
   return info?.title ? `${label} · ${info.title}` : label;
 }
 
-/** A column's frame: header and body slots the page fills and patches. */
+/** A column's frame: header, the call filters' bar (chat and calls columns) and body slots the page fills and patches. */
 export function renderColumn(column, info = {}) {
   const perChat = column.panel !== "list";
   const body =
@@ -1939,7 +2214,11 @@ export function renderColumn(column, info = {}) {
     "data-chat-id": perChat ? (info.chatId ?? null) : null,
     "data-view-as": info.viewAs ?? "",
     "aria-label": columnTitle(column, info),
-  })}><header class="tv-pane-header" data-slot="header"></header><div class="tv-pane-body">${body}</div></section>`;
+  })}><header class="tv-pane-header" data-slot="header"></header>${
+    column.panel === "chat" || column.panel === "calls"
+      ? '<div class="tv-pane-tools" data-slot="tools"></div>'
+      : ""
+  }<div class="tv-pane-body">${body}</div></section>`;
 }
 
 /** The header of a per-chat column: the chat, its kind, open-alone and hide. */

@@ -151,6 +151,9 @@ export function bindViewer(root, actions) {
       case "jump-latest":
         actions.jumpLatest(column);
         break;
+      case "load-older-calls":
+        actions.loadOlderCalls(column);
+        break;
       case "phone-pane":
         actions.phonePane(control.getAttribute("data-pane"));
         break;
@@ -162,6 +165,32 @@ export function bindViewer(root, actions) {
   });
   root.addEventListener("change", (event) => {
     const target = event.target;
+    const filter =
+      target instanceof HTMLInputElement
+        ? target.closest(
+            "[data-role='call-filter-bot'], [data-role='call-filter-method']",
+          )
+        : null;
+    if (filter) {
+      const boxes = [...filter.querySelectorAll("input[type='checkbox']")];
+      const checked = boxes.filter((box) => box.checked);
+      // Nothing checked would show nothing; keep the last one.
+      if (!checked.length) {
+        target.checked = true;
+        return;
+      }
+      const values =
+        checked.length === boxes.length
+          ? null
+          : checked.map((box) => box.value);
+      actions.filterCalls(
+        filter.getAttribute("data-role") === "call-filter-bot"
+          ? "bots"
+          : "methods",
+        values,
+      );
+      return;
+    }
     if (!(target instanceof HTMLSelectElement)) return;
     const role = target.getAttribute("data-role");
     if (role === "view-as") actions.setAs(target.value);
@@ -215,7 +244,26 @@ export function bindViewer(root, actions) {
   };
   root.addEventListener("pointerup", finish);
   root.addEventListener("pointercancel", finish);
+  // A details element's toggle does not bubble.
+  root.addEventListener(
+    "toggle",
+    (event) => {
+      if (event.target?.getAttribute?.("data-role") === "call-filters")
+        actions.callFiltersOpen(event.target.open);
+    },
+    true,
+  );
   root.addEventListener("keydown", (event) => {
+    const call =
+      event.target instanceof Element &&
+      (event.key === "Enter" || event.key === " ")
+        ? event.target.closest("[data-kind='call']")
+        : null;
+    if (call === event.target) {
+      event.preventDefault();
+      highlightCall(root, call);
+      return;
+    }
     const divider =
       event.target instanceof Element
         ? event.target.closest("[data-role='divider']")
@@ -270,8 +318,78 @@ function revealMessage(origin, messageId) {
   setTimeout(() => target.removeAttribute("data-flash"), 1200);
 }
 
-/** Hides the calls the bots and methods filters leave out (calls are not drawn yet). */
-export function applyCallFilters(root, view) {}
+/**
+ * Marks what a call touched with data-highlighted="true", clearing the last
+ * highlight: the messages it names (by chat id and message id, so a forward
+ * finds its source chat's message), its ephemeral message and its user in
+ * the call's chat, and everything it produced (data-request-id). Scrolls to
+ * the first; a named message that is not on the page gets a note in the
+ * call's column.
+ */
+export function highlightCall(root, callElement) {
+  for (const element of root.querySelectorAll("[data-highlighted]"))
+    element.removeAttribute("data-highlighted");
+  for (const note of root.querySelectorAll("[data-role='pane-note']"))
+    note.remove();
+  const read = (name) => callElement.getAttribute(name);
+  const all = (selector) => [...root.querySelectorAll(selector)];
+  const key = read("data-chat-key");
+  const inChat = key ? `[data-chat-key="${CSS.escape(key)}"]` : "";
+  const found = [];
+  const notes = [];
+  for (const target of (read("data-target-messages") ?? "")
+    .split(" ")
+    .filter(Boolean)) {
+    const [chatId, messageId] = target.split(":");
+    const messages = all(
+      `[data-kind='message'][data-chat-id="${CSS.escape(chatId)}"][data-message-id="${CSS.escape(messageId)}"]`,
+    );
+    if (messages.length) found.push(...messages);
+    else notes.push(missingNote(root, chatId, messageId));
+  }
+  const ephemeral = read("data-target-ephemeral-id");
+  if (ephemeral && inChat)
+    found.push(
+      ...all(
+        `[data-kind='message']${inChat}[data-ephemeral-id="${CSS.escape(ephemeral)}"]`,
+      ),
+    );
+  const user = read("data-target-user-id");
+  if (user && inChat)
+    found.push(...all(`[data-member-id="${CSS.escape(user)}"]${inChat}`));
+  const request = read("data-request-id");
+  if (request)
+    found.push(
+      ...all(
+        `[data-request-id="${CSS.escape(request)}"]:not([data-kind='call'])`,
+      ),
+    );
+  callElement.setAttribute("data-highlighted", "true");
+  for (const element of found) element.setAttribute("data-highlighted", "true");
+  found[0]?.scrollIntoView({ block: "center" });
+  const column = callElement.closest("section[data-column-id]");
+  const body = column?.querySelector(".tv-pane-body");
+  if (notes.length && body) {
+    const note = root.ownerDocument.createElement("p");
+    note.className = "tv-pane-note";
+    note.setAttribute("data-role", "pane-note");
+    note.setAttribute("role", "status");
+    note.textContent = notes.join("; ");
+    body.prepend(note);
+  }
+}
 
-/** Highlights what a call affected (calls are not drawn yet). */
-export function highlightCall(root, callElement) {}
+/** Why a message a call names is not on the page. */
+function missingNote(root, chatId, messageId) {
+  const column = root.querySelector(
+    `section[data-panel='chat'][data-chat-id="${CSS.escape(chatId)}"]`,
+  );
+  if (!column)
+    return `message ${messageId} is in chat ${chatId}, which is not open`;
+  const loaded = [
+    ...column.querySelectorAll("[data-kind='message'][data-message-id]"),
+  ].map((element) => Number(element.getAttribute("data-message-id")));
+  return loaded.length && Number(messageId) < Math.min(...loaded)
+    ? `message ${messageId} is older than the loaded history`
+    : `message ${messageId} is not in the loaded history`;
+}

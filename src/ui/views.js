@@ -180,3 +180,51 @@ export function inTopic(item, topic) {
       : null;
   return topic === "general" ? thread == null : thread === Number(topic);
 }
+
+/**
+ * The calls a chat's page shows, from the chat's calls (each with its
+ * request_number): those that fall among the page's items in a merged stream
+ * (render.js mergeStream) — numbered above the after_request of the item just
+ * older than the page (from the first call when there is none), and up to the
+ * page's newest item's after_request, or every newer call when the page holds
+ * the chat's newest item. An empty chat shows every call. With `callsBefore`,
+ * the calls numbered below it instead, whatever the page.
+ *
+ * `items` is the list `page` (a pageWindow) was cut from. At most `limit`
+ * calls, the newest: `calls_truncated` then says older ones were left out,
+ * and `calls_oldest_request` is the oldest number sent, for the next
+ * `callsBefore`.
+ */
+export function callWindow(
+  items,
+  calls,
+  page,
+  { callsBefore = null, limit = 1000 } = {},
+) {
+  let after = -Infinity;
+  let upTo = Infinity;
+  if (callsBefore != null) {
+    upTo = callsBefore - 1;
+  } else if (page.items.length) {
+    const first = viewFirstFrom(items, page.items[0].seq);
+    const last = page.items[page.items.length - 1];
+    if (first > 0) after = items[first - 1].after_request;
+    if (viewFirstFrom(items, last.seq) < items.length - 1) {
+      upTo = last.after_request;
+    }
+  } else if (items.length) {
+    return { calls: [], calls_truncated: false, calls_oldest_request: null };
+  }
+  const inside = calls
+    .filter(
+      (call) => call.request_number > after && call.request_number <= upTo,
+    )
+    .sort((left, right) => left.request_number - right.request_number);
+  const kept = inside.slice(Math.max(0, inside.length - limit));
+  const truncated = kept.length < inside.length;
+  return {
+    calls: kept,
+    calls_truncated: truncated,
+    calls_oldest_request: truncated ? kept[0].request_number : null,
+  };
+}

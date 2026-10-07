@@ -97,6 +97,22 @@ function patchScrolled(
   else if (anchor?.isConnected) scroller.scrollTop = anchor.offsetTop - offset;
 }
 
+/** Calls by request number, oldest first; the newer copy of a call wins. */
+function mergeCalls(current, incoming) {
+  const byId = new Map(current.map((call) => [call.request_id, call]));
+  for (const call of incoming ?? []) byId.set(call.request_id, call);
+  return [...byId.values()].sort(
+    (left, right) => left.request_number - right.request_number,
+  );
+}
+
+/** The higher of two "calls below this may be missing" marks. */
+function higherGap(left, right) {
+  if (left == null) return right ?? null;
+  if (right == null) return left;
+  return Math.max(left, right);
+}
+
 function refOfColumn(columnId) {
   const text = String(columnId ?? "");
   return text.includes(":") ? text.slice(text.indexOf(":") + 1) : null;
@@ -128,6 +144,7 @@ export function startViewer({ render, interact, views, source, root }) {
     status: recording ? "recording" : "reconnecting",
     signature: null,
     eventVersion: 0,
+    filtersOpen: false,
   };
   root.innerHTML = [
     '<div class="tv-app">',
@@ -214,6 +231,10 @@ export function startViewer({ render, interact, views, source, root }) {
       newer: 0,
       countedAt: null,
       scroll: null,
+      // The calls of the loaded range, and the request number below which
+      // some may not be loaded yet (null: none missing).
+      calls: [],
+      callsGap: null,
     };
   }
 
@@ -316,9 +337,10 @@ export function startViewer({ render, interact, views, source, root }) {
 
   /**
    * Loads a chat: "latest" (the newest page, attached), "older" (the page
-   * before the oldest loaded item) or "refresh" (exactly the loaded range,
-   * plus new items while attached). One fetch per chat at a time; a change
-   * meanwhile marks the chat for one more refresh.
+   * before the oldest loaded item), "refresh" (exactly the loaded range,
+   * plus new items while attached) or "older-calls" (the calls before the
+   * oldest loaded one, when some are missing). One fetch per chat at a time;
+   * a change meanwhile marks the chat for one more refresh.
    */
   async function loadSlot(slot, mode = "refresh") {
     if (slot.busy) {
@@ -327,6 +349,7 @@ export function startViewer({ render, interact, views, source, root }) {
       markBusy();
       return;
     }
+    if (mode === "older-calls" && slot.callsGap == null) return;
     slot.busy = true;
     markBusy();
     const generation = ui.generation;
@@ -334,7 +357,9 @@ export function startViewer({ render, interact, views, source, root }) {
     const oldest = slot.items[0]?.seq;
     const newest = slot.items.at(-1)?.seq;
     let params;
-    if (mode === "older" && oldest != null)
+    if (mode === "older-calls")
+      params = { ...base, calls_before: slot.callsGap };
+    else if (mode === "older" && oldest != null)
       params = { ...base, before: oldest, limit: PAGE_SIZE };
     else if (mode === "latest" || oldest == null)
       params = { ...base, limit: PAGE_SIZE };
@@ -362,7 +387,7 @@ export function startViewer({ render, interact, views, source, root }) {
         slot.version = Math.max(slot.version, askedAt);
       } else {
         if (noteInstance(page) || page.version < slot.version) return;
-        applyPage(slot, page, effective);
+        applyPage(slot, page, effective, mode);
         // The first answer tells whether the chat is a forum; a topic filter then applies.
         if (
           page.chat?.is_forum &&
@@ -371,7 +396,9 @@ export function startViewer({ render, interact, views, source, root }) {
         )
           slot.next = "latest";
         const last = slot.items.at(-1)?.seq ?? 0;
-        if (
+        if (effective === "older-calls") {
+          // A page of calls says nothing about newer items.
+        } else if (
           !slot.attached &&
           page.latest_seq != null &&
           page.latest_seq > last &&
@@ -415,7 +442,12 @@ export function startViewer({ render, interact, views, source, root }) {
     }
   }
 
-  function applyPage(slot, page, mode) {
+  /**
+   * Takes a page into the chat's loaded range. Calls only accumulate (a call
+   * never goes away, only its outcome changes): a refresh merges them, and
+   * only the calls of items dropped from the range leave with them.
+   */
+  function applyPage(slot, page, mode, asked = mode) {
     slot.page = page;
     slot.missing = false;
     slot.loaded = true;
@@ -423,6 +455,26 @@ export function startViewer({ render, interact, views, source, root }) {
     slot.version = page.version;
     slot.files = { ...slot.files, ...(page.files ?? {}) };
     slot.users = { ...slot.users, ...(page.users ?? {}) };
+    const calls = page.calls ?? [];
+    const pageGap = page.calls_truncated ? page.calls_oldest_request : null;
+    if (mode === "older-calls") {
+      slot.calls = mergeCalls(slot.calls, calls);
+      slot.callsGap = pageGap;
+      slot.scroll = "keep";
+      return;
+    }
+    if (mode === "latest" && asked !== "refresh") {
+      slot.calls = calls;
+      slot.callsGap = pageGap;
+    } else if (mode === "older") {
+      slot.calls = mergeCalls(slot.calls, calls);
+      slot.callsGap = higherGap(slot.callsGap, pageGap);
+    } else {
+      // A refresh covers the whole loaded range: when it holds every call,
+      // none is missing; else what was missing still is.
+      slot.calls = mergeCalls(slot.calls, calls);
+      if (!page.calls_truncated) slot.callsGap = null;
+    }
     if (mode === "older") {
       const known = new Set(slot.items.map((item) => item.seq));
       const merged = [
@@ -434,6 +486,9 @@ export function startViewer({ render, interact, views, source, root }) {
         slot.items = merged.slice(0, LOADED_LIMIT);
         slot.attached = false;
         slot.countedAt = null;
+        // Calls after the newest item kept go with the dropped items.
+        const upTo = slot.items.at(-1).after_request;
+        slot.calls = slot.calls.filter((call) => call.request_number <= upTo);
       } else slot.items = merged;
       slot.scroll = "keep";
     } else if (mode === "latest") {
@@ -445,8 +500,14 @@ export function startViewer({ render, interact, views, source, root }) {
       slot.items = page.items;
       slot.hasOlder = page.has_older;
       if (slot.attached && slot.items.length > LOADED_LIMIT) {
+        // Calls up to the newest item dropped go with it.
+        const dropped =
+          slot.items[slot.items.length - LOADED_LIMIT - 1].after_request;
         slot.items = slot.items.slice(-LOADED_LIMIT);
         slot.hasOlder = true;
+        slot.calls = slot.calls.filter((call) => call.request_number > dropped);
+        if (slot.callsGap != null && slot.callsGap <= dropped + 1)
+          slot.callsGap = null;
       }
     }
   }
@@ -602,10 +663,20 @@ export function startViewer({ render, interact, views, source, root }) {
     });
   }
 
+  /** The loaded calls the view's bots and methods filters let through. */
+  function shownCalls(slot) {
+    return slot.calls.filter((call) => render.callShown(call, ui.view));
+  }
+
   function renderSlot(slot) {
     const ctx = contextOf(slot);
     const page = slot.page;
     const entry = listEntryOf(slot);
+    // In the combined layout the chat column carries the calls inline.
+    const inlineCalls =
+      ui.view.layout === "combined" &&
+      ui.view.show.includes("calls") &&
+      ui.view.as == null;
     for (const column of render.columnsFor(ui.view)) {
       if (column.ref !== slot.ref) continue;
       const element = columnElement(column.id);
@@ -625,6 +696,7 @@ export function startViewer({ render, interact, views, source, root }) {
           missing: slot.missing,
         }),
       );
+      const tools = element.querySelector("[data-slot='tools']");
       const scroller = element.querySelector("[data-slot='scroll']");
       const top = element.querySelector("[data-slot='top']");
       const items = element.querySelector("[data-slot='items']");
@@ -655,12 +727,20 @@ export function startViewer({ render, interact, views, source, root }) {
             : "";
         patchHtml(
           top,
-          `${notMember}${render.renderAccessNote(page)}${notMember ? "" : older}`,
+          `${notMember}${render.renderAccessNote(page)}${notMember ? "" : older}${inlineCalls ? render.renderOlderCalls(slot.callsGap) : ""}`,
+        );
+        patchHtml(
+          tools,
+          inlineCalls
+            ? render.renderCallFilters(slot.calls, ui.view, ctx, {
+                open: ui.filtersOpen,
+              })
+            : "",
         );
         const list = render.chatStream(slot.items, ctx, {
           layout: ui.view.layout,
           show: ui.view.show,
-          calls: page?.calls ?? [],
+          calls: shownCalls(slot),
         });
         const empty = notMember
           ? ""
@@ -698,15 +778,24 @@ export function startViewer({ render, interact, views, source, root }) {
         patchHtml(top, "");
         patchKeyed(items, page ? render.memberEntries(page, ctx) : []);
       } else if (column.panel === "calls") {
-        patchHtml(top, "");
         patchHtml(
+          tools,
+          render.renderCallFilters(slot.calls, ui.view, ctx, {
+            open: ui.filtersOpen,
+          }),
+        );
+        patchHtml(top, render.renderOlderCalls(slot.callsGap));
+        patchScrolled(
+          scroller,
           items,
-          render.renderCallsPanel(ctx, page?.calls ?? [], ui.view),
+          render.streamEntries(shownCalls(slot), ctx, {
+            empty: `<p class="tv-empty" data-role="no-calls">${slot.calls.length ? "No calls match the filter" : "No bot calls yet"}</p>`,
+          }),
+          scrollMode,
         );
       }
     }
     slot.scroll = null;
-    interact.applyCallFilters(root, ui.view);
   }
 
   function renderAll() {
@@ -783,6 +872,21 @@ export function startViewer({ render, interact, views, source, root }) {
     jumpLatest(columnId) {
       const slot = ui.slots.get(refOfColumn(columnId));
       if (slot) loadSlot(slot, "latest");
+    },
+    loadOlderCalls(columnId) {
+      const slot = ui.slots.get(refOfColumn(columnId));
+      if (slot) loadSlot(slot, "older-calls");
+    },
+    filterCalls(kind, values) {
+      const list = values?.length
+        ? kind === "bots"
+          ? values.map(Number)
+          : values
+        : null;
+      setView({ ...ui.view, [kind]: list });
+    },
+    callFiltersOpen(open) {
+      ui.filtersOpen = open === true;
     },
     phonePane(columnId) {
       ui.phonePane = columnId;
@@ -986,14 +1090,6 @@ export function liveSource(base = "/_fake/ui") {
 
 // ── recording source ──────────────────────────────────────────────────
 
-function isPresent(member) {
-  if (!member) return false;
-  return (
-    ["creator", "administrator", "member"].includes(member.status) ||
-    (member.status === "restricted" && member.is_member === true)
-  );
-}
-
 function compactItem(item) {
   if (!item) return null;
   if (item.kind === "event")
@@ -1035,32 +1131,36 @@ export function staticSource(json, viewsApi) {
     if (pages[text]) return text;
     return /^\d+$/.test(text) && firstBot ? `${text}:${firstBot.id}` : text;
   };
+  // What a member sees of a recorded chat, by the server's own filter: their
+  // state from the recorded members, and the bans that revoked their messages
+  // from the recorded calls.
   const viewOf = (page, userId) => {
     const chat = page.chat ?? {};
-    const row =
-      (page.members ?? []).find((entry) => Number(entry.user_id) === userId) ??
-      null;
-    const present =
-      chat.type === "private"
-        ? Number(chat.user_id) === userId
-        : isPresent(row?.member);
-    const as = {
-      user_id: userId,
-      status: chat.type === "private" ? null : (row?.member?.status ?? null),
-      in_chat: present,
-      access: chat.type === "group" ? "while_member" : present ? "all" : "none",
-      history_may_be_hidden:
-        present && chat.type === "supergroup" && !chat.is_forum,
-    };
-    if (as.access === "none") return { as, items: [] };
-    return {
-      as,
-      items: viewsApi.visibleTo(
+    if (chat.type === "private") {
+      return viewsApi.visibleTo(
         page.items ?? [],
-        { user_id: userId, ...(row?.member ?? {}) },
+        { user_id: userId, status: null, revoked_by: [] },
         chat,
-      ),
-    };
+      );
+    }
+    const member =
+      (page.members ?? []).find((entry) => Number(entry.user_id) === userId)
+        ?.member ?? null;
+    return viewsApi.visibleTo(
+      page.items ?? [],
+      {
+        user_id: userId,
+        status: member?.status ?? "left",
+        ...(member?.status === "restricted"
+          ? { is_member: member.is_member !== false }
+          : {}),
+        revoked_by:
+          chat.type === "group"
+            ? viewsApi.revokedBy(page.calls ?? [], chat.id, userId)
+            : [],
+      },
+      chat,
+    );
   };
   return {
     mode: "static",
@@ -1098,12 +1198,21 @@ export function staticSource(json, viewsApi) {
       if (params.as != null) ({ items, as } = viewOf(full, Number(params.as)));
       if (params.topic != null && full.chat?.is_forum)
         items = items.filter((item) => viewsApi.inTopic(item, params.topic));
-      const window = viewsApi.pageWindow(items, {
-        limit: params.limit ?? PAGE_SIZE,
-        before: params.before ?? null,
-        from: params.from ?? null,
-        to: params.to ?? null,
-      });
+      const callsBefore = params.calls_before ?? null;
+      const window =
+        callsBefore != null
+          ? { items: [], has_older: false, oldest_seq: null, latest_seq: null }
+          : viewsApi.pageWindow(items, {
+              limit: params.limit ?? PAGE_SIZE,
+              before: params.before ?? null,
+              from: params.from ?? null,
+              to: params.to ?? null,
+            });
+      const calls = as
+        ? { calls: [], calls_truncated: false, calls_oldest_request: null }
+        : viewsApi.callWindow(items, full.calls ?? [], window, {
+            callsBefore,
+          });
       const limit = params.members_limit ?? MEMBERS_SHOWN;
       return {
         ...full,
@@ -1112,7 +1221,7 @@ export function staticSource(json, viewsApi) {
         files,
         members: as || !limit ? [] : (full.members ?? []).slice(0, limit),
         join_requests: as ? [] : (full.join_requests ?? []),
-        calls: as ? [] : (full.calls ?? []),
+        ...calls,
       };
     },
     subscribe(deliver) {

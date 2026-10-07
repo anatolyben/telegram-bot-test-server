@@ -9336,6 +9336,7 @@ ${buttons}
             outcome: "rejected",
             status: 401,
             failed: 401,
+            description: "Unauthorized",
           },
           response,
           rejectedRequests,
@@ -9419,6 +9420,7 @@ ${buttons}
           failed: failure.error_code,
           status: failure.error_code,
           outcome: "rejected",
+          description: failure.description,
           completed_at: clock.now(),
         });
         waits.notify();
@@ -9447,6 +9449,7 @@ ${buttons}
         Object.assign(receipt, {
           outcome: answerTrue ? "unimplemented_ok" : "rejected",
           status: answerTrue ? 200 : 404,
+          ...(answerTrue ? {} : { description: "Not Found: method not found" }),
           completed_at: clock.now(),
         });
         if (!answerTrue) receipt.failed = 404;
@@ -9473,6 +9476,9 @@ ${buttons}
         Object.assign(receipt, {
           applied: true,
           status: 200,
+          ...(result instanceof Described
+            ? { description: result.description }
+            : {}),
           completed_at: clock.now(),
           outcome:
             failure?.drop_after_apply ||
@@ -9508,6 +9514,10 @@ ${buttons}
           outcome: receipt.applied ? "failed_after_apply" : "rejected",
           failed: error instanceof TelegramError ? error.code : 500,
           status: error instanceof TelegramError ? error.code : 500,
+          description:
+            error instanceof TelegramError
+              ? error.message
+              : "Internal Server Error",
           completed_at: clock.now(),
         });
         if (!(error instanceof TelegramError)) throw error;
