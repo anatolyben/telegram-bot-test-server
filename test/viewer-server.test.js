@@ -270,6 +270,7 @@ it("lists every chat, each private chat once per bot, and opens a private chat w
       `${carol}:${second.id}`,
       `${dave}:${BOT}`,
       `${dave}:${second.id}`,
+      "all",
     ].sort(),
   );
   expect(rows[basic]).toMatchObject({ type: "group", migrated_to: upgraded });
@@ -1104,4 +1105,40 @@ it("lists each message's reactions, most chosen first, names who chose them, and
   expect((await reactionsOf()).map((each) => each.total_count)).toEqual([
     1, 1, 1,
   ]);
+});
+
+it("shows every chat in one Activity feed, in order, each item with its chat, and a member only their chats", async () => {
+  const { fake, api, page } = await setup();
+  const log = await fake.createChat({ title: "Log", ownerId: OWNER });
+  await fake.setBotMembership(log, BOT);
+  const ann = await fake.createUser({ first_name: "Ann" });
+  await fake.join(CHAT, ann);
+  await fake.post(CHAT, ann, "hello group");
+  await api("sendMessage", { chat_id: log, text: "noted" });
+  await fake.sendDirectMessage(ann, "/start");
+  await api("sendMessage", { chat_id: CHAT, text: "bye group" });
+
+  const feed = await page("all");
+  expect(feed.chat).toMatchObject({ key: "all", title: "Activity" });
+  const texts = feed.items
+    .filter((item) => item.kind === "message" && item.message.text)
+    .map((item) => [item.message.text, item.chat_label]);
+  expect(texts).toEqual([
+    ["hello group", "Viewer"],
+    ["noted", "Log"],
+    ["/start", "Ann ↔ @example_bot"],
+    ["bye group", "Viewer"],
+  ]);
+  const seqs = feed.items.map((item) => item.seq);
+  expect(seqs).toEqual([...seqs].sort((left, right) => left - right));
+  expect(feed.calls.map((call) => call.chat_label)).toEqual(
+    expect.arrayContaining(["Viewer", "Log"]),
+  );
+
+  // Seen as Ann: the group and her private chat, not the log she is not in.
+  const asAnn = await page("all", `?as=${ann}`);
+  expect(new Set(asAnn.items.map((item) => item.chat_label))).toEqual(
+    new Set(["Viewer", "Ann ↔ @example_bot"]),
+  );
+  expect(asAnn.calls).toEqual([]);
 });

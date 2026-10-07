@@ -292,6 +292,7 @@ export function createUiState(model) {
   function resolve(ref) {
     const text = String(ref);
     if (text === "calls") return { key: "calls", kind: "calls", chat: null };
+    if (text === "all") return { key: "all", kind: "all", chat: null };
     const pair = /^(\d+):(\d+)$/.exec(text);
     if (pair) return privatePair(Number(pair[1]), Number(pair[2]));
     if (/^\d+$/.test(text)) {
@@ -347,8 +348,55 @@ export function createUiState(model) {
     };
   }
 
-  /** Every item of a chat or private pair, oldest first. */
+  /**
+   * Every chat and private pair with something in it (with `as`, only those
+   * that person can open), as targets: groups first, then private pairs.
+   */
+  function everyTarget(as = null) {
+    const targets = [];
+    for (const chat of model.chats()) {
+      if (as !== null && !chat.members.has(as)) continue;
+      targets.push({ key: String(chat.id), kind: "group", chat });
+    }
+    for (const chat of model.privateChats()) {
+      if (as !== null && chat.id !== as) continue;
+      const pairs = new Set();
+      for (const stored of [
+        ...chat.messages.values(),
+        ...(chat.events ?? []),
+      ]) {
+        pairs.add(model.privatePairOf(chat, stored));
+      }
+      for (const botId of pairs) {
+        const target = privatePair(chat.id, botId);
+        if (target) targets.push(target);
+      }
+    }
+    return targets;
+  }
+
+  /** A chat's name in the "all" feed: its title, or "<person> ↔ @<bot>". */
+  function labelOf(target) {
+    if (target.kind === "group") return target.chat.title ?? String(target.key);
+    if (target.kind === "private") {
+      const bot = model.bots().find((record) => record.id === target.botId);
+      return `${fullName(target.user)} ↔ @${bot?.username ?? target.botId}`;
+    }
+    return "Bot calls without a chat";
+  }
+
+  /** Every item of a chat or private pair (or of all of them, "all"), oldest first. */
   function itemsOf(target) {
+    if (target.kind === "all") {
+      const items = [];
+      for (const each of everyTarget()) {
+        const label = labelOf(each);
+        for (const item of itemsOf(each)) {
+          items.push({ ...item, chat_ref: each.key, chat_label: label });
+        }
+      }
+      return items.sort((left, right) => left.seq - right.seq);
+    }
     const { chat } = target;
     if (!chat) return [];
     const keep =
@@ -370,6 +418,23 @@ export function createUiState(model) {
 
   /** The page's description of the chat. */
   function chatJson(target) {
+    if (target.kind === "all") {
+      return {
+        key: "all",
+        id: null,
+        type: "all",
+        title: "Activity",
+        is_forum: false,
+        topics: [],
+        migrated_to: null,
+        migrated_from: null,
+        permissions: null,
+        description: null,
+        photo_file_id: null,
+        user_id: null,
+        bot_id: null,
+      };
+    }
     if (target.kind === "calls") {
       return {
         key: "calls",
@@ -556,6 +621,11 @@ export function createUiState(model) {
 
   /** The calls of a chat, or of "calls" (those no chat holds), oldest first. */
   function callsOf(key) {
+    if (key === "all") {
+      return [...callsByChat().values()]
+        .flat()
+        .sort((left, right) => left.request_number - right.request_number);
+    }
     return callsByChat({ only: key }).get(key) ?? [];
   }
 
@@ -739,24 +809,8 @@ export function createUiState(model) {
   function state(query = {}) {
     const as = integer(query, "as", null, 1);
     const rows = [];
-    for (const chat of model.chats()) {
-      if (as !== null && !chat.members.has(as)) continue;
-      const target = { key: String(chat.id), kind: "group", chat };
+    for (const target of everyTarget(as)) {
       rows.push(row(target, itemsOf(target), as));
-    }
-    for (const chat of model.privateChats()) {
-      if (as !== null && chat.id !== as) continue;
-      const pairs = new Set();
-      for (const stored of [
-        ...chat.messages.values(),
-        ...(chat.events ?? []),
-      ]) {
-        pairs.add(model.privatePairOf(chat, stored));
-      }
-      for (const botId of pairs) {
-        const target = privatePair(chat.id, botId);
-        if (target) rows.push(row(target, itemsOf(target), as));
-      }
     }
     // Most recent first; chats with nothing in them last, in creation order.
     rows.sort(
@@ -765,6 +819,11 @@ export function createUiState(model) {
     // The calls no chat holds come first; a member sees no calls.
     const calls = as === null ? callsRow() : null;
     if (calls) rows.unshift(calls);
+    // "Activity" (every chat in one feed) comes first in the test view.
+    if (as === null) {
+      const all = { key: "all", kind: "all", chat: null };
+      rows.unshift(row(all, itemsOf(all), null));
+    }
     return {
       instance: model.instance(),
       epoch: model.epoch(),
@@ -816,7 +875,24 @@ export function createUiState(model) {
     const all = itemsOf(target);
     let items = all;
     let as = null;
-    if (read.as !== null) {
+    if (read.as !== null && target.kind === "all") {
+      // Seen as a member: each chat they can open, as they see it.
+      items = [];
+      for (const each of everyTarget(read.as)) {
+        const label = labelOf(each);
+        for (const item of seenBy(each, itemsOf(each), read.as).items) {
+          items.push({ ...item, chat_ref: each.key, chat_label: label });
+        }
+      }
+      items.sort((left, right) => left.seq - right.seq);
+      as = {
+        user_id: read.as,
+        status: null,
+        in_chat: true,
+        access: "member",
+        history_may_be_hidden: false,
+      };
+    } else if (read.as !== null) {
       ({ items, as } = seenBy(target, items, read.as));
     }
     if (read.topic !== null) {
@@ -850,7 +926,20 @@ export function createUiState(model) {
         : { calls: [], calls_truncated: false, calls_oldest_request: null };
     if (calls.calls.length) {
       const created = storedBy(all);
-      calls.calls = calls.calls.map((found) => callItem(found, created));
+      const labels =
+        target.kind === "all"
+          ? new Map(everyTarget().map((each) => [each.key, labelOf(each)]))
+          : null;
+      calls.calls = calls.calls.map((found) => {
+        const item = callItem(found, created);
+        if (!labels) return item;
+        const key = found.chat?.key ?? "calls";
+        return {
+          ...item,
+          chat_ref: key,
+          chat_label: labels.get(key) ?? "Bot calls without a chat",
+        };
+      });
     }
     return pageJson(target, window, as, calls, read.membersLimit);
   }

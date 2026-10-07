@@ -31,7 +31,7 @@ export const escapeAttr = escapeHtml;
 // ── View state in the URL ──────────────────────────────────────────────
 
 const PANEL_NAMES = new Set(PANELS);
-const REF_PATTERN = /^(?:-?\d{1,20}|\d{1,20}:\d{1,20}|calls)$/;
+const REF_PATTERN = /^(?:-?\d{1,20}|\d{1,20}:\d{1,20}|calls|all)$/;
 const METHOD_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
 
 function listParam(value) {
@@ -65,9 +65,13 @@ export function parseView(search) {
   const shown = new Set(
     listParam(params.get("show")).filter((panel) => PANEL_NAMES.has(panel)),
   );
+  // Opened without a chat, or on "all", the page is the one feed of every
+  // chat with its calls and events; the chat list and members stay off.
   const show = shown.size
     ? PANELS.filter((panel) => shown.has(panel))
-    : [...PANELS];
+    : !chats.length || chats[0] === "all"
+      ? ["chat", "calls", "events"]
+      : [...PANELS];
   const layout = LAYOUTS.includes(params.get("layout"))
     ? params.get("layout")
     : "combined";
@@ -129,9 +133,9 @@ export function viewToSearch(view) {
 
 /** The chat a URL without one opens: the most recently active, never the calls row. */
 export function defaultChat(state) {
-  return (
-    (state?.chats ?? []).find((chat) => chat.type !== "calls")?.key ?? null
-  );
+  const chats = state?.chats ?? [];
+  if (chats.some((chat) => chat.type === "all")) return "all";
+  return chats.find((chat) => chat.type !== "calls")?.key ?? null;
 }
 
 /**
@@ -157,7 +161,7 @@ export function columnsFor(view) {
     for (const panel of ["calls", "events"])
       if (!viewAs && ownColumns && show.has(panel))
         columns.push({ id: `${panel}:${ref}`, panel, ref });
-    if (!viewAs && show.has("members"))
+    if (!viewAs && show.has("members") && ref !== "all")
       columns.push({ id: `members:${ref}`, panel: "members", ref });
   }
   return columns;
@@ -315,6 +319,8 @@ export function personName(ctx, id) {
 function botTag(ctx, user) {
   if (!user) return null;
   const bot = ctx.bots.get(Number(user.id));
+  // With one bot there is nothing to tell apart.
+  if (bot && bot.first && ctx.bots.size === 1) return null;
   if (bot)
     return bot.first ? "first bot" : bot.deleted ? "deleted bot" : "added bot";
   return user.is_bot ? "bot" : null;
@@ -1292,7 +1298,7 @@ function senderLine(item, ctx, kind) {
     kind === "guest-bot"
       ? "guest bot"
       : kind === "first-bot"
-        ? "first bot"
+        ? botTag(ctx, from)
         : kind === "added-bot"
           ? (botTag(ctx, from) ?? "added bot")
           : "bot";
@@ -1300,7 +1306,7 @@ function senderLine(item, ctx, kind) {
     kind === "guest-bot"
       ? ` <span class="tv-sender-note">for ${escapeHtml(nameOf(m.guest_bot_caller_user))}</span>`
       : "";
-  return `<div class="tv-sender tv-id-${identitySlot(from.id)}">${name}${from.username ? ` <span class="tv-sender-note">@${escapeHtml(from.username)}</span>` : ""} <span class="tv-tag">${tag}</span>${caller}</div>`;
+  return `<div class="tv-sender tv-id-${identitySlot(from.id)}">${name}${from.username ? ` <span class="tv-sender-note">@${escapeHtml(from.username)}</span>` : ""}${tag ? ` <span class="tv-tag">${tag}</span>` : ""}${caller}</div>`;
 }
 
 /**
@@ -1531,7 +1537,7 @@ export function renderEvent(event, ctx) {
     "data-user-id": event.user_id,
     "data-request-id": event.request_id,
     "data-before-window": event.before_window === true,
-  })}><span class="tv-event-glyph" aria-hidden="true">${EVENT_GLYPHS[event.type] ?? "•"}</span><span class="tv-event-text">${eventText(event, ctx)}</span>${timeTag(event.at)}</div>`;
+  })}><span class="tv-event-text">${eventText(event, ctx)}</span>${timeTag(event.at)}</div>`;
 }
 
 // ── Calls ──────────────────────────────────────────────────────────────
@@ -1675,8 +1681,10 @@ function callParams(call, ctx) {
   const p = call.params ?? {};
   const parts = [];
   const person = (id) => `<strong>${nameWithTag(ctx, id)}</strong>`;
+  // In the "all" feed the chat's header above the call names its chat.
   const ownChat =
-    ctx.chat?.type !== "calls" && String(p.chat_id) === String(ctx.chat?.id);
+    call.chat_label != null ||
+    (ctx.chat?.type !== "calls" && String(p.chat_id) === String(ctx.chat?.id));
   if (p.chat_id != null && !ownChat)
     parts.push(`chat ${escapeHtml(p.chat_id)}`);
   if (p.user_id != null) parts.push(`user ${person(p.user_id)}`);
@@ -1786,8 +1794,9 @@ export function renderCall(call, ctx) {
     "data-target-user-id": call.targets?.user_id,
     "data-target-ephemeral-id": call.targets?.ephemeral_message_id,
     "data-before-window": call.before_window === true,
+    title: `Bot API call, request ${call.request_id}`,
     tabindex: "0",
-  })}><div class="tv-call-line"><span class="tv-call-glyph" aria-hidden="true">⇢</span><span class="tv-call-bot">${callBot(call, ctx)}</span><code class="tv-call-method">${escapeHtml(call.method)}</code><span class="tv-call-outcome"${attrs({ "data-outcome": call.outcome })}>${escapeHtml(callOutcome(call))}</span>${tags}<span class="tv-call-number" title="${escapeAttr(`request ${call.request_id}`)}">#${escapeHtml(call.request_number)}</span>${timeTag(call.at)}</div>${params.length ? `<div class="tv-call-params">${params.join(" · ")}</div>` : ""}${error}</div>`;
+  })}><div class="tv-call-head"><span class="tv-call-bot tv-id-${identitySlot(call.bot_id)}">${callBot(call, ctx)}</span><span class="tv-call-kind">Bot API call</span></div><div class="tv-call-line"><code class="tv-call-method">${escapeHtml(call.method)}</code><span class="tv-call-outcome"${attrs({ "data-outcome": call.outcome })}>${escapeHtml(callOutcome(call))}</span>${tags}</div>${params.length ? `<div class="tv-call-params">${params.join(" · ")}</div>` : ""}${error}<div class="tv-call-foot">${timeTag(call.at)}</div></div>`;
 }
 
 /**
@@ -1909,6 +1918,7 @@ export function streamEntries(list, ctx, options = {}) {
         markerBefore = index;
     });
   }
+  let lastChat = null;
   list.forEach((item, index) => {
     const time = itemTime(item);
     const day = dayKey(time);
@@ -1918,6 +1928,15 @@ export function streamEntries(list, ctx, options = {}) {
         html: `<div class="tv-day" data-role="day"><span>${escapeHtml(dayLabel(time))}</span></div>`,
       });
       lastDay = day;
+      lastChat = null;
+    }
+    // In the "all" feed, a header names the chat each run of items is in.
+    if (item.chat_label != null && item.chat_ref !== lastChat) {
+      out.push({
+        key: `c${entryKey(item)}`,
+        html: `<div class="tv-chat-switch" data-role="chat-switch" data-chat-ref="${escapeAttr(item.chat_ref)}"><span>In ${escapeHtml(item.chat_label)}</span></div>`,
+      });
+      lastChat = item.chat_ref;
     }
     if (index === markerBefore)
       out.push({
@@ -1929,6 +1948,7 @@ export function streamEntries(list, ctx, options = {}) {
     const near = (other) =>
       groupKeys[index] != null &&
       groupKeys[other] === groupKeys[index] &&
+      list[other].chat_ref === item.chat_ref &&
       Math.abs(itemTime(list[other]) - time) <= 300_000 &&
       dayKey(itemTime(list[other])) === day &&
       Math.max(index, other) !== markerBefore;
@@ -2335,9 +2355,9 @@ export function chatListEntries(
 // ── Frame: toolbar, columns, phone navigation ──────────────────────────
 
 const PANEL_LABELS = {
-  list: "Chats",
-  chat: "Chat",
-  calls: "Calls",
+  list: "All chats",
+  chat: "Messages",
+  calls: "Bot calls",
   events: "Events",
   members: "Members",
 };
@@ -2356,14 +2376,14 @@ export function renderToolbar(view, { people = [] } = {}) {
     (layout) =>
       `<button type="button" class="tv-toggle" data-role="layout" data-layout="${layout}" aria-pressed="${view.layout === layout}">${layout === "combined" ? "Combined" : "Split"}</button>`,
   ).join("");
-  const options = [{ id: "", name: "Test view (everything)" }, ...people]
+  const options = [{ id: "", name: "Everyone" }, ...people]
     .map(
       ({ id, name }) =>
         `<option value="${escapeAttr(id)}"${String(view.as ?? "") === String(id) ? " selected" : ""}>${escapeHtml(id === "" ? name : `As ${name}`)}</option>`,
     )
     .join("");
   const themes = [
-    ["", "System theme"],
+    ["", "Auto theme"],
     ["light", "Light"],
     ["dark", "Dark"],
   ]
@@ -2382,7 +2402,11 @@ export function renderToolbar(view, { people = [] } = {}) {
   return [
     el(
       "div",
-      { class: "tv-toolbar-group", role: "group", "aria-label": "Panels" },
+      {
+        class: "tv-toolbar-group tv-panel-toggles",
+        role: "group",
+        "aria-label": "Panels",
+      },
       toggles,
     ),
     el(
@@ -2597,8 +2621,8 @@ export function renderDivider(after, label, width = 0, minimum = 0) {
 }
 
 /**
- * The phone's bottom bar: Back and one button per column; with two chats or
- * more, each chat's buttons carry its title, shortened.
+ * The phone's bottom bar: one tab per column (the chat list is the way back);
+ * with two chats or more, each chat's tabs carry its title, shortened.
  */
 export function renderPhoneNav(columns, active, titles = {}) {
   const several =
@@ -2613,9 +2637,7 @@ export function renderPhoneNav(columns, active, titles = {}) {
       return `<button type="button" class="tv-phone-button" data-role="phone-pane" data-pane="${escapeAttr(column.id)}"${column.id === active ? ' aria-current="page"' : ""}>${escapeHtml(label)}</button>`;
     })
     .join("");
-  const back =
-    columns.some((column) => column.id === "list") && active !== "list";
-  return `<button type="button" class="tv-phone-button" data-role="phone-back"${back ? "" : " disabled"}>Back</button>${buttons}`;
+  return buttons;
 }
 
 /** The banner a member sees in a chat they are not in, or another user's private chat. */

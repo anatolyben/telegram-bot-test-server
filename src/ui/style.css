@@ -534,50 +534,53 @@ select {
 }
 
 @media (max-width: 799px) {
+  /* A phone shows every panel on one page, one under another: the chat
+     list, then each chat, then its calls, events and members. The page
+     scrolls; each panel keeps its own scroll inside a fixed height. */
+  .tv-app {
+    height: auto;
+    overflow: visible;
+  }
   .tv-workspace {
+    grid-auto-rows: auto;
     grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: none;
+    overflow: visible;
   }
-  /* The panes stack in one cell and the hidden ones keep their layout, so
-     each keeps its scroll place (a chat its latest message) while hidden. */
   .tv-workspace > .tv-column {
-    grid-area: 1 / 1;
+    border-bottom: 8px solid var(--tv-page);
+    height: 70vh;
+    height: 70dvh;
   }
-  .tv-workspace > .tv-column:not([data-phone-active]) {
-    visibility: hidden;
+  .tv-workspace > .tv-column--list {
+    height: auto;
+    max-height: 40vh;
+    max-height: 40dvh;
   }
-  .tv-workspace > .tv-divider {
+  .tv-workspace > .tv-divider,
+  .tv-phone-nav {
     display: none;
+  }
+  /* One panel alone (the "all" feed, or one chat) fills the screen. */
+  .tv-app:has(.tv-workspace > .tv-column:only-of-type) {
+    height: 100vh;
+    height: 100dvh;
+    overflow: hidden;
+  }
+  .tv-workspace:has(> .tv-column:only-of-type) {
+    grid-template-rows: minmax(0, 1fr);
+  }
+  .tv-workspace > .tv-column:only-of-type {
+    border-bottom: 0;
+    height: auto;
   }
   .tv-pane-header {
     height: 52px;
   }
-  .tv-phone-nav {
-    background: var(--tv-surface);
-    border-top: 1px solid var(--tv-border);
-    display: flex;
-    gap: var(--tv-space-2);
-    overflow-x: auto;
-    padding: var(--tv-space-2) 10px max(10px, env(safe-area-inset-bottom));
-  }
-  .tv-phone-button {
-    background: var(--tv-surface);
-    border: 1px solid var(--tv-border-strong);
-    border-radius: var(--tv-radius-control);
-    cursor: pointer;
-    flex: 0 0 auto;
-    font-size: 12px;
-    font-weight: 500;
-    min-height: 40px;
-    padding: 0 12px;
-    white-space: nowrap;
-  }
-  .tv-phone-button[aria-current="page"] {
-    background: var(--tv-accent);
-    border-color: var(--tv-accent);
-    color: var(--tv-on-accent);
-  }
-  .tv-phone-button:disabled {
-    opacity: 0.5;
+  /* Every panel is already on the page, so the toolbar's panel toggles and
+     the brand only take room. */
+  .tv-panel-toggles {
+    display: none;
   }
   /* Every control stays on the page, in rows: the panels and the status,
      then layout, view as and theme. */
@@ -609,12 +612,38 @@ select {
     order: 2;
   }
   .tv-toolbar-controls > .tv-select {
-    flex: 1 1 96px;
+    flex: 1 1 0;
     min-width: 0;
   }
   .tv-select select {
     max-width: none;
     width: 100%;
+  }
+  /* One compact row: status, layout, view as, theme. */
+  .tv-toolbar {
+    flex-wrap: nowrap;
+    gap: 4px;
+    min-height: 0;
+    padding: 4px 6px;
+  }
+  .tv-toolbar .tv-toggle,
+  .tv-toolbar .tv-select select,
+  .tv-toolbar .tv-live {
+    font-size: 11px;
+    height: 26px;
+    line-height: 16px;
+    min-height: 0;
+    padding: 0 6px;
+  }
+  .tv-toolbar .tv-select select {
+    padding-right: 16px;
+  }
+  .tv-toolbar [data-slot="status"] {
+    margin-left: 0;
+    order: 0;
+  }
+  .tv-pane-header {
+    height: 40px;
   }
 }
 
@@ -743,6 +772,24 @@ select {
   font-variant-numeric: tabular-nums;
   line-height: 16px;
   padding: 2px 8px;
+}
+
+/* ── The "all" feed's chat headers ── */
+
+.tv-chat-switch {
+  display: flex;
+  justify-content: flex-start;
+  margin: 14px 0 4px;
+  padding: 0 10px;
+}
+
+.tv-chat-switch span {
+  background: var(--tv-surface);
+  border: 1px solid var(--tv-border-strong);
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 10px;
 }
 
 /* ── Chat list ────────────────────────────────────────────────────────── */
@@ -1756,6 +1803,48 @@ select {
   display: none;
 }
 
+/* The call filter sits in the header's row, at its right end. */
+.tv-column--chat:has(> .tv-pane-tools:not(:empty)),
+.tv-column--calls:has(> .tv-pane-tools:not(:empty)) {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+.tv-column:has(> .tv-pane-tools:not(:empty)) > .tv-pane-header {
+  grid-column: 1;
+  grid-row: 1;
+}
+.tv-column:has(> .tv-pane-tools:not(:empty)) > .tv-pane-tools {
+  align-items: center;
+  display: flex;
+  grid-column: 2;
+  grid-row: 1;
+  padding: 0 10px 0 4px;
+  position: relative;
+}
+.tv-column:has(> .tv-pane-tools:not(:empty)) > .tv-pane-body {
+  grid-column: 1 / -1;
+  grid-row: 2;
+}
+/* Its choices open over the chat instead of pushing it down. */
+.tv-pane-tools .tv-call-filters[open] .tv-call-filter-sets {
+  background: var(--tv-surface);
+  border: 1px solid var(--tv-border);
+  border-radius: var(--tv-radius-control);
+  box-shadow: 0 6px 20px rgb(0 0 0 / 0.15);
+  padding: 8px;
+  position: absolute;
+  right: 6px;
+  top: 100%;
+  width: min(380px, 92vw);
+  z-index: 20;
+}
+/* A panel alone on the page has nothing to open apart or hide. */
+.tv-workspace > .tv-column:only-of-type [data-role="open-alone"],
+.tv-workspace > .tv-column:only-of-type [data-role="hide-panel"] {
+  display: none;
+}
+
 .tv-pane-note {
   background: var(--tv-warning-soft);
   border-bottom: 1px solid var(--tv-border);
@@ -1819,6 +1908,7 @@ select {
 }
 
 .tv-call-bot {
+  color: var(--tv-idc, inherit);
   font-weight: 600;
 }
 
@@ -2116,4 +2206,51 @@ select {
   .tv-divider::before {
     background: CanvasText;
   }
+}
+
+/* ── One look in the chat: calls as the bot's bubbles, events as pills ── */
+
+/* An event reads like any service line ("Ann joined"): a centered pill. */
+.tv-stream > .tv-event {
+  background: var(--tv-surface);
+  border: 0;
+  border-radius: 999px;
+  box-shadow: 0 1px 2px rgba(16, 35, 47, 0.15);
+  color: var(--tv-muted);
+  font-weight: 500;
+  max-width: 86%;
+  padding: 4px 12px;
+  text-align: center;
+}
+
+/* A call is drawn like the bot's message: a bubble under the avatar line,
+   the bot's name on top, the time at the bottom right. */
+.tv-stream > .tv-call {
+  align-self: flex-start;
+  background: var(--tv-chat-bubble-bot);
+  border: 0;
+  border-radius: 16px;
+  box-shadow: 0 1px 2px rgba(16, 35, 47, 0.15);
+  font-size: 13px;
+  line-height: 18px;
+  margin: 3px 10px 3px 50px;
+  max-width: min(86%, 560px);
+  padding: 5px 10px 4px;
+}
+
+.tv-call-head {
+  align-items: baseline;
+  display: flex;
+  gap: 6px;
+}
+
+.tv-call-kind {
+  color: var(--tv-muted);
+  font-size: 11px;
+}
+
+.tv-call-foot {
+  color: var(--tv-muted);
+  font-size: 11px;
+  text-align: right;
 }

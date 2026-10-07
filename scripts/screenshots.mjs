@@ -211,7 +211,7 @@ try {
     file: "viewer-desktop.jpg",
     viewport: { width: 1180, height: 960 },
     scale: 1600 / 1180,
-    query: `chat=${CLUB}&show=list,chat,calls,events&theme=light`,
+    query: `chat=all&show=list,chat,calls,events&theme=light`,
   });
   await shoot({
     file: "viewer-as-member.png",

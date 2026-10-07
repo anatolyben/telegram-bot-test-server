@@ -186,7 +186,9 @@ it("puts each call in the chat it acted on, and calls without one under calls", 
   expect(other.calls[1].params).toEqual({ url: "http://127.0.0.1:9/hook" });
   expect(JSON.stringify(other)).not.toContain("do-not-show");
   const state = await (await fetch(`${fake.viewerUrl}/api/state`)).json();
-  expect(state.chats[0]).toMatchObject({
+  // The Activity feed comes first, then the calls no chat holds.
+  expect(state.chats[0]).toMatchObject({ key: "all", title: "Activity" });
+  expect(state.chats[1]).toMatchObject({
     key: "calls",
     call_count: 6,
     last_call: { method: "sendMessage", journal: "rejected_requests" },

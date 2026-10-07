@@ -979,9 +979,13 @@ snapshot or start a fresh server.
 ### Watch the chats in a browser
 
 A server started with `ui: true` serves a live view of its chats at `server.viewerUrl`
-(`<origin>/_fake/ui`): every chat in a list on the left, the selected chat drawn as a chat window,
-and panels for the chat's events, its members and the bot calls. It follows the test as it runs,
-with no reload, so you can watch a scenario or screenshot it with Playwright.
+(`<origin>/_fake/ui`). It opens on **Activity**: every chat in one feed, drawn as a chat window,
+in the order things happened, so you never switch between chats. A small "In Book Club" line marks
+which chat the next items belong to. Messages are bubbles as in Telegram; each Bot API call is a
+bubble from the bot ("Bot API call", the method, whether Telegram accepted or refused it, and its
+error); a change to a member is a centered line like "Ann joined". It follows the test as it runs,
+with no reload, so you can watch a scenario or screenshot it with Playwright. The chat list, a
+single chat and its members panel are a toggle away.
 
 ```js
 const server = await startTestServer({
@@ -1044,10 +1048,11 @@ The view lives in the URL, so a link, a test or a Playwright script reproduces i
 everything changed on the page (panels, layout, view as, topic, theme, the open chat) updates the
 URL:
 
-- `chat`: a group id, `<user id>:<bot id>` for a private chat, or a user id for their chat with the
-  first bot. Without it, the most recently active chat.
+- `chat`: a group id, `<user id>:<bot id>` for a private chat, a user id for their chat with the
+  first bot, or `all` for the Activity feed. Without it, Activity.
 - `chats`: up to four chats, comma-separated, shown side by side.
-- `show`: the panels, comma-separated: `list`, `chat`, `calls`, `events`, `members`. Default: all.
+- `show`: the panels, comma-separated: `list`, `chat`, `calls`, `events`, `members`. Default: all
+  for one chat; `chat,calls,events` for Activity, which has no members panel.
   In the combined layout, `calls` and `events` turn the inline calls and events on or off.
 - `layout`: `combined` (calls and events inline in the chat; the default) or `split` (each in its
   own panel).
@@ -1061,13 +1066,14 @@ Unknown parameters and values are ignored, and the page drops them from the URL,
 
 For example, `/_fake/ui?chats=-1001000000001,-1001000000002&show=chat,calls,events` shows a group
 beside its log chat, each with its bot calls and events, and `?chat=-1001000000001&show=members`
-only the members. A page opened without `chat` shows the most recently active chat and writes it
-into the URL. Each panel's ↗ opens it alone in a new tab, and × hides it. The dividers between
-columns resize them, with the mouse or the arrow keys. In a narrow window one panel shows at a
-time, with a bar at the bottom: Back to the chat list, and a button for each panel.
+only the members. A page opened without `chat` shows Activity and writes `chat=all` into the URL.
+Each panel's ↗ opens it alone in a new tab, and × hides it; a panel alone on the page has neither.
+The dividers between columns resize them, with the mouse or the arrow keys. On a phone the panels
+that are on stack one under another on one scrolling page, a panel alone fills the screen, and the
+toolbar is one compact row.
 
 **View as a member.** `as=<user id>`, or the select in the toolbar, shows each chat as that member
-sees it: no deleted messages, no other member's ephemeral messages (their own read "only you see
+sees it (in Activity, only the chats they can open): no deleted messages, no other member's ephemeral messages (their own read "only you see
 this"), no events, calls or member panels, a reply to or pin of a deleted message as Telegram shows
 it, and a poll's results only once they have voted or it has closed. The chat list holds only their
 chats. They see everything in a channel, forum or supergroup they are in now and nothing in one they
@@ -1079,7 +1085,7 @@ created with count as present from the start.
 Here a book club group is seen as its member Carol, in a phone-sized window. The link the bot
 deleted is gone, and her own reactions are marked:
 
-<img src="https://raw.githubusercontent.com/anatolyben/telegram-bot-test-server/v0.13.0/docs/images/viewer-as-member.png"
+<img src="https://raw.githubusercontent.com/anatolyben/telegram-bot-test-server/v0.13.1/docs/images/viewer-as-member.png"
   alt="The book club group on a phone, seen as Carol: the bot's welcome with its Rules button, the
   messages and their reactions, and no deleted link" width="320">
 
@@ -2340,6 +2346,11 @@ fields below.
 
 ## Changes
 
+- **0.13.1**: the viewer opens on Activity, every chat in one feed in the order things happened,
+  each run of items marked with its chat ("In Book Club"); a Bot API call is drawn as a bubble from
+  the bot and a member change as a centered line, like Telegram's service messages. On a phone the
+  panels stack on one page instead of behind tabs, and the toolbar is one row. The panel toggles
+  read "All chats", "Messages" and "Bot calls"; with one bot, its "first bot" tag is left out.
 - **0.13.0**: open URL buttons, deliver one button press twice, run a clock that keeps moving, and
   see reactions in the viewer. Pending message and update waits, `drainDeliveries`, `snapshot` and
   `restore` are faster on long chats and journals, and work as before ([measurements][performance]).
@@ -2494,8 +2505,8 @@ This is an early-stage project with a deliberately small scope, and the public A
 Pin an exact version:
 
 ```sh
-pnpm add -D --save-exact telegram-bot-test-server@0.13.0
-# or: npm install --save-dev --save-exact telegram-bot-test-server@0.13.0
+pnpm add -D --save-exact telegram-bot-test-server@0.13.1
+# or: npm install --save-dev --save-exact telegram-bot-test-server@0.13.1
 ```
 
 ## License
@@ -2513,4 +2524,4 @@ MIT
 [behavior-url-buttons]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#url-buttons
 [owner-docs]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/owner-accounts.md
 [performance]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/performance.md
-[viewer-desktop]: https://raw.githubusercontent.com/anatolyben/telegram-bot-test-server/v0.13.0/docs/images/viewer-desktop.jpg
+[viewer-desktop]: https://raw.githubusercontent.com/anatolyben/telegram-bot-test-server/v0.13.1/docs/images/viewer-desktop.jpg

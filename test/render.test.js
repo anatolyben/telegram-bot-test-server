@@ -434,9 +434,11 @@ describe("render", () => {
   });
 
   it("reads the view from the URL and writes it back", () => {
+    // With no chat the page opens on the Activity feed, without the chat
+    // list and members; one chat still shows every panel.
     expect(parseView("")).toEqual({
       chats: [],
-      show: ["list", "chat", "calls", "events", "members"],
+      show: ["chat", "calls", "events"],
       layout: "combined",
       as: null,
       bots: null,
@@ -444,6 +446,13 @@ describe("render", () => {
       topic: null,
       theme: null,
     });
+    expect(parseView(`?chat=${GROUP}`).show).toEqual([
+      "list",
+      "chat",
+      "calls",
+      "events",
+      "members",
+    ]);
     const view = parseView(
       `?chat=1&chats=${GROUP},${GROUP},8800000000:123456&show=bogus,calls,list,chat&layout=split&as=8800000000&bots=123456&methods=deleteMessage,banChatMember&topic=general&theme=dark`,
     );

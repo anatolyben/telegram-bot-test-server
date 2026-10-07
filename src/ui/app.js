@@ -823,6 +823,11 @@ export function startViewer({ render, interact, views, source, root }) {
     selectChat(key) {
       ui.phonePane = ui.view.show.includes("chat") ? `chat:${key}` : null;
       setView({ ...ui.view, chats: [key], topic: null }, "push");
+      // On a phone the panels are stacked: bring the chosen chat into view.
+      if (window.matchMedia("(max-width: 799px)").matches)
+        root
+          .querySelector("[data-role='workspace'] > [data-panel='chat']")
+          ?.scrollIntoView({ block: "start" });
     },
     togglePanel(panel) {
       const shown = new Set(ui.view.show);
