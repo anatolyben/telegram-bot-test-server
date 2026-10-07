@@ -639,6 +639,122 @@ timers, your database and your app's state.
 Between independent scenarios, drop unused failure rules with `clearFailures()`, then restore a
 snapshot or start a fresh server.
 
+### Watch the chats in a browser
+
+A server started with `ui: true` serves a live view of its chats at `server.viewerUrl`
+(`<origin>/_fake/ui`): every chat in a list on the left, the selected chat drawn as a chat window,
+and panels for the chat's events, its members and the bot calls. It follows the test as it runs,
+with no reload, so you can watch a scenario or screenshot it with Playwright.
+
+```js
+const server = await startTestServer({
+  botToken: "123456:TEST",
+  chats: [{ id: GROUP, title: "Test Group", ownerId: 5000000001 }],
+  ui: true,
+});
+console.log(server.viewerUrl); // http://127.0.0.1:54321/_fake/ui
+```
+
+From the command line, `--ui` prints the address. The viewer is off by default, and it answers only
+on this computer: a request from another machine, through a proxy or tunnel, or under another host
+name gets 403. It never changes the server's state, adds nothing to Bot API answers or updates, and
+an open viewer does not hold up `snapshot()`, `restore()` or a wait.
+
+What it shows, only from what the server stores:
+
+- **Chats**: groups, supergroups, channels, forums and each user's private chat with each bot,
+  most recently active first.
+- **Messages**: the sender's name and initial, bots tagged as the first bot, an added bot or a guest
+  bot; text with its entities, replies, forwards and captions; photos as the images themselves and
+  other media as labelled placeholders; inline keyboards as buttons (hover one for its callback
+  data); edits; and service messages: joins, leaves, pins, title and photo changes, upgrades and
+  topics. Times are UTC.
+- **Deletions**: a deleted message stays, greyed and marked with the bot that deleted it.
+- **Ephemeral messages**, marked with the member who sees them.
+- **Events** Telegram shows as no message: member changes (restrictions, bans, promotions, their
+  expiry), join requests (pending, approved, declined) and unpins.
+- **Members**: each one's status, restrictions and rights, the bots' included, and pending join
+  requests.
+
+The view lives in the URL, so a link, a test or a Playwright script reproduces it exactly, and
+everything changed on the page (panels, layout, view as, topic, theme, the open chat) updates the
+URL:
+
+| Parameter         | Values                                                                                              | Default                       |
+| ----------------- | --------------------------------------------------------------------------------------------------- | ----------------------------- |
+| `chat`            | a group id, `<user id>:<bot id>` for a private chat, or a user id for their chat with the first bot | the most recently active chat |
+| `chats`           | up to four chats, comma-separated, shown side by side                                               |                               |
+| `show`            | panels, comma-separated: `list`, `chat`, `calls`, `events`, `members`                               | all of them                   |
+| `layout`          | `combined` (calls and events inline in the chat) or `split` (each in its own panel)                 | `combined`                    |
+| `as`              | a user id: the chats as that member sees them                                                       | the test view                 |
+| `bots`, `methods` | comma-separated: calls from these bots or of these methods only                                     | all                           |
+| `topic`           | a forum topic's `message_thread_id`, or `general`                                                   | all topics                    |
+| `theme`           | `light` or `dark`                                                                                   | the system's                  |
+
+For example, `/_fake/ui?chats=-1001000000001,-1001000000002&show=chat` shows a group beside its log
+chat, and `?chat=-1001000000001&show=members` only the members. A page opened without `chat` shows
+the most recently active chat and writes it into the URL. Each panel's ↗ opens it alone in a new tab,
+and × hides it. The dividers between columns resize them, with the mouse or the arrow keys. In a
+narrow window one panel shows at a time, with a bar to switch.
+
+**View as a member.** `as=<user id>`, or the select in the toolbar, shows each chat as that member
+sees it: no deleted messages, no other member's ephemeral messages (their own read "only you see
+this"), no events, calls or member panels, a reply to or pin of a deleted message as Telegram shows
+it, and a poll's results only once they have voted or it has closed. The chat list holds only their
+chats. They see everything in a channel, forum or supergroup they are in now and nothing in one they
+are not in (a note says why); in a basic group, what was posted while they were in it, and nothing
+after a ban with `revoke_messages`. Not modeled: whether a private supergroup hides its earlier
+history from new members (the view marks where that history would start), and members a chat was
+created with count as present from the start.
+
+**Long chats.** A chat shows its latest 200 messages and events; "Load older messages" adds 200 at a
+time. At most 600 stay loaded: loading more drops the newest, and "Jump to latest" goes back to the
+end.
+
+**Several tabs.** All viewer tabs of one browser share one event stream, so any number of them stay
+live.
+
+**Selecting with Playwright.** Chats, messages, buttons and members carry stable data attributes:
+
+| Element       | Attributes                                                                                                                                                                                                                                                                                                                                                                        |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| the page      | `[data-role="app"]` with `data-instance`, `data-epoch`, `data-version`, and `data-busy="true"` while loading                                                                                                                                                                                                                                                                      |
+| chat list row | `data-chat-key`, `data-chat-id`, `data-chat-type` (`supergroup`, `group`, `channel`, `private`), `data-forum`; private chats `data-user-id`, `data-bot-id`; `aria-current="true"` when open                                                                                                                                                                                       |
+| column        | `data-column-id` (`list` or `<panel>:<chat>`), `data-panel`, `data-chat-key`, `data-chat-id`, `data-view-as`                                                                                                                                                                                                                                                                      |
+| message       | `data-kind="message"`, `data-chat-key`, `data-seq`, `data-message-id` or, for an ephemeral message, `data-ephemeral-id` and `data-receiver-id`; `data-author-id`, `data-author-kind` (`user`, `first-bot`, `added-bot`, `guest-bot`, `bot`, `channel`), `data-deleted` and `data-deleted-by`, `data-edited`, `data-service`, `data-thread-id`, `data-reply-to`, `data-request-id` |
+| inline button | `data-button-text`, `data-button-data`, `data-button-url`, `data-button-row`, `data-button-col`                                                                                                                                                                                                                                                                                   |
+| event         | `data-kind="event"`, `data-chat-key`, `data-event-id`, `data-event-type` (`member`, `join_request`, `unpin`), `data-user-id`, `data-request-id`                                                                                                                                                                                                                                   |
+| member        | `data-chat-key`, `data-member-id`, `data-member-status`, `data-member-in-chat`, `data-member-bot`                                                                                                                                                                                                                                                                                 |
+| join request  | `data-chat-key`, `data-join-request-user-id`                                                                                                                                                                                                                                                                                                                                      |
+
+`data-chat-key` tells a user's private chats with two bots apart. View as and the topic filter leave
+what is hidden out of the page, so a count of zero means it is not shown. The page keeps its event
+stream open, so Playwright's `networkidle` never settles; after acting, read the server's version
+and wait for the page to catch up:
+
+```js
+const { version } = await (await fetch(`${server.origin}/_fake/ui/api/state`)).json();
+await page.waitForFunction(
+  (wanted) =>
+    Number(document.body.dataset.version) >= wanted &&
+    !document.body.hasAttribute("data-busy"),
+  version,
+);
+const spam = page.locator(`[data-kind="message"][data-message-id="${spamId}"]`);
+console.log(await spam.getAttribute("data-deleted-by")); // the bot that deleted it
+```
+
+The viewer's routes, all `GET` and all on this computer only:
+
+| Route                        | Answer                                                                                                            |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `/_fake/ui`                  | the page                                                                                                          |
+| `/_fake/ui/assets/<file>`    | its scripts and stylesheet                                                                                        |
+| `/_fake/ui/api/state`        | the chat list (`?as=<user id>` for a member's)                                                                    |
+| `/_fake/ui/api/chats/<chat>` | a chat's messages and events, members and calls (`limit`, `before`, `from`, `to`, `as`, `topic`, `members_limit`) |
+| `/_fake/ui/files/<file_id>`  | a stored image's bytes                                                                                            |
+| `/_fake/ui/events`           | the live event stream (server-sent events)                                                                        |
+
 ### Telegram Login
 
 The server also answers Telegram Login (OpenID Connect) at oauth.telegram.org's paths, so an app

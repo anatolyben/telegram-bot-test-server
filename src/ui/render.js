@@ -1,0 +1,2120 @@
+// The viewer's renderer: the viewer JSON (GET /_fake/ui/api/…, or a
+// recording's twin) in, HTML strings out. Pure: no DOM and no Node APIs, so
+// vitest imports it and a recording inlines it. Every user-controlled string
+// goes through escapeHtml, in text and in attributes alike.
+
+export const PANELS = Object.freeze([
+  "list",
+  "chat",
+  "calls",
+  "events",
+  "members",
+]);
+export const LAYOUTS = Object.freeze(["combined", "split"]);
+export const MAX_CHATS = 4;
+
+const HTML_ESCAPES = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;",
+};
+
+/** Text for an HTML text node or a quoted attribute value. */
+export function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => HTML_ESCAPES[char]);
+}
+
+export const escapeAttr = escapeHtml;
+
+// ── View state in the URL ──────────────────────────────────────────────
+
+const PANEL_NAMES = new Set(PANELS);
+const REF_PATTERN = /^(?:-?\d{1,20}|\d{1,20}:\d{1,20}|calls)$/;
+const METHOD_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+
+function listParam(value) {
+  return String(value ?? "")
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function positiveInteger(value) {
+  const text = String(value ?? "").trim();
+  if (!/^\d{1,16}$/.test(text)) return null;
+  const number = Number(text);
+  return Number.isSafeInteger(number) && number > 0 ? number : null;
+}
+
+/**
+ * The view a /_fake/ui URL asks for. Unknown names and invalid values fall
+ * back to the default; `chats` is empty when the URL names no chat (the page
+ * then resolves the most recent one, once).
+ */
+export function parseView(search) {
+  const params = new URLSearchParams(String(search ?? ""));
+  const refs = (value) => [
+    ...new Set(listParam(value).filter((ref) => REF_PATTERN.test(ref))),
+  ];
+  let chats = params.has("chats")
+    ? refs(params.get("chats")).slice(0, MAX_CHATS)
+    : [];
+  if (!chats.length) chats = refs(params.get("chat")).slice(0, 1);
+  const shown = new Set(
+    listParam(params.get("show")).filter((panel) => PANEL_NAMES.has(panel)),
+  );
+  const show = shown.size
+    ? PANELS.filter((panel) => shown.has(panel))
+    : [...PANELS];
+  const layout = LAYOUTS.includes(params.get("layout"))
+    ? params.get("layout")
+    : "combined";
+  const bots = [
+    ...new Set(
+      listParam(params.get("bots")).map(positiveInteger).filter(Boolean),
+    ),
+  ];
+  const methods = [
+    ...new Set(
+      listParam(params.get("methods")).filter((name) =>
+        METHOD_PATTERN.test(name),
+      ),
+    ),
+  ];
+  const topicParam = params.get("topic");
+  const topic =
+    topicParam === "general" ? "general" : positiveInteger(topicParam);
+  const theme = ["light", "dark"].includes(params.get("theme"))
+    ? params.get("theme")
+    : null;
+  return {
+    chats,
+    show,
+    layout,
+    as: positiveInteger(params.get("as")),
+    bots: bots.length ? bots : null,
+    methods: methods.length ? methods : null,
+    topic,
+    theme,
+  };
+}
+
+function searchValue(value) {
+  return encodeURIComponent(String(value))
+    .replace(/%2C/gi, ",")
+    .replace(/%3A/gi, ":");
+}
+
+/** The query string for a view: the chat always, everything else only when it is not the default. */
+export function viewToSearch(view) {
+  const parts = [];
+  const chats = view.chats ?? [];
+  if (chats.length > 1) parts.push(`chats=${chats.map(searchValue).join(",")}`);
+  else parts.push(`chat=${searchValue(chats[0] ?? "")}`);
+  const show = PANELS.filter((panel) => (view.show ?? PANELS).includes(panel));
+  if (show.length && show.length !== PANELS.length)
+    parts.push(`show=${show.join(",")}`);
+  if (view.layout === "split") parts.push("layout=split");
+  if (view.as != null) parts.push(`as=${searchValue(view.as)}`);
+  if (view.bots?.length)
+    parts.push(`bots=${view.bots.map(searchValue).join(",")}`);
+  if (view.methods?.length)
+    parts.push(`methods=${view.methods.map(searchValue).join(",")}`);
+  if (view.topic != null) parts.push(`topic=${searchValue(view.topic)}`);
+  if (view.theme) parts.push(`theme=${searchValue(view.theme)}`);
+  return `?${parts.join("&")}`;
+}
+
+/** The chat a URL without one opens: the most recently active, never the calls row. */
+export function defaultChat(state) {
+  return (
+    (state?.chats ?? []).find((chat) => chat.type !== "calls")?.key ?? null
+  );
+}
+
+/**
+ * The columns a view shows, in order: `list`, then for each chat its `chat`,
+ * `calls` and `events` (their own columns in split, or when the chat panel is
+ * hidden; inline otherwise) and `members`. View-as hides calls, events and
+ * members. The calls row's only column is its call timeline.
+ */
+export function columnsFor(view) {
+  const show = new Set(view.show ?? PANELS);
+  const viewAs = view.as != null;
+  const columns = [];
+  if (show.has("list")) columns.push({ id: "list", panel: "list", ref: null });
+  for (const ref of view.chats ?? []) {
+    if (ref === "calls") {
+      if (!viewAs && (show.has("calls") || show.has("chat")))
+        columns.push({ id: "calls:calls", panel: "calls", ref });
+      continue;
+    }
+    if (show.has("chat"))
+      columns.push({ id: `chat:${ref}`, panel: "chat", ref });
+    const ownColumns = view.layout === "split" || !show.has("chat");
+    for (const panel of ["calls", "events"])
+      if (!viewAs && ownColumns && show.has(panel))
+        columns.push({ id: `${panel}:${ref}`, panel, ref });
+    if (!viewAs && show.has("members"))
+      columns.push({ id: `members:${ref}`, panel: "members", ref });
+  }
+  return columns;
+}
+
+// ── Small helpers ──────────────────────────────────────────────────────
+
+/** The identity colour slot (1-8) of an id, as classes tv-id-1 … tv-id-8. */
+export function identitySlot(id) {
+  let hash = 0;
+  for (const char of String(id ?? ""))
+    hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  return (hash % 8) + 1;
+}
+
+const MONTHS = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+];
+const pad2 = (number) => String(number).padStart(2, "0");
+
+/** HH:MM in UTC, so a live view and a recording opened elsewhere read the same. */
+export function clockTime(ms) {
+  const date = new Date(Number(ms));
+  if (Number.isNaN(date.getTime())) return "";
+  return `${pad2(date.getUTCHours())}:${pad2(date.getUTCMinutes())}`;
+}
+
+function isoTime(ms) {
+  const date = new Date(Number(ms));
+  return Number.isNaN(date.getTime()) ? "" : date.toISOString();
+}
+
+function dayKey(ms) {
+  return isoTime(ms).slice(0, 10);
+}
+
+function dayLabel(ms) {
+  const date = new Date(Number(ms));
+  return `${date.getUTCDate()} ${MONTHS[date.getUTCMonth()]} ${date.getUTCFullYear()}`;
+}
+
+/** A date for "until …": day, month, year and UTC time. */
+function untilText(seconds) {
+  const ms = Number(seconds) * 1000;
+  return `${dayLabel(ms)} ${clockTime(ms)} UTC`;
+}
+
+function timeTag(ms, extra = "") {
+  return `<time class="tv-time" datetime="${escapeAttr(isoTime(ms))}" title="${escapeAttr(isoTime(ms))}">${extra}${escapeHtml(clockTime(ms))}</time>`;
+}
+
+function attrs(map) {
+  let out = "";
+  for (const [name, value] of Object.entries(map)) {
+    if (value == null || value === false) continue;
+    out += ` ${name}="${escapeAttr(value === true ? "true" : value)}"`;
+  }
+  return out;
+}
+
+/** An element: its name, escaped attributes (null and false left out) and inner HTML. */
+function el(name, attributes, ...children) {
+  return `<${name}${attrs(attributes ?? {})}>${children.join("")}</${name}>`;
+}
+
+function formatBytes(size) {
+  const bytes = Number(size);
+  if (!Number.isFinite(bytes) || bytes < 0) return null;
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function formatDuration(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  return hours
+    ? `${hours}:${pad2(minutes)}:${pad2(total % 60)}`
+    : `${minutes}:${pad2(total % 60)}`;
+}
+
+function oneLine(text, max = 80) {
+  const flat = String(text ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const chars = Array.from(flat);
+  return chars.length > max ? `${chars.slice(0, max - 1).join("")}…` : flat;
+}
+
+function rightName(key) {
+  return key.replace(/^can_/, "").replace(/_/g, " ");
+}
+
+// ── People ─────────────────────────────────────────────────────────────
+
+/**
+ * What a renderer needs besides the item: bots by id, users, image files,
+ * the first bot, the chat, and the member the page is viewed as (or null).
+ */
+export function makeContext(page, options = {}) {
+  const bots = new Map();
+  for (const bot of page?.bots ?? []) bots.set(Number(bot.id), bot);
+  const first = (page?.bots ?? []).find((bot) => bot.first);
+  return {
+    bots,
+    users: page?.users ?? {},
+    files: page?.files ?? {},
+    firstBotId: first ? Number(first.id) : null,
+    chat: page?.chat ?? null,
+    key: String(options.key ?? page?.chat?.key ?? ""),
+    as: options.as ?? page?.as?.user_id ?? null,
+    asInfo: page?.as ?? null,
+    links: options.links ?? new Map(),
+  };
+}
+
+function userOf(ctx, id) {
+  if (id == null) return null;
+  return ctx.users[String(id)] ?? ctx.bots.get(Number(id)) ?? null;
+}
+
+function nameOf(user) {
+  if (!user) return "";
+  const name = [user.first_name, user.last_name]
+    .filter(Boolean)
+    .join(" ")
+    .trim();
+  if (name) return name;
+  if (user.title) return user.title;
+  return user.username ? `@${user.username}` : `User ${user.id}`;
+}
+
+/** A person's display name: first and last name, else @username, else the id. */
+export function personName(ctx, id) {
+  if (id == null) return "someone";
+  const user = userOf(ctx, id);
+  return user ? nameOf(user) : `User ${id}`;
+}
+
+/** How a bot is labelled: the first bot, an added bot, or any other bot user. */
+function botTag(ctx, user) {
+  if (!user) return null;
+  const bot = ctx.bots.get(Number(user.id));
+  if (bot) return bot.first ? "first bot" : "added bot";
+  return user.is_bot ? "bot" : null;
+}
+
+function nameWithTag(ctx, id) {
+  const name = escapeHtml(personName(ctx, id));
+  const tag = botTag(ctx, userOf(ctx, id));
+  return tag ? `${name} <span class="tv-tag">${escapeHtml(tag)}</span>` : name;
+}
+
+function avatar(id, name, ctx, { size = "", photoId = null } = {}) {
+  const initial =
+    Array.from(String(name ?? "").trim())[0]?.toUpperCase() || "?";
+  const image = photoId ? imageTag(ctx, photoId, "tv-avatar-image") : "";
+  return `<span class="tv-avatar${size} tv-id-${identitySlot(id)}" aria-hidden="true">${escapeHtml(initial)}${image}</span>`;
+}
+
+// ── Text and entities ──────────────────────────────────────────────────
+
+const LINK_PROTOCOLS = new Set(["http:", "https:", "mailto:", "tg:"]);
+
+/** The URL as a safe href, or null: only http, https, mailto and tg links open. */
+export function safeHref(url) {
+  const text = String(url ?? "").trim();
+  if (!text || /[\u0000-\u001f\u007f]/.test(text)) return null;
+  try {
+    return LINK_PROTOCOLS.has(new URL(text).protocol) ? text : null;
+  } catch {
+    return null;
+  }
+}
+
+function linkOpen(url, className) {
+  const href = safeHref(url);
+  if (!href)
+    return {
+      open: `<span class="${className} tv-link-blocked" title="${escapeAttr(url)}">`,
+      close: "</span>",
+    };
+  return {
+    open: `<a class="${className}" href="${escapeAttr(href)}" target="_blank" rel="noopener noreferrer" title="${escapeAttr(url)}">`,
+    close: "</a>",
+  };
+}
+
+function entityTags(entity, covered) {
+  switch (entity.type) {
+    case "bold":
+      return { open: "<strong>", close: "</strong>" };
+    case "italic":
+      return { open: "<em>", close: "</em>" };
+    case "underline":
+      return { open: "<u>", close: "</u>" };
+    case "strikethrough":
+      return { open: "<s>", close: "</s>" };
+    case "spoiler":
+      return {
+        open: '<span class="tv-spoiler" title="spoiler">',
+        close: "</span>",
+      };
+    case "code":
+      return { open: '<code class="tv-code">', close: "</code>" };
+    case "pre":
+      return {
+        open: `<pre class="tv-pre">${entity.language ? `<span class="tv-pre-language">${escapeHtml(entity.language)}</span>` : ""}<code>`,
+        close: "</code></pre>",
+      };
+    case "blockquote":
+      return {
+        open: '<blockquote class="tv-blockquote">',
+        close: "</blockquote>",
+      };
+    case "expandable_blockquote":
+      return {
+        open: '<blockquote class="tv-blockquote" data-expandable="true">',
+        close: "</blockquote>",
+      };
+    case "text_link":
+      return linkOpen(entity.url, "tv-link");
+    case "url":
+      return linkOpen(
+        /^[a-z][a-z0-9+.-]*:/i.test(covered) ? covered : `http://${covered}`,
+        "tv-link",
+      );
+    case "email":
+      return linkOpen(`mailto:${covered}`, "tv-link");
+    case "mention":
+    case "hashtag":
+    case "cashtag":
+    case "bot_command":
+    case "phone_number":
+      return {
+        open: `<span class="tv-entity" data-entity="${escapeAttr(entity.type)}">`,
+        close: "</span>",
+      };
+    case "text_mention":
+      return {
+        open: `<span class="tv-entity" data-entity="text_mention" title="${escapeAttr(`user ${entity.user?.id ?? ""}`)}">`,
+        close: "</span>",
+      };
+    case "custom_emoji":
+      return {
+        open: `<span class="tv-custom-emoji" title="${escapeAttr(`custom emoji ${entity.custom_emoji_id ?? ""}`)}">`,
+        close: "</span>",
+      };
+    case "date_time": {
+      const when =
+        entity.unix_time != null
+          ? isoTime(Number(entity.unix_time) * 1000)
+          : "";
+      return {
+        open: `<span class="tv-entity" data-entity="date_time" title="${escapeAttr(when)}">`,
+        close: "</span>",
+      };
+    }
+    default:
+      return { open: "", close: "" };
+  }
+}
+
+/**
+ * Text with its entities, by UTF-16 offset (JavaScript string indices are
+ * UTF-16, as Telegram's offsets are). Entities nest when one lies inside
+ * another; a partial overlap is cut at the outer entity's end.
+ */
+export function renderText(text, entities = []) {
+  const source = String(text ?? "");
+  const list = (Array.isArray(entities) ? entities : [])
+    .filter(
+      (entity) =>
+        Number.isInteger(entity?.offset) &&
+        Number.isInteger(entity?.length) &&
+        entity.length > 0,
+    )
+    .map((entity, index) => ({
+      entity,
+      index,
+      start: Math.max(0, entity.offset),
+      end: Math.min(source.length, entity.offset + entity.length),
+    }))
+    .filter((span) => span.end > span.start)
+    .sort((a, b) => a.start - b.start || b.end - a.end || a.index - b.index);
+  let out = "";
+  let position = 0;
+  const stack = [];
+  const emit = (to) => {
+    if (to > position) out += escapeHtml(source.slice(position, to));
+    position = Math.max(position, to);
+  };
+  const closeTop = () => {
+    const span = stack.pop();
+    emit(span.end);
+    out += span.close;
+  };
+  for (const span of list) {
+    while (stack.length && stack.at(-1).end <= span.start) closeTop();
+    if (span.start < position) continue;
+    const end = stack.length ? Math.min(span.end, stack.at(-1).end) : span.end;
+    if (end <= span.start) continue;
+    const tags = entityTags(span.entity, source.slice(span.start, end));
+    emit(span.start);
+    out += tags.open;
+    stack.push({ end, close: tags.close });
+  }
+  while (stack.length) closeTop();
+  emit(source.length);
+  return out;
+}
+
+// ── Media ──────────────────────────────────────────────────────────────
+
+const IMAGE_URL =
+  /^(?:\/_fake\/ui\/files\/[A-Za-z0-9_-]+|data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+)$/;
+
+function imageTag(ctx, fileId, className, alt = "") {
+  const file = fileId ? ctx.files[fileId] : null;
+  if (!file || !IMAGE_URL.test(String(file.url))) return "";
+  return `<img class="${className}" src="${escapeAttr(file.url)}" alt="${escapeAttr(alt)}"${attrs({ width: file.width, height: file.height })} loading="lazy" decoding="async">`;
+}
+
+function lastPhoto(sizes) {
+  if (Array.isArray(sizes)) return sizes.at(-1) ?? null;
+  return sizes?.file_id ? sizes : null;
+}
+
+const CONTENT_KINDS = [
+  ["live_photo", "Live photo"],
+  ["photo", "Photo"],
+  ["animation", "GIF"],
+  ["video", "Video"],
+  ["video_note", "Video message"],
+  ["audio", "Audio"],
+  ["voice", "Voice message"],
+  ["document", "File"],
+  ["sticker", "Sticker"],
+  ["story", "Story"],
+  ["paid_media", "Paid media"],
+  ["venue", "Venue"],
+  ["location", "Location"],
+  ["contact", "Contact"],
+  ["dice", "Dice"],
+  ["poll", "Poll"],
+  ["checklist", "Checklist"],
+  ["game", "Game"],
+  ["invoice", "Invoice"],
+];
+
+/** The message's content key (photo, video, poll …), or null for text and service messages. */
+export function contentKind(message) {
+  return CONTENT_KINDS.find(([key]) => message?.[key] != null)?.[0] ?? null;
+}
+
+function contentLabel(message) {
+  const kind = contentKind(message);
+  return kind ? CONTENT_KINDS.find(([key]) => key === kind)[1] : null;
+}
+
+const FILE_GLYPHS = {
+  photo: "▣",
+  live_photo: "▣",
+  animation: "▶",
+  video: "▶",
+  video_note: "◉",
+  audio: "♪",
+  voice: "♪",
+  document: "▤",
+  sticker: "☺",
+  story: "◌",
+  paid_media: "★",
+};
+
+function placeholder(kind, label, file = {}, extra = []) {
+  const meta = [
+    file.mime_type,
+    file.width && file.height ? `${file.width}×${file.height}` : null,
+    file.duration != null ? formatDuration(file.duration) : null,
+    formatBytes(file.file_size),
+    ...extra,
+  ].filter(Boolean);
+  return el(
+    "div",
+    { class: "tv-file", "data-media": kind },
+    el(
+      "span",
+      { class: "tv-file-icon", "aria-hidden": "true" },
+      FILE_GLYPHS[kind] ?? "▤",
+    ),
+    el(
+      "span",
+      { class: "tv-file-copy" },
+      el("span", { class: "tv-file-kind" }, escapeHtml(label)),
+      file.file_name
+        ? el("span", { class: "tv-file-name" }, escapeHtml(file.file_name))
+        : "",
+      meta.length
+        ? el("span", { class: "tv-file-meta" }, escapeHtml(meta.join(" · ")))
+        : "",
+    ),
+  );
+}
+
+function box(kind, title, rows) {
+  const lines = rows
+    .filter(([, value]) => value != null && value !== "")
+    .map(
+      ([label, value]) =>
+        `<span class="tv-box-label">${escapeHtml(label)}</span><span class="tv-box-value">${escapeHtml(value)}</span>`,
+    )
+    .join("");
+  return `<div class="tv-box" data-media="${escapeAttr(kind)}"><span class="tv-box-title">${escapeHtml(title)}</span>${lines ? `<span class="tv-box-grid">${lines}</span>` : ""}</div>`;
+}
+
+function photoBlock(ctx, photo, label, kind) {
+  const image = imageTag(ctx, photo?.file_id, "tv-photo", label);
+  if (image)
+    return `<div class="tv-media" data-media="${escapeAttr(kind)}">${image}</div>`;
+  return placeholder(kind, label, photo ?? {});
+}
+
+function renderPoll(poll, item, ctx) {
+  const viewer = ctx.as;
+  const mine = viewer != null ? (item.votes?.[String(viewer)] ?? null) : null;
+  const reveal = viewer == null || poll.is_closed === true || mine != null;
+  const quiz = poll.type === "quiz";
+  const correct = new Set(
+    poll.correct_option_ids ??
+      (poll.correct_option_id != null ? [poll.correct_option_id] : []),
+  );
+  const voters = new Map();
+  if (viewer == null)
+    for (const [userId, options] of Object.entries(item.votes ?? {}))
+      for (const option of options ?? []) {
+        if (!voters.has(option)) voters.set(option, []);
+        voters.get(option).push(personName(ctx, userId));
+      }
+  const total = Number(poll.total_voter_count) || 0;
+  const flags = [
+    quiz ? "Quiz" : "Poll",
+    poll.is_anonymous === false ? "public" : "anonymous",
+    poll.allows_multiple_answers ? "multiple answers" : null,
+    poll.is_closed ? "closed" : null,
+  ].filter(Boolean);
+  const image = poll.media
+    ? imageTag(ctx, lastPhoto(poll.media.photo)?.file_id, "tv-photo")
+    : "";
+  const options = (poll.options ?? [])
+    .map((option, index) => {
+      const count = Number(option.voter_count) || 0;
+      const isMine = mine?.includes(index) ?? false;
+      const isCorrect = quiz && reveal && correct.has(index);
+      const who = voters.get(index);
+      const share = total ? ` · ${Math.round((count / total) * 100)}%` : "";
+      return el(
+        "li",
+        {
+          class: "tv-poll-option",
+          "data-option": index,
+          "data-mine": isMine,
+          "data-correct": isCorrect,
+        },
+        el(
+          "span",
+          { class: "tv-poll-text" },
+          escapeHtml(option.text),
+          isCorrect ? ' <span class="tv-poll-mark">✓ correct</span>' : "",
+          isMine ? ' <span class="tv-poll-mark">your vote</span>' : "",
+        ),
+        reveal
+          ? el("span", { class: "tv-poll-count" }, `${count}${share}`)
+          : "",
+        who?.length
+          ? el("span", { class: "tv-poll-voters" }, escapeHtml(who.join(", ")))
+          : "",
+      );
+    })
+    .join("");
+  const footer = reveal
+    ? `${total} ${total === 1 ? "vote" : "votes"}`
+    : "Vote to see the results";
+  const explanation =
+    quiz && reveal && poll.explanation
+      ? `<div class="tv-poll-explanation">${renderText(poll.explanation, poll.explanation_entities)}</div>`
+      : "";
+  return el(
+    "div",
+    { class: "tv-box tv-poll", "data-media": "poll" },
+    image,
+    el("span", { class: "tv-box-eyebrow" }, escapeHtml(flags.join(" · "))),
+    el(
+      "span",
+      { class: "tv-poll-question" },
+      renderText(poll.question, poll.question_entities),
+    ),
+    el("ol", { class: "tv-poll-options" }, options),
+    explanation,
+    el("span", { class: "tv-poll-footer" }, escapeHtml(footer)),
+  );
+}
+
+function renderMedia(message, item, ctx) {
+  const m = message;
+  if (m.live_photo)
+    return photoBlock(
+      ctx,
+      lastPhoto(m.live_photo.photo ?? m.photo),
+      "Live photo",
+      "live_photo",
+    );
+  if (m.photo) return photoBlock(ctx, lastPhoto(m.photo), "Photo", "photo");
+  if (m.sticker) {
+    const image = imageTag(
+      ctx,
+      m.sticker.file_id,
+      "tv-sticker",
+      m.sticker.emoji ?? "sticker",
+    );
+    if (image)
+      return `<div class="tv-media" data-media="sticker">${image}</div>`;
+    const kind = m.sticker.is_video
+      ? "video sticker"
+      : m.sticker.is_animated
+        ? "animated sticker"
+        : null;
+    return placeholder(
+      "sticker",
+      `Sticker${m.sticker.emoji ? ` ${m.sticker.emoji}` : ""}`,
+      m.sticker,
+      [kind, m.sticker.set_name],
+    );
+  }
+  for (const [key, label] of [
+    ["animation", "GIF"],
+    ["video", "Video"],
+    ["video_note", "Video message"],
+    ["audio", "Audio"],
+    ["voice", "Voice message"],
+    ["document", "File"],
+  ])
+    if (m[key]) {
+      const file = m[key];
+      const extra = key === "audio" ? [file.performer, file.title] : [];
+      return placeholder(
+        key,
+        label,
+        key === "video_note"
+          ? { ...file, width: file.length, height: file.length }
+          : file,
+        extra,
+      );
+    }
+  if (m.story)
+    return placeholder("story", "Story", {}, [
+      m.story.chat?.title,
+      m.story.id != null ? `story ${m.story.id}` : null,
+    ]);
+  if (m.paid_media)
+    return placeholder("paid_media", "Paid media", {}, [
+      m.paid_media.star_count != null
+        ? `${m.paid_media.star_count} stars`
+        : null,
+    ]);
+  if (m.venue)
+    return box("venue", "Venue", [
+      ["Title", m.venue.title],
+      ["Address", m.venue.address],
+      [
+        "Location",
+        m.venue.location
+          ? `${m.venue.location.latitude}, ${m.venue.location.longitude}`
+          : null,
+      ],
+    ]);
+  if (m.location)
+    return box(
+      "location",
+      m.location.live_period ? "Live location" : "Location",
+      [
+        ["Latitude", m.location.latitude],
+        ["Longitude", m.location.longitude],
+        [
+          "Accuracy",
+          m.location.horizontal_accuracy != null
+            ? `${m.location.horizontal_accuracy} m`
+            : null,
+        ],
+        [
+          "Live for",
+          m.location.live_period != null ? `${m.location.live_period} s` : null,
+        ],
+      ],
+    );
+  if (m.contact)
+    return box("contact", "Contact", [
+      [
+        "Name",
+        [m.contact.first_name, m.contact.last_name].filter(Boolean).join(" "),
+      ],
+      ["Phone", m.contact.phone_number],
+      ["User id", m.contact.user_id],
+    ]);
+  if (m.dice)
+    return box("dice", `Dice ${m.dice.emoji ?? ""}`.trim(), [
+      ["Value", m.dice.value],
+    ]);
+  if (m.poll) return renderPoll(m.poll, item, ctx);
+  if (m.checklist)
+    return box("checklist", "Checklist", [
+      ["Title", m.checklist.title],
+      ["Tasks", (m.checklist.tasks ?? []).map((task) => task.text).join(", ")],
+    ]);
+  if (m.game) return box("game", "Game", [["Title", m.game.title]]);
+  if (m.invoice)
+    return box("invoice", "Invoice", [
+      ["Title", m.invoice.title],
+      [
+        "Amount",
+        m.invoice.total_amount != null
+          ? `${m.invoice.total_amount} ${m.invoice.currency ?? ""}`
+          : null,
+      ],
+    ]);
+  return "";
+}
+
+// ── Inline keyboards ───────────────────────────────────────────────────
+
+const BUTTON_ACTIONS = [
+  "url",
+  "callback_data",
+  "web_app",
+  "login_url",
+  "switch_inline_query",
+  "switch_inline_query_current_chat",
+  "switch_inline_query_chosen_chat",
+  "copy_text",
+  "callback_game",
+  "pay",
+];
+
+function buttonTitle(button) {
+  const action = BUTTON_ACTIONS.find((name) => button[name] !== undefined);
+  if (!action) return "no action";
+  const value = button[action];
+  if (typeof value === "string") return `${action}: ${value}`;
+  if (value && typeof value === "object") {
+    const inner = value.url ?? value.text ?? value.query;
+    return inner != null ? `${action}: ${inner}` : action;
+  }
+  return action;
+}
+
+function renderKeyboard(markup) {
+  const rows = markup?.inline_keyboard;
+  if (!Array.isArray(rows) || !rows.length) return "";
+  const html = rows
+    .map(
+      (row, rowIndex) =>
+        `<div class="tv-keyboard-row">${(row ?? [])
+          .map(
+            (button, colIndex) =>
+              `<span class="tv-key" role="button" aria-disabled="true"${attrs({
+                title: buttonTitle(button),
+                "data-button-text": button.text ?? "",
+                "data-button-data": button.callback_data,
+                "data-button-url": button.url,
+                "data-button-row": rowIndex,
+                "data-button-col": colIndex,
+              })}>${escapeHtml(button.text ?? "")}${button.url ? '<span class="tv-key-mark" aria-hidden="true">↗</span>' : ""}</span>`,
+          )
+          .join("")}</div>`,
+    )
+    .join("");
+  return `<div class="tv-keyboard">${html}</div>`;
+}
+
+// ── Messages ───────────────────────────────────────────────────────────
+
+const SERVICE_TYPES = [
+  "new_chat_members",
+  "left_chat_member",
+  "pinned_message",
+  "new_chat_title",
+  "new_chat_photo",
+  "delete_chat_photo",
+  "migrate_to_chat_id",
+  "migrate_from_chat_id",
+  "forum_topic_created",
+  "forum_topic_edited",
+  "forum_topic_closed",
+  "forum_topic_reopened",
+  "group_chat_created",
+  "supergroup_chat_created",
+  "channel_chat_created",
+];
+
+/** The service type of a message (new_chat_members, pinned_message …), or null for a regular message. */
+export function serviceType(message) {
+  return (
+    SERVICE_TYPES.find(
+      (key) => message?.[key] != null && message[key] !== false,
+    ) ?? null
+  );
+}
+
+/** Who a message is from, for data-author-kind: user, first-bot, added-bot, guest-bot, bot or channel. */
+export function authorKind(item, ctx) {
+  const m = item.message ?? {};
+  if (m.sender_chat || ctx.chat?.type === "channel") return "channel";
+  if (m.guest_bot_caller_user) return "guest-bot";
+  const bot = m.from ? ctx.bots.get(Number(m.from.id)) : null;
+  if (bot) return bot.first ? "first-bot" : "added-bot";
+  return m.from?.is_bot ? "bot" : "user";
+}
+
+function senderOf(message) {
+  if (message?.sender_chat)
+    return {
+      id: message.sender_chat.id,
+      name: message.sender_chat.title ?? "Chat",
+    };
+  if (message?.from) return { id: message.from.id, name: nameOf(message.from) };
+  if (message?.chat?.type === "channel")
+    return { id: message.chat.id, name: message.chat.title ?? "Channel" };
+  return { id: null, name: "Unknown" };
+}
+
+function originName(origin) {
+  if (!origin) return "";
+  if (origin.type === "user") return nameOf(origin.sender_user);
+  if (origin.type === "hidden_user")
+    return origin.sender_user_name ?? "Hidden user";
+  const chat = origin.type === "channel" ? origin.chat : origin.sender_chat;
+  const title = chat?.title ?? (origin.type === "channel" ? "Channel" : "Chat");
+  return origin.author_signature
+    ? `${title} (${origin.author_signature})`
+    : title;
+}
+
+function messageSummary(message) {
+  const text = message?.text ?? message?.caption;
+  if (text) return oneLine(text);
+  return (
+    contentLabel(message) ??
+    (serviceType(message) ? "Service message" : "Message")
+  );
+}
+
+function renderReply(item, ctx) {
+  const m = item.message;
+  const reply = m.reply_to_message;
+  const external = m.external_reply;
+  if (!reply && !external) return "";
+  // A forum topic's messages reply to the topic's first message; Telegram draws no quote for it.
+  if (
+    reply &&
+    m.is_topic_message &&
+    Number(reply.message_id) === Number(m.message_thread_id) &&
+    !m.quote
+  )
+    return "";
+  const replyId = reply?.message_id ?? external?.message_id ?? null;
+  if (item.reply_deleted && ctx.as != null)
+    return `<blockquote class="tv-quote tv-quote--deleted"${attrs({ "data-reply-to": replyId })}><span class="tv-quote-author">Deleted message</span></blockquote>`;
+  const author = reply
+    ? senderOf(reply)
+    : { id: null, name: originName(external.origin) };
+  const quoted = m.quote?.text ?? null;
+  const target = reply ?? external;
+  const text = quoted ?? messageSummary(target);
+  const thumb = imageTag(
+    ctx,
+    lastPhoto(target.photo)?.file_id,
+    "tv-quote-thumb",
+  );
+  const flag = item.reply_deleted
+    ? ' <span class="tv-quote-flag">deleted</span>'
+    : "";
+  const from =
+    external && !reply
+      ? '<span class="tv-quote-source">from another chat</span>'
+      : "";
+  return el(
+    "blockquote",
+    {
+      class: `tv-quote tv-id-${identitySlot(author.id ?? author.name)}`,
+      "data-reply-to": replyId,
+    },
+    thumb,
+    el(
+      "span",
+      { class: "tv-quote-copy" },
+      el("span", { class: "tv-quote-author" }, escapeHtml(author.name), flag),
+      el("span", { class: "tv-quote-text" }, escapeHtml(oneLine(text, 120))),
+      from,
+    ),
+  );
+}
+
+function messageAttrs(item, ctx, service) {
+  const m = item.message ?? {};
+  return attrs({
+    "data-kind": "message",
+    "data-chat-key": ctx.key,
+    "data-chat-id": ctx.chat?.id ?? m.chat?.id,
+    "data-seq": item.seq,
+    "data-message-id": item.ephemeral ? null : m.message_id,
+    "data-ephemeral-id": item.ephemeral ? m.ephemeral_message_id : null,
+    "data-receiver-id": item.ephemeral ? m.receiver_user?.id : null,
+    "data-author-id": item.author ?? m.from?.id ?? m.sender_chat?.id,
+    "data-author-kind": authorKind(item, ctx),
+    "data-deleted": item.deleted === true,
+    "data-deleted-by": item.deleted ? item.deleted_by?.bot_id : null,
+    "data-edited": m.edit_date != null,
+    "data-service": service,
+    "data-thread-id": m.message_thread_id,
+    "data-reply-to":
+      m.reply_to_message?.message_id ?? m.external_reply?.message_id,
+    "data-request-id": item.request_id,
+    "data-before-window": item.before_window === true,
+  });
+}
+
+function actorName(message, ctx) {
+  if (message.from)
+    return (
+      nameWithTag(ctx, message.from.id) || escapeHtml(nameOf(message.from))
+    );
+  if (message.sender_chat)
+    return escapeHtml(message.sender_chat.title ?? "The channel");
+  return "The chat";
+}
+
+function quoteText(text) {
+  return `“${escapeHtml(oneLine(text, 60))}”`;
+}
+
+function linkDetails(event) {
+  if (!event) return "";
+  const parts = [];
+  if (event.via_join_request) parts.push("by request");
+  if (event.invite_link_name || event.invite_link)
+    parts.push(
+      `via ${event.invite_link_name ? quoteText(event.invite_link_name) : escapeHtml(event.invite_link)}`,
+    );
+  return parts.length
+    ? ` <span class="tv-service-detail">· ${parts.join(" · ")}</span>`
+    : "";
+}
+
+function serviceText(item, ctx, type) {
+  const m = item.message;
+  const actor = actorName(m, ctx);
+  const actorId = m.from?.id ?? null;
+  switch (type) {
+    case "new_chat_members": {
+      const members = m.new_chat_members ?? [];
+      const linked = ctx.as == null ? linkDetails(ctx.links.get(item.seq)) : "";
+      if (members.length === 1 && members[0].id === actorId)
+        return `${actor} joined${linked}`;
+      return `${actor} added ${members.map((user) => nameWithTag(ctx, user.id) || escapeHtml(nameOf(user))).join(", ")}${linked}`;
+    }
+    case "left_chat_member": {
+      const left = m.left_chat_member;
+      if (left?.id === actorId) return `${actor} left`;
+      return `${actor} removed ${nameWithTag(ctx, left?.id) || escapeHtml(nameOf(left))}`;
+    }
+    case "pinned_message": {
+      const pinned = m.pinned_message;
+      if (item.pinned_deleted && ctx.as != null)
+        return `${actor} pinned a deleted message`;
+      const what =
+        (pinned?.text ?? pinned?.caption)
+          ? quoteText(pinned.text ?? pinned.caption)
+          : escapeHtml((contentLabel(pinned) ?? "a message").toLowerCase());
+      return `${actor} pinned ${what}${item.pinned_deleted ? ' <span class="tv-service-detail">· since deleted</span>' : ""}`;
+    }
+    case "new_chat_title":
+      return `${actor} changed the title to ${quoteText(m.new_chat_title)}`;
+    case "new_chat_photo":
+      return `${actor} changed the photo`;
+    case "delete_chat_photo":
+      return `${actor} removed the photo`;
+    case "migrate_to_chat_id":
+      return `Moved to supergroup ${escapeHtml(m.migrate_to_chat_id)}`;
+    case "migrate_from_chat_id":
+      return `Upgraded from basic group ${escapeHtml(m.migrate_from_chat_id)}`;
+    case "forum_topic_created":
+      return `Topic ${quoteText(m.forum_topic_created.name)} created`;
+    case "forum_topic_edited":
+      return m.forum_topic_edited.name != null
+        ? `Topic renamed to ${quoteText(m.forum_topic_edited.name)}`
+        : "Topic icon changed";
+    case "forum_topic_closed":
+      return `${actor} closed the topic`;
+    case "forum_topic_reopened":
+      return `${actor} reopened the topic`;
+    case "group_chat_created":
+    case "supergroup_chat_created":
+      return `${actor} created the group`;
+    case "channel_chat_created":
+      return "Channel created";
+    default:
+      return escapeHtml(type);
+  }
+}
+
+function renderService(item, ctx, type) {
+  const m = item.message;
+  const photo =
+    type === "new_chat_photo"
+      ? imageTag(
+          ctx,
+          lastPhoto(m.new_chat_photo)?.file_id,
+          "tv-service-photo",
+          "new chat photo",
+        )
+      : "";
+  const deleted = item.deleted && ctx.as == null ? deletedMark(item, ctx) : "";
+  return `<div class="tv-service-row"${messageAttrs(item, ctx, type)}><span class="tv-service">${serviceText(item, ctx, type)}${photo}${deleted}<span class="tv-service-time">${timeTag(item.at ?? m.date * 1000)}</span></span></div>`;
+}
+
+function deletedMark(item, ctx) {
+  const by = item.deleted_by;
+  const bot = by ? userOf(ctx, by.bot_id) : null;
+  const label = bot?.username
+    ? `@${bot.username}`
+    : by
+      ? personName(ctx, by.bot_id)
+      : "a bot";
+  const title = by ? `${by.method} at ${isoTime(by.at)}` : "deleted";
+  return `<span class="tv-deleted" title="${escapeAttr(title)}">Deleted · ${escapeHtml(label)}</span>`;
+}
+
+function senderLine(item, ctx, kind) {
+  const m = item.message;
+  if (kind === "channel") {
+    const chat =
+      m.sender_chat ?? (ctx.chat?.type === "channel" ? ctx.chat : m.chat);
+    const author =
+      item.author != null &&
+      Number(item.author) !== Number(chat?.id) &&
+      ctx.as == null
+        ? ` <span class="tv-sender-note">posted by ${escapeHtml(personName(ctx, item.author))}</span>`
+        : "";
+    return `<div class="tv-sender tv-id-${identitySlot(chat?.id)}"><span class="tv-sender-name">${escapeHtml(chat?.title ?? "Channel")}</span>${m.author_signature ? ` <span class="tv-sender-note">${escapeHtml(m.author_signature)}</span>` : ""}${author}</div>`;
+  }
+  const from = m.from ?? {};
+  const name = `<span class="tv-sender-name">${escapeHtml(nameOf(from))}</span>`;
+  if (kind === "user")
+    return `<div class="tv-sender tv-id-${identitySlot(from.id)}">${name}</div>`;
+  const tag =
+    kind === "guest-bot"
+      ? "guest bot"
+      : kind === "first-bot"
+        ? "first bot"
+        : kind === "added-bot"
+          ? "added bot"
+          : "bot";
+  const caller =
+    kind === "guest-bot"
+      ? ` <span class="tv-sender-note">for ${escapeHtml(nameOf(m.guest_bot_caller_user))}</span>`
+      : "";
+  return `<div class="tv-sender tv-id-${identitySlot(from.id)}">${name}${from.username ? ` <span class="tv-sender-note">@${escapeHtml(from.username)}</span>` : ""} <span class="tv-tag">${tag}</span>${caller}</div>`;
+}
+
+/**
+ * One message: a service pill, or a bubble with its sender, forward, reply,
+ * media, text, keyboard and markers. `position` says whether it continues a
+ * group of the same author's messages (no repeated name or avatar).
+ */
+export function renderMessage(item, ctx, position = {}) {
+  const m = item.message ?? {};
+  if (item.deleted && ctx.as != null) return "";
+  const service = serviceType(m);
+  if (service) return renderService(item, ctx, service);
+  const kind = authorKind(item, ctx);
+  const sender =
+    kind === "channel"
+      ? senderOf(m.sender_chat ? m : { chat: ctx.chat ?? m.chat })
+      : senderOf(m);
+  const outgoing =
+    ctx.as != null && Number(item.author) === Number(ctx.as) && kind === "user";
+  const bot =
+    kind === "first-bot" ||
+    kind === "added-bot" ||
+    kind === "guest-bot" ||
+    kind === "bot";
+  const classes = [
+    "tv-msg",
+    outgoing ? "tv-msg--out" : "",
+    position.groupedWithPrevious ? "tv-msg--continued" : "",
+    position.groupedWithNext ? "tv-msg--followed" : "",
+  ].filter(Boolean);
+  const avatarHtml = outgoing
+    ? ""
+    : position.groupedWithNext
+      ? '<span class="tv-avatar-spacer" aria-hidden="true"></span>'
+      : avatar(sender.id, sender.name, ctx);
+  const receiver = m.receiver_user;
+  const ephemeral = item.ephemeral
+    ? `<div class="tv-ephemeral" title="ephemeral message ${escapeAttr(m.ephemeral_message_id)}">◐ ${
+        ctx.as != null && Number(receiver?.id) === Number(ctx.as)
+          ? "only you see this"
+          : `only ${escapeHtml(receiver ? nameOf(receiver) : "one member")} sees this`
+      }</div>`
+    : "";
+  const header =
+    !position.groupedWithPrevious && !outgoing
+      ? senderLine(item, ctx, kind)
+      : "";
+  const forward = m.forward_origin
+    ? `<div class="tv-forward">Forwarded from <strong>${escapeHtml(originName(m.forward_origin))}</strong></div>`
+    : "";
+  const topic =
+    ctx.chat?.is_forum && m.message_thread_id != null
+      ? `<div class="tv-topic-label" data-topic-id="${escapeAttr(m.message_thread_id)}">${escapeHtml(topicName(ctx, m.message_thread_id))}</div>`
+      : "";
+  const media = renderMedia(m, item, ctx);
+  const text = m.text ?? m.caption ?? null;
+  const entities = m.text != null ? m.entities : m.caption_entities;
+  const meta = `<span class="tv-meta">${item.deleted ? deletedMark(item, ctx) : ""}${timeTag(item.at ?? m.date * 1000, m.edit_date != null ? '<span class="tv-edited">edited · </span>' : "")}</span>`;
+  const body =
+    text != null
+      ? `<div class="tv-text">${renderText(text, entities)}${meta}</div>`
+      : `<div class="tv-meta-row">${meta}</div>`;
+  const bubbleClass = [
+    "tv-bubble",
+    bot ? "tv-bubble--bot" : "",
+    position.groupedWithNext ? "" : "tv-bubble--tail",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return `<div class="${classes.join(" ")}"${messageAttrs(item, ctx, null)}>${avatarHtml}<div class="tv-msg-body"><div class="${bubbleClass}">${ephemeral}${header}${topic}${forward}${renderReply(item, ctx)}${media}${body}</div>${renderKeyboard(m.reply_markup)}</div></div>`;
+}
+
+function topicName(ctx, threadId) {
+  const topic = (ctx.chat?.topics ?? []).find(
+    (entry) => Number(entry.message_thread_id) === Number(threadId),
+  );
+  return topic ? topic.name : `topic ${threadId}`;
+}
+
+// ── Events ─────────────────────────────────────────────────────────────
+
+const IN_CHAT = new Set(["creator", "administrator", "member"]);
+
+/** The isInChat rule: in the chat, or restricted and still a member. */
+export function memberInChat(member) {
+  if (!member) return false;
+  return (
+    IN_CHAT.has(member.status) ||
+    (member.status === "restricted" && member.is_member === true)
+  );
+}
+
+function rightsList(member, value) {
+  return Object.keys(member ?? {})
+    .filter((key) => key.startsWith("can_") && member[key] === value)
+    .map(rightName);
+}
+
+function untilPhrase(member) {
+  const until = Number(member?.until_date ?? 0);
+  return until > 0 ? `until ${escapeHtml(untilText(until))}` : "forever";
+}
+
+function permissionsPhrase(member) {
+  const off = rightsList(member, false);
+  const on = rightsList(member, true);
+  if (!off.length) return "";
+  if (!on.length) return ": all permissions off";
+  return `: can't ${escapeHtml(off.join(", "))}`;
+}
+
+function memberEventText(event, ctx) {
+  const user = nameWithTag(ctx, event.user_id);
+  const actor =
+    event.actor_id != null ? nameWithTag(ctx, event.actor_id) : null;
+  const before = event.old ?? { status: "left" };
+  const after = event.new ?? { status: "left" };
+  const self =
+    event.actor_id != null && Number(event.actor_id) === Number(event.user_id);
+  const by = actor && !self ? ` by ${actor}` : "";
+  const subject = user;
+  if (event.reason === "expired")
+    return before.status === "kicked"
+      ? `${user}'s ban ended`
+      : `${user}'s restriction ended`;
+  const wasIn = memberInChat(before);
+  const isIn = memberInChat(after);
+  const via = linkDetails(event);
+  if (after.status === "kicked")
+    return `${subject} banned ${untilPhrase(after)}${by}`;
+  if (before.status === "kicked" && !isIn) return `${subject} unbanned${by}`;
+  if (!wasIn && isIn) {
+    const base =
+      self || !actor ? `${subject} joined` : `${actor} added ${subject}`;
+    const role =
+      after.status === "administrator"
+        ? " as administrator"
+        : after.status === "restricted"
+          ? " (restricted)"
+          : "";
+    return `${base}${role}${via}`;
+  }
+  if (wasIn && !isIn)
+    return self || !actor ? `${subject} left` : `${actor} removed ${subject}`;
+  if (after.status === "restricted" && before.status !== "restricted")
+    return `${subject} restricted ${untilPhrase(after)}${permissionsPhrase(after)}${by}`;
+  if (after.status === "restricted")
+    return `${subject}'s restrictions changed, ${untilPhrase(after)}${permissionsPhrase(after)}${by}`;
+  if (before.status === "restricted" && after.status === "member")
+    return `${subject} unrestricted${by}`;
+  if (after.status === "administrator" && before.status !== "administrator") {
+    const rights = rightsList(after, true);
+    return `${subject} promoted${rights.length ? `: ${escapeHtml(rights.join(", "))}` : ""}${by}`;
+  }
+  if (before.status === "administrator" && after.status !== "administrator")
+    return `${subject} demoted${by}`;
+  if (after.status === "administrator") {
+    if (before.custom_title !== after.custom_title)
+      return `${subject}'s title set to ${after.custom_title ? quoteText(after.custom_title) : "none"}${by}`;
+    const gained = rightsList(after, true).filter(
+      (right) => !rightsList(before, true).includes(right),
+    );
+    const lost = rightsList(before, true).filter(
+      (right) => !rightsList(after, true).includes(right),
+    );
+    const change = [
+      gained.length ? `+${gained.join(", +")}` : "",
+      lost.length ? `−${lost.join(", −")}` : "",
+    ]
+      .filter(Boolean)
+      .join("; ");
+    return `${subject}'s rights changed${change ? `: ${escapeHtml(change)}` : ""}${by}`;
+  }
+  return `${subject}: ${escapeHtml(before.status)} → ${escapeHtml(after.status)}${by}`;
+}
+
+function eventText(event, ctx) {
+  if (event.type === "member") return memberEventText(event, ctx);
+  if (event.type === "join_request") {
+    const user = nameWithTag(ctx, event.user_id);
+    if (event.state === "pending") {
+      const link = event.invite_link_name
+        ? quoteText(event.invite_link_name)
+        : event.invite_link
+          ? escapeHtml(event.invite_link)
+          : "a link";
+      return `${user} asked to join via ${link}`;
+    }
+    return `${user}'s join request ${event.state === "approved" ? "approved" : "declined"} by ${nameWithTag(ctx, event.bot_id)}`;
+  }
+  if (event.type === "unpin") {
+    const bot = nameWithTag(ctx, event.bot_id);
+    if (event.all || event.message_id == null)
+      return `${bot} unpinned all messages`;
+    return `${bot} unpinned <span class="tv-message-link" data-link-message-id="${escapeAttr(event.message_id)}">message ${escapeHtml(event.message_id)}</span>`;
+  }
+  return escapeHtml(event.type);
+}
+
+const EVENT_GLYPHS = { member: "◆", join_request: "✉", unpin: "⌖" };
+
+/** A chat event that Telegram shows as no message: member changes, join requests, unpins. */
+export function renderEvent(event, ctx) {
+  return `<div class="tv-event"${attrs({
+    "data-kind": "event",
+    "data-chat-key": ctx.key,
+    "data-chat-id": ctx.chat?.id,
+    "data-event-id": event.seq,
+    "data-seq": event.seq,
+    "data-event-type": event.type,
+    "data-user-id": event.user_id,
+    "data-request-id": event.request_id,
+    "data-before-window": event.before_window === true,
+  })}><span class="tv-event-glyph" aria-hidden="true">${EVENT_GLYPHS[event.type] ?? "•"}</span><span class="tv-event-text">${eventText(event, ctx)}</span>${timeTag(event.at)}</div>`;
+}
+
+// ── Streams (chat column, events panel) ────────────────────────────────
+
+/** Member events by the service message they link (event.service_seq). */
+export function serviceLinks(items) {
+  const links = new Map();
+  for (const item of items ?? [])
+    if (item.kind === "event" && item.service_seq != null)
+      links.set(item.service_seq, item);
+  return links;
+}
+
+/** Merges calls into the chat stream by request order (calls are not drawn yet). */
+export function mergeStream(items, calls) {
+  return items;
+}
+
+/** One call of the timeline (calls are not drawn yet). */
+export function renderCall(call, ctx) {
+  return "";
+}
+
+/** The calls panel (calls are not drawn yet). */
+export function renderCallsPanel(ctx, calls, view) {
+  return '<p class="tv-empty" data-role="no-calls">No calls are recorded yet.</p>';
+}
+
+function itemTime(item) {
+  if (item.at != null) return Number(item.at);
+  return Number(item.message?.date ?? 0) * 1000;
+}
+
+function groupKeyOf(item, ctx) {
+  if (item.kind !== "message" || serviceType(item.message)) return null;
+  const m = item.message;
+  const kind = authorKind(item, ctx);
+  const who =
+    kind === "channel"
+      ? `${m.sender_chat?.id ?? ctx.chat?.id}${ctx.as == null ? `/${item.author}` : ""}`
+      : m.from?.id;
+  return `${kind}:${who}:${item.ephemeral ? `e${m.receiver_user?.id}` : ""}:${item.deleted ? "d" : ""}`;
+}
+
+function entryKey(item) {
+  if (item.kind === "call") return `c${item.request_id}`;
+  return `${item.kind === "event" ? "e" : "m"}${item.seq}`;
+}
+
+function drawn(item, ctx, position) {
+  if (item.kind === "event") return renderEvent(item, ctx);
+  if (item.kind === "call") return renderCall(item, ctx);
+  return renderMessage(item, ctx, position);
+}
+
+/**
+ * Keyed entries for a list of items: day separators, groups of one author's
+ * messages within five minutes, and the history marker for view-as. Each
+ * entry is { key, html }, so the page replaces only what changed.
+ */
+export function streamEntries(list, ctx, options = {}) {
+  const out = [];
+  let lastDay = null;
+  const groupKeys = list.map((item) => groupKeyOf(item, ctx));
+  const asInfo = ctx.asInfo;
+  let markerBefore = -1;
+  if (asInfo?.history_may_be_hidden) {
+    markerBefore = 0;
+    list.forEach((item, index) => {
+      if (
+        item.kind === "message" &&
+        (item.message?.new_chat_members ?? []).some(
+          (user) => Number(user.id) === Number(asInfo.user_id),
+        )
+      )
+        markerBefore = index;
+    });
+  }
+  list.forEach((item, index) => {
+    const time = itemTime(item);
+    const day = dayKey(time);
+    if (day && day !== lastDay) {
+      out.push({
+        key: `d${day}`,
+        html: `<div class="tv-day" data-role="day"><span>${escapeHtml(dayLabel(time))}</span></div>`,
+      });
+      lastDay = day;
+    }
+    if (index === markerBefore)
+      out.push({
+        key: "history-marker",
+        html: '<div class="tv-history-note" data-role="history-hidden">Earlier history may be hidden for new members (not modeled)</div>',
+      });
+    // Grouped: the same author, within five minutes, on the same day, with
+    // no marker between the two.
+    const near = (other) =>
+      groupKeys[index] != null &&
+      groupKeys[other] === groupKeys[index] &&
+      Math.abs(itemTime(list[other]) - time) <= 300_000 &&
+      dayKey(itemTime(list[other])) === day &&
+      Math.max(index, other) !== markerBefore;
+    const position = {
+      groupedWithPrevious: index > 0 && near(index - 1),
+      groupedWithNext: index < list.length - 1 && near(index + 1),
+    };
+    const html = drawn(item, ctx, position);
+    if (html) out.push({ key: entryKey(item), html });
+  });
+  if (!list.length && options.empty)
+    out.push({ key: "empty", html: options.empty });
+  return out;
+}
+
+/**
+ * What the chat column draws. Combined: messages, events (when shown) and
+ * calls (when shown) by time; split: messages only. An event whose service
+ * message is drawn is left out: the message carries its details.
+ */
+export function chatStream(
+  items,
+  ctx,
+  { layout = "combined", show = PANELS, calls = [] } = {},
+) {
+  const shown = new Set(show);
+  const inline = layout === "combined";
+  const drawnSeqs = new Set(
+    items.filter((item) => item.kind === "message").map((item) => item.seq),
+  );
+  const list = items.filter((item) => {
+    if (item.kind === "message") return true;
+    if (
+      item.kind !== "event" ||
+      !inline ||
+      !shown.has("events") ||
+      ctx.as != null
+    )
+      return false;
+    return item.service_seq == null || !drawnSeqs.has(item.service_seq);
+  });
+  return inline && shown.has("calls") && ctx.as == null
+    ? mergeStream(list, calls)
+    : list;
+}
+
+/** What the events panel lists: events and service messages, by seq, each change once. */
+export function eventsStream(items) {
+  const services = new Set(
+    items
+      .filter((item) => item.kind === "message" && serviceType(item.message))
+      .map((item) => item.seq),
+  );
+  return items.filter((item) => {
+    if (item.kind === "message") return services.has(item.seq);
+    return (
+      item.kind === "event" &&
+      (item.service_seq == null || !services.has(item.service_seq))
+    );
+  });
+}
+
+// ── Members ────────────────────────────────────────────────────────────
+
+/** A member's status in words: "restricted until …", "banned forever", "left" … */
+export function memberStatusText(member) {
+  if (!member) return "not a member";
+  switch (member.status) {
+    case "restricted":
+      return `restricted ${member.until_date ? `until ${untilText(member.until_date)}` : "forever"}${member.is_member === false ? " · not in the chat" : ""}`;
+    case "kicked":
+      return `banned ${member.until_date ? `until ${untilText(member.until_date)}` : "forever"}`;
+    default:
+      return member.status;
+  }
+}
+
+function memberCard(ctx, userId, member, extra = {}) {
+  const user = userOf(ctx, userId);
+  const name = user ? nameOf(user) : `User ${userId}`;
+  const tag = botTag(ctx, user);
+  const rows = [["ID", String(userId)]];
+  if (member) rows.push(["Status", memberStatusText(member)]);
+  if (member?.custom_title) rows.push(["Title", member.custom_title]);
+  if (member?.status === "restricted") {
+    const off = rightsList(member, false);
+    rows.push(["Can't", off.length ? off.join(", ") : "nothing restricted"]);
+  }
+  if (member?.status === "administrator") {
+    const on = rightsList(member, true);
+    rows.push(["Rights", on.length ? on.join(", ") : "none"]);
+    if (member.is_anonymous) rows.push(["Anonymous", "yes"]);
+  }
+  if (extra.role) rows.push(["Role", extra.role]);
+  const grid = rows
+    .map(
+      ([label, value]) =>
+        `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd>`,
+    )
+    .join("");
+  const status = member?.status ?? null;
+  const handle = [
+    user?.username ? `@${escapeHtml(user.username)}` : "",
+    tag ? ` <span class="tv-tag">${escapeHtml(tag)}</span>` : "",
+  ].join("");
+  return el(
+    "article",
+    {
+      class: "tv-member",
+      "data-chat-key": ctx.key,
+      "data-member-id": userId,
+      "data-member-status": status,
+      "data-member-in-chat": String(
+        member ? memberInChat(member) : extra.inChat === true,
+      ),
+      "data-member-bot": Boolean(user?.is_bot),
+    },
+    el(
+      "header",
+      { class: "tv-member-head" },
+      avatar(userId, name, ctx),
+      el(
+        "span",
+        { class: "tv-member-names" },
+        el("strong", {}, escapeHtml(name)),
+        handle ? el("span", {}, handle) : "",
+      ),
+      status
+        ? el(
+            "span",
+            { class: "tv-status", "data-status": status },
+            escapeHtml(status === "kicked" ? "banned" : status),
+          )
+        : "",
+    ),
+    el("dl", { class: "tv-member-grid" }, grid),
+  );
+}
+
+/** Keyed entries for the members panel: chat permissions, members, the rest's count, join requests. */
+export function memberEntries(page, ctx) {
+  const chat = page.chat ?? {};
+  const out = [];
+  if (chat.type === "private") {
+    out.push({
+      key: "section-people",
+      html: '<h3 class="tv-section">In this chat</h3>',
+    });
+    out.push({
+      key: `m${chat.user_id}`,
+      html: memberCard(ctx, chat.user_id, null, { role: "user", inChat: true }),
+    });
+    out.push({
+      key: `m${chat.bot_id}`,
+      html: memberCard(ctx, chat.bot_id, null, { role: "bot", inChat: true }),
+    });
+    return out;
+  }
+  if (chat.permissions) {
+    const off = Object.keys(chat.permissions).filter(
+      (key) => chat.permissions[key] === false,
+    );
+    out.push({
+      key: "permissions",
+      html: `<section class="tv-permissions" data-role="chat-permissions"><h3 class="tv-section">Default permissions</h3><p>${off.length ? `Members can't ${escapeHtml(off.map(rightName).join(", "))}` : "Members may do everything"}</p></section>`,
+    });
+  }
+  const members = page.members ?? [];
+  out.push({
+    key: "section-members",
+    html: `<h3 class="tv-section">Members <span class="tv-count">${escapeHtml(page.members_total ?? members.length)}</span></h3>`,
+  });
+  for (const row of members)
+    out.push({
+      key: `m${row.user_id}`,
+      html: memberCard(ctx, row.user_id, row.member),
+    });
+  const more = Number(page.members_total ?? members.length) - members.length;
+  if (more > 0)
+    out.push({
+      key: "more",
+      html: `<p class="tv-more" data-role="more-members">${escapeHtml(more)} more members</p>`,
+    });
+  const requests = page.join_requests ?? [];
+  if (requests.length) {
+    out.push({
+      key: "section-requests",
+      html: `<h3 class="tv-section">Join requests <span class="tv-count">${requests.length}</span></h3>`,
+    });
+    for (const request of requests) {
+      const name = personName(ctx, request.user_id);
+      const link = request.invite_link_name
+        ? `“${request.invite_link_name}”`
+        : (request.invite_link ?? "");
+      const asked = request.date
+        ? `${dayLabel(request.date * 1000)} ${clockTime(request.date * 1000)} UTC`
+        : "";
+      out.push({
+        key: `jr${request.user_id}`,
+        html: el(
+          "article",
+          {
+            class: "tv-request",
+            "data-chat-key": ctx.key,
+            "data-join-request-user-id": request.user_id,
+          },
+          avatar(request.user_id, name, ctx),
+          el(
+            "span",
+            { class: "tv-member-names" },
+            el("strong", {}, escapeHtml(name)),
+            el(
+              "span",
+              {},
+              escapeHtml(`asked ${asked}${link ? ` via ${link}` : ""}`),
+            ),
+          ),
+        ),
+      });
+    }
+  }
+  return out;
+}
+
+// ── Chat list ──────────────────────────────────────────────────────────
+
+const TYPE_LABELS = {
+  supergroup: "supergroup",
+  group: "basic group",
+  channel: "channel",
+  private: "private",
+  calls: "calls",
+};
+const SERVICE_LABELS = {
+  new_chat_members: "joined or added",
+  left_chat_member: "left or removed",
+  pinned_message: "pinned a message",
+  new_chat_title: "changed the title",
+  new_chat_photo: "changed the photo",
+  delete_chat_photo: "removed the photo",
+  migrate_to_chat_id: "moved to a supergroup",
+  migrate_from_chat_id: "upgraded from a basic group",
+  forum_topic_created: "created a topic",
+  forum_topic_edited: "edited a topic",
+};
+
+function listPreview(entry, ctx) {
+  if (entry.type === "calls")
+    return `${escapeHtml(entry.call_count ?? 0)} calls without a chat`;
+  const last = entry.last;
+  if (!last) return "No messages yet";
+  if (last.kind === "event") {
+    const label =
+      {
+        member: "Member change",
+        join_request: "Join request",
+        unpin: "Unpinned",
+      }[last.media] ?? "Event";
+    return `<span class="tv-list-event">${escapeHtml(label)}${userOf(ctx, last.author) ? ` · ${escapeHtml(personName(ctx, last.author))}` : ""}</span>`;
+  }
+  const author = userOf(ctx, last.author)
+    ? `<span class="tv-list-author">${escapeHtml(personName(ctx, last.author))}:</span> `
+    : "";
+  if (last.deleted)
+    return `${author}<span class="tv-list-deleted">Deleted message</span>`;
+  if (last.media && SERVICE_TYPES.includes(last.media))
+    return `${author}<span class="tv-list-event">${escapeHtml(SERVICE_LABELS[last.media] ?? "service message")}</span>`;
+  const media = last.media
+    ? (CONTENT_KINDS.find(([key]) => key === last.media)?.[1] ?? last.media)
+    : null;
+  const text =
+    last.preview != null
+      ? escapeHtml(oneLine(last.preview, 100))
+      : escapeHtml(media ?? "Message");
+  return `${author}${last.ephemeral ? '<span class="tv-list-flag">◐</span> ' : ""}${media && last.preview != null ? `${escapeHtml(media)} · ` : ""}${text}`;
+}
+
+/** Keyed rows of the chat list. `current` holds the open chats' keys; `search` filters by title. */
+export function chatListEntries(
+  state,
+  { view = null, current = [], search = "", users = {} } = {},
+) {
+  const ctx = makeContext({
+    bots: state?.bots ?? [],
+    users,
+    files: state?.files ?? {},
+  });
+  const open = new Set(current.map(String));
+  const needle = String(search ?? "")
+    .trim()
+    .toLowerCase();
+  return (state?.chats ?? []).map((entry) => {
+    const href = view
+      ? viewToSearch({ ...view, chats: [entry.key], topic: null })
+      : `?chat=${searchValue(entry.key)}`;
+    const bot =
+      entry.type === "private"
+        ? state.bots?.find(
+            (candidate) => Number(candidate.id) === Number(entry.bot_id),
+          )
+        : null;
+    const title = entry.title ?? String(entry.id ?? entry.key);
+    const badges = [
+      entry.is_forum ? "forum" : (TYPE_LABELS[entry.type] ?? entry.type),
+      entry.migrated_to != null ? "upgraded" : null,
+    ].filter(Boolean);
+    const memberView = view?.as != null;
+    const pending = memberView ? 0 : Number(entry.pending_join_requests) || 0;
+    const time = entry.last?.at ?? entry.last_call?.at ?? null;
+    const hidden =
+      needle &&
+      !`${title} ${bot?.username ?? ""} ${entry.key}`
+        .toLowerCase()
+        .includes(needle);
+    const picture =
+      entry.type === "calls"
+        ? '<span class="tv-avatar tv-avatar--list tv-avatar--calls" aria-hidden="true">⇄</span>'
+        : avatar(entry.id ?? entry.key, title, ctx, {
+            size: " tv-avatar--list",
+            photoId: entry.photo_file_id,
+          });
+    const chips = [
+      ...badges.map((badge) =>
+        el("span", { class: "tv-chip" }, escapeHtml(badge)),
+      ),
+      entry.deleted_count && !memberView
+        ? el(
+            "span",
+            { class: "tv-chip tv-chip--danger" },
+            `${escapeHtml(entry.deleted_count)} deleted`,
+          )
+        : "",
+    ];
+    const html = el(
+      "a",
+      {
+        class: "tv-list-item",
+        href,
+        "data-chat-key": entry.key,
+        "data-chat-id": entry.id,
+        "data-chat-type": entry.type,
+        "data-forum": entry.is_forum === true,
+        "data-user-id": entry.type === "private" ? entry.user_id : null,
+        "data-bot-id": entry.type === "private" ? entry.bot_id : null,
+        "aria-current": open.has(String(entry.key)) ? "true" : null,
+        hidden: hidden ? "hidden" : null,
+      },
+      picture,
+      el(
+        "span",
+        { class: "tv-list-copy" },
+        el(
+          "span",
+          { class: "tv-list-line" },
+          el("span", { class: "tv-list-title" }, escapeHtml(title)),
+          bot
+            ? el(
+                "span",
+                { class: "tv-list-with" },
+                `with @${escapeHtml(bot.username ?? bot.first_name)}`,
+              )
+            : "",
+          time != null
+            ? el(
+                "time",
+                { class: "tv-list-time", datetime: isoTime(time) },
+                escapeHtml(clockTime(time)),
+              )
+            : "",
+        ),
+        el(
+          "span",
+          { class: "tv-list-line" },
+          el("span", { class: "tv-list-preview" }, listPreview(entry, ctx)),
+          pending
+            ? el(
+                "span",
+                { class: "tv-badge", title: "pending join requests" },
+                String(pending),
+              )
+            : "",
+        ),
+        el("span", { class: "tv-list-badges" }, ...chips),
+      ),
+    );
+    return { key: entry.key, html };
+  });
+}
+
+// ── Frame: toolbar, columns, phone navigation ──────────────────────────
+
+const PANEL_LABELS = {
+  list: "Chats",
+  chat: "Chat",
+  calls: "Calls",
+  events: "Events",
+  members: "Members",
+};
+
+/** The toolbar's controls: panel toggles, layout, view-as and theme. */
+export function renderToolbar(view, { people = [] } = {}) {
+  const shown = new Set(view.show ?? PANELS);
+  const viewAs = view.as != null;
+  const toggles = PANELS.map((panel) => {
+    const disabled =
+      (viewAs && ["calls", "events", "members"].includes(panel)) ||
+      (shown.has(panel) && shown.size === 1);
+    return `<button type="button" class="tv-toggle" data-role="toggle-panel" data-panel="${panel}" aria-pressed="${shown.has(panel) && !(viewAs && ["calls", "events", "members"].includes(panel))}"${disabled ? " disabled" : ""}>${PANEL_LABELS[panel]}</button>`;
+  }).join("");
+  const layouts = LAYOUTS.map(
+    (layout) =>
+      `<button type="button" class="tv-toggle" data-role="layout" data-layout="${layout}" aria-pressed="${view.layout === layout}">${layout === "combined" ? "Combined" : "Split"}</button>`,
+  ).join("");
+  const options = [{ id: "", name: "Test view (everything)" }, ...people]
+    .map(
+      ({ id, name }) =>
+        `<option value="${escapeAttr(id)}"${String(view.as ?? "") === String(id) ? " selected" : ""}>${escapeHtml(id === "" ? name : `As ${name}`)}</option>`,
+    )
+    .join("");
+  const themes = [
+    ["", "System theme"],
+    ["light", "Light"],
+    ["dark", "Dark"],
+  ]
+    .map(
+      ([value, label]) =>
+        `<option value="${value}"${(view.theme ?? "") === value ? " selected" : ""}>${label}</option>`,
+    )
+    .join("");
+  const select = (label, role, html) =>
+    el(
+      "label",
+      { class: "tv-select" },
+      el("span", { class: "tv-visually-hidden" }, label),
+      el("select", { "data-role": role }, html),
+    );
+  return [
+    el(
+      "div",
+      { class: "tv-toolbar-group", role: "group", "aria-label": "Panels" },
+      toggles,
+    ),
+    el(
+      "div",
+      { class: "tv-toolbar-group", role: "group", "aria-label": "Layout" },
+      layouts,
+    ),
+    select("View as", "view-as", options),
+    select("Theme", "theme", themes),
+  ].join("");
+}
+
+/** The live status pill: live, reconnecting, stopped, or a recording's name and window. */
+export function renderStatus(status, text = "", recording = null) {
+  const labels = {
+    live: "Live",
+    reconnecting: "Connecting…",
+    stopped: "Server stopped",
+    recording: "Recording",
+  };
+  const label = recording
+    ? `Recording ${recording.name ?? ""}`.trim()
+    : (labels[status] ?? status);
+  const detail = text
+    ? `<span class="tv-status-detail">${escapeHtml(text)}</span>`
+    : "";
+  return `<span class="tv-live" data-role="status" data-status="${escapeAttr(status)}" role="status"><span class="tv-live-dot" aria-hidden="true"></span>${escapeHtml(label)}${detail}</span>`;
+}
+
+function columnTitle(column, info) {
+  if (column.panel === "list") return "Chats";
+  const label = PANEL_LABELS[column.panel];
+  return info?.title ? `${label} · ${info.title}` : label;
+}
+
+/** A column's frame: header and body slots the page fills and patches. */
+export function renderColumn(column, info = {}) {
+  const perChat = column.panel !== "list";
+  const body =
+    column.panel === "chat"
+      ? `<div class="tv-wallpaper"><div class="tv-scroll" data-slot="scroll"><div data-slot="top"></div><div class="tv-stream" data-slot="items"></div><div data-slot="bottom"></div></div></div>`
+      : column.panel === "list"
+        ? `<div class="tv-scroll tv-list" data-slot="scroll"><div data-slot="items"></div></div>`
+        : `<div class="tv-scroll tv-panel-scroll" data-slot="scroll"><div data-slot="top"></div><div class="tv-panel-list" data-slot="items"></div><div data-slot="bottom"></div></div>`;
+  return `<section class="tv-column tv-column--${column.panel}"${attrs({
+    "data-panel": column.panel,
+    "data-column-id": column.id,
+    "data-chat-key": perChat ? (info.key ?? column.ref) : null,
+    "data-chat-id": perChat ? (info.chatId ?? null) : null,
+    "data-view-as": info.viewAs ?? "",
+    "aria-label": columnTitle(column, info),
+  })}><header class="tv-pane-header" data-slot="header"></header><div class="tv-pane-body">${body}</div></section>`;
+}
+
+/** The header of a per-chat column: the chat, its kind, open-alone and hide. */
+export function renderPaneHeader(
+  column,
+  {
+    page = null,
+    entry = null,
+    ctx = null,
+    openAlone = "",
+    topic = null,
+    missing = false,
+  } = {},
+) {
+  const chat = page?.chat ?? entry ?? {};
+  const title =
+    chat.title ??
+    (column.ref === "calls" ? "Bot calls without a chat" : column.ref);
+  const label = PANEL_LABELS[column.panel];
+  const kind = chat.type
+    ? chat.is_forum
+      ? "forum"
+      : (TYPE_LABELS[chat.type] ?? chat.type)
+    : missing
+      ? "not found"
+      : "";
+  const members = entry?.member_count
+    ? `${entry.member_count} ${entry.member_count === 1 ? "member" : "members"}`
+    : null;
+  const subtitle = [label, kind, column.panel === "chat" ? members : null]
+    .filter(Boolean)
+    .join(" · ");
+  const photo = chat.photo_file_id ?? entry?.photo_file_id ?? null;
+  const pic =
+    column.ref === "calls"
+      ? '<span class="tv-avatar tv-avatar--header tv-avatar--calls" aria-hidden="true">⇄</span>'
+      : avatar(chat.id ?? column.ref, title, ctx ?? makeContext(page ?? {}), {
+          size: " tv-avatar--header",
+          photoId: photo,
+        });
+  const topics =
+    column.panel === "chat" && chat.is_forum && (chat.topics ?? []).length
+      ? `<label class="tv-select tv-select--small"><span class="tv-visually-hidden">Topic</span><select data-role="topic-filter">${[
+          ["", "All topics"],
+          ["general", "General"],
+          ...(chat.topics ?? []).map((entryTopic) => [
+            String(entryTopic.message_thread_id),
+            entryTopic.name,
+          ]),
+        ]
+          .map(
+            ([value, name]) =>
+              `<option value="${escapeAttr(value)}"${value ? ` data-topic-id="${escapeAttr(value)}"` : ""}${String(topic ?? "") === value ? " selected" : ""}>${escapeHtml(name)}</option>`,
+          )
+          .join("")}</select></label>`
+      : "";
+  return [
+    pic,
+    el(
+      "span",
+      { class: "tv-pane-titles" },
+      el("span", { class: "tv-pane-title" }, escapeHtml(title)),
+      el("span", { class: "tv-pane-subtitle" }, escapeHtml(subtitle)),
+    ),
+    topics,
+    paneButtons(column.panel, label, openAlone),
+  ].join("");
+}
+
+/** A panel header's "open alone" link and hide button. */
+function paneButtons(panel, label, openAlone) {
+  return [
+    el(
+      "a",
+      {
+        class: "tv-icon-button",
+        "data-role": "open-alone",
+        href: openAlone,
+        target: "_blank",
+        rel: "noopener",
+        title: "Open this panel alone in a new tab",
+        "aria-label": `Open ${label} alone`,
+      },
+      "↗",
+    ),
+    el(
+      "button",
+      {
+        type: "button",
+        class: "tv-icon-button",
+        "data-role": "hide-panel",
+        "data-panel": panel,
+        title: "Hide this panel",
+        "aria-label": `Hide ${label}`,
+      },
+      "×",
+    ),
+  ].join("");
+}
+
+/** The list column's header: search, count, open-alone and hide. */
+export function renderListHeader(count, search = "", openAlone = "") {
+  const input = `<input${attrs({ type: "search", "data-role": "chat-search", placeholder: "Search chats", value: search, autocomplete: "off" })}>`;
+  return [
+    el(
+      "label",
+      { class: "tv-search" },
+      el("span", { class: "tv-visually-hidden" }, "Search chats"),
+      input,
+    ),
+    el(
+      "span",
+      { class: "tv-count", "data-role": "chat-count" },
+      escapeHtml(count),
+    ),
+    paneButtons("list", "Chats", openAlone),
+  ].join("");
+}
+
+/** A divider between two columns, resizable by pointer and keyboard. */
+export function renderDivider(after, label, width = 0, minimum = 0) {
+  return el(
+    "div",
+    {
+      class: "tv-divider",
+      role: "separator",
+      "data-role": "divider",
+      "data-after": after,
+      tabindex: "0",
+      "aria-orientation": "vertical",
+      "aria-label": `Resize ${label}`,
+      "aria-valuenow": Math.round(width),
+      "aria-valuemin": minimum,
+    },
+    "<span></span>",
+  );
+}
+
+/** The phone's bottom bar: Back and one button per column. */
+export function renderPhoneNav(columns, active, titles = {}) {
+  const several =
+    new Set(columns.filter((column) => column.ref).map((column) => column.ref))
+      .size > 1;
+  const buttons = columns
+    .map((column) => {
+      const label =
+        several && column.ref
+          ? `${PANEL_LABELS[column.panel]} · ${titles[column.ref] ?? column.ref}`
+          : PANEL_LABELS[column.panel];
+      return `<button type="button" class="tv-phone-button" data-role="phone-pane" data-pane="${escapeAttr(column.id)}"${column.id === active ? ' aria-current="page"' : ""}>${escapeHtml(label)}</button>`;
+    })
+    .join("");
+  const back =
+    columns.some((column) => column.id === "list") && active !== "list";
+  return `<button type="button" class="tv-phone-button" data-role="phone-back"${back ? "" : " disabled"}>Back</button>${buttons}`;
+}
+
+/** The banner a member sees in a chat they are not in, or another user's private chat. */
+export function renderNotMember(page, ctx) {
+  const info = page?.as;
+  if (!info || info.access !== "none") return "";
+  const name = escapeHtml(personName(ctx, info.user_id));
+  const chat = page.chat ?? {};
+  const text =
+    chat.type === "private" && Number(chat.user_id) !== Number(info.user_id)
+      ? `${name} can't see this chat`
+      : `${name} is not in this chat now (${escapeHtml(info.status === "kicked" ? "banned" : (info.status ?? "never joined"))})`;
+  return `<div class="tv-banner" data-role="not-member">${text}</div>`;
+}
+
+/** The note shown with view-as in a basic group: only what was posted while the member was in it. */
+export function renderAccessNote(page) {
+  const info = page?.as;
+  if (!info) return "";
+  if (info.access === "while_member")
+    return '<div class="tv-history-note" data-role="access-note">Shown: what was posted while this member was in the group</div>';
+  return "";
+}
