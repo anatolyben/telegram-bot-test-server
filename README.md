@@ -250,6 +250,24 @@ expect(votes.get(ann)).toBe(1); // your app's own state
 The press resolves with the bot's answer once the webhook has answered both deliveries. It needs a
 webhook: a polling bot gets an update again only by not confirming it, so the press is refused.
 
+A user can also open a URL button, named by its text or by its index (row by row, from 0). A link
+to the bot does what Telegram's app does with it: `https://t.me/<bot>?start=<parameter>` sends
+`/start <parameter>` from the user in their private chat with the bot, and a `startgroup` or
+`startchannel` link adds the bot to the chat `addToChatId` names. Any other URL changes nothing and
+comes back, for the test to follow:
+
+```js
+// Your bot's welcome message has a button to https://t.me/example_bot?start=verify.
+await server.openUrlButton(GROUP, message.message_id, ann, "I'm human");
+// Your bot got "/start verify" from Ann, and answers her privately.
+await server.waitFor({
+  kind: "message",
+  chatId: ann,
+  botId: BOT_ID,
+  contains: "verified",
+});
+```
+
 The test can also call the Bot API as the bot, for example to make an invite link, and then have
 a user open it:
 
@@ -1571,6 +1589,20 @@ handed to the bot ([Make users act](#make-users-act)). The owner account actions
   presses an inline button on an ephemeral message; works like `pressButton`.
 - `pressDirectButton(userId, messageId, data, { deliverTwice })`: the user presses a button in
   their private chat with the bot.
+- `openUrlButton(chatId, messageId, userId, button, { addToChatId })`: the user opens a URL
+  button, named by its text or its index (row by row, from 0). A link to one of the server's bots
+  does what Telegram's app does with it. `https://t.me/<bot>?start=<parameter>` (or
+  `tg://resolve?domain=<bot>&start=<parameter>`) sends `/start <parameter>` from the user in their
+  private chat with the bot. A `startgroup=<parameter>` or `startchannel` link adds the bot, as the
+  user, to the group or channel `addToChatId` names, with the rights its `admin=` asks for, as
+  `addBotViaLink` does. Resolves with `{ url }`, and for such a link also `link`, `bot_id`,
+  `chat_id` and, for `start`, the message's `message_id`. Any other URL changes nothing. It fails
+  for a button that is not a URL button, for a user not in the chat, and for a `start` link to a
+  bot other than the first, since users write privately only to the first bot.
+- `openEphemeralUrlButton(chatId, ephemeralMessageId, userId, button, { addToChatId })`: the
+  receiver opens a URL button on an ephemeral message; works like `openUrlButton`.
+- `openDirectUrlButton(userId, messageId, button, { addToChatId })`: the user opens a URL button
+  in their private chat with the bot.
 
 **Private chats**
 
@@ -1827,6 +1859,18 @@ bot to call `answerCallbackQuery`, and returns `{ answered, text, show_alert }`,
 count. With `deliver_twice: true`, the bot's webhook gets the same update twice, as `deliverTwice`
 does; a bot without a webhook answers 409.
 
+- `POST chats/:id/messages/:messageId/open-url`: the user `{ user_id, button, add_to_chat_id? }`
+  opens a URL button, as `openUrlButton` does.
+- `POST chats/:id/ephemeral-messages/:eid/open-url`: its receiver
+  `{ user_id, button, add_to_chat_id? }` opens a URL button.
+- `POST users/:id/dm/:messageId/open-url`: the user opens a URL button in the private chat
+  `{ button, add_to_chat_id? }`.
+
+`button` is the button's text, or its index counted row by row from 0. Each returns `{ url }`, and
+for a link to one of the server's bots also `link`, `bot_id`, `chat_id` and, for `start`,
+`message_id`. A button that is not a URL button, a user who cannot see the message, and a
+`startgroup` or `startchannel` link without `add_to_chat_id` answer 400.
+
 **Private chats**
 
 - `POST users/:id/dm`: the user sends the bot a direct message, with the same body as
@@ -2059,7 +2103,10 @@ formatting and replies, and request parsing and update delivery.
 - Members deleting messages: no test action does it, so every deletion is a bot's.
 - A private chat per bot: a user's private messages with every bot are kept in one chat with one
   run of message ids, so a bot can delete or pin a message in another bot's private chat with that
-  user. The viewer still shows each bot's private chat apart.
+  user. The viewer still shows each bot's private chat apart. Users write privately only to the
+  first bot, so opening a `start` link to another bot fails.
+- Following other links a URL button opens, such as invite links, web apps and games: the URL comes
+  back, and the test acts on it (an invite link with `joinByLink`).
 - Updates when a restriction or ban runs out: the member's status changes on time, and no update is
   sent.
 - The older fields the Bot API server still writes beside newer ones: `forward_from`,
@@ -2251,6 +2298,10 @@ fields below.
     (`deliver_twice` over HTTP) delivers one press twice, with the same `update_id` and callback
     query id, so a test can check that the bot ignores the duplicate
     ([Make users act](#make-users-act)).
+  - New: `openUrlButton`, `openEphemeralUrlButton` and `openDirectUrlButton` (`POST .../open-url`)
+    open a URL button. A `start` link to the bot sends `/start <parameter>` in the user's private
+    chat, and a `startgroup` or `startchannel` link adds the bot to the chat the user picks; any
+    other URL comes back unchanged ([URL buttons][behavior-url-buttons]).
   - Changed: when a person edits an administrator with `promoteMember`, the administrator keeps
     who promoted them. A bot that promoted them keeps `can_be_edited` and can still edit and
     title them; 0.12.0 made the person their promoter
@@ -2379,5 +2430,6 @@ MIT
 [behavior-join-queries]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#join-request-queries-bot-api-10x
 [behavior-parameters]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#parameters
 [behavior-upgrade]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#basic-groups-and-the-upgrade
+[behavior-url-buttons]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#url-buttons
 [owner-docs]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/owner-accounts.md
 [performance]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/performance.md

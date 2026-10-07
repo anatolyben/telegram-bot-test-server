@@ -252,6 +252,304 @@ describe("who may add the bot as an administrator", () => {
   });
 });
 
+describe("opening a URL button", () => {
+  /** The bot sends a message with one button per row; returns it. */
+  async function sendButtons(api, chatId, buttons) {
+    const sent = await api("sendMessage", {
+      chat_id: chatId,
+      text: "Pick one",
+      reply_markup: { inline_keyboard: buttons.map((button) => [button]) },
+    });
+    expect(sent.ok).toBe(true);
+    return sent.result;
+  }
+  const privateMessages = (hook) =>
+    hook.ofType("message").filter((message) => message.chat.type === "private");
+
+  /** A group with the bot as an administrator, and Ann in it. */
+  async function groupWithAnn(fake, me) {
+    const group = await fake.createChat({ ownerId: OWNER });
+    await fake.setBotMembership(group, me.id, { status: "administrator" });
+    const ann = await fake.createUser({ first_name: "Ann", username: "ann" });
+    await fake.join(group, ann);
+    return { group, ann };
+  }
+
+  it("sends /start with the parameter in the person's private chat, on first contact and later", async () => {
+    const { fake, api, hook, me } = await setup();
+    const { group, ann } = await groupWithAnn(fake, me);
+    const url = "https://t.me/modbot?start=verify_123";
+    const { message_id } = await sendButtons(api, group, [
+      { text: "I'm human", url },
+      { text: "Start", url: "tg://resolve?domain=ModBot&start=" },
+    ]);
+    // Ann never wrote to the bot, so it cannot write to her yet.
+    expect(
+      (await api("sendMessage", { chat_id: ann, text: "Hi" })).status,
+    ).toBe(403);
+
+    const opened = await fake.openUrlButton(
+      group,
+      message_id,
+      ann,
+      "I'm human",
+    );
+
+    expect(opened).toEqual({
+      url,
+      link: "start",
+      bot_id: me.id,
+      chat_id: ann,
+      message_id: expect.any(Number),
+    });
+    await expect.poll(() => privateMessages(hook)).toHaveLength(1);
+    expect(privateMessages(hook)[0]).toMatchObject({
+      message_id: opened.message_id,
+      from: { id: ann },
+      chat: { id: ann, type: "private" },
+      text: "/start verify_123",
+      entities: [{ type: "bot_command", offset: 0, length: 6 }],
+    });
+    expect(
+      (await api("sendMessage", { chat_id: ann, text: "Welcome" })).ok,
+    ).toBe(true);
+
+    // The chat has messages now, and the link sends /start again. The second
+    // button, by its index, is a tg:// link with an empty parameter.
+    await fake.openUrlButton(group, message_id, ann, 0);
+    await fake.openUrlButton(group, message_id, ann, 1);
+    await expect
+      .poll(() => privateMessages(hook).map((message) => message.text))
+      .toEqual(["/start verify_123", "/start verify_123", "/start"]);
+  });
+
+  it("adds the bot to the group the person picks for a startgroup link, with the rights it asks for", async () => {
+    const { fake, api, hook, me } = await setup();
+    const { group } = await groupWithAnn(fake, me);
+    const shop = await fake.createChat({ title: "Shop", ownerId: OWNER });
+    const url =
+      "https://t.me/modbot?startgroup=ws_1&admin=delete_messages+restrict_members+post_messages";
+    const { message_id } = await sendButtons(api, group, [
+      { text: "Add me", url },
+    ]);
+    const before = hook.updates.length;
+
+    expect(
+      await fake.openUrlButton(group, message_id, OWNER, "Add me", {
+        addToChatId: shop,
+      }),
+    ).toEqual({ url, link: "startgroup", bot_id: me.id, chat_id: shop });
+
+    const member = await fake.getMember(shop, me.id);
+    expect(member).toMatchObject({
+      status: "administrator",
+      can_manage_chat: true,
+      can_delete_messages: true,
+      can_restrict_members: true,
+      can_pin_messages: false,
+    });
+    // post_messages is a channel right, so a group link leaves it out.
+    expect(member.can_post_messages).toBeUndefined();
+    await expect.poll(() => hook.updates.length - before).toBe(3);
+    const added = hook.updates.slice(before);
+    expect(added.find((update) => update.my_chat_member)).toMatchObject({
+      my_chat_member: {
+        chat: { id: shop },
+        from: { id: OWNER },
+        new_chat_member: { status: "administrator" },
+      },
+    });
+    expect(added.find((update) => update.message?.text)?.message).toMatchObject(
+      {
+        chat: { id: shop },
+        from: { id: OWNER },
+        text: "/start@modbot ws_1",
+      },
+    );
+  });
+
+  it("adds the bot to a channel for a startchannel link with rights", async () => {
+    const { fake, api, hook, me } = await setup();
+    await api("setWebhook", {
+      url: hook.url,
+      allowed_updates: ["message", "channel_post", "my_chat_member"],
+    });
+    const { group } = await groupWithAnn(fake, me);
+    const channel = await fake.createChat({ type: "channel", ownerId: OWNER });
+    const url =
+      "tg://resolve?domain=modbot&startchannel&admin=post_messages+pin_messages";
+    const bare = "https://t.me/modbot?startchannel";
+    const { message_id } = await sendButtons(api, group, [
+      { text: "Add to channel", url },
+      { text: "Without rights", url: bare },
+    ]);
+
+    // Without admin rights it is not a startchannel link.
+    expect(
+      await fake.openUrlButton(group, message_id, OWNER, "Without rights", {
+        addToChatId: channel,
+      }),
+    ).toEqual({ url: bare });
+    expect((await fake.getMember(channel, me.id)).status).toBe("left");
+
+    expect(
+      await fake.openUrlButton(group, message_id, OWNER, "Add to channel", {
+        addToChatId: channel,
+      }),
+    ).toEqual({ url, link: "startchannel", bot_id: me.id, chat_id: channel });
+    const member = await fake.getMember(channel, me.id);
+    expect(member).toMatchObject({
+      status: "administrator",
+      can_post_messages: true,
+    });
+    // pin_messages is a group right.
+    expect(member.can_pin_messages).toBeUndefined();
+    expect(await fake.getMessages(channel)).toEqual([]);
+  });
+
+  it("returns any other URL and does nothing", async () => {
+    const { fake, api, me } = await setup();
+    const { group, ann } = await groupWithAnn(fake, me);
+    const urls = [
+      "https://example.com/rules",
+      "https://t.me/unknown_bot?start=x",
+      "https://t.me/ann?start=x",
+      "https://t.me/modbot",
+      "https://t.me/modbot?start=not.valid",
+      "https://t.me/+AbCdEf",
+    ];
+    const { message_id } = await sendButtons(
+      api,
+      group,
+      urls.map((url, index) => ({ text: `Link ${index}`, url })),
+    );
+    const before = (await fake.getBotUpdates(me.id)).updates.length;
+
+    for (const [index, url] of urls.entries()) {
+      expect(await fake.openUrlButton(group, message_id, ann, index)).toEqual({
+        url,
+      });
+    }
+
+    expect((await fake.getBotUpdates(me.id)).updates).toHaveLength(before);
+    expect(await fake.getDirectMessages(ann)).toEqual([]);
+  });
+
+  it("refuses a button that is not a URL button, and a person who cannot see the message", async () => {
+    const { fake, api, me } = await setup();
+    await fake.addBot({ token: OTHER_TOKEN, username: "otherbot" });
+    const { group, ann } = await groupWithAnn(fake, me);
+    const outsider = await fake.createUser();
+    const channel = await fake.createChat({ type: "channel", ownerId: OWNER });
+    const { message_id } = await sendButtons(api, group, [
+      { text: "Vote", callback_data: "vote" },
+      { text: "Add me", url: "https://t.me/modbot?startgroup=x" },
+      { text: "Other", url: "https://t.me/otherbot?start=x" },
+    ]);
+    const open = (userId, button, options) =>
+      fake.openUrlButton(group, message_id, userId, button, options);
+
+    await expect(open(ann, "Vote")).rejects.toThrow(/not a URL button/);
+    await expect(open(ann, "Nope")).rejects.toThrow(/no button/);
+    await expect(open(ann, 3)).rejects.toThrow(/no button/);
+    await expect(open(outsider, 1)).rejects.toThrow(/Can't access the chat/);
+    // A startgroup link needs the group the person picks.
+    await expect(open(OWNER, "Add me")).rejects.toThrow(/add_to_chat_id/);
+    await expect(
+      open(OWNER, "Add me", { addToChatId: channel }),
+    ).rejects.toThrow(/group/);
+    expect((await fake.getMember(channel, me.id)).status).toBe("left");
+    // Only the first bot has private chats here.
+    await expect(open(ann, "Other")).rejects.toThrow(/first bot/);
+
+    await api("deleteMessage", { chat_id: group, message_id });
+    await expect(open(ann, 1)).rejects.toThrow(/MESSAGE_ID_INVALID/);
+  });
+
+  it("opens URL buttons over HTTP, on ephemeral messages and in private chats", async () => {
+    const { fake, api, hook, me } = await setup();
+    const { group, ann } = await groupWithAnn(fake, me);
+    const bob = await fake.createUser({ first_name: "Bob" });
+    await fake.join(group, bob);
+    const control = async (path, body) => {
+      const response = await fetch(`${fake.origin}/_fake/${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return { status: response.status, body: await response.json() };
+    };
+    const url = "https://t.me/modbot?start=team_7";
+    const plain = await sendButtons(api, group, [{ text: "Join", url }]);
+
+    expect(
+      await control(`chats/${group}/messages/${plain.message_id}/open-url`, {
+        user_id: ann,
+        button: "Join",
+      }),
+    ).toEqual({
+      status: 200,
+      body: {
+        url,
+        link: "start",
+        bot_id: me.id,
+        chat_id: ann,
+        message_id: expect.any(Number),
+      },
+    });
+
+    const ephemeral = await api("sendMessage", {
+      chat_id: group,
+      text: "Just for you",
+      reply_markup: { inline_keyboard: [[{ text: "Join", url }]] },
+      ephemeral_message_parameters: { receiver_user_id: bob },
+    });
+    const eid = ephemeral.result.ephemeral_message_id;
+    expect(
+      await control(`chats/${group}/ephemeral-messages/${eid}/open-url`, {
+        user_id: ann,
+        button: 0,
+      }),
+    ).toMatchObject({ status: 400, body: { error: expect.any(String) } });
+    expect(
+      (
+        await control(`chats/${group}/ephemeral-messages/${eid}/open-url`, {
+          user_id: bob,
+          button: 0,
+        })
+      ).body,
+    ).toMatchObject({ link: "start", chat_id: bob });
+    expect(
+      await fake.openEphemeralUrlButton(group, eid, bob, "Join"),
+    ).toMatchObject({ link: "start", chat_id: bob });
+
+    const rules = "https://example.com/rules";
+    const direct = await api("sendMessage", {
+      chat_id: ann,
+      text: "Welcome",
+      reply_markup: { inline_keyboard: [[{ text: "Rules", url: rules }]] },
+    });
+    expect(
+      await control(`users/${ann}/dm/${direct.result.message_id}/open-url`, {
+        button: "Rules",
+      }),
+    ).toEqual({ status: 200, body: { url: rules } });
+    expect(
+      await fake.openDirectUrlButton(ann, direct.result.message_id, 0),
+    ).toEqual({ url: rules });
+
+    await expect
+      .poll(() =>
+        privateMessages(hook).map((message) => [message.chat.id, message.text]),
+      )
+      .toEqual([
+        [ann, "/start team_7"],
+        [bob, "/start team_7"],
+        [bob, "/start team_7"],
+      ]);
+  });
+});
+
 describe("basic groups and the upgrade to a supergroup", () => {
   it("gives a basic group an id without the -100 prefix", async () => {
     const { fake, api, me } = await setup();

@@ -1440,6 +1440,159 @@ function linkUserId(url) {
   return null;
 }
 
+// The rights a startgroup or startchannel link's admin= parameter names, by
+// their Bot API names (TDLib LinkManager get_administrator_rights;
+// https://core.telegram.org/api/links#group-channel-bot-links).
+const LINK_ADMIN_RIGHTS = Object.freeze({
+  change_info: "can_change_info",
+  post_messages: "can_post_messages",
+  edit_messages: "can_edit_messages",
+  delete_messages: "can_delete_messages",
+  restrict_members: "can_restrict_members",
+  invite_users: "can_invite_users",
+  pin_messages: "can_pin_messages",
+  manage_topics: "can_manage_topics",
+  promote_members: "can_promote_members",
+  manage_video_chats: "can_manage_video_chats",
+  post_stories: "can_post_stories",
+  edit_stories: "can_edit_stories",
+  delete_stories: "can_delete_stories",
+  manage_direct_messages: "can_manage_direct_messages",
+  manage_tags: "can_manage_tags",
+  send_welcome_messages: "can_send_welcome_messages",
+  anonymous: "is_anonymous",
+  manage_chat: "can_manage_chat",
+});
+// The rights a link drops for a kind of chat (TDLib's AdministratorRights
+// constructor, for a supergroup and for a channel).
+const LINK_RIGHTS_DROPPED = Object.freeze({
+  group: [
+    "can_post_messages",
+    "can_edit_messages",
+    "can_manage_direct_messages",
+  ],
+  channel: [
+    "can_pin_messages",
+    "can_manage_topics",
+    "can_manage_tags",
+    "is_anonymous",
+  ],
+});
+
+/**
+ * A link's path segments and arguments, as TDLib's parse_url_query reads
+ * them (tdutils HttpUrl.cpp): segments split on "/" without empty ones at
+ * the end; arguments in order, split on "&" and the first "=", with "+" read
+ * as a space, and those without a name dropped.
+ */
+function urlQuery(text) {
+  const decode = (part, plus) => {
+    const spaced = plus ? part.replace(/\+/g, " ") : part;
+    try {
+      return decodeURIComponent(spaced);
+    } catch {
+      return spaced;
+    }
+  };
+  const query = (text.startsWith("/") ? text.slice(1) : text).split("#")[0];
+  const end = query.indexOf("?");
+  const path = (end === -1 ? query : query.slice(0, end))
+    .split("/")
+    .map((segment) => decode(segment, false));
+  while (path.length > 0 && path.at(-1) === "") path.pop();
+  const args = [];
+  if (end !== -1) {
+    for (const pair of query.slice(end + 1).split("&")) {
+      const equals = pair.indexOf("=");
+      const key = decode(equals === -1 ? pair : pair.slice(0, equals), true);
+      if (key === "") continue;
+      const value = equals === -1 ? "" : pair.slice(equals + 1);
+      args.push([key, decode(value, true)]);
+    }
+  }
+  return { path, args };
+}
+
+/**
+ * The rights a link's first admin= argument asks for in a group or a
+ * channel, each one true or false, or null for none. Any right brings
+ * can_manage_chat, as TDLib's AdministratorRights adds it.
+ */
+function linkRights(args, kind) {
+  const admin = args.find(([key]) => key === "admin")?.[1] ?? "";
+  const asked = new Set(
+    admin
+      .split(" ")
+      .filter((name) => Object.hasOwn(LINK_ADMIN_RIGHTS, name))
+      .map((name) => LINK_ADMIN_RIGHTS[name])
+      .filter((right) => !LINK_RIGHTS_DROPPED[kind].includes(right)),
+  );
+  if (asked.size === 0) return null;
+  return Object.fromEntries(
+    ADMIN_RIGHTS.map((right) => [
+      right,
+      right === "can_manage_chat" || asked.has(right),
+    ]),
+  );
+}
+
+/**
+ * What a link to a username asks a bot for, as TDLib's LinkManager reads it
+ * (get_link_info, parse_tg_link_query, parse_t_me_link_query). The link is
+ * https://t.me/<username> (telegram.me and telegram.dog alike) or
+ * tg://resolve?domain=<username>, and the first of these arguments decides:
+ * start=<parameter> starts the bot in a private chat, startgroup=<parameter>
+ * adds it to a group, and startchannel adds it to a channel, with the rights
+ * admin= asks for. A parameter has only base64url characters, maybe none
+ * (is_valid_start_parameter), and a startchannel link without rights is not
+ * one. Returns { username, kind, parameter, rights }, or null for any other
+ * link.
+ */
+function botLink(url) {
+  let link = String(url);
+  if (link.includes("#")) link = link.slice(0, link.indexOf("#"));
+  let username;
+  let args;
+  if (link.slice(0, 3).toLowerCase() === "tg:") {
+    const rest = link.slice(3);
+    const query = urlQuery(rest.startsWith("//") ? rest.slice(2) : rest);
+    if (query.path.length !== 1 || query.path[0] !== "resolve") return null;
+    username = query.args.find(([key]) => key === "domain")?.[1] ?? "";
+    args = query.args;
+  } else {
+    if (unparsableUrl(link)) return null;
+    const parts = urlParts(link);
+    const host = parts.host.replace(/^www\./, "");
+    if (
+      !["http", "https"].includes(parts.protocol) ||
+      parts.userinfo ||
+      ![0, 80, 443].includes(parts.port) ||
+      !["t.me", "telegram.me", "telegram.dog"].includes(host)
+    ) {
+      return null;
+    }
+    const query = urlQuery(parts.query);
+    if (query.path.length !== 1) return null;
+    [username] = query.path;
+    args = query.args;
+  }
+  for (const [key, value] of args) {
+    const parameter = /^[\w-]*$/.test(value) ? value : null;
+    if (key === "start" && parameter != null) {
+      return { username, kind: "start", parameter, rights: null };
+    }
+    if (key === "startgroup" && parameter != null) {
+      const rights = linkRights(args, "group");
+      return { username, kind: "startgroup", parameter, rights };
+    }
+    const rights = key === "startchannel" ? linkRights(args, "channel") : null;
+    if (rights) {
+      return { username, kind: "startchannel", parameter: "", rights };
+    }
+  }
+  return null;
+}
+
 function readBody(request) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -8810,6 +8963,9 @@ export async function startTestServer({
             body.deliver_twice === true,
           );
         }
+        if (method === "POST" && parts[4] === "open-url") {
+          return openUrlButton(chat, requireUser(body.user_id), entry, body);
+        }
       }
       if (sub === "messages" && method === "GET" && subId) {
         const entry = chat.messages.get(Number(subId));
@@ -8921,6 +9077,15 @@ export async function startTestServer({
           body.deliver_twice === true,
         );
       }
+      if (method === "POST" && subId && parts[4] === "open-url") {
+        if (!existing) throw new TelegramError(400, "MESSAGE_ID_INVALID");
+        return openUrlButton(
+          existing,
+          requireUser(id),
+          existing.messages.get(Number(subId)),
+          body,
+        );
+      }
       if (method === "POST" && subId && parts[4] === "vote") {
         if (!existing) throw new TelegramError(400, "Message not found");
         return vote(existing, requireUser(id), subId, body.option_ids);
@@ -8993,6 +9158,22 @@ export async function startTestServer({
         chat.messages.get(Number(subId)),
         body.data,
         body.deliver_twice === true,
+      );
+    }
+    if (
+      resource === "chats" &&
+      id &&
+      sub === "messages" &&
+      subId &&
+      parts[4] === "open-url" &&
+      method === "POST"
+    ) {
+      const chat = requireChat(id);
+      return openUrlButton(
+        chat,
+        requireUser(body.user_id),
+        chat.messages.get(Number(subId)),
+        body,
       );
     }
     if (
@@ -9178,6 +9359,120 @@ export async function startTestServer({
     } finally {
       openQueries.delete(queryId);
     }
+  }
+
+  /**
+   * A person opens an inline keyboard's URL button, named by its text or by
+   * its index, counted row by row from 0. Telegram's app opens the URL and
+   * tells no bot, so the URL comes back and nothing changes, except for a
+   * link to one of this server's bots (botLink), which does what the app does
+   * with it (https://core.telegram.org/api/links#bot-links):
+   * - start: the person starts the bot in their private chat, and the bot
+   *   gets "/start <parameter>" (only "/start" without one), as
+   *   messages.startBot sends it (TDLib sendBotStartMessage). On first
+   *   contact the app shows a START button and starts the bot once it is
+   *   pressed; in a chat with messages it starts the bot at once (TDLib
+   *   internalLinkTypeBotStart autostart). Here the person always goes on.
+   * - startgroup and startchannel: the person adds the bot to the group or
+   *   channel they pick (add_to_chat_id), as addBotViaLink does.
+   * A link to a username that is no bot here does nothing either; UNVERIFIED
+   * for a deleted bot's username, which Telegram does not document. The
+   * person must see the message: be in the chat, or be an ephemeral
+   * message's receiver. UNVERIFIED: these refusals are this server's, since
+   * the app asks Telegram nothing.
+   */
+  async function openUrlButton(
+    chat,
+    user,
+    entry,
+    { button, add_to_chat_id: addTo },
+  ) {
+    if (!entry || entry.deleted) {
+      throw new TelegramError(400, "MESSAGE_ID_INVALID");
+    }
+    const receiver = entry.message.receiver_user;
+    if (receiver && receiver.id !== user.id) {
+      throw new TelegramError(
+        400,
+        "Only the receiver of an ephemeral message sees it",
+      );
+    }
+    if (!receiver && chat.type !== "private" && !isInChat(chat, user.id)) {
+      throw new TelegramError(400, "Can't access the chat");
+    }
+    const buttons = entry.message.reply_markup?.inline_keyboard?.flat() ?? [];
+    let found;
+    if (typeof button === "string") {
+      found = buttons.find((candidate) => candidate.text === button);
+    } else if (Number.isInteger(button) && button >= 0) {
+      found = buttons[button];
+    } else {
+      throw new TelegramError(
+        400,
+        "button must be a button's text or its index",
+      );
+    }
+    if (!found) {
+      throw new TelegramError(
+        400,
+        `The message has no button ${typeof button === "string" ? "with that text" : "at that index"}`,
+      );
+    }
+    if (inlineButtonAction(found) !== "url") {
+      throw new TelegramError(400, "The button is not a URL button");
+    }
+    const url = String(found.url);
+    const link = botLink(url);
+    // Usernames match in any case (TDLib clean_username).
+    const record =
+      link &&
+      [...bots.values()].find(
+        (candidate) =>
+          String(candidate.username ?? "").toLowerCase() ===
+          link.username.toLowerCase(),
+      );
+    if (!record) return { url };
+    if (link.kind === "start") {
+      if (record !== bot) {
+        throw new TelegramError(
+          400,
+          `Users write privately only to the first bot here, not to @${record.username}`,
+        );
+      }
+      const text = link.parameter ? `/start ${link.parameter}` : "/start";
+      const { message_id: messageId } = await post(messageChat(user.id), {
+        user_id: user.id,
+        text,
+      });
+      return {
+        url,
+        link: "start",
+        bot_id: record.id,
+        chat_id: user.id,
+        message_id: messageId,
+      };
+    }
+    if (addTo == null) {
+      throw new TelegramError(
+        400,
+        `A ${link.kind} link adds the bot to a chat the person picks: give add_to_chat_id`,
+      );
+    }
+    const target = requireChat(addTo);
+    if ((target.type === "channel") !== (link.kind === "startchannel")) {
+      throw new TelegramError(
+        400,
+        link.kind === "startchannel"
+          ? "A startchannel link adds the bot to a channel"
+          : "A startgroup link adds the bot to a group or supergroup",
+      );
+    }
+    await addBotViaLink(target, record, {
+      by: user.id,
+      startParameter: link.parameter,
+      rights: link.rights,
+    });
+    return { url, link: link.kind, bot_id: record.id, chat_id: target.id };
   }
 
   async function join(chat, { user_id: userId, invite_link: link }) {
@@ -11176,6 +11471,33 @@ ${buttons}
       act("POST", `users/${userId}/dm/${messageId}/callback`, {
         data,
         deliver_twice: deliverTwice === true,
+      }),
+    openUrlButton: (chatId, messageId, userId, button, { addToChatId } = {}) =>
+      act("POST", `chats/${chatId}/messages/${messageId}/open-url`, {
+        user_id: userId,
+        button,
+        ...(addToChatId != null ? { add_to_chat_id: addToChatId } : {}),
+      }),
+    openEphemeralUrlButton: (
+      chatId,
+      ephemeralMessageId,
+      userId,
+      button,
+      { addToChatId } = {},
+    ) =>
+      act(
+        "POST",
+        `chats/${chatId}/ephemeral-messages/${ephemeralMessageId}/open-url`,
+        {
+          user_id: userId,
+          button,
+          ...(addToChatId != null ? { add_to_chat_id: addToChatId } : {}),
+        },
+      ),
+    openDirectUrlButton: (userId, messageId, button, { addToChatId } = {}) =>
+      act("POST", `users/${userId}/dm/${messageId}/open-url`, {
+        button,
+        ...(addToChatId != null ? { add_to_chat_id: addToChatId } : {}),
       }),
     getMessages: (chatId) => act("GET", `chats/${chatId}/messages`),
     getMessage: (chatId, messageId) =>

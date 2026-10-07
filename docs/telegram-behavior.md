@@ -35,7 +35,7 @@ byte identical.
   [reactions](#reactions), [media](#media), [files](#files)
 - [Buttons and ephemeral messages](#buttons-and-ephemeral-messages):
   [inline keyboards](#inline-keyboards), [callback queries](#callback-queries),
-  [ephemeral messages](#ephemeral-messages)
+  [URL buttons](#url-buttons), [ephemeral messages](#ephemeral-messages)
 - [Text formatting and replies](#text-formatting-and-replies): [formatting](#formatting),
   [cleaning](#text-cleaning), [length limits](#length-limits),
   [dates and explicit entities](#dates-and-explicit-entities),
@@ -607,6 +607,44 @@ update, with the same `update_id` and callback query id ([Update delivery](#upda
 test makes this happen with `deliverTwice` ([Redelivery](#redelivery)). Unverified: what Telegram
 answers a second `answerCallbackQuery` for a query already answered; here it fails with
 `query is too old and response timeout expired or query ID is invalid`.
+
+### URL buttons
+
+Opening a URL button asks Telegram nothing, so no bot hears of it unless the link is to a bot.
+`openUrlButton` and its ephemeral and private-chat forms read the link as TDLib's `LinkManager`
+does. A bot link is `https://t.me/<bot>` (or `telegram.me`, `telegram.dog`) or
+`tg://resolve?domain=<bot>`; the username matches in any case. The first of these arguments
+decides what it does:
+
+- `start=<parameter>`: the user starts the bot in their private chat. The bot gets
+  `/start <parameter>` from them, with a `bot_command` entity over `/start`, as
+  `messages.startBot` sends it; with an empty parameter it gets only `/start`. On first contact
+  Telegram's app shows a START button and sends this once the user presses it. In a chat that has
+  messages, it sends it at once. Either way the bot gets the same message, and here the user always
+  goes on. The bot may then write to the user.
+- `startgroup=<parameter>`: the user adds the bot to the group they pick (`addToChatId`), as under
+  [Adding the bot through a link](#adding-the-bot-through-a-link). `admin=`, such as
+  `admin=delete_messages+restrict_members`, asks for those rights, with `can_manage_chat`. Rights a
+  group cannot have, such as `post_messages`, are left out.
+- `startchannel&admin=<rights>`: the user adds the bot to the channel they pick, as an
+  administrator with those rights. Rights a channel cannot have, such as `pin_messages`, are left
+  out, and without rights it is not such a link.
+
+A parameter has only `A-Z`, `a-z`, `0-9`, `_` and `-`; with any other character the link only
+opens the bot's chat. Any other URL, or a link to a username that is no bot on this server, changes
+nothing and comes back. Telegram takes a parameter of up to 64 characters; this server does not
+check the length.
+
+A `start` link to a bot other than the first fails, since users write privately only to the first
+bot here. Unverified, since the app asks Telegram nothing: a user who cannot see the message (who
+is not in the chat, or is not the receiver of an ephemeral message) is refused, as is a button that
+is not a URL button. Also unverified: a link to a deleted bot, which does nothing here.
+
+Telegram's docs: [bot links](https://core.telegram.org/api/links#bot-links),
+[group and channel bot links](https://core.telegram.org/api/links#group-channel-bot-links),
+[deep linking](https://core.telegram.org/bots/features#deep-linking). TDLib:
+`internalLinkTypeBotStart`, `internalLinkTypeBotStartInGroup`, `internalLinkTypeBotAddToChannel`
+and `sendBotStartMessage`.
 
 ### Ephemeral messages
 

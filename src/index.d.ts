@@ -121,6 +121,28 @@ export interface PressOptions {
   deliverTwice?: boolean;
 }
 
+export interface OpenUrlOptions {
+  /**
+   * The group (startgroup link) or channel (startchannel link) the person
+   * picks to add the bot to. Required for those links; ignored otherwise.
+   */
+  addToChatId?: number;
+}
+
+/**
+ * What opening a URL button did. Only url for any other URL. A start link
+ * also gives the /start message's id in the person's private chat
+ * (chat_id); a startgroup or startchannel link gives the chat the bot was
+ * added to.
+ */
+export interface OpenedUrl {
+  url: string;
+  link?: "start" | "startgroup" | "startchannel";
+  bot_id?: number;
+  chat_id?: number;
+  message_id?: number;
+}
+
 export interface UserFields {
   first_name?: string;
   last_name?: string;
@@ -1026,6 +1048,36 @@ export interface TelegramBotTestServer {
     data: string,
     options?: PressOptions,
   ): Promise<ButtonAnswer>;
+  /**
+   * The user opens a URL button, named by its text or its index (row by row,
+   * from 0). A t.me/<bot>?start=<parameter> link to the first bot sends
+   * "/start <parameter>" in the user's private chat; a startgroup or
+   * startchannel link to one of the server's bots adds it to addToChatId as
+   * addBotViaLink does. Any other URL changes nothing. Refused for a button
+   * that is not a URL button, or a user not in the chat.
+   */
+  openUrlButton(
+    chatId: number,
+    messageId: number,
+    userId: number,
+    button: string | number,
+    options?: OpenUrlOptions,
+  ): Promise<OpenedUrl>;
+  /** The receiver of an ephemeral message opens one of its URL buttons. */
+  openEphemeralUrlButton(
+    chatId: number,
+    ephemeralMessageId: number,
+    userId: number,
+    button: string | number,
+    options?: OpenUrlOptions,
+  ): Promise<OpenedUrl>;
+  /** The user opens a URL button in their private chat with the bot. */
+  openDirectUrlButton(
+    userId: number,
+    messageId: number,
+    button: string | number,
+    options?: OpenUrlOptions,
+  ): Promise<OpenedUrl>;
   /**
    * Messages not deleted, newest first, with ephemeral messages (message_id 0,
    * receiver_user set) in the order they were sent. Their file_ids are the
