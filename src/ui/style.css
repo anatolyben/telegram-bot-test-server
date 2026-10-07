@@ -1139,6 +1139,14 @@ select {
   font-weight: 400;
 }
 
+.tv-sender-rank {
+  color: var(--tv-muted);
+  float: right;
+  font-size: 12px;
+  font-weight: 400;
+  margin-left: 12px;
+}
+
 .tv-text {
   font-size: 13px;
   line-height: 18px;
@@ -1393,6 +1401,32 @@ select {
   color: var(--tv-muted);
   font-size: 12px;
   line-height: 16px;
+}
+
+.tv-avatar--card {
+  font-size: 17px;
+  height: 40px;
+  width: 40px;
+}
+
+.tv-contact,
+.tv-location {
+  max-width: 320px;
+  min-width: 200px;
+  padding-right: 8px;
+}
+
+.tv-location-meta > span {
+  white-space: nowrap;
+}
+
+.tv-contact-name {
+  font-weight: 600;
+}
+
+.tv-contact-phone,
+.tv-location-point {
+  font-variant-numeric: tabular-nums;
 }
 
 .tv-box {

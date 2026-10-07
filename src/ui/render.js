@@ -421,7 +421,7 @@ function entityTags(entity, covered) {
       };
     case "text_mention":
       return {
-        open: `<span class="tv-entity" data-entity="text_mention" title="${escapeAttr(`user ${entity.user?.id ?? ""}`)}">`,
+        open: `<span class="tv-entity" data-entity="text_mention" title="${escapeAttr(`${nameOf(entity.user) || "someone"} · user ${entity.user?.id ?? ""}`)}">`,
         close: "</span>",
       };
     case "custom_emoji":
@@ -596,6 +596,104 @@ function box(kind, title, rows) {
   return `<div class="tv-box" data-media="${escapeAttr(kind)}"><span class="tv-box-title">${escapeHtml(title)}</span>${lines ? `<span class="tv-box-grid">${lines}</span>` : ""}</div>`;
 }
 
+/** A live location's period in words: "15 min", "1 h 30 min". */
+function periodText(seconds) {
+  const minutes = Math.round(Number(seconds) / 60);
+  const hours = Math.floor(minutes / 60);
+  return [hours ? `${hours} h` : "", minutes % 60 ? `${minutes % 60} min` : ""]
+    .filter(Boolean)
+    .join(" ");
+}
+
+/**
+ * A location as a card: its point, the accuracy, and for a live one how
+ * long it is shared (0x7FFFFFFF is until the sender stops it), when that
+ * ends, its heading and the proximity alert radius. No map is drawn.
+ */
+function locationCard(location, date) {
+  const live = Number(location.live_period) > 0;
+  const forever = Number(location.live_period) === 0x7fffffff;
+  const ends =
+    live && !forever && date != null
+      ? `, until ${clockTime((Number(date) + Number(location.live_period)) * 1000)}`
+      : "";
+  const meta = [
+    location.horizontal_accuracy != null
+      ? `± ${location.horizontal_accuracy} m`
+      : null,
+    live
+      ? forever
+        ? "live until stopped"
+        : `live for ${periodText(location.live_period)}${ends}`
+      : null,
+    location.heading != null ? `heading ${location.heading}°` : null,
+    location.proximity_alert_radius != null
+      ? `alerts within ${location.proximity_alert_radius} m`
+      : null,
+  ].filter(Boolean);
+  return el(
+    "div",
+    {
+      class: "tv-file tv-location",
+      "data-media": "location",
+      "data-live": live,
+    },
+    el("span", { class: "tv-file-icon", "aria-hidden": "true" }, "⌖"),
+    el(
+      "span",
+      { class: "tv-file-copy" },
+      el(
+        "span",
+        { class: "tv-file-kind" },
+        live ? "Live location" : "Location",
+      ),
+      el(
+        "span",
+        { class: "tv-location-point" },
+        escapeHtml(`${location.latitude}, ${location.longitude}`),
+      ),
+      meta.length
+        ? el(
+            "span",
+            { class: "tv-file-meta tv-location-meta" },
+            meta.map((part) => el("span", {}, escapeHtml(part))).join(" · "),
+          )
+        : "",
+    ),
+  );
+}
+
+/** A contact as a card: the initial, the name, the phone and the account it names. */
+function contactCard(contact, ctx) {
+  const name = [contact.first_name, contact.last_name]
+    .filter(Boolean)
+    .join(" ");
+  return el(
+    "div",
+    { class: "tv-file tv-contact", "data-media": "contact" },
+    avatar(contact.user_id ?? contact.phone_number, name, ctx, {
+      size: " tv-avatar--card",
+    }),
+    el(
+      "span",
+      { class: "tv-file-copy" },
+      el("strong", { class: "tv-contact-name" }, escapeHtml(name)),
+      el(
+        "span",
+        { class: "tv-contact-phone" },
+        escapeHtml(contact.phone_number),
+      ),
+      contact.user_id != null
+        ? el(
+            "span",
+            { class: "tv-file-meta" },
+            escapeHtml(`user ${contact.user_id}`),
+          )
+        : "",
+    ),
+  );
+}
+
 function photoBlock(ctx, photo, label, kind) {
   const image = imageTag(ctx, photo?.file_id, "tv-photo", label);
   if (image)
@@ -756,34 +854,8 @@ function renderMedia(message, item, ctx) {
           : null,
       ],
     ]);
-  if (m.location)
-    return box(
-      "location",
-      m.location.live_period ? "Live location" : "Location",
-      [
-        ["Latitude", m.location.latitude],
-        ["Longitude", m.location.longitude],
-        [
-          "Accuracy",
-          m.location.horizontal_accuracy != null
-            ? `${m.location.horizontal_accuracy} m`
-            : null,
-        ],
-        [
-          "Live for",
-          m.location.live_period != null ? `${m.location.live_period} s` : null,
-        ],
-      ],
-    );
-  if (m.contact)
-    return box("contact", "Contact", [
-      [
-        "Name",
-        [m.contact.first_name, m.contact.last_name].filter(Boolean).join(" "),
-      ],
-      ["Phone", m.contact.phone_number],
-      ["User id", m.contact.user_id],
-    ]);
+  if (m.location) return locationCard(m.location, m.date);
+  if (m.contact) return contactCard(m.contact, ctx);
   if (m.dice)
     return box("dice", `Dice ${m.dice.emoji ?? ""}`.trim(), [
       ["Value", m.dice.value],
@@ -1119,11 +1191,15 @@ function renderService(item, ctx, type) {
 function deletedMark(item, ctx) {
   const by = item.deleted_by;
   const bot = by ? userOf(ctx, by.bot_id) : null;
-  const label = bot?.username
+  const name = bot?.username
     ? `@${bot.username}`
     : by
       ? personName(ctx, by.bot_id)
       : "a bot";
+  const label =
+    by && ctx.bots.get(Number(by.bot_id))?.deleted
+      ? `${name} (deleted bot)`
+      : name;
   const title = by ? `${by.method} at ${isoTime(by.at)}` : "deleted";
   return `<span class="tv-deleted" title="${escapeAttr(title)}">Deleted · ${escapeHtml(label)}</span>`;
 }
@@ -1139,7 +1215,11 @@ function senderLine(item, ctx, kind) {
       ctx.as == null
         ? ` <span class="tv-sender-note">posted by ${escapeHtml(personName(ctx, item.author))}</span>`
         : "";
-    return `<div class="tv-sender tv-id-${identitySlot(chat?.id)}"><span class="tv-sender-name">${escapeHtml(chat?.title ?? "Channel")}</span>${m.author_signature ? ` <span class="tv-sender-note">${escapeHtml(m.author_signature)}</span>` : ""}${author}</div>`;
+    // The signature sits at the line's end, where Telegram puts an admin's title.
+    const rank = m.author_signature
+      ? `<span class="tv-sender-rank">${escapeHtml(m.author_signature)}</span>`
+      : "";
+    return `<div class="tv-sender tv-id-${identitySlot(chat?.id)}">${rank}<span class="tv-sender-name">${escapeHtml(chat?.title ?? "Channel")}</span>${author}</div>`;
   }
   const from = m.from ?? {};
   const name = `<span class="tv-sender-name">${escapeHtml(nameOf(from))}</span>`;
@@ -1720,9 +1800,11 @@ function groupKeyOf(item, ctx) {
   if (item.kind !== "message" || serviceType(item.message)) return null;
   const m = item.message;
   const kind = authorKind(item, ctx);
+  // Posts on behalf of a chat group by the chat and the signature (an
+  // admin's title), and in the test view by who posted.
   const who =
     kind === "channel"
-      ? `${m.sender_chat?.id ?? ctx.chat?.id}${ctx.as == null ? `/${item.author}` : ""}`
+      ? `${m.sender_chat?.id ?? ctx.chat?.id}/${m.author_signature ?? ""}${ctx.as == null ? `/${item.author}` : ""}`
       : m.from?.id;
   return `${kind}:${who}:${item.ephemeral ? `e${m.receiver_user?.id}` : ""}:${item.deleted ? "d" : ""}`;
 }
@@ -2031,9 +2113,19 @@ function listPreview(entry, ctx) {
       : "No messages yet";
   if (last.kind === "event")
     return `<span class="tv-list-event">${eventText(last.event, ctx)}</span>`;
-  const author = userOf(ctx, last.author)
-    ? `<span class="tv-list-author">${escapeHtml(personName(ctx, last.author))}:</span> `
-    : "";
+  // A post on behalf of a chat names that chat, and nobody when it is this
+  // chat itself (an anonymous admin's post, a channel's own post).
+  const sender = last.sender_chat
+    ? Number(last.sender_chat.id) === Number(entry.id)
+      ? null
+      : (last.sender_chat.title ?? "Chat")
+    : userOf(ctx, last.author)
+      ? personName(ctx, last.author)
+      : null;
+  const author =
+    sender != null
+      ? `<span class="tv-list-author">${escapeHtml(sender)}:</span> `
+      : "";
   if (last.deleted)
     return `${author}<span class="tv-list-deleted">Deleted message</span>`;
   if (last.message && SERVICE_TYPES.includes(last.media))
@@ -2084,6 +2176,7 @@ export function chatListEntries(
     const badges = [
       entry.is_forum ? "forum" : (TYPE_LABELS[entry.type] ?? entry.type),
       entry.migrated_to != null ? "upgraded" : null,
+      bot?.deleted ? "deleted bot" : null,
     ].filter(Boolean);
     const memberView = view?.as != null;
     const pending = memberView ? 0 : Number(entry.pending_join_requests) || 0;
@@ -2138,7 +2231,7 @@ export function chatListEntries(
             ? el(
                 "span",
                 { class: "tv-list-with" },
-                `with @${escapeHtml(bot.username ?? bot.first_name)}${bot.deleted ? " (deleted)" : ""}`,
+                `with @${escapeHtml(bot.username ?? bot.first_name)}`,
               )
             : "",
           time != null

@@ -903,7 +903,8 @@ What it shows, only from what the server stores:
 - **Messages**: the sender's name and initial, bots tagged as the first bot, an added bot, a
   deleted bot or a guest bot; a channel post or a post on behalf of a chat as the chat, with its
   signature and, in the test's view, who posted it; text with its entities, replies, forwards and
-  captions; photos as the images themselves, contacts and locations with their fields, and other
+  captions; photos as the images themselves; a contact as a card with the name and phone; a
+  location as a card with its point, accuracy and how long a live one is shared (no map); other
   media as labeled placeholders; inline keyboards as buttons (hover one for its callback data);
   edits (not a bot's change of only the keyboard, which Telegram's apps do not mark either); and
   service messages: joins, leaves, pins, title and photo changes, upgrades and topics. Times are

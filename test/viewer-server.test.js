@@ -922,7 +922,11 @@ it("names who posted on behalf of a chat, in the message log and the viewer", as
   expect(read.users[bob]).toMatchObject({ first_name: "Bob" });
   const { body: state } = await get("api/state");
   const row = state.chats.find((each) => each.key === String(CHAT));
-  expect(row.last).toMatchObject({ author: bob, preview: "Follow us" });
+  expect(row.last).toMatchObject({
+    author: bob,
+    sender_chat: { id: news, title: "News" },
+    preview: "Follow us",
+  });
   expect(state.users[bob]).toMatchObject({ first_name: "Bob" });
 });
 

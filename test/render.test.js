@@ -5,12 +5,15 @@ import { describe, expect, it } from "vitest";
 import {
   chatListEntries,
   chatStream,
+  clockTime,
   columnsFor,
+  identitySlot,
   makeContext,
   memberEntries,
   parseView,
   renderEvent,
   renderMessage,
+  renderCall,
   renderPaneHeader,
   renderText,
   renderToolbar,
@@ -51,6 +54,20 @@ const CHAT = {
   id: GROUP,
   title: "Test Group & Friends <i>",
   type: "supergroup",
+};
+const NEWS = { id: CHANNEL, title: "News <i>", type: "channel" };
+// The users Telegram puts in `from` of a post on behalf of a group or a channel.
+const GROUP_BOT = {
+  id: 1087968824,
+  is_bot: true,
+  first_name: "Group",
+  username: "GroupAnonymousBot",
+};
+const CHANNEL_BOT = {
+  id: 136817688,
+  is_bot: true,
+  first_name: "Channel",
+  username: "Channel_Bot",
 };
 const HOSTILE = [
   EVE.first_name,
@@ -708,5 +725,452 @@ describe("render", () => {
       `data-member-id="${SECOND.id}" data-member-status="administrator" data-member-in-chat="true" data-member-bot="true"`,
     );
     expect(members).toContain('data-role="more-members" data-count="3"');
+  });
+
+  it("draws a post on behalf of a group or a channel with that chat as the sender", () => {
+    const anonymous = message(
+      {
+        from: GROUP_BOT,
+        sender_chat: CHAT,
+        author_signature: "Mods <b>",
+        text: "Read the rules",
+      },
+      { author: ANN.id },
+    );
+    const asChannel = message(
+      { from: CHANNEL_BOT, sender_chat: NEWS, text: "Follow us" },
+      { author: OLGA.id },
+    );
+    const testView = (item) => renderMessage(item, makeContext(pageOf([item])));
+    const asEve = (item) =>
+      renderMessage(item, makeContext(pageOf([item]), { as: EVE.id }));
+    const html = [anonymous, asChannel].flatMap((item) => [
+      testView(item),
+      asEve(item),
+    ]);
+    expectSafe(html.join("\n"));
+    expect(html.join("\n")).not.toMatch(/Mods <b>|News <i>/);
+    const [group, groupAsEve, channel, channelAsEve] = html;
+
+    // The group is the sender: its name and initial, and the admin's title.
+    expect(group).toContain('data-author-kind="channel"');
+    expect(group).toContain(
+      `tv-avatar tv-id-${identitySlot(GROUP)}" aria-hidden="true">T</span>`,
+    );
+    expect(group).toContain(
+      `<span class="tv-sender-name">${escaped(CHAT.title)}</span>`,
+    );
+    expect(group).toContain(escaped("Mods <b>"));
+    expect(group).toContain("posted by Ann Lee");
+    expect(group).not.toContain("Group</span>");
+    // A member sees the group and the title, never who posted.
+    expect(groupAsEve).toContain(escaped(CHAT.title));
+    expect(groupAsEve).toContain(escaped("Mods <b>"));
+    expect(groupAsEve).not.toContain("Ann");
+
+    expect(channel).toContain(
+      `tv-avatar tv-id-${identitySlot(CHANNEL)}" aria-hidden="true">N</span>`,
+    );
+    expect(channel).toContain(
+      `<span class="tv-sender-name">${escaped(NEWS.title)}</span>`,
+    );
+    expect(channel).toContain("posted by Olga");
+    expect(channelAsEve).toContain(escaped(NEWS.title));
+    expect(channelAsEve).not.toContain("Olga");
+
+    // Two admins' posts in a row: a member tells them apart by the title.
+    const untitled = message(
+      { from: GROUP_BOT, sender_chat: CHAT, text: "First" },
+      { author: OLGA.id },
+    );
+    const titled = message(
+      {
+        from: GROUP_BOT,
+        sender_chat: CHAT,
+        author_signature: "Mods <b>",
+        text: "Second",
+      },
+      { author: ANN.id },
+    );
+    const eve = makeContext(pageOf([untitled, titled]), { as: EVE.id });
+    const stream = streamEntries([untitled, titled], eve).map(
+      (entry) => entry.html,
+    );
+    expect(
+      stream.filter((html) => html.includes("tv-sender-name")),
+    ).toHaveLength(2);
+    expect(stream.at(-1)).toContain(
+      `<span class="tv-sender-rank">${escaped("Mods <b>")}</span>`,
+    );
+  });
+
+  it("names a forward's group and its signature", () => {
+    const partners = {
+      id: -1001000000009,
+      title: "Partners <b>",
+      type: "supergroup",
+    };
+    const signed = message({
+      from: ANN,
+      text: "seen there",
+      forward_origin: {
+        type: "chat",
+        sender_chat: partners,
+        author_signature: "Mods <i>",
+        date: 1,
+      },
+    });
+    const plain = message({
+      from: ANN,
+      text: "seen here",
+      forward_origin: {
+        type: "chat",
+        sender_chat: { ...partners, title: "Partners" },
+        date: 1,
+      },
+    });
+    const ctx = makeContext(pageOf([signed, plain]));
+    const html = [signed, plain].map((item) => renderMessage(item, ctx));
+    expectSafe(html.join("\n"));
+    expect(html[0]).toContain(
+      "Forwarded from <strong>Partners &lt;b&gt; (Mods &lt;i&gt;)</strong>",
+    );
+    expect(html[1]).toContain("Forwarded from <strong>Partners</strong>");
+  });
+
+  it("draws a contact as a card with the contact's name and phone", () => {
+    const linked = message({
+      from: ANN,
+      contact: {
+        phone_number: "+1 555 <0100>",
+        first_name: "Bob <b>",
+        last_name: "Stone",
+        user_id: OLGA.id,
+      },
+    });
+    const bare = message({
+      from: ANN,
+      contact: { phone_number: "+15550101", first_name: "Cy" },
+    });
+    const ctx = makeContext(pageOf([linked, bare]));
+    const [card, plain] = [linked, bare].map((item) =>
+      renderMessage(item, ctx),
+    );
+    expectSafe(`${card}\n${plain}`);
+    expect(card).not.toMatch(/Bob <b>|<0100>/);
+    expect(card).toContain('data-media="contact"');
+    expect(card).toContain(
+      `tv-id-${identitySlot(OLGA.id)}" aria-hidden="true">B</span>`,
+    );
+    expect(card).toContain(
+      `<strong class="tv-contact-name">${escaped("Bob <b> Stone")}</strong>`,
+    );
+    expect(card).toContain(
+      `<span class="tv-contact-phone">${escaped("+1 555 <0100>")}</span>`,
+    );
+    expect(card).toContain(`user ${OLGA.id}`);
+    expect(plain).toContain(
+      '<strong class="tv-contact-name">Cy</strong><span class="tv-contact-phone">+15550101</span>',
+    );
+    expect(plain).not.toContain("user ");
+  });
+
+  it("draws a location as a card with its point, accuracy and live period", () => {
+    const live = message({
+      from: ANN,
+      location: {
+        latitude: 51.5,
+        longitude: -0.12,
+        horizontal_accuracy: 15,
+        live_period: 5400,
+        heading: 90,
+        proximity_alert_radius: 500,
+      },
+    });
+    const still = message({
+      from: ANN,
+      location: { latitude: -33.8688, longitude: 151.2093 },
+    });
+    const forever = message({
+      from: ANN,
+      location: { latitude: 0, longitude: 0, live_period: 0x7fffffff },
+    });
+    const ctx = makeContext(pageOf([live, still, forever]));
+    const [liveHtml, stillHtml, foreverHtml] = [live, still, forever].map(
+      (item) => renderMessage(item, ctx),
+    );
+    expectSafe([liveHtml, stillHtml, foreverHtml].join("\n"));
+    expect(liveHtml).toContain('data-media="location" data-live="true"');
+    expect(liveHtml).toContain("Live location");
+    expect(liveHtml).toContain("51.5, -0.12");
+    const ends = clockTime((live.message.date + 5400) * 1000);
+    expect(liveHtml.replace(/<[^>]+>/g, "")).toContain(
+      `± 15 m · live for 1 h 30 min, until ${ends} · heading 90° · alerts within 500 m`,
+    );
+    expect(stillHtml).toContain('data-media="location"');
+    expect(stillHtml).not.toContain("data-live");
+    expect(stillHtml).toContain("-33.8688, 151.2093");
+    expect(stillHtml).not.toMatch(/live|±/i);
+    expect(foreverHtml).toContain("0, 0");
+    expect(foreverHtml).toContain("live until stopped");
+  });
+
+  it("draws the phone numbers, text links and text mentions a test gives", () => {
+    const text = "Call +1 212 555 0123, read the docs, ask Zed";
+    const url = 'https://example.com/docs?a=1&b="2"';
+    const zed = { id: 8800000009, is_bot: false, first_name: 'Zed "<b>"' };
+    const item = message({
+      from: ANN,
+      text,
+      entities: [
+        { type: "phone_number", offset: 5, length: 15 },
+        { type: "text_link", offset: text.indexOf("docs"), length: 4, url },
+        {
+          type: "text_mention",
+          offset: text.indexOf("Zed"),
+          length: 3,
+          user: zed,
+        },
+      ],
+    });
+    const html = renderMessage(item, makeContext(pageOf([item])));
+    expectSafe(html);
+    expect(html).toContain(
+      '<span class="tv-entity" data-entity="phone_number">+1 212 555 0123</span>',
+    );
+    expect(html).toContain(
+      `<a class="tv-link" href="${escaped(url)}" target="_blank" rel="noopener noreferrer" title="${escaped(url)}">docs</a>`,
+    );
+    expect(html).toContain(
+      `data-entity="text_mention" title="${escaped(`${zed.first_name} · user ${zed.id}`)}">Zed</span>`,
+    );
+    expect(html).not.toContain(zed.first_name);
+  });
+
+  it("draws a reposted file as it drew the original", () => {
+    const sizes = [
+      { file_id: "small", file_unique_id: "u1", width: 90, height: 60 },
+      { file_id: "large", file_unique_id: "u2", width: 320, height: 240 },
+    ];
+    const report = {
+      file_id: "doc",
+      file_unique_id: "u3",
+      file_name: "report <final>.pdf",
+      mime_type: "application/pdf",
+      file_size: 2048,
+    };
+    const items = [
+      message({ from: ANN, photo: sizes, caption: "receipt" }),
+      message({ from: EVE, photo: sizes, caption: "again" }),
+      message({ from: ANN, document: report }),
+      message({ from: EVE, document: report }),
+    ];
+    const ctx = makeContext(
+      pageOf(items, {
+        files: {
+          large: { url: "/_fake/ui/files/large", width: 320, height: 240 },
+        },
+      }),
+    );
+    const media = items.map(
+      (item) =>
+        renderMessage(item, ctx).match(
+          /<div class="tv-(?:media|file)".*?<\/div>/,
+        )?.[0],
+    );
+    expectSafe(media.join("\n"));
+    expect(media[0]).toContain('src="/_fake/ui/files/large"');
+    expect(media[1]).toBe(media[0]);
+    expect(media[2]).toContain(escaped("report <final>.pdf"));
+    expect(media[3]).toBe(media[2]);
+  });
+
+  it("shows a person's promotion and demotion in the member panel and the event lines", () => {
+    const admin = {
+      status: "administrator",
+      custom_title: "Mods <b>",
+      is_anonymous: true,
+      can_manage_chat: true,
+      can_delete_messages: true,
+      can_restrict_members: false,
+    };
+    const card = (member) =>
+      memberEntries(
+        pageOf([], {
+          members: [{ user_id: ANN.id, member }],
+          members_total: 1,
+        }),
+        makeContext(pageOf([])),
+      )
+        .map((entry) => entry.html)
+        .join("");
+    const promotedCard = card(admin);
+    const demotedCard = card({ status: "member" });
+    expectSafe(`${promotedCard}\n${demotedCard}`);
+    expect(promotedCard).toContain(
+      `data-member-id="${ANN.id}" data-member-status="administrator"`,
+    );
+    expect(promotedCard).toContain(
+      "<dt>Rights</dt><dd>manage chat, delete messages</dd><dt>Anonymous</dt><dd>yes</dd>",
+    );
+    expect(promotedCard).toContain(
+      `<dt>Title</dt><dd>${escaped("Mods <b>")}</dd>`,
+    );
+    expect(demotedCard).toContain('data-member-status="member"');
+    expect(demotedCard).not.toMatch(/Rights|Anonymous|Title/);
+
+    const change = (seq, old, now) => ({
+      kind: "event",
+      seq,
+      at: 1,
+      type: "member",
+      user_id: ANN.id,
+      actor_id: OLGA.id,
+      request_id: null,
+      reason: "change",
+      old,
+      new: now,
+    });
+    const ctx = makeContext(pageOf([]));
+    expect(renderEvent(change(1, { status: "member" }, admin), ctx)).toContain(
+      "Ann Lee promoted: manage chat, delete messages, anonymous by Olga",
+    );
+    expect(renderEvent(change(2, admin, { status: "member" }), ctx)).toContain(
+      "Ann Lee demoted by Olga",
+    );
+  });
+
+  it("labels a deleted bot as deleted wherever it names it", () => {
+    const page = pageOf([], {
+      bots: [
+        { ...pageOf([]).bots[0] },
+        { ...pageOf([]).bots[1], deleted: true },
+      ],
+      members: [{ user_id: SECOND.id, member: { status: "left" } }],
+      members_total: 1,
+    });
+    const ctx = makeContext(page);
+    const said = renderMessage(
+      message({ from: SECOND, text: "answer 2+2" }),
+      ctx,
+    );
+    const left = renderMessage(
+      message({ from: SECOND, left_chat_member: SECOND }),
+      ctx,
+    );
+    const removed = renderMessage(
+      message(
+        { from: EVE, text: "spam" },
+        {
+          deleted: true,
+          deleted_by: {
+            bot_id: SECOND.id,
+            method: "deleteMessage",
+            at: 1_800_000_000_000,
+          },
+        },
+      ),
+      ctx,
+    );
+    const event = renderEvent(
+      {
+        kind: "event",
+        seq: 1,
+        at: 1,
+        type: "member",
+        user_id: SECOND.id,
+        actor_id: SECOND.id,
+        reason: "change",
+        old: { status: "administrator" },
+        new: { status: "left" },
+      },
+      ctx,
+    );
+    const card = memberEntries(page, ctx)
+      .map((entry) => entry.html)
+      .join("");
+    const call = renderCall(
+      {
+        journal: "rejected_requests",
+        bot_id: SECOND.id,
+        method: "getMe",
+        outcome: "rejected",
+        status: 401,
+        description: "Unauthorized",
+        request_number: 4,
+        at: 1,
+      },
+      makeContext({ ...page, chat: null }, { key: "calls" }),
+    );
+    const row = chatListEntries(
+      {
+        bots: page.bots,
+        users: page.users,
+        chats: [
+          {
+            key: `${ANN.id}:${SECOND.id}`,
+            id: ANN.id,
+            type: "private",
+            user_id: ANN.id,
+            bot_id: SECOND.id,
+            title: "Ann Lee",
+            last: null,
+          },
+        ],
+      },
+      { view: parseView("") },
+    )[0].html;
+    const tag = '<span class="tv-tag">deleted bot</span>';
+    expect(said).toContain(tag);
+    expect(left).toContain(`Second Bot ${tag} left`);
+    expect(event).toContain(`Second Bot ${tag} left`);
+    expect(card).toContain(
+      `@second_bot <span class="tv-tag">deleted bot</span>`,
+    );
+    expect(call).toContain(`Second Bot ${tag}`);
+    expect(removed).toContain("Deleted · @second_bot (deleted bot)");
+    expect(row).toContain("with @second_bot</span>");
+    expect(row).toContain('<span class="tv-chip">deleted bot</span>');
+  });
+
+  it("names the chat list's last poster as the chat shows them", () => {
+    const row = (last) =>
+      chatListEntries(
+        {
+          bots: pageOf([]).bots,
+          users: pageOf([]).users,
+          chats: [
+            {
+              key: String(GROUP),
+              id: GROUP,
+              type: "supergroup",
+              title: CHAT.title,
+              last: {
+                kind: "message",
+                seq: 1,
+                at: 1,
+                preview: "hello",
+                media: null,
+                deleted: false,
+                ephemeral: false,
+                ...last,
+              },
+            },
+          ],
+        },
+        { view: parseView("") },
+      )[0].html;
+    // An anonymous admin posts as the group itself: no name before the text.
+    const anonymous = row({ author: ANN.id, sender_chat: CHAT });
+    expect(anonymous).not.toContain("tv-list-author");
+    expect(anonymous).not.toContain("Ann");
+    const sentAs = row({ author: OLGA.id, sender_chat: NEWS });
+    expect(sentAs).toContain(
+      `<span class="tv-list-author">${escaped("News <i>")}:</span> hello`,
+    );
+    expect(sentAs).not.toContain("Olga");
+    expect(row({ author: ANN.id })).toContain(
+      '<span class="tv-list-author">Ann Lee:</span> hello',
+    );
   });
 });

@@ -78,10 +78,11 @@ export function pageWindow(
 
 /**
  * The chat list's short form of a chat's latest item, or null: its seq,
- * time and author, the first 100 characters of its text or caption, what it
- * holds (`media`: a content or service field, or an event's type), whether
- * it is deleted or ephemeral, and for a service message or an event the
- * message or event itself, so the list words the change as the chat does.
+ * time and author, the chat it was posted on behalf of (`sender_chat`), the
+ * first 100 characters of its text or caption, what it holds (`media`: a
+ * content or service field, or an event's type), whether it is deleted or
+ * ephemeral, and for a service message or an event the message or event
+ * itself, so the list words the change as the chat does.
  */
 export function listPreview(item) {
   if (!item) return null;
@@ -115,6 +116,7 @@ export function listPreview(item) {
       null,
     deleted: item.deleted === true,
     ephemeral: item.ephemeral === true,
+    ...(message.sender_chat ? { sender_chat: message.sender_chat } : {}),
     ...(service
       ? { message, pinned_deleted: item.pinned_deleted === true }
       : {}),
