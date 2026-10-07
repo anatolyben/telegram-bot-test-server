@@ -1207,6 +1207,23 @@ describe("reactions and join request queries", () => {
     });
   });
 
+  it("keeps a bot's custom emoji reaction with its custom_emoji_id", async () => {
+    const { fake, api, member } = await setup();
+    const id = await fake.post(GROUP, member, "react to me");
+    for (const customEmojiId of ["5368324170671202286", 42]) {
+      expect(
+        await api("setMessageReaction", {
+          chat_id: GROUP,
+          message_id: id,
+          reaction: [{ type: "custom_emoji", custom_emoji_id: customEmojiId }],
+        }),
+      ).toMatchObject({ ok: true });
+      expect((await fake.getMessage(GROUP, id)).reactions).toEqual({
+        123456: [`#${customEmojiId}`],
+      });
+    }
+  });
+
   it("sets a reaction on an album's first remaining message", async () => {
     const { fake, api, member } = await setup();
     const album = await fake.postAlbum(GROUP, member, [

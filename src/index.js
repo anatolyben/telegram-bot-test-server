@@ -878,10 +878,24 @@ function reactionType(reaction) {
     return { type, emoji: requiredString(reaction, "emoji") };
   }
   if (type === "custom_emoji") {
-    requiredLong(reaction, "custom_emoji_id");
-    return reaction;
+    return {
+      type,
+      custom_emoji_id: requiredLong(reaction, "custom_emoji_id"),
+    };
   }
   throw new Error("invalid reaction type specified");
+}
+
+/**
+ * A reaction as a message keeps it: the emoji, or "#" and the custom emoji's
+ * id. TDLib also marks a custom emoji reaction with a leading "#"
+ * (ReactionType.cpp), so no emoji reaction starts with one. The viewer reads
+ * it back (ui/state.js reactionsOf).
+ */
+function storedReaction(reaction) {
+  return reaction.type === "custom_emoji"
+    ? `#${reaction.custom_emoji_id}`
+    : reaction.emoji;
 }
 
 /** An InputPollOption's text: the option itself, or its text field. */
@@ -5469,10 +5483,7 @@ export async function startTestServer({
       }
       entry.reactions ??= new Map();
       if (reactions.length) {
-        entry.reactions.set(
-          caller.id,
-          reactions.map((reaction) => String(reaction.emoji ?? "")),
-        );
+        entry.reactions.set(caller.id, reactions.map(storedReaction));
       } else entry.reactions.delete(caller.id);
       return true;
     },

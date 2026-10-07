@@ -1181,4 +1181,105 @@ describe("render", () => {
       '<span class="tv-list-author">Ann Lee:</span> hello',
     );
   });
+
+  it("draws a message's reactions as chips, names who chose each, and marks a member's own", () => {
+    const reactions = [
+      {
+        type: "emoji",
+        emoji: "👍",
+        total_count: 2,
+        user_ids: [OLGA.id, EVE.id],
+      },
+      {
+        type: "custom_emoji",
+        custom_emoji_id: "5368324170671202286",
+        total_count: 1,
+        user_ids: [BOT.id],
+      },
+      {
+        type: "emoji",
+        emoji: "<b>bad</b>",
+        total_count: 1,
+        user_ids: [ANN.id],
+      },
+    ];
+    const post = message({ from: ANN, text: "React to me" }, { reactions });
+    const pinned = message(
+      { from: OLGA, pinned_message: post.message },
+      { reactions: reactions.slice(0, 1) },
+    );
+    const plain = message({ from: ANN, text: "No reactions" });
+    // Each chip's attributes, in the order drawn.
+    const chipsOf = (html) =>
+      [...html.matchAll(/<span class="tv-reaction"([^>]*)>/g)].map(([, rest]) =>
+        Object.fromEntries(
+          [...rest.matchAll(/\s([a-z-]+)="([^"]*)"/g)].map(
+            ([, name, value]) => [name, value],
+          ),
+        ),
+      );
+    const draw = (item, as) =>
+      renderMessage(item, makeContext(pageOf([item]), { as }));
+
+    const testView = draw(post);
+    // Eve's name holds " onerror=", which expectSafe refuses even escaped in
+    // an attribute: her name is checked escaped in the title instead.
+    for (const value of HOSTILE) expect(testView).not.toContain(value);
+    expect(chipsOf(testView)).toEqual([
+      {
+        "data-reaction-type": "emoji",
+        "data-reaction-emoji": "👍",
+        "data-reaction-count": "2",
+        "data-reaction-user-ids": `${OLGA.id} ${EVE.id}`,
+        title: escaped(`Olga, ${EVE.first_name}`),
+      },
+      {
+        "data-reaction-type": "custom_emoji",
+        "data-custom-emoji-id": "5368324170671202286",
+        "data-reaction-count": "1",
+        "data-reaction-user-ids": String(BOT.id),
+        title: "custom emoji 5368324170671202286 · Example Bot",
+      },
+      {
+        "data-reaction-type": "emoji",
+        "data-reaction-emoji": escaped("<b>bad</b>"),
+        "data-reaction-count": "1",
+        "data-reaction-user-ids": String(ANN.id),
+        title: "Ann Lee",
+      },
+    ]);
+    expect(testView).toContain(
+      '<span class="tv-reaction-emoji">👍</span><span class="tv-reaction-count">2</span>',
+    );
+    expect(chipsOf(draw(pinned))).toHaveLength(1);
+    expect(draw(plain)).not.toContain("tv-reaction");
+
+    // Seen as Eve: the counts, her own reaction marked, and nobody's name.
+    const asEve = draw(post, EVE.id);
+    expectSafe(asEve);
+    expect(chipsOf(asEve)).toEqual([
+      {
+        "data-reaction-type": "emoji",
+        "data-reaction-emoji": "👍",
+        "data-reaction-count": "2",
+        "data-reaction-mine": "true",
+        title: "your reaction",
+      },
+      {
+        "data-reaction-type": "custom_emoji",
+        "data-custom-emoji-id": "5368324170671202286",
+        "data-reaction-count": "1",
+        title: "custom emoji 5368324170671202286",
+      },
+      {
+        "data-reaction-type": "emoji",
+        "data-reaction-emoji": escaped("<b>bad</b>"),
+        "data-reaction-count": "1",
+      },
+    ]);
+    expect(chipsOf(draw(post, OLGA.id))[0]["data-reaction-mine"]).toBe("true");
+    expect(chipsOf(draw(post, ANN.id))[0]["data-reaction-mine"]).toBe(
+      undefined,
+    );
+  });
 });

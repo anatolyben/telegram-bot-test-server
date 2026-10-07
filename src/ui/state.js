@@ -189,6 +189,40 @@ function shortText(value) {
   return chars.length > 200 ? `${chars.slice(0, 200).join("")}…` : value;
 }
 
+/**
+ * A message's reactions (its stored map of user id to reactions, index.js
+ * storedReaction) as td_api's messageReaction has them: each reaction's type
+ * and total_count, and here also who chose it (`user_ids`). The most chosen
+ * come first, as TDLib sorts them (MessageReactions::sort_reactions).
+ * UNVERIFIED: the order of reactions chosen as often. TDLib orders them by
+ * Telegram's list of active reactions, which this server does not have; here
+ * they keep the order of the members who chose them, by when each first
+ * reacted to the message.
+ */
+function reactionsOf(stored) {
+  const found = new Map();
+  for (const [userId, chosen] of stored ?? []) {
+    for (const value of chosen) {
+      if (!found.has(value)) {
+        const custom = /^#(-?\d+)$/.exec(value);
+        found.set(value, {
+          ...(custom
+            ? { type: "custom_emoji", custom_emoji_id: custom[1] }
+            : { type: "emoji", emoji: value }),
+          total_count: 0,
+          user_ids: [],
+        });
+      }
+      const reaction = found.get(value);
+      reaction.total_count += 1;
+      reaction.user_ids.push(userId);
+    }
+  }
+  return [...found.values()].sort(
+    (left, right) => right.total_count - left.total_count,
+  );
+}
+
 /** A person's or bot's name as the chat list shows it. */
 function fullName(user) {
   return [user.first_name, user.last_name].filter(Boolean).join(" ");
@@ -294,6 +328,7 @@ export function createUiState(model) {
    * A stored message as a page item. `edit_hidden`: its last edit was a
    * bot's change of only its keyboard, which Telegram's apps do not mark as
    * edited (the message's edit_hide), though the bot gets its edit_date.
+   * `reactions`: its reactions now (reactionsOf), when it has any.
    */
   function messageItem(chat, entry) {
     const { message } = entry;
@@ -301,12 +336,14 @@ export function createUiState(model) {
       quoted != null &&
       quoted.chat?.id === chat.id &&
       chat.messages.get(quoted.message_id)?.deleted === true;
+    const reactions = reactionsOf(entry.reactions);
     return {
       kind: "message",
       ...model.messageLogEntry(entry),
       reply_deleted: deletedIn(message.reply_to_message),
       pinned_deleted: deletedIn(message.pinned_message),
       ...(entry.editHidden ? { edit_hidden: true } : {}),
+      ...(reactions.length ? { reactions } : {}),
     };
   }
 
@@ -835,6 +872,9 @@ export function createUiState(model) {
       if (item.kind === "message") {
         ids.add(item.author);
         ids.add(item.message.receiver_user?.id);
+        for (const reaction of item.reactions ?? []) {
+          for (const id of reaction.user_ids) ids.add(id);
+        }
       } else {
         for (const id of [item.user_id, item.actor_id, item.bot_id]) {
           ids.add(id);

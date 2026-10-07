@@ -1049,3 +1049,59 @@ it("keeps a deleted bot's private chats, calls and membership, marked deleted un
     [second.id, false],
   ]);
 });
+
+it("lists each message's reactions, most chosen first, names who chose them, and follows their changes", async () => {
+  const { fake, api, page } = await setup();
+  const stream = events(fake);
+  await stream.next("hello");
+  const people = [];
+  for (const name of ["Ann", "Sam", "Zoe"]) {
+    const user = await fake.createUser({ first_name: name });
+    await fake.join(CHAT, user);
+    people.push(user);
+  }
+  const [author, first, second] = people;
+  const id = await fake.post(CHAT, author, "react to me");
+  await fake.react(CHAT, id, author, "🔥");
+  await fake.react(CHAT, id, first, "👍");
+  await fake.react(CHAT, id, second, "👍");
+  await api("setMessageReaction", {
+    chat_id: CHAT,
+    message_id: id,
+    reaction: [
+      { type: "custom_emoji", custom_emoji_id: "5368324170671202286" },
+    ],
+  });
+  const reactionsOf = async (query = "") =>
+    (await page(CHAT, query)).items.find(
+      (item) => item.message?.message_id === id,
+    ).reactions;
+  expect(await reactionsOf()).toEqual([
+    { type: "emoji", emoji: "👍", total_count: 2, user_ids: [first, second] },
+    { type: "emoji", emoji: "🔥", total_count: 1, user_ids: [author] },
+    {
+      type: "custom_emoji",
+      custom_emoji_id: "5368324170671202286",
+      total_count: 1,
+      user_ids: [BOT],
+    },
+  ]);
+  // A page without the members panel still names everyone who reacted.
+  const named = await page(CHAT, "?members_limit=0");
+  expect(named.members).toEqual([]);
+  for (const user of people) {
+    expect(named.users[user]).toMatchObject({ id: user });
+  }
+  // A member sees the same reactions.
+  expect(await reactionsOf(`?as=${first}`)).toEqual(await reactionsOf());
+
+  // Taking a reaction back moves the version, and the stream tells of it.
+  await fake.react(CHAT, id, first, null);
+  const { version } = await page(CHAT);
+  let change;
+  do change = await stream.next("change");
+  while (change.data.version < version);
+  expect((await reactionsOf()).map((each) => each.total_count)).toEqual([
+    1, 1, 1,
+  ]);
+});

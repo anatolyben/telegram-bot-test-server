@@ -1548,11 +1548,80 @@ select {
   opacity: 0.7;
 }
 
+/* Reactions: chips under the text, the time at the end of their row. */
+.tv-reactions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.tv-reaction {
+  align-items: center;
+  background: color-mix(in srgb, var(--tv-accent) 14%, transparent);
+  border-radius: 999px;
+  color: var(--tv-accent-text);
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 600;
+  gap: 4px;
+  line-height: 18px;
+  padding: 2px 8px 2px 6px;
+}
+
+.tv-reaction[title] {
+  cursor: help;
+}
+
+.tv-reaction[data-reaction-mine="true"] {
+  background: var(--tv-accent);
+  color: var(--tv-on-accent);
+}
+
+.tv-reaction-emoji {
+  font-size: 15px;
+  font-variant-emoji: emoji;
+  font-weight: 400;
+}
+
+/* A custom emoji's image is not stored: a plain mark stands in for it. */
+.tv-reaction-custom {
+  border: 1px dashed currentColor;
+  border-radius: 4px;
+  font-size: 11px;
+  font-variant-emoji: text;
+  line-height: 14px;
+  padding: 0 2px;
+}
+
+.tv-reaction-count {
+  font-variant-numeric: tabular-nums;
+}
+
+.tv-reactions .tv-meta {
+  float: none;
+  margin: 0 0 0 auto;
+  padding-left: 8px;
+}
+
 /* Service messages: what Telegram shows as a centred line. */
 .tv-service-row {
   display: flex;
+  flex-wrap: wrap;
   justify-content: center;
   padding: 4px 10px;
+}
+
+.tv-service-row > .tv-reactions {
+  flex-basis: 100%;
+  justify-content: center;
+}
+
+/* On the wallpaper, as the service line itself. */
+.tv-service-row .tv-reaction:not([data-reaction-mine="true"]) {
+  background: var(--tv-surface);
+  box-shadow: 0 1px 2px rgba(16, 35, 47, 0.15);
 }
 
 .tv-service {

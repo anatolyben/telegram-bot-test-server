@@ -1017,6 +1017,12 @@ What it shows, only from what the server stores:
   keyboards as buttons (hover one for its callback data); edits (not a bot's change of only the
   keyboard, which Telegram's apps do not mark either); and service messages: joins, leaves, pins,
   title and photo changes, upgrades and topics. Times are UTC.
+- **Reactions** under each message: a chip for each emoji or custom emoji, with how many chose
+  it, the most chosen first, as TDLib sorts them. A custom emoji's image is not stored, so a mark
+  stands in for it (hover for its id). In the test's view, hover a chip for who chose it; seen
+  as a member, their own reaction is marked. Unverified: the order of reactions chosen equally
+  often. TDLib orders them by Telegram's list of active reactions, which this server does not
+  have; here they follow the members who chose them, by when each first reacted to the message.
 - **Deletions**: a deleted message stays, grayed and marked with the bot that deleted it.
 - **Ephemeral messages**, marked with the member who sees them.
 - **Events** Telegram shows as no message: member changes by a bot or a person (restrictions,
@@ -1097,6 +1103,9 @@ otherwise. In a recording, items from before it carry `data-before-window`.
   `data-pinned-deleted`, `data-request-id`.
 - **Inline button**: `data-button-text`, `data-button-data`, `data-button-url`, `data-button-row`,
   `data-button-col`.
+- **Reaction** (inside its message): `data-reaction-type` (`emoji` or `custom_emoji`),
+  `data-reaction-emoji` or `data-custom-emoji-id`, `data-reaction-count`; in the test's view
+  `data-reaction-user-ids` (space-separated), and seen as a member `data-reaction-mine`.
 - **Event**: `data-kind="event"`, `data-chat-key`, `data-event-id`, `data-event-type` (`member`,
   `join_request`, `unpin`), `data-user-id`, `data-request-id`.
 - **Call**: `data-kind="call"`, `data-chat-key` (`calls` for calls without a chat),
@@ -1137,7 +1146,9 @@ The viewer's routes, all `GET` and all on this computer only:
 - `/_fake/ui/assets/<file>`: its scripts and stylesheet.
 - `/_fake/ui/api/state`: the chat list (`?as=<user id>` for a member's).
 - `/_fake/ui/api/chats/<chat>`: a chat's messages and events, members and calls (`limit`,
-  `before`, `from`, `to`, `as`, `topic`, `members_limit`, `calls_before`).
+  `before`, `from`, `to`, `as`, `topic`, `members_limit`, `calls_before`). A message with
+  reactions has `reactions`: for each, its `type`, `emoji` or `custom_emoji_id`, `total_count`
+  and `user_ids`, the most chosen first.
 - `/_fake/ui/files/<file_id>`: a stored image's bytes.
 - `/_fake/ui/events`: the live event stream (server-sent events).
 
@@ -1212,9 +1223,9 @@ afterEach(async ({ task }) => {
 - `stopRecording(name)` returns `{ name, html, json, files }`: `html` is the page as text and
   `json` its twin as an object; `files` comes only with `recordDir`. They hold every message and
   event stored after the start, deleted ones included, and every Bot API call received after it,
-  with the members as they are at the stop. Older messages that a recorded call names (a
-  forward's in the chat it came from) or that a recorded message replies to are included too,
-  marked "from before the recording".
+  with the members and each message's reactions as they are at the stop. Older messages that a
+  recorded call names (a forward's in the chat it came from) or that a recorded message replies
+  to are included too, marked "from before the recording".
 - With the `recordDir` option, `stopRecording` also writes `<name>.html` and `<name>.json` there,
   making the directory if needed and replacing earlier files of that name, and returns their paths
   in `files` as `{ html, json }`. Only the option chooses the directory, never a request.
@@ -1863,7 +1874,8 @@ API routes do; only the viewer (`/_fake/ui`) answers this computer alone. Keep t
   `getMessageLog` returns it: `{ chat_id, epoch, cursor, messages }`. `include_deleted` is `true`
   or `1`. A bad `since` answers 400, and an `epoch` other than the server's 409.
 - `GET chats/:id/messages/:messageId`: `{ exists, deleted, message, reactions }`, reactions by user
-  id.
+  id, each a list of emoji; a custom emoji is `#` and its `custom_emoji_id`, such as
+  `#5368324170671202286`.
 - `GET chats/:id/ephemeral-messages/:eid`: `{ exists, deleted, message }` for the ephemeral message
   with `ephemeral_message_id` `:eid`.
 - `GET chats/:id/members/:userId`: the member as `getChatMember` would return it.
@@ -2147,10 +2159,10 @@ formatting and replies, and request parsing and update delivery.
   this server.
 - Fetching media from HTTP URLs (a URL stands in as a one-byte file), several sizes per photo,
   `sendLivePhoto` and `editMessageLiveLocation`.
-- In the viewer and recordings: business chats, reactions, the chat description, what an edited
-  message said before, and a map for a location. Only PNG, JPEG, GIF and WebP images are drawn;
-  video, voice, documents and other media are labeled placeholders. View as a member has the
-  limits listed under [Watch the chats in a browser](#watch-the-chats-in-a-browser).
+- In the viewer and recordings: business chats, the chat description, what an edited message said
+  before, a custom emoji's image, and a map for a location. Only PNG, JPEG, GIF and WebP images are
+  drawn; video, voice, documents and other media are labeled placeholders. View as a member has
+  the limits listed under [Watch the chats in a browser](#watch-the-chats-in-a-browser).
 - Edits in the message log, which lists messages and deletions after a mark. The `quiet` wait
   cannot see work a bot does after it confirmed an update, such as a background job.
 - A manual or running clock from the command line, which runs on real time only; a clock push when
@@ -2315,6 +2327,11 @@ fields below.
 
 ## Changes
 
+- **0.13.0**:
+  - New: the viewer and recordings draw each message's reactions, with who chose them
+    ([Watch the chats in a browser](#watch-the-chats-in-a-browser)).
+  - Fixed: a bot's custom emoji reaction keeps its id. `getMessage` lists it as `#` and its
+    `custom_emoji_id`, where it listed an empty string.
 - **0.12.1**: pending message and update waits, `drainDeliveries`, `snapshot` and `restore` are
   faster on long chats and journals, and work as before ([measurements][performance]).
   - Fixed: `getMessage`, `getMessages`, `getEphemeralMessage` and `getDirectMessages` return
