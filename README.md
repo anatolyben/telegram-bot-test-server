@@ -1167,6 +1167,7 @@ afterEach(async ({ task }) => {
   Its scripts, styles, data and images are inside it, and its content security policy lets it load
   nothing else. It needs JavaScript. Recording works with the `ui` option on or off.
 - The JSON twin has `format: "telegram-bot-test-server-recording"` and `format_version: 1`; the
+  recording's `name`; in `chats_filter`, the chats asked for, as text (`null` for every chat); the
   marks in `window` (`start_seq` and `stop_seq` on the message log's cursor, `start_request` and
   `stop_request` on the count of Bot API requests, `started_at` and `stopped_at` in server time);
   the chat list in `state`; in `pages`, one page per chat, in the shape of the viewer's
