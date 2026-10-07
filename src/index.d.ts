@@ -66,6 +66,15 @@ export interface TelegramBotTestServerOptions {
 
 /** A message as the server stores it, in the Bot API's Message shape. */
 export type Message = { message_id: number; [field: string]: unknown };
+
+/** A MessageEntity in the Bot API's shape, such as { type: "bold", offset: 0, length: 4 }. */
+export type MessageEntity = {
+  type: string;
+  offset: number;
+  length: number;
+  [field: string]: unknown;
+};
+
 /** A Bot API Poll: id, question, options with voter_count, total_voter_count, ... */
 export type Poll = { id: string; [field: string]: unknown };
 
@@ -145,13 +154,57 @@ export interface PostedMessage {
     fileName?: string;
     mimeType?: string;
   };
-  /** Where a forwarded message came from: a user, a hidden user's name, or a channel post. */
+  /**
+   * Where a forwarded message came from: a user, a hidden user's name, a
+   * channel post, or a group's own post (a group or supergroup chatId, no
+   * messageId). authorSignature goes with a channel or group origin.
+   */
   forwardFrom?: {
     userId?: number;
     senderName?: string;
     chatId?: number;
     messageId?: number;
+    authorSignature?: string;
   };
+  /**
+   * Entities for the text, in the Bot API's shape, checked as Telegram checks
+   * a user's. Types Telegram finds by itself are ignored, but phone_number.
+   */
+  entities?: MessageEntity[];
+  /** Entities for the caption, read like entities. */
+  captionEntities?: MessageEntity[];
+  /**
+   * In a supergroup, post on behalf of a chat: the group itself (an anonymous
+   * administrator, who posts so anyway) or a channel the user created.
+   * Anything else fails with SEND_AS_PEER_INVALID.
+   */
+  sendAs?: number;
+  /** A contact, as a message of its own; needs can_send_messages. */
+  contact?: {
+    phoneNumber: string;
+    firstName: string;
+    lastName?: string;
+    vcard?: string;
+    /** The Telegram user the number belongs to. */
+    userId?: number;
+  };
+  /**
+   * A location, as a message of its own; needs can_send_messages. A
+   * livePeriod other than 0 makes it a live location.
+   */
+  location?: {
+    latitude: number;
+    longitude: number;
+    horizontalAccuracy?: number;
+    livePeriod?: number;
+    heading?: number;
+    proximityAlertRadius?: number;
+  };
+  /**
+   * Post an earlier file again, by a file_id read from a message: it keeps
+   * its kind and file_unique_id. A caption may go with it.
+   */
+  fileId?: string;
   /**
    * A poll, as a message of its own (no text or media), with sendPoll's
    * fields and checks. Needs can_send_polls in a group.
@@ -608,7 +661,8 @@ export interface TelegramBotTestServer {
    * channel, only the creator and administrators with can_post_messages may,
    * and bots get the post as channel_post. Fails with MESSAGE_EMPTY when the
    * text shows nothing once trimmed (only spaces or blank characters such as
-   * zero-width spaces); such a caption is dropped.
+   * zero-width spaces); such a caption is dropped. In a supergroup, an
+   * anonymous administrator's post comes from the group (sender_chat).
    */
   post(
     chatId: number,
@@ -691,12 +745,13 @@ export interface TelegramBotTestServer {
   ): Promise<number>;
   /**
    * The user sends the bot a direct message: text, or anything post() takes
-   * (a photo, media, a caption, a reply, a forward or a poll); returns the
-   * message_id. Text that shows nothing once trimmed fails with MESSAGE_EMPTY.
+   * but threadId and sendAs (a photo, media, a caption, a reply, a forward, a
+   * poll, a contact, a location or an earlier file); returns the message_id.
+   * Text that shows nothing once trimmed fails with MESSAGE_EMPTY.
    */
   sendDirectMessage(
     userId: number,
-    message: string | Omit<PostedMessage, "threadId">,
+    message: string | Omit<PostedMessage, "threadId" | "sendAs">,
   ): Promise<number>;
   /**
    * The user votes in a poll: option indexes, or an empty list to retract.

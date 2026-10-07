@@ -1470,3 +1470,638 @@ describe("direct messages", () => {
     );
   });
 });
+
+describe("posts on behalf of a chat", () => {
+  // The users the Bot API names as `from` of a message sent on behalf of a
+  // chat in a group (TDLib UserManager.cpp).
+  const GROUP_ANONYMOUS_BOT = {
+    id: 1087968824,
+    is_bot: true,
+    first_name: "Group",
+    username: "GroupAnonymousBot",
+  };
+  const CHANNEL_BOT = {
+    id: 136817688,
+    is_bot: true,
+    first_name: "Channel",
+    username: "Channel_Bot",
+  };
+
+  it("posts an anonymous administrator's message as the group, which bots get, forward and delete", async () => {
+    const { fake, api, member, me } = await setup();
+    await fake.setBotMembership(GROUP, me.id, {
+      rights: { can_promote_members: true },
+    });
+    await api("promoteChatMember", {
+      chat_id: GROUP,
+      user_id: member,
+      is_anonymous: true,
+      can_pin_messages: true,
+    });
+    await api("setChatAdministratorCustomTitle", {
+      chat_id: GROUP,
+      user_id: member,
+      custom_title: "Mod",
+    });
+
+    const id = await fake.post(GROUP, member, "Read the rules");
+    const { message } = await fake.getMessage(GROUP, id);
+    expect(Object.keys(message).slice(0, 6)).toEqual([
+      "message_id",
+      "from",
+      "author_signature",
+      "sender_chat",
+      "chat",
+      "date",
+    ]);
+    expect(message).toMatchObject({
+      from: GROUP_ANONYMOUS_BOT,
+      author_signature: "Mod",
+      sender_chat: { id: GROUP, title: "Test Group", type: "supergroup" },
+      text: "Read the rules",
+    });
+    expect(message.from).toEqual(GROUP_ANONYMOUS_BOT);
+    const delivered = (await api("getUpdates")).result
+      .map((update) => update.message)
+      .find((sent) => sent?.message_id === id);
+    expect(delivered).toEqual(message);
+    // A wait still finds it by the person who posted it.
+    await fake.waitFor({
+      kind: "message",
+      chatId: GROUP,
+      userId: member,
+      text: "Read the rules",
+    });
+    // Naming the group itself is the same as posting anonymously.
+    const named = await fake.post(GROUP, member, {
+      text: "again",
+      sendAs: GROUP,
+    });
+    expect((await fake.getMessage(GROUP, named)).message).toMatchObject({
+      from: GROUP_ANONYMOUS_BOT,
+      sender_chat: { id: GROUP },
+    });
+
+    const forward = await api("forwardMessage", {
+      chat_id: GROUP,
+      from_chat_id: GROUP,
+      message_id: id,
+    });
+    expect(forward.result.forward_origin).toEqual({
+      type: "chat",
+      sender_chat: { id: GROUP, title: "Test Group", type: "supergroup" },
+      author_signature: "Mod",
+      date: message.date,
+    });
+    expect(
+      (await api("deleteMessage", { chat_id: GROUP, message_id: id })).result,
+    ).toBe(true);
+    expect((await fake.getMessage(GROUP, id)).deleted).toBe(true);
+  });
+
+  it("posts as a channel the member created, and refuses any other chat to send as", async () => {
+    const { fake, api, member } = await setup();
+    const channel = await fake.createChat({
+      type: "channel",
+      title: "Member News",
+      ownerId: member,
+    });
+
+    const id = await fake.post(GROUP, member, {
+      text: "Follow us",
+      sendAs: channel,
+    });
+    const { message } = await fake.getMessage(GROUP, id);
+    expect(message.from).toEqual(CHANNEL_BOT);
+    expect(message.sender_chat).toEqual({
+      id: channel,
+      title: "Member News",
+      type: "channel",
+    });
+    expect(message).not.toHaveProperty("author_signature");
+    const forward = await api("forwardMessage", {
+      chat_id: GROUP,
+      from_chat_id: GROUP,
+      message_id: id,
+    });
+    expect(forward.result.forward_origin).toEqual({
+      type: "chat",
+      sender_chat: { id: channel, title: "Member News", type: "channel" },
+      date: message.date,
+    });
+    expect(
+      (await api("deleteMessage", { chat_id: GROUP, message_id: id })).result,
+    ).toBe(true);
+
+    const others = await fake.createChat({ type: "channel", ownerId: OWNER });
+    const basic = await fake.createChat({ type: "group", ownerId: member });
+    const before = await fake.getMessages(GROUP);
+    for (const [chatId, sendAs] of [
+      [GROUP, others],
+      [GROUP, GROUP],
+      [GROUP, member],
+      [basic, channel],
+    ]) {
+      await expect(
+        fake.post(chatId, member, { text: "as someone", sendAs }),
+      ).rejects.toThrow(/^SEND_AS_PEER_INVALID$/);
+    }
+    await expect(
+      fake.sendDirectMessage(member, { text: "hi", sendAs: channel }),
+    ).rejects.toThrow(/^SEND_AS_PEER_INVALID$/);
+    expect(await fake.getMessages(GROUP)).toEqual(before);
+  });
+
+  it("forwards a post made on behalf of a group or supergroup", async () => {
+    const { fake, member } = await setup();
+    const other = await fake.createChat({
+      title: "Other Group",
+      ownerId: OWNER,
+    });
+    const basic = await fake.createChat({
+      type: "group",
+      title: "Small Group",
+      ownerId: OWNER,
+    });
+    const read = async (forwardFrom) =>
+      (
+        await fake.getMessage(
+          GROUP,
+          await fake.post(GROUP, member, { text: "fwd", forwardFrom }),
+        )
+      ).message.forward_origin;
+
+    expect(await read({ chatId: other, authorSignature: "Admin" })).toEqual({
+      type: "chat",
+      sender_chat: { id: other, title: "Other Group", type: "supergroup" },
+      author_signature: "Admin",
+      date: expect.any(Number),
+    });
+    expect(await read({ chatId: basic })).toEqual({
+      type: "chat",
+      sender_chat: { id: basic, title: "Small Group", type: "group" },
+      date: expect.any(Number),
+    });
+    await expect(
+      fake.post(GROUP, member, {
+        text: "fwd",
+        forwardFrom: { chatId: other, messageId: 1 },
+      }),
+    ).rejects.toThrow(/message_id/);
+    await expect(
+      fake.post(GROUP, member, {
+        text: "fwd",
+        forwardFrom: { userId: member, authorSignature: "Admin" },
+      }),
+    ).rejects.toThrow(/author_signature/);
+  });
+});
+
+describe("contacts and locations", () => {
+  it("delivers a member's contact and location, in a group and privately", async () => {
+    const { fake, api, member } = await setup();
+    const contact = await fake.post(GROUP, member, {
+      contact: {
+        phoneNumber: "+15550100",
+        firstName: "Ann",
+        lastName: "Lee",
+        vcard: "BEGIN:VCARD\nEND:VCARD",
+        userId: member,
+      },
+    });
+    const place = await fake.post(GROUP, member, {
+      location: { latitude: 51.5, longitude: -0.12, horizontalAccuracy: 20.5 },
+    });
+    const live = await fake.post(GROUP, member, {
+      location: {
+        latitude: 1.5,
+        longitude: 2.5,
+        livePeriod: 900,
+        heading: 90,
+        proximityAlertRadius: 100,
+        horizontalAccuracy: 3000,
+      },
+      replyTo: place,
+    });
+    const read = async (id) => (await fake.getMessage(GROUP, id)).message;
+
+    const shared = await read(contact);
+    expect(shared.contact).toEqual({
+      phone_number: "+15550100",
+      first_name: "Ann",
+      last_name: "Lee",
+      vcard: "BEGIN:VCARD\nEND:VCARD",
+      user_id: member,
+    });
+    expect(Object.keys(shared.contact)).toEqual([
+      "phone_number",
+      "first_name",
+      "last_name",
+      "vcard",
+      "user_id",
+    ]);
+    expect((await read(place)).location).toEqual({
+      latitude: 51.5,
+      longitude: -0.12,
+      horizontal_accuracy: 20.5,
+    });
+    const moving = await read(live);
+    expect(moving.location).toEqual({
+      latitude: 1.5,
+      longitude: 2.5,
+      live_period: 900,
+      heading: 90,
+      proximity_alert_radius: 100,
+      horizontal_accuracy: 1500,
+    });
+    expect(moving.reply_to_message.message_id).toBe(place);
+
+    const direct = await fake.sendDirectMessage(member, {
+      contact: { phoneNumber: "+15550101", firstName: "Bo" },
+    });
+    expect(
+      (await fake.getDirectMessages(member)).find(
+        (message) => message.message_id === direct,
+      ).contact,
+    ).toEqual({ phone_number: "+15550101", first_name: "Bo" });
+    const updates = (await api("getUpdates")).result.map(
+      (update) => update.message,
+    );
+    expect(
+      updates
+        .filter((message) => message.contact || message.location)
+        .map((message) => message.message_id),
+    ).toEqual([contact, place, live, direct]);
+  });
+
+  it("refuses contacts and locations as Telegram's app does", async () => {
+    const { fake, api, member } = await setup();
+    await api("restrictChatMember", {
+      chat_id: GROUP,
+      user_id: member,
+      use_independent_chat_permissions: true,
+      permissions: { can_send_messages: false, can_send_photos: true },
+    });
+    const contact = { phoneNumber: "+15550100", firstName: "Ann" };
+    for (const message of [
+      { contact },
+      { location: { latitude: 1, longitude: 2 } },
+    ]) {
+      await expect(fake.post(GROUP, member, message)).rejects.toThrow(
+        /^CHAT_WRITE_FORBIDDEN$/,
+      );
+    }
+    await fake.post(GROUP, member, { photo: BYTES });
+
+    const other = await fake.createUser();
+    await fake.join(GROUP, other);
+    const refusals = [
+      [
+        { location: { latitude: 91, longitude: 0 } },
+        "Invalid location specified",
+      ],
+      [
+        { location: { latitude: 0, longitude: 181, livePeriod: 60 } },
+        "Invalid live location specified",
+      ],
+      [
+        { location: { latitude: 0, longitude: 0, livePeriod: 30 } },
+        "Wrong live location period specified",
+      ],
+      [
+        {
+          location: { latitude: 0, longitude: 0, livePeriod: 60, heading: 361 },
+        },
+        "Wrong live location heading specified",
+      ],
+      [
+        {
+          location: {
+            latitude: 0,
+            longitude: 0,
+            livePeriod: 60,
+            proximityAlertRadius: 100001,
+          },
+        },
+        "Wrong live location proximity alert radius specified",
+      ],
+      [{ contact: { ...contact, userId: 999999999 } }, "User not found"],
+    ];
+    for (const [message, error] of refusals) {
+      await expect(fake.post(GROUP, other, message)).rejects.toThrow(
+        new RegExp(`^${error}$`),
+      );
+    }
+    await expect(
+      fake.post(GROUP, other, { text: "and", contact }),
+    ).rejects.toThrow(/one kind of content/);
+    // A permanent live location.
+    const forever = await fake.post(GROUP, other, {
+      location: { latitude: 0, longitude: 0, livePeriod: 0x7fffffff },
+    });
+    expect(
+      (await fake.getMessage(GROUP, forever)).message.location.live_period,
+    ).toBe(0x7fffffff);
+  });
+});
+
+describe("entities members give", () => {
+  it("keeps the entities a member's app sends and the phone numbers the test marks", async () => {
+    const { fake, member, me } = await setup();
+    const text =
+      "Call +1 212 555 0123, read this or see example.com, ask @xavier";
+    const id = await fake.post(GROUP, member, {
+      text,
+      entities: [
+        { type: "phone_number", offset: 5, length: 15 },
+        { type: "text_link", offset: 27, length: 4, url: "Promo.EXAMPLE/x y" },
+        { type: "bold", offset: 0, length: 4 },
+        // Telegram finds these by itself, so a given one is ignored.
+        { type: "url", offset: 0, length: 4 },
+        { type: "mention", offset: 5, length: 3 },
+      ],
+    });
+    const { message } = await fake.getMessage(GROUP, id);
+    expect(message.text).toBe(text);
+    expect(message.entities).toEqual([
+      { type: "bold", offset: 0, length: 4 },
+      { type: "phone_number", offset: 5, length: 15 },
+      {
+        type: "text_link",
+        offset: 27,
+        length: 4,
+        url: "http://promo.example/x%20y",
+      },
+      { type: "url", offset: 39, length: 11 },
+      { type: "mention", offset: 56, length: 7 },
+    ]);
+
+    const mention = await fake.post(GROUP, member, {
+      text: "hi friend",
+      entities: [
+        {
+          type: "text_link",
+          offset: 3,
+          length: 6,
+          url: `tg://user?id=${me.id}`,
+        },
+        {
+          type: "text_link",
+          offset: 0,
+          length: 2,
+          url: "tg://resolve?domain=x",
+        },
+      ],
+    });
+    expect((await fake.getMessage(GROUP, mention)).message.entities).toEqual([
+      { type: "text_link", offset: 0, length: 2, url: "tg://resolve?domain=x" },
+      {
+        type: "text_mention",
+        offset: 3,
+        length: 6,
+        user: {
+          id: me.id,
+          is_bot: true,
+          first_name: me.first_name,
+          username: me.username,
+        },
+      },
+    ]);
+
+    const photo = await fake.post(GROUP, member, {
+      photo: BYTES,
+      caption: "  call +44 20 7946 0958",
+      captionEntities: [{ type: "phone_number", offset: 7, length: 16 }],
+    });
+    expect((await fake.getMessage(GROUP, photo)).message).toMatchObject({
+      caption: "call +44 20 7946 0958",
+      caption_entities: [{ type: "phone_number", offset: 5, length: 16 }],
+    });
+    const direct = await fake.sendDirectMessage(member, {
+      text: "my number +1 555 0100",
+      entities: [{ type: "phone_number", offset: 10, length: 11 }],
+    });
+    expect(
+      (await fake.getDirectMessages(member)).find(
+        (sent) => sent.message_id === direct,
+      ).entities,
+    ).toEqual([{ type: "phone_number", offset: 10, length: 11 }]);
+  });
+
+  it("refuses entities Telegram refuses", async () => {
+    const { fake, member } = await setup();
+    const refusals = [
+      [
+        [{ type: "text_link", offset: 0, length: 2, url: "nodot" }],
+        "Entity URL 'nodot' is invalid: Wrong HTTP URL",
+      ],
+      [
+        [{ type: "text_link", offset: 0, length: 2, url: "ftp://a.com" }],
+        "Entity URL 'ftp://a.com' is invalid: Unsupported URL protocol",
+      ],
+      [
+        [{ type: "text_link", offset: 0, length: 2, url: "tg:http://a.com" }],
+        "Entity URL 'tg:http://a.com' is invalid: Wrong tg URL",
+      ],
+      [
+        [{ type: "text_link", offset: 0, length: 2 }],
+        `can't parse MessageEntity: Can't find field "url"`,
+      ],
+      [
+        [
+          {
+            type: "text_mention",
+            offset: 0,
+            length: 2,
+            user: { id: 999999999 },
+          },
+        ],
+        "User not found",
+      ],
+      [
+        [{ type: "custom_emoji", offset: 0, length: 2, custom_emoji_id: "0" }],
+        "Invalid custom emoji identifier specified",
+      ],
+      [
+        [{ type: "phone_number", offset: 3, length: 5 }],
+        "can't parse entities: Entity beginning at UTF-16 offset 3 ends after the end of the text at UTF-16 offset 8",
+      ],
+      [
+        [{ type: "sparkle", offset: 0, length: 2 }],
+        "can't parse MessageEntity: Unsupported type specified",
+      ],
+    ];
+    for (const [entities, error] of refusals) {
+      await expect(
+        fake.post(GROUP, member, { text: "hello", entities }),
+      ).rejects.toThrow(error);
+    }
+    await expect(
+      fake.post(GROUP, member, { text: "hello", entities: "bold" }),
+    ).rejects.toThrow(/entities/);
+  });
+});
+
+describe("files members post again", () => {
+  it("posts an earlier file again with its file_unique_id, while a new upload is a new file", async () => {
+    const { fake, api, upload, member } = await setup();
+    const other = await fake.createUser();
+    await fake.join(GROUP, other);
+    const first = await fake.post(GROUP, member, { photo: BYTES });
+    const [photo] = (await fake.getMessage(GROUP, first)).message.photo;
+
+    const again = await fake.post(GROUP, other, {
+      fileId: photo.file_id,
+      caption: "seen this?",
+    });
+    expect((await fake.getMessage(GROUP, again)).message).toMatchObject({
+      photo: [photo],
+      caption: "seen this?",
+    });
+    const fresh = await fake.post(GROUP, member, { photo: BYTES });
+    expect(
+      (await fake.getMessage(GROUP, fresh)).message.photo[0].file_unique_id,
+    ).not.toBe(photo.file_unique_id);
+
+    // A file the bot sent keeps its name and kind when a member posts it.
+    const sent = await upload("sendDocument", {
+      chat_id: String(GROUP),
+      document: Buffer.from("%PDF"),
+    });
+    const document = sent.result.document;
+    const reposted = await fake.post(GROUP, other, {
+      fileId: document.file_id,
+    });
+    expect((await fake.getMessage(GROUP, reposted)).message.document).toEqual(
+      document,
+    );
+    const direct = await fake.sendDirectMessage(member, {
+      fileId: document.file_id,
+    });
+    expect(
+      (await fake.getDirectMessages(member)).find(
+        (message) => message.message_id === direct,
+      ).document.file_unique_id,
+    ).toBe(document.file_unique_id);
+    const file = await api("getFile", { file_id: document.file_id });
+    expect(file.result.file_unique_id).toBe(document.file_unique_id);
+  });
+
+  it("refuses an unknown file, and needs the permission for the file's kind", async () => {
+    const { fake, api, member } = await setup();
+    const other = await fake.createUser();
+    await fake.join(GROUP, other);
+    const first = await fake.post(GROUP, other, { photo: BYTES });
+    const [photo] = (await fake.getMessage(GROUP, first)).message.photo;
+    await api("restrictChatMember", {
+      chat_id: GROUP,
+      user_id: member,
+      use_independent_chat_permissions: true,
+      permissions: { can_send_messages: true, can_send_photos: false },
+    });
+
+    await expect(
+      fake.post(GROUP, member, { fileId: photo.file_id }),
+    ).rejects.toThrow(/^CHAT_WRITE_FORBIDDEN$/);
+    await expect(
+      fake.post(GROUP, other, { fileId: "no-such-file" }),
+    ).rejects.toThrow(/file_id/);
+    await expect(
+      fake.post(GROUP, other, { fileId: photo.file_id, text: "and text" }),
+    ).rejects.toThrow(/one kind of content/);
+  });
+});
+
+describe("control routes for what members post", () => {
+  it("takes the new message fields in snake_case over HTTP", async () => {
+    const { fake, member } = await setup();
+    const control = async (path, body) => {
+      const response = await fetch(`${fake.origin}/_fake/${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return { status: response.status, ...(await response.json()) };
+    };
+    const channel = await fake.createChat({ type: "channel", ownerId: member });
+    const other = await fake.createChat({ ownerId: OWNER, title: "Other" });
+    const photo = await fake.post(GROUP, member, { photo: BYTES });
+    const [{ file_id }] = (await fake.getMessage(GROUP, photo)).message.photo;
+
+    const posts = [
+      { text: "as channel", send_as: channel },
+      {
+        text: "fwd",
+        forward_from: { chat_id: other, author_signature: "Admin" },
+      },
+      {
+        contact: {
+          phone_number: "+15550100",
+          first_name: "Ann",
+          user_id: member,
+        },
+      },
+      {
+        location: {
+          latitude: 1,
+          longitude: 2,
+          live_period: 60,
+          heading: 5,
+          proximity_alert_radius: 10,
+          horizontal_accuracy: 1,
+        },
+      },
+      {
+        text: "call +1 555 0100",
+        entities: [{ type: "phone_number", offset: 5, length: 11 }],
+      },
+      {
+        file_id,
+        caption: "+1 555 0100",
+        caption_entities: [{ type: "phone_number", offset: 0, length: 11 }],
+      },
+    ];
+    const ids = [];
+    for (const body of posts) {
+      const answer = await control(`chats/${GROUP}/messages`, {
+        user_id: member,
+        ...body,
+      });
+      expect(answer.status).toBe(200);
+      ids.push(answer.message_id);
+    }
+    const messages = await Promise.all(
+      ids.map(async (id) => (await fake.getMessage(GROUP, id)).message),
+    );
+    expect(messages[0].sender_chat.id).toBe(channel);
+    expect(messages[1].forward_origin).toMatchObject({
+      type: "chat",
+      author_signature: "Admin",
+    });
+    expect(messages[2].contact.user_id).toBe(member);
+    expect(messages[3].location).toEqual({
+      latitude: 1,
+      longitude: 2,
+      live_period: 60,
+      heading: 5,
+      proximity_alert_radius: 10,
+      horizontal_accuracy: 1,
+    });
+    expect(messages[4].entities).toEqual([
+      { type: "phone_number", offset: 5, length: 11 },
+    ]);
+    expect(messages[5]).toMatchObject({
+      photo: [{ file_id }],
+      caption_entities: [{ type: "phone_number", offset: 0, length: 11 }],
+    });
+    const direct = await control(`users/${member}/dm`, {
+      location: { latitude: 3, longitude: 4 },
+    });
+    expect(direct.status).toBe(200);
+    expect(
+      (await fake.getDirectMessages(member)).find(
+        (message) => message.message_id === direct.message_id,
+      ).location,
+    ).toEqual({ latitude: 3, longitude: 4 });
+  });
+});

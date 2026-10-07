@@ -248,6 +248,26 @@ await server.waitFor({
 });
 ```
 
+Members also share contacts and locations, post an earlier file again (it keeps its
+`file_unique_id`), give their text entities such as `phone_number` or `text_link`, and post on
+behalf of a chat. An administrator with `is_anonymous` posts as the group, as on Telegram:
+
+```js
+// Ann is an administrator with is_anonymous (your bot promoted her).
+await server.post(GROUP, ann, "Read the rules"); // sender_chat is the group
+const news = await server.createChat({ type: "channel", title: "News", ownerId: bob });
+await server.post(GROUP, bob, { text: "Follow us", sendAs: news }); // sender_chat is News
+await server.post(GROUP, bob, { contact: { phoneNumber: "+15550100", firstName: "Bob" } });
+await server.post(GROUP, bob, { location: { latitude: 51.5, longitude: -0.12 } });
+await server.post(GROUP, bob, {
+  text: "Call +1 212 555 0123",
+  entities: [{ type: "phone_number", offset: 5, length: 15 }],
+});
+const first = await server.post(GROUP, bob, { photo });
+const [size] = (await server.getMessage(GROUP, first)).message.photo;
+await server.post(GROUP, ann, { fileId: size.file_id }); // the same file_unique_id
+```
+
 Users can also post photos, media, albums and forwards, edit their messages, react, pin, press
 buttons in private chats and on ephemeral messages, change their profile, and rename the chat or
 change its photo. [Test actions](#test-actions) lists them all.
@@ -939,12 +959,24 @@ the bot's Bot API root. Each action resolves once the update it causes has been 
   with `type` `video`, `animation`, `sticker`, `voice`, `audio`, `video_note` or `document`; a
   caption goes with every kind but stickers and video notes; `replyTo` is the `message_id` it
   replies to; `threadId` is a forum topic; `forwardFrom` is `{ userId }`, `{ senderName }` (a hidden
-  user) or `{ chatId, messageId? }` (a channel post); `poll` is a poll of the user's own, a message
-  by itself, with `sendPoll`'s fields (`question`, `options`, `type`, `is_anonymous`,
-  `allows_multiple_answers`, `allows_revoting`, `correct_option_ids`, `explanation`) and checks,
-  and needs `can_send_polls`. Fails if the user is not allowed to post. Text and captions are
-  trimmed as Telegram's apps send them, and text that then shows nothing fails with
-  `MESSAGE_EMPTY`.
+  user), `{ chatId, messageId? }` (a channel post) or `{ chatId }` of a group or supergroup (a post
+  made on its behalf), with `authorSignature?` for a channel or group; `poll` is a poll of the
+  user's own, a message by itself, with `sendPoll`'s fields (`question`, `options`, `type`,
+  `is_anonymous`, `allows_multiple_answers`, `allows_revoting`, `correct_option_ids`,
+  `explanation`) and checks, and needs `can_send_polls`. Fails if the user is not allowed to post.
+  Text and captions are trimmed as Telegram's apps send them, and text that then shows nothing
+  fails with `MESSAGE_EMPTY`. It also takes:
+  - `contact`: `{ phoneNumber, firstName, lastName?, vcard?, userId? }`, and `location`:
+    `{ latitude, longitude, horizontalAccuracy?, livePeriod?, heading?, proximityAlertRadius? }`
+    (live when `livePeriod` is not 0). Each is a message by itself and needs `can_send_messages`.
+  - `fileId`: a file from an earlier message, by any bot's `file_id` for it. The message keeps the
+    file's kind and `file_unique_id`; a caption may go with it.
+  - `entities` and `captionEntities`: `MessageEntity` objects for the text and the caption,
+    checked as Telegram checks a user's. Types Telegram finds by itself are ignored, except
+    `phone_number`, which this server does not find.
+  - `sendAs`: in a supergroup, the chat to post on behalf of: the group itself, for an anonymous
+    administrator, or a channel the user created. Others fail with `SEND_AS_PEER_INVALID`. An
+    administrator with `is_anonymous` posts as the group even without it.
 - `vote(chatId, messageId, userId, optionIds)`: the user votes in a poll: option indexes, or `[]` to
   take the vote back. Fails as Telegram's app refuses: `Can't answer closed poll`,
   `Can't choose more than 1 option in the poll`, `Invalid option identifier specified`,
@@ -983,9 +1015,9 @@ the bot's Bot API root. Each action resolves once the update it causes has been 
 **Private chats**
 
 - `sendDirectMessage(userId, message)`: the user messages the bot privately; returns the
-  `message_id`. `message` is text, or anything `post` takes but `threadId`: a photo, other media
-  with a caption, a reply to one of the bot's messages, a forward or a poll. Empty text fails with
-  `MESSAGE_EMPTY`.
+  `message_id`. `message` is text, or anything `post` takes but `threadId` and `sendAs`: a photo,
+  other media with a caption, a reply to one of the bot's messages, a forward, a poll, a contact,
+  a location or an earlier file. Empty text fails with `MESSAGE_EMPTY`.
 - `voteDirect(userId, messageId, optionIds)`: the user votes in a poll the bot sent to their private
   chat; works like `vote`.
 - `getDirectMessages(userId)`: an array of the messages in the private chat between the user and
@@ -1131,8 +1163,11 @@ that fails answers `{ error }` with an HTTP status.
 - `POST chats/:id/messages`: the user posts `{ user_id, text }`, `{ user_id, photo_base64,
   caption? }` or `{ user_id, media: { type, base64, file_name?, mime_type? }, caption? }`,
   optionally `reply_to`, `message_thread_id` or
-  `forward_from: { user_id | sender_name | chat_id, message_id? }`, or a poll
-  `{ user_id, poll: { question, options, ... } }`; returns `{ message_id }`.
+  `forward_from: { user_id | sender_name | chat_id, message_id?, author_signature? }`, or a poll
+  `{ user_id, poll: { question, options, ... } }`; returns `{ message_id }`. It also takes
+  `contact: { phone_number, first_name, last_name?, vcard?, user_id? }`, `location: { latitude,
+  longitude, horizontal_accuracy?, live_period?, heading?, proximity_alert_radius? }`, `file_id`,
+  `entities`, `caption_entities` and `send_as`, as `post` does.
 - `POST chats/:id/messages/:messageId/vote`: the user `{ user_id, option_ids }` votes in a poll
   (`option_ids: []` takes the vote back); returns the poll.
 - `POST chats/:id/albums`: the user posts an album
@@ -1173,8 +1208,9 @@ count.
 **Private chats**
 
 - `POST users/:id/dm`: the user sends the bot a direct message, with the same body as
-  `POST chats/:id/messages` without `user_id` and `message_thread_id`: `{ text }`,
-  `{ photo_base64, caption? }`, `{ media, caption? }`, `reply_to`, `forward_from` or `poll`.
+  `POST chats/:id/messages` without `user_id`, `message_thread_id` and `send_as`: `{ text }`,
+  `{ photo_base64, caption? }`, `{ media, caption? }`, `reply_to`, `forward_from`, `poll`,
+  `contact`, `location`, `file_id` or `entities`.
 - `POST users/:id/dm/:messageId/vote`: the user `{ option_ids }` votes in a poll the bot sent
   privately.
 - `GET users/:id/dm`: an array of the private chat's messages, newest first.
@@ -1521,6 +1557,11 @@ fields below.
 
 ## Changes
 
+- **0.12.0**: members post on behalf of a chat (an anonymous administrator as the group, or a
+  channel they created), forward a group's own post (`MessageOriginChat`), share contacts and
+  locations, give their text entities such as `phone_number` and `text_link`, and post an earlier
+  file again with its `file_unique_id`. A bot's forward of a message sent on behalf of a chat now
+  has a `chat` origin.
 - **0.11.0**: the server answers as Telegram does wherever 0.10.0 did not, checked against the Bot
   API docs and the source of Telegram's Bot API server and TDLib: channel posts, who receives which
   update, webhook retries and concurrency, per-bot updates and file ids, ephemeral messages, invite

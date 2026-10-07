@@ -28,7 +28,8 @@ byte identical.
   [service messages about the bot itself](#service-messages-about-the-bot-itself),
   [forum topics](#forum-topics), [business connections](#business-connections),
   [command menus](#command-menus)
-- [Messages](#messages): [what members send](#what-members-send), [entities](#entities),
+- [Messages](#messages): [what members send](#what-members-send),
+  [posts on behalf of a chat](#posts-on-behalf-of-a-chat), [entities](#entities),
   [deleting](#deleting-messages), [editing](#editing), [editing media](#editing-media),
   [forwards and copies](#forwards-and-copies), [pins](#pins), [polls](#polls),
   [reactions](#reactions), [media](#media), [files](#files)
@@ -301,11 +302,36 @@ here.
 Besides text and photos, members post videos, animations (which carry a `document` too), stickers,
 voice notes, audio, video notes and documents, each needing its own permission (`can_send_videos`,
 `can_send_voice_notes`, ...), plus albums sharing a `media_group_id` and forwards with
-`forward_origin` (a user, a hidden user or a channel post). An edit by the author reaches bots as
+`forward_origin` (a user, a hidden user, a channel post, or a post made on behalf of a group, with
+`type: "chat"` and an optional `author_signature`). An edit by the author reaches bots as
 `edited_message` (in a channel, `edited_channel_post`) with `edit_date`. A member's text and
 captions, in posts and in edits, are trimmed of spaces and newlines at both ends, as Telegram's apps
 send them. A post, private message or edit whose text then shows nothing (only spaces, zero-width or
 other blank characters) fails with `MESSAGE_EMPTY`; such a caption is dropped.
+
+Contacts and locations need `can_send_messages`, as in TDLib's `can_send_message_content`, in groups
+and in the bot's private chat. A contact keeps `last_name`, `vcard` and `user_id` when given; the
+user must exist (`User not found`). Telegram fills `user_id` when the number belongs to an account;
+test users have no phone numbers, so the test names the user. A location is checked with TDLib's
+texts: a point off the map fails with `Invalid location specified` (`Invalid live location
+specified` for a live one), and a `live_period` other than 0 makes it live, from 60 seconds to a day
+or `0x7FFFFFFF`, with a heading of 1 to 360 and an alert radius up to 100000
+(`Wrong live location period specified` and the like). `horizontal_accuracy` is held to 1500
+meters. Unverified: what Telegram answers an empty phone number or first name, which TDLib does not
+check; this server refuses them as incomplete.
+
+### Posts on behalf of a chat
+
+In a supergroup, an administrator with `is_anonymous` posts as the group, as TDLib's
+`create_message_to_send` does: the message has `sender_chat` (the group), `from` the
+`@GroupAnonymousBot` user (id 1087968824) as the Bot API writes it, and the administrator's custom
+title as `author_signature`. A member may also post as a channel they created (`sendAs`); `from`
+is then `@Channel_Bot` (id 136817688) and `sender_chat` the channel. Naming any other chat, or any
+chat outside a supergroup or in a private chat, fails with `SEND_AS_PEER_INVALID`. These are real
+messages of the chat: bots get them, delete them with the usual rights, and a forward of one has
+the `chat` origin with the sender chat and signature. Waits and failure rules still name the person
+who posted. Telegram offers only public channels the user created; chats made in a test have no
+public username, so here any channel the member created counts.
 
 ### Entities
 
@@ -315,6 +341,17 @@ them: `mention`, `bot_command` (anywhere it does not touch a letter, digit, `_`,
 without a protocol needs a common top-level domain, so `example.com` and `shop.xyz` are links and
 `package.json`, `spam.test` and `evil.local` are not; with a protocol, as in
 `http://spam.invalid/x`, any domain is. Phone numbers are not marked.
+
+A test may also give a member's text or caption `entities` in the Bot API's `MessageEntity` shape.
+They are read as the Bot API reads them, then checked as TDLib checks a user's input entities
+(`get_message_entities`, `fix_formatted_text`): ranges must fit the text, a `text_link` URL must
+pass `LinkManager::check_link` and is kept as it rewrites it (`spam.example` becomes
+`http://spam.example/`), a `tg://user?id=` link becomes a `text_mention`, a mentioned user must
+exist, and a custom emoji id must not be 0. Refusals carry those texts, such as
+`Entity URL 'nodot' is invalid: Wrong HTTP URL`, without the Bot API's `Bad Request: `. The types
+Telegram finds by itself are found here and ignored when given, except `phone_number`: Telegram's
+server marks phone numbers by rules it does not publish, so the test marks them. Not modeled:
+Telegram drops a premium custom emoji from a user without Premium.
 
 ### Deleting messages
 
@@ -356,7 +393,10 @@ photo or video, and an audio or document keeps its kind. Other messages' media c
 ### Forwards and copies
 
 A forward carries `forward_origin`; a copy does not. A forward of a forward keeps the first origin
-and its date. A bot cannot forward from a chat it is not in; the source chat gets the checks under
+and its date. A message sent on behalf of a chat in a group (see
+[Posts on behalf of a chat](#posts-on-behalf-of-a-chat)) is forwarded with a `chat` origin, as
+TDLib's `MessageOrigin` reads Telegram's forward header. A bot cannot forward from a chat it is
+not in; the source chat gets the checks under
 [Which chats a bot may use](#which-chats-a-bot-may-use) for a call that needs only read access,
 before the chat the message goes to. A missing message fails with `message to forward not found` or
 `message to copy not found`. Service messages can't be forwarded or copied
@@ -469,7 +509,10 @@ a photo cannot stand in for any other kind, nor any other kind for a photo
 (`can't use file of type Photo as Document`), and a document, video or the like sent by another
 method stays what it was; a live photo's video sent on its own is a video. `getFile`'s `file_path`
 starts with the directory TDLib keeps that kind of file in, such as `photos/`, `voice/` or `music/`.
-The control API shows messages with the first bot's file_ids.
+The control API shows messages with the first bot's file_ids. A member posts an earlier file again
+by any bot's file_id for it (`fileId`): the message keeps its kind, `file_unique_id` and what its
+first sender said, and needs the permission for that kind. A new upload of the same bytes is a new
+file with a new `file_unique_id`.
 
 Telegram's docs: [sending files](https://core.telegram.org/bots/api#sending-files).
 
