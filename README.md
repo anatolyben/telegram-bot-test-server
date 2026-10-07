@@ -5,6 +5,10 @@ especially bots that manage groups. Your bot talks to it instead of Telegram, yo
 users, and then checks what the bot did. It keeps everything in memory and never talks to Telegram,
 so tests need no real accounts, phone numbers or groups, and can run as often as they like in CI.
 
+![The chat viewer in a browser: the chat list; a book club group where a bot welcomes a new member,
+removes a spam link and mutes its author, with each Bot API call beside what it did; and the
+group's members][viewer-desktop]
+
 **Start:** [Install](#install) · [Quick start](#quick-start) · [How it works](#how-it-works)
 
 **Guide:** [Write a test](#write-a-test) · [Make users act](#make-users-act) ·
@@ -1070,6 +1074,13 @@ are not in (a note says why); in a basic group, what was posted while they were 
 after a ban with `revoke_messages`. Not modeled: whether a private supergroup hides its earlier
 history from new members (the view marks where that history would start), and members a chat was
 created with count as present from the start.
+
+Here a book club group is seen as its member Carol, in a phone-sized window. The link the bot
+deleted is gone, and her own reactions are marked:
+
+<img src="https://raw.githubusercontent.com/anatolyben/telegram-bot-test-server/main/docs/images/viewer-as-member.png"
+  alt="The book club group on a phone, seen as Carol: the bot's welcome with its Rules button, the
+  messages and their reactions, and no deleted link" width="320">
 
 **Long chats.** A chat shows its latest 200 messages and events; "Load older messages" adds 200 at a
 time. At most 600 stay loaded: loading more drops the newest, and "Jump to latest", which says how
@@ -2453,6 +2464,17 @@ The scaling benchmark accepts `BENCH_HISTORY`, `BENCH_MESSAGES`, `BENCH_OBSERVER
 [measurements and regression record][performance] has the commands, raw samples and observed
 costs.
 
+`node scripts/screenshots.mjs` makes the two screenshots in `docs/images` again. A small grammY bot
+looks after a book club while the script plays its members, and Playwright takes the pictures.
+Playwright is not a dependency, so install it with its Chromium anywhere and point `PLAYWRIGHT`
+at it:
+
+```sh
+npm install --prefix /tmp/shots playwright
+/tmp/shots/node_modules/.bin/playwright install chromium
+PLAYWRIGHT=/tmp/shots/node_modules/playwright node scripts/screenshots.mjs
+```
+
 ## Status
 
 This is an early-stage project with a deliberately small scope, and the public API may still change.
@@ -2478,3 +2500,4 @@ MIT
 [behavior-url-buttons]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#url-buttons
 [owner-docs]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/owner-accounts.md
 [performance]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/performance.md
+[viewer-desktop]: https://raw.githubusercontent.com/anatolyben/telegram-bot-test-server/main/docs/images/viewer-desktop.png
