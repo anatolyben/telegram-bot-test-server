@@ -485,56 +485,67 @@ export function createUiState(model) {
   }
 
   /**
-   * The calls of a chat, or of "calls" (those no chat holds), oldest first,
-   * each with the chat it belongs to: the chat its chat_id names (a private
-   * chat as the user's chat with the calling bot), or the chat of the button
-   * press or join request query it answers. Business calls, calls naming no
-   * chat this server has, and refused requests (an unknown token, a body that
-   * could not be read) belong to "calls".
+   * The chat a call belongs to, `{ key, id }`: the chat its chat_id names (a
+   * private chat as the user's chat with the calling bot), or the chat of the
+   * button press or join request query it answers. Null for business calls
+   * and calls naming no chat this server has: they belong to "calls".
    */
-  function callsOf(key) {
-    const botIds = new Set(model.bots().map((record) => record.id));
-    const chatOf = (call) => {
-      const params = call.params ?? {};
-      if (params.business_connection_id != null) return null;
-      const method = String(call.method).toLowerCase();
-      const id = idOf(
-        method === "answercallbackquery"
-          ? model.chatOfQuery(params.callback_query_id)
-          : method === "answerchatjoinrequestquery"
-            ? model.chatOfQuery(params.chat_join_request_query_id)
-            : params.chat_id,
-      );
-      if (id === null) return null;
-      if (id < 0) {
-        const chat = model.chat(id);
-        return chat ? { key: String(chat.id), id: chat.id } : null;
-      }
-      const user = model.user(id);
-      return user && !user.is_bot && botIds.has(call.bot_id)
-        ? { key: `${id}:${call.bot_id}`, id }
-        : null;
-    };
-    const found = [];
-    const keep = (call, journal, chat) =>
-      found.push({
-        call,
-        journal,
-        chat,
-        request_number: requestNumber(call.request_id),
-      });
-    for (const call of model.calls()) {
-      const chat = chatOf(call);
-      if ((chat?.key ?? "calls") === key) keep(call, "calls", chat);
-    }
-    if (key === "calls") {
-      for (const call of model.rejectedRequests()) {
-        keep(call, "rejected_requests", null);
-      }
-    }
-    return found.sort(
-      (left, right) => left.request_number - right.request_number,
+  function callChat(call, botIds) {
+    const params = call.params ?? {};
+    if (params.business_connection_id != null) return null;
+    const method = String(call.method).toLowerCase();
+    const id = idOf(
+      method === "answercallbackquery"
+        ? model.chatOfQuery(params.callback_query_id)
+        : method === "answerchatjoinrequestquery"
+          ? model.chatOfQuery(params.chat_join_request_query_id)
+          : params.chat_id,
     );
+    if (id === null) return null;
+    if (id < 0) {
+      const chat = model.chat(id);
+      return chat ? { key: String(chat.id), id: chat.id } : null;
+    }
+    const user = model.user(id);
+    return user && !user.is_bot && botIds.has(call.bot_id)
+      ? { key: `${id}:${call.bot_id}`, id }
+      : null;
+  }
+
+  /**
+   * The calls numbered above `after` (of the chat `only`, else of every
+   * chat), by the key of the chat each belongs to (callChat), oldest first.
+   * Refused requests (an unknown token, a body that could not be read)
+   * belong to "calls".
+   */
+  function callsByChat({ after = 0, only = null } = {}) {
+    const botIds = new Set(model.bots().map((record) => record.id));
+    const byKey = new Map();
+    const keep = (key, call, journal, chat) => {
+      const number = requestNumber(call.request_id);
+      if (number <= after) return;
+      if (!byKey.has(key)) byKey.set(key, []);
+      byKey.get(key).push({ call, journal, chat, request_number: number });
+    };
+    for (const call of model.calls()) {
+      const chat = callChat(call, botIds);
+      const key = chat?.key ?? "calls";
+      if (only === null || key === only) keep(key, call, "calls", chat);
+    }
+    if (only === null || only === "calls") {
+      for (const call of model.rejectedRequests()) {
+        keep("calls", call, "rejected_requests", null);
+      }
+    }
+    for (const found of byKey.values()) {
+      found.sort((left, right) => left.request_number - right.request_number);
+    }
+    return byKey;
+  }
+
+  /** The calls of a chat, or of "calls" (those no chat holds), oldest first. */
+  function callsOf(key) {
+    return callsByChat({ only: key }).get(key) ?? [];
   }
 
   function requestNumber(requestId) {
@@ -616,9 +627,11 @@ export function createUiState(model) {
     return created;
   }
 
-  /** The chat list's row of the calls no chat holds; null when there are none. */
-  function callsRow() {
-    const found = callsOf("calls");
+  /**
+   * The chat list's row of the calls no chat holds (`found`, by default all
+   * of them); null when there are none.
+   */
+  function callsRow(found = callsOf("calls")) {
     if (!found.length) return null;
     return {
       key: "calls",
@@ -806,6 +819,16 @@ export function createUiState(model) {
       const created = storedBy(all);
       calls.calls = calls.calls.map((found) => callItem(found, created));
     }
+    return pageJson(target, window, as, calls, read.membersLimit);
+  }
+
+  /**
+   * A chat's page: `window` (its items and where they sit in the chat), the
+   * member it is seen as (`as`), its drawn-up `calls`, and the members (at
+   * most `membersLimit`, plus any its items or calls name), join requests,
+   * users and images it names.
+   */
+  function pageJson(target, window, as, calls, membersLimit) {
     const group = target.kind === "group" && as === null ? target.chat : null;
     const named = new Set();
     const ids = new Set(target.kind === "private" ? [target.userId] : []);
@@ -824,7 +847,7 @@ export function createUiState(model) {
       ids.add(call.targets.user_id);
       if (call.targets.user_id != null) named.add(call.targets.user_id);
     }
-    const members = group ? membersOf(group, read.membersLimit, named) : [];
+    const members = group ? membersOf(group, membersLimit, named) : [];
     const joinRequests = group
       ? [...group.joinRequests].map(([userId, request]) => ({
           user_id: userId,
@@ -864,6 +887,157 @@ export function createUiState(model) {
     };
   }
 
+  /** A chat's stored messages, ephemeral messages and events. */
+  function* storedIn(chat) {
+    yield* chat.messages.values();
+    yield* chat.ephemeral?.values() ?? [];
+    yield* chat.events ?? [];
+  }
+
+  /**
+   * What a recording keeps (index.js record/start and record/stop): for each
+   * chat, its items stored after the seq `startSeq` and its calls numbered
+   * after `startRequest`, as one page with every member and call. Older
+   * messages that a recorded call names (for a forward, in the chat it came
+   * from) or that a recorded message replies to come first, as context
+   * (`before_window`). `refs` names the chats; null records every chat with
+   * an item or a call in the window, and a ref that names no chat is listed
+   * in `missing`. The images the pages show are in one `files` table, and
+   * the state and pages keep none of their own.
+   */
+  function recorded({ refs = null, startSeq, startRequest }) {
+    const found = callsByChat({ after: startRequest });
+    const targets = new Map();
+    const missing = [];
+    const add = (target) => {
+      if (target && !targets.has(target.key)) targets.set(target.key, target);
+    };
+    if (refs !== null) {
+      for (const ref of refs) {
+        const target = resolve(ref);
+        if (target) add(target);
+        else missing.push(String(ref));
+      }
+    } else {
+      for (const chat of model.chats()) {
+        for (const stored of storedIn(chat)) {
+          if (stored.seq <= startSeq) continue;
+          add({ key: String(chat.id), kind: "group", chat });
+          break;
+        }
+      }
+      for (const chat of model.privateChats()) {
+        for (const stored of storedIn(chat)) {
+          if (stored.seq > startSeq) {
+            add(privatePair(chat.id, model.privatePairOf(chat, stored)));
+          }
+        }
+      }
+      for (const key of found.keys()) add(resolve(key));
+    }
+    // The calls first: a chat's context includes the messages any recorded
+    // call names in it.
+    const all = new Map();
+    const calls = new Map();
+    const named = new Map();
+    const namedIn = (chatId) => {
+      if (!named.has(chatId)) {
+        named.set(chatId, { messages: new Set(), ephemeral: new Set() });
+      }
+      return named.get(chatId);
+    };
+    for (const target of targets.values()) {
+      const items = itemsOf(target);
+      const created = storedBy(items);
+      const drawn = (found.get(target.key) ?? []).map((each) =>
+        callItem(each, created),
+      );
+      all.set(target.key, items);
+      calls.set(target.key, drawn);
+      for (const call of drawn) {
+        for (const { chat_id, message_id } of call.targets.messages) {
+          namedIn(chat_id).messages.add(message_id);
+        }
+        if (call.targets.ephemeral_message_id !== null) {
+          namedIn(call.chat_id).ephemeral.add(
+            call.targets.ephemeral_message_id,
+          );
+        }
+      }
+    }
+    const pages = {};
+    const files = {};
+    const rows = [];
+    for (const target of targets.values()) {
+      const items = all.get(target.key);
+      let start = items.findIndex((item) => item.seq > startSeq);
+      if (start < 0) start = items.length;
+      const chatId =
+        target.kind === "private" ? target.userId : (target.chat?.id ?? null);
+      const messages = new Set(named.get(chatId)?.messages);
+      const ephemeral = named.get(chatId)?.ephemeral ?? new Set();
+      const window = items.slice(start);
+      for (const item of window) {
+        const reply =
+          item.kind === "message" ? item.message.reply_to_message : null;
+        if (reply && reply.chat?.id === chatId) messages.add(reply.message_id);
+      }
+      const context = items
+        .slice(0, start)
+        .filter(
+          (item) =>
+            item.kind === "message" &&
+            (item.ephemeral
+              ? ephemeral.has(item.message.ephemeral_message_id)
+              : messages.has(item.message.message_id)),
+        )
+        .map((item) => ({ ...item, before_window: true }));
+      const kept = [...context, ...window];
+      const page = pageJson(
+        target,
+        {
+          items: kept,
+          has_older: false,
+          oldest_seq: kept.length ? kept[0].seq : null,
+          latest_seq: kept.length ? kept[kept.length - 1].seq : null,
+        },
+        null,
+        {
+          calls: calls.get(target.key),
+          calls_truncated: false,
+          calls_oldest_request: null,
+        },
+        Infinity,
+      );
+      Object.assign(files, page.files);
+      page.files = {};
+      pages[target.key] = page;
+      if (target.kind !== "calls") rows.push(row(target, kept, null));
+    }
+    rows.sort(
+      (left, right) => (right.last?.seq ?? -1) - (left.last?.seq ?? -1),
+    );
+    const callsList = targets.has("calls")
+      ? callsRow(found.get("calls") ?? [])
+      : null;
+    if (callsList) rows.unshift(callsList);
+    return {
+      state: {
+        instance: model.instance(),
+        epoch: model.epoch(),
+        version: model.version(),
+        cursor: model.cursor(),
+        clock: model.clock(),
+        bots: botList(),
+        chats: rows,
+        files: {},
+      },
+      pages,
+      files,
+      missing,
+    };
+  }
+
   /** A stored image's bytes and type, for /_fake/ui/files; null otherwise. */
   function file(fileId) {
     const info = imageOf(String(fileId));
@@ -872,5 +1046,5 @@ export function createUiState(model) {
       : null;
   }
 
-  return { state, page, resolve, file };
+  return { state, page, resolve, file, recorded };
 }

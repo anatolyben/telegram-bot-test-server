@@ -1280,6 +1280,15 @@ function viewerHost(host) {
   );
 }
 
+// A recording's name, which also names its files in recordDir.
+const RECORDING_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
+const RECORDING_NAME_ERROR =
+  'a recording needs a name of letters, digits, ".", "_" and "-"';
+// A chat as the viewer and recordings name it: a group's id, a user's chat
+// with a bot ("<user id>:<bot id>"), a user's chat with the first bot (their
+// id alone), or "calls", the bot calls no chat holds.
+const CHAT_REF = /^(?:-[1-9]\d*|[1-9]\d*(?::[1-9]\d*)?|calls)$/;
+
 function httpUrl(value) {
   try {
     return ["http:", "https:"].includes(new URL(String(value)).protocol);
@@ -1310,6 +1319,7 @@ function readBody(request) {
  *   floodControl?: boolean,
  *   ui?: boolean,
  *   clockWebhook?: string,
+ *   recordDir?: string,
  *   log?: (line: string) => void,
  * }} options
  */
@@ -1328,6 +1338,7 @@ export async function startTestServer({
   floodControl = false,
   ui = false,
   clockWebhook,
+  recordDir,
   log = () => {},
 }) {
   if (unimplementedMode !== "error" && unimplementedMode !== "ok") {
@@ -1340,6 +1351,12 @@ export async function startTestServer({
   }
   if (clockWebhook !== undefined && !httpUrl(clockWebhook)) {
     throw new TypeError("clockWebhook must be an http(s) URL");
+  }
+  if (
+    recordDir !== undefined &&
+    (typeof recordDir !== "string" || recordDir === "")
+  ) {
+    throw new TypeError("recordDir must be a directory path");
   }
   // The live viewer, created once the server listens; null with ui off.
   let viewer = null;
@@ -1386,6 +1403,11 @@ export async function startTestServer({
   const deliveryJournal = [];
   const deliveryAttempts = new Map();
   const snapshots = new Map();
+  // Recordings in progress by name, each with the marks it started at. They
+  // are not state: a snapshot leaves them out and a restore leaves them be.
+  const recordings = new Map();
+  // Loaded with the first recording, whether the viewer is on or not.
+  let recorder = null;
   const joinDecisions = new Map();
   const expiryTasks = new Map();
   const users = new Map();
@@ -7471,6 +7493,91 @@ export async function startTestServer({
     return { restored: true, epoch };
   }
 
+  /**
+   * Start recording what happens from now on, in the chats `refs` names (any
+   * ref the viewer takes; checked for its form only, since a scenario may
+   * start recording before its chats exist) or in every chat.
+   */
+  async function startRecording({ name, chats: refs } = {}) {
+    if (typeof name !== "string" || !RECORDING_NAME.test(name)) {
+      throw new TelegramError(400, RECORDING_NAME_ERROR);
+    }
+    if (refs !== undefined && (!Array.isArray(refs) || refs.length === 0)) {
+      throw new TelegramError(400, "chats must list one or more chats");
+    }
+    for (const ref of refs ?? []) {
+      if (
+        (typeof ref !== "string" && typeof ref !== "number") ||
+        !CHAT_REF.test(String(ref))
+      ) {
+        throw new TelegramError(400, `bad chat reference: ${ref}`);
+      }
+    }
+    recorder ??= await import("./ui/recording.js").then((module) =>
+      module.createRecorder(uiModel),
+    );
+    if (recordings.has(name)) {
+      throw new TelegramError(409, `recording ${name} is already running`);
+    }
+    const recording = {
+      name,
+      chats: refs === undefined ? null : refs.map(String),
+      epoch,
+      startSeq: nextSeq,
+      startRequest: requestSequence,
+      startedAt: clock.now(),
+    };
+    recordings.set(name, recording);
+    return {
+      name,
+      started_at: recording.startedAt,
+      epoch,
+      start_seq: recording.startSeq,
+      start_request: recording.startRequest,
+    };
+  }
+
+  /**
+   * Stop a recording: its HTML file and JSON twin, also written into
+   * recordDir when the server has one. A recording that started before a
+   * restore is dropped: its marks belong to the state the restore replaced.
+   */
+  async function stopRecording({ name } = {}) {
+    if (typeof name !== "string" || !RECORDING_NAME.test(name)) {
+      throw new TelegramError(400, RECORDING_NAME_ERROR);
+    }
+    const recording = recordings.get(name);
+    if (!recording) {
+      throw new TelegramError(404, `recording ${name} is not running`);
+    }
+    recordings.delete(name);
+    if (recording.epoch !== epoch) {
+      throw new TelegramError(
+        409,
+        `recording ${name} started before a restore; start it after restoring`,
+      );
+    }
+    const { html, json } = recorder.build(recording, {
+      stopSeq: nextSeq,
+      stopRequest: requestSequence,
+      stoppedAt: clock.now(),
+    });
+    if (recordDir === undefined) return { name, html, json };
+    try {
+      return {
+        name,
+        html,
+        json,
+        files: await recorder.save(recordDir, name, { html, json }),
+      };
+    } catch (error) {
+      throw new TelegramError(
+        500,
+        `recording ${name} could not be written: ${error.message}`,
+      );
+    }
+  }
+
   async function drainDeliveries({ botId, timeoutMs = 1000 } = {}) {
     if (
       botId != null &&
@@ -7541,6 +7648,12 @@ export async function startTestServer({
       if (!snapshots.delete(id))
         throw new TelegramError(404, "Unknown snapshot for this server");
       return { ok: true };
+    }
+    if (resource === "record" && id === "start" && method === "POST") {
+      return startRecording(body);
+    }
+    if (resource === "record" && id === "stop" && method === "POST") {
+      return stopRecording(body);
     }
     if (resource === "restore" && method === "POST") {
       clockWork += 1;
@@ -9753,6 +9866,12 @@ ${buttons}
     snapshot: () => act("POST", "snapshots"),
     restore: (snapshot) => act("POST", "restore", { snapshot }),
     releaseSnapshot: (snapshot) => act("DELETE", `snapshots/${snapshot}`),
+    startRecording: (name, { chats } = {}) =>
+      act("POST", "record/start", {
+        name,
+        ...(chats !== undefined ? { chats } : {}),
+      }),
+    stopRecording: (name) => act("POST", "record/stop", { name }),
     getClock: () => act("GET", "clock"),
     advanceTime: (ms) => act("POST", "clock", { ms }),
     drainDeliveries,
@@ -10087,6 +10206,7 @@ ${buttons}
         clock.clear();
         expiryTasks.clear();
         snapshots.clear();
+        recordings.clear();
         const closing = [...responseClosures];
         await new Promise((resolve) => {
           server.close(resolve);

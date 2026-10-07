@@ -2,7 +2,7 @@
 /**
  * Run the fake as a standalone server.
  *
- *   telegram-bot-test-server --token 123456:TEST --port 8081 [--host 127.0.0.1] [--config chats.json] [--ui]
+ *   telegram-bot-test-server --token 123456:TEST --port 8081 [--host 127.0.0.1] [--config chats.json] [--ui] [--record-dir recordings]
  *
  * The optional config file holds { "chats": [...], "publicChats": [...] }, in the
  * shape startTestServer() takes. Point the bot's Bot API base URL at the
@@ -21,12 +21,13 @@ const { values } = parseArgs({
     config: { type: "string" },
     "unimplemented-ok": { type: "boolean", default: false },
     ui: { type: "boolean", default: false },
+    "record-dir": { type: "string" },
   },
 });
 
 if (!values.token) {
   console.error(
-    "Usage: telegram-bot-test-server --token <id>:<secret> [--port 8081] [--host 127.0.0.1] [--username name] [--config chats.json] [--unimplemented-ok] [--ui]",
+    "Usage: telegram-bot-test-server --token <id>:<secret> [--port 8081] [--host 127.0.0.1] [--username name] [--config chats.json] [--unimplemented-ok] [--ui] [--record-dir dir]",
   );
   process.exit(2);
 }
@@ -44,6 +45,9 @@ const fake = await startTestServer({
   publicChats: config.publicChats ?? [],
   unimplemented: values["unimplemented-ok"] ? "ok" : "error",
   ui: values.ui,
+  ...(values["record-dir"] !== undefined
+    ? { recordDir: values["record-dir"] }
+    : {}),
   log: (line) => console.log(`[telegram-bot-test-server] ${line}`),
 });
 console.log(`[telegram-bot-test-server] listening at ${fake.origin}`);

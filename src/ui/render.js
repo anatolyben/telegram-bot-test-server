@@ -1172,6 +1172,10 @@ export function renderMessage(item, ctx, position = {}) {
       ? '<span class="tv-avatar-spacer" aria-hidden="true"></span>'
       : avatar(sender.id, sender.name, ctx);
   const receiver = m.receiver_user;
+  // A recording keeps older messages its calls and replies name, as context.
+  const context = item.before_window
+    ? '<div class="tv-context-note">from before the recording</div>'
+    : "";
   const ephemeral = item.ephemeral
     ? `<div class="tv-ephemeral" title="ephemeral message ${escapeAttr(m.ephemeral_message_id)}">◐ ${
         ctx.as != null && Number(receiver?.id) === Number(ctx.as)
@@ -1205,7 +1209,7 @@ export function renderMessage(item, ctx, position = {}) {
   ]
     .filter(Boolean)
     .join(" ");
-  return `<div class="${classes.join(" ")}"${messageAttrs(item, ctx, null)}>${avatarHtml}<div class="tv-msg-body"><div class="${bubbleClass}">${ephemeral}${header}${topic}${forward}${renderReply(item, ctx)}${media}${body}</div>${renderKeyboard(m.reply_markup)}</div></div>`;
+  return `<div class="${classes.join(" ")}"${messageAttrs(item, ctx, null)}>${avatarHtml}<div class="tv-msg-body"><div class="${bubbleClass}">${context}${ephemeral}${header}${topic}${forward}${renderReply(item, ctx)}${media}${body}</div>${renderKeyboard(m.reply_markup)}</div></div>`;
 }
 
 function topicName(ctx, threadId) {

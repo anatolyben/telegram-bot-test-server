@@ -12,7 +12,9 @@ so tests need no real accounts, phone numbers or groups, and can run as often as
 [Webhooks and polling](#webhooks-and-polling) · [More than one bot](#more-than-one-bot) ·
 [Channels, basic groups and forums](#channels-basic-groups-and-forums) ·
 [Failures, flood control and time](#failures-flood-control-and-time) · [Snapshots](#snapshots) ·
-[Telegram Login](#telegram-login) · [Owner accounts (GramJS)](#owner-accounts-gramjs) ·
+[Watch the chats in a browser](#watch-the-chats-in-a-browser) ·
+[Record a scenario](#record-a-scenario) · [Telegram Login](#telegram-login) ·
+[Owner accounts (GramJS)](#owner-accounts-gramjs) ·
 [Other languages](#other-languages-command-line-and-http)
 
 **Reference:** [Options](#options) · [Test actions](#test-actions) ·
@@ -782,6 +784,66 @@ rule failed, delayed or dropped is tagged `injected`, and a method this server l
   that is not loaded gets a note instead.
 - A chat's page holds at most 1000 calls; **Load older calls** fetches the earlier ones.
 
+### Record a scenario
+
+A recording keeps what happened in Telegram between two points of a test, as one HTML page that
+opens offline, with no server running, and its JSON twin. A test report can link each scenario to
+its page:
+
+```js
+const server = await startTestServer({
+  botToken: "123456:TEST",
+  chats: [{ id: GROUP, title: "Test Group", ownerId: 5000000001 }],
+  recordDir: "test-results/recordings",
+});
+
+await server.startRecording("spam-is-removed", { chats: [GROUP] });
+// The scenario: users act, the bot answers.
+const { files } = await server.stopRecording("spam-is-removed");
+console.log(files.html); // /…/test-results/recordings/spam-is-removed.html
+```
+
+Or one recording per test, named after it:
+
+```js
+const nameOf = (task) =>
+  task.name.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[-._]+/, "").slice(0, 100);
+beforeEach(async ({ task }) => {
+  await server.startRecording(nameOf(task));
+});
+afterEach(async ({ task }) => {
+  await server.stopRecording(nameOf(task));
+});
+```
+
+- `startRecording(name, { chats })` starts one. The name is letters, digits, `.`, `_` and `-`,
+  starting with a letter or digit; it also names the files. `chats` names chats as the viewer's
+  `chat` parameter does: a group id, `<user id>:<bot id>`, a user id (their chat with the first
+  bot) or `calls`. Without it, the recording holds every chat something happened in. A chat may be
+  named before it exists; one that still does not exist at the stop is listed in `missing_chats`.
+  Any number of recordings run at once, each under its own name.
+- `stopRecording(name)` returns `{ name, html, json }`: every message and event stored after the
+  start, deleted ones included, and every Bot API call received after it, with the members as they
+  are at the stop. Older messages that a recorded call names (a forward's in the chat it came from)
+  or that a recorded message replies to are included too, marked "from before the recording".
+- With the `recordDir` option, `stopRecording` also writes `<name>.html` and `<name>.json` there,
+  making the directory if needed and replacing earlier files of that name, and returns their paths
+  in `files`. Only the option chooses the directory, never a request.
+- The page is the viewer in a single file: the same panels, layouts, call filters, view as and
+  highlights, and the same URL parameters (`spam-is-removed.html?chat=-1001234567890&layout=split`).
+  Its scripts, styles, data and images are inside it, and its content security policy lets it load
+  nothing else. It needs JavaScript. Recording works with the `ui` option on or off.
+- The JSON twin has `format: "telegram-bot-test-server-recording"` and `format_version: 1`; the
+  marks in `window` (`start_seq` and `stop_seq` on the message log's cursor, `start_request` and
+  `stop_request` on the count of Bot API requests, `started_at` and `stopped_at` in server time);
+  the chat list in `state`; in `pages`, one page per chat, in the shape of the viewer's
+  `/_fake/ui/api/chats/<chat>`, with all its items, members and calls (context items carry
+  `before_window: true`); and every image once, as a `data:` URI, in `files`.
+- Recordings are not part of snapshots. One that started before a `restore` cannot be stopped:
+  `stopRecording` fails and drops it, since its marks belong to the state the restore replaced.
+  When tests restore a snapshot, restore first, then start recording. `stop()` drops recordings
+  still running.
+
 ### Telegram Login
 
 The server also answers Telegram Login (OpenID Connect) at oauth.telegram.org's paths, so an app
@@ -932,6 +994,7 @@ Read the origin from that line. SIGTERM or Ctrl-C stops the server.
 | `--username`         | `example_bot`   | The bot's username.                                    |
 | `--config`           | none            | A JSON file with `chats` and `publicChats`.            |
 | `--unimplemented-ok` | off             | Answer `true` to unsupported methods that return True. |
+| `--record-dir`       | none            | Where recordings are written.                          |
 
 These are all the flags; there is no `--help`. Without `--token` it prints its usage line, and an
 unknown flag stops it with an error.
@@ -1047,6 +1110,8 @@ deliveries routes take camelCase fields, like their JavaScript methods.
   ([Flood control](#flood-control)).
 - `clock` (default real time): `{ now: <Unix ms> }`: a manual clock that only `advanceTime` moves
   ([Time](#time)).
+- `recordDir` (default none): the directory `stopRecording` writes each recording into
+  ([Record a scenario](#record-a-scenario)).
 - `log` (default none): receives one line per notable event: unsupported methods, webhook
   failures, internal errors.
 
@@ -1213,6 +1278,11 @@ the bot's Bot API root. Each action resolves once the update it causes has been 
   ([Snapshots](#snapshots)).
 - `getClock()`, `advanceTime(ms)`: read and move a manual clock ([Time](#time)).
 
+**Recordings**
+
+- `startRecording(name, { chats })`, `stopRecording(name)`: record what happens between the two as
+  an HTML page and its JSON twin ([Record a scenario](#record-a-scenario)).
+
 **Stopping**
 
 - `stop()`: shut the server down. It cancels waits and delays, aborts deliveries in progress,
@@ -1374,6 +1444,14 @@ count.
 - `POST updates/:updateId/redeliver`: deliver that update again to its bot's webhook
   `{ bot_id? }`; 404 for an unknown update, 409 when the bot has no webhook or `bot_id` must name
   one of several bots that got it. Returns `{ update_id }`.
+
+**Recordings**
+
+- `POST record/start`: start recording `{ name, chats? }`; returns
+  `{ name, started_at, epoch, start_seq, start_request }`. A bad name or chat answers 400, and a
+  name already recording 409.
+- `POST record/stop`: stop `{ name }`; returns `{ name, html, json, files? }`. An unknown name
+  answers 404, and a recording that started before a restore 409.
 
 **Waits, snapshots, time and deliveries**
 

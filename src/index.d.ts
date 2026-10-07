@@ -65,6 +65,12 @@ export interface TelegramBotTestServerOptions {
   ui?: boolean;
   /** POST { now, mode } here whenever the manual clock is set or advanced. Default none. */
   clockWebhook?: string;
+  /**
+   * Write each stopped recording here, as `<name>.html` and `<name>.json`
+   * (the directory is made when missing). Default none: stopRecording only
+   * returns them.
+   */
+  recordDir?: string;
   log?: (line: string) => void;
 }
 
@@ -431,6 +437,67 @@ export interface FakeClockState {
   now: number;
   scheduled: number;
 }
+/** A chat as the viewer and recordings name it: a group's id, "<user id>:<bot id>", a user id (their chat with the first bot) or "calls". */
+export type ChatRef = number | string;
+
+export interface RecordingStarted {
+  name: string;
+  /** Server clock milliseconds. */
+  started_at: number;
+  epoch: number;
+  /** The message log cursor at the start: the recording holds what comes after it. */
+  start_seq: number;
+  /** How many Bot API requests had been received: it holds the calls after them. */
+  start_request: number;
+}
+
+/**
+ * A recording's data, in the viewer's own shapes: the chat list (`state`) and
+ * one page per recorded chat, keyed by its ChatRef, with every item and call
+ * of the window, every member, and older messages the window's calls or
+ * replies name (`before_window: true`).
+ */
+export interface RecordingJson {
+  format: "telegram-bot-test-server-recording";
+  format_version: 1;
+  name: string;
+  /** The chats asked for, as text; null for every chat. */
+  chats_filter: string[] | null;
+  window: {
+    epoch: number;
+    start_seq: number;
+    stop_seq: number;
+    start_request: number;
+    stop_request: number;
+    started_at: number;
+    stopped_at: number;
+  };
+  state: Record<string, unknown>;
+  pages: Record<string, Record<string, unknown>>;
+  /** Every image the pages show, once, as a data: URI. */
+  files: Record<
+    string,
+    {
+      url: string;
+      mime_type: string;
+      width: number | null;
+      height: number | null;
+      size: number;
+    }
+  >;
+  /** Chats asked for that did not exist when the recording stopped. */
+  missing_chats: string[];
+}
+
+export interface Recording {
+  name: string;
+  /** One standalone page that shows the recording offline. */
+  html: string;
+  json: RecordingJson;
+  /** Where they were written, with the recordDir option. */
+  files?: { html: string; json: string };
+}
+
 export interface FakeDelivery {
   update_id: number;
   bot_id: number;
@@ -506,6 +573,20 @@ export interface TelegramBotTestServer {
   snapshot(): Promise<string>;
   restore(snapshot: string): Promise<{ restored: true; epoch: number }>;
   releaseSnapshot(snapshot: string): Promise<{ ok: true }>;
+  /**
+   * Record what happens from now on, in the chats named (by default every
+   * chat something happens in), until stopRecording. Any number of names can
+   * record at once.
+   */
+  startRecording(
+    name: string,
+    options?: { chats?: ChatRef[] },
+  ): Promise<RecordingStarted>;
+  /**
+   * The recording as one HTML page and its JSON twin. A recording that
+   * started before a restore is dropped with an error.
+   */
+  stopRecording(name: string): Promise<Recording>;
   getClock(): Promise<FakeClockState>;
   advanceTime(ms: number): Promise<FakeClockState>;
   /**
