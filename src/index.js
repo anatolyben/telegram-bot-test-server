@@ -7457,14 +7457,22 @@ export async function startTestServer({
       type: sent.type,
       chat_id: sent.chatId,
       at: sent.at,
-      state: queued.has(updateId)
-        ? "pending"
-        : sent.received && !sent.dropped
-          ? "delivered"
-          : "dropped",
+      state: updateState(sent, updateId, queued),
       received: sent.received,
       update: JSON.parse(sent.body),
     };
+  }
+
+  /**
+   * An update's state: pending while it is in the bot's queue, then delivered
+   * once the bot confirmed it, or dropped.
+   */
+  function updateState(sent, updateId, queued) {
+    return queued.has(updateId)
+      ? "pending"
+      : sent.received && !sent.dropped
+        ? "delivered"
+        : "dropped";
   }
 
   /** The updates a bot was sent, in update_id order, filtered by `keep`. */
@@ -7707,6 +7715,56 @@ export async function startTestServer({
     };
   }
 
+  /**
+   * The read of an update wait. It looks at each update the bot was sent once,
+   * for its type and chat, which never change, and keeps those that match;
+   * their state it checks on every read. An update leaves the queue only once
+   * and is dropped only while in it, so one that left it delivered, or one
+   * dropped, stays so: when that is not the state waited for, it is let go.
+   * The first match is then the one observe finds.
+   */
+  function updateWaitRead(condition) {
+    const types = condition.type == null ? null : [condition.type].flat();
+    let read = null;
+    let next = 0;
+    let kept = [];
+    return () => {
+      const record = requireBot(condition.botId);
+      if (record !== read) {
+        read = record;
+        next = Math.max(
+          record.firstUpdateId,
+          (condition.afterUpdateId ?? 0) + 1,
+        );
+        kept = [];
+      }
+      for (; next <= record.lastUpdateId; next += 1) {
+        const sent = sentUpdates.get(updateKey(record.id, next));
+        if (
+          sent &&
+          (types === null || types.includes(sent.type)) &&
+          (condition.chatId == null || sent.chatId === condition.chatId)
+        ) {
+          kept.push({ updateId: next, sent });
+        }
+      }
+      if (kept.length === 0) return null;
+      const queued = new Set(record.queue.map((update) => update.update_id));
+      const open = [];
+      for (const { updateId, sent } of kept) {
+        const state = updateState(sent, updateId, queued);
+        if (condition.state == null || state === condition.state) {
+          return journalEntry(record, updateId, queued);
+        }
+        if (state === "pending" || !(sent.received || sent.dropped)) {
+          open.push({ updateId, sent });
+        }
+      }
+      kept = open;
+      return null;
+    };
+  }
+
   function observe(condition, describe = false) {
     if (condition.kind === "quiet") {
       const { busy, observed } = quietState(condition.botIds);
@@ -7929,7 +7987,9 @@ export async function startTestServer({
           ? quiet
           : condition.kind === "message" && condition.messageId == null
             ? messageWaitRead(condition)
-            : () => observe(condition).result,
+            : condition.kind === "update"
+              ? updateWaitRead(condition)
+              : () => observe(condition).result,
         timeoutMs,
         () =>
           diagnostic(
