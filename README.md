@@ -268,6 +268,14 @@ const [size] = (await server.getMessage(GROUP, first)).message.photo;
 await server.post(GROUP, ann, { fileId: size.file_id }); // the same file_unique_id
 ```
 
+The owner, or an administrator with `can_promote_members`, promotes members with the rights they
+choose and demotes them. The chat's administrator bots get `chat_member`:
+
+```js
+await server.promoteMember(GROUP, ann, { rights: { can_delete_messages: true } });
+await server.demoteMember(GROUP, ann);
+```
+
 Users can also post photos, media, albums and forwards, edit their messages, react, pin, press
 buttons in private chats and on ephemeral messages, change their profile, and rename the chat or
 change its photo. [Test actions](#test-actions) lists them all.
@@ -433,6 +441,10 @@ const secondBot = new Bot("654321:SECOND", { client: { apiRoot: server.origin } 
 `status` the bot becomes an administrator; `rights` grants or withholds rights, such as
 `{ can_post_messages: false }`. The bot gets `my_chat_member`, the chat's administrator bots
 `chat_member`, and a group a service message when the bot joins or leaves.
+
+`deleteBot(second.id)` deletes a bot that `addBot` added. It leaves every chat it is in, so the
+other bots hear of it as when a bot leaves, and its token then gets 401 `Unauthorized`. The first
+bot can't be deleted.
 
 Each bot has its own membership and rights in each chat, its own `update_id` sequence, its own
 `file_id`s, and hears only the button presses on keyboards it put on messages. Users write
@@ -1045,11 +1057,25 @@ the bot's Bot API root. Each action resolves once the update it causes has been 
 - `addBot({ token, username, firstName, loginClientSecret, supportsJoinRequestQueries })`: another
   bot, with its own webhook or update queue; it is in no chat yet. Returns the bot's user, with
   its `id`.
+- `deleteBot(botId)`: a bot `addBot` added is deleted. Its token gets 401 `Unauthorized` from then
+  on, and a waiting `getUpdates` answers at once. It leaves every chat it is in, as with
+  `leaveChat`; Telegram does not document what a deleted bot's chats see, so this is unverified.
+  It stays a user that earlier messages name, and a press on its buttons goes unanswered. The
+  first bot can't be deleted. Returns `{ deleted: true }`.
 - `createChat({ ownerId, title, type, ownerName, isForum })`: a new supergroup, forum (`isForum`),
   basic group (`type: "group"`) or channel (`type: "channel"`) with no bot in it; returns its id.
 - `setBotMembership(chatId, botId, { status, rights, by })`: the owner (or `by`) adds, promotes,
   demotes or removes a bot; `status` is `administrator` (default), `member`, `left` or `kicked`.
   The bot gets `my_chat_member`. Returns its membership.
+- `promoteMember(chatId, userId, { by, rights })`: a person (`by`, default the creator) makes a
+  member an administrator with `rights`, such as `{ can_delete_messages: true }`. Rights left out
+  are not granted, and no right at all makes them a member. The person must be the creator or an
+  administrator with `can_promote_members`, who grants only rights they hold and edits only
+  administrators they promoted. Refusals carry Telegram's texts, such as `Not enough rights`,
+  `RIGHT_FORBIDDEN` or `CHAT_ADMIN_REQUIRED`. In a basic group only the creator promotes, with the
+  group's fixed rights. The chat's administrator bots get `chat_member`. Returns the member.
+- `demoteMember(chatId, userId, { by })`: a person makes an administrator a member again, under
+  the same rules. Demoting someone who is not an administrator changes nothing.
 - `addBotViaLink(chatId, botId, { by, startParameter, rights })`: a person adds the bot through its
   `startgroup` link (as an administrator with `rights`), then `/start@<bot> <startParameter>` is
   posted; or its `startchannel` link. Returns the bot's membership.
@@ -1223,6 +1249,8 @@ count.
   `{ token, username, first_name?, login_client_secret?, supports_join_request_queries? }`; it is
   in no chat yet.
 - `GET bots`: every bot, with its webhook URL and `login_client_secret`.
+- `DELETE bots/:id`: delete a bot added with `POST bots`, as `deleteBot` does; returns
+  `{ deleted: true }`.
 - `POST chats`: create
   `{ owner_id, title?, type?: "supergroup" | "group" | "channel", owner_name?, is_forum? }`;
   returns the chat.
@@ -1232,6 +1260,10 @@ count.
 - `POST chats/:id/bots` with `start_parameter`: a person `{ by?, bot_id, start_parameter, rights? }`
   adds the bot through its `startgroup` link, or, with `rights` and an empty `start_parameter`, a
   channel's `startchannel` link.
+- `POST chats/:id/members/:userId/promote`: a person `{ by?, rights }` makes the member an
+  administrator, as `promoteMember` does; returns the member.
+- `POST chats/:id/members/:userId/demote`: a person `{ by? }` makes the administrator a member
+  again; returns the member.
 - `POST chats/:id/migrate`: upgrade a basic group `{ by? }`; returns the new supergroup.
 - `POST chats/:id/title`: a person renames the chat `{ by?, title }`.
 - `POST chats/:id/photo`: a person sets the chat photo `{ by?, base64 }`.
@@ -1561,7 +1593,8 @@ fields below.
   channel they created), forward a group's own post (`MessageOriginChat`), share contacts and
   locations, give their text entities such as `phone_number` and `text_link`, and post an earlier
   file again with its `file_unique_id`. A bot's forward of a message sent on behalf of a chat now
-  has a `chat` origin.
+  has a `chat` origin. People promote and demote members (`promoteMember`, `demoteMember`), and a
+  test deletes a bot it added (`deleteBot`).
 - **0.11.0**: the server answers as Telegram does wherever 0.10.0 did not, checked against the Bot
   API docs and the source of Telegram's Bot API server and TDLib: channel posts, who receives which
   update, webhook retries and concurrency, per-bot updates and file ids, ephemeral messages, invite

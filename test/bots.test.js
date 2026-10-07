@@ -2354,6 +2354,96 @@ describe("bot membership", () => {
   });
 });
 
+describe("deleting a bot", () => {
+  it("takes a deleted bot out of its chats, telling the other bots, and refuses its token", async () => {
+    const { fake, api, second } = await setup();
+    const me = (await api("getMe")).result;
+    const channel = await fake.createChat({ type: "channel", ownerId: OWNER });
+    await fake.setBotMembership(channel, me.id, { status: "administrator" });
+    for (const chat of [GROUP, channel]) {
+      await fake.setBotMembership(chat, second.id, { status: "administrator" });
+    }
+    const hook = await startReceiver();
+    await api("setWebhook", {
+      url: hook.url,
+      allowed_updates: ["message", "chat_member", "callback_query"],
+    });
+    const sent = await api(
+      "sendMessage",
+      {
+        chat_id: GROUP,
+        text: "vote",
+        reply_markup: {
+          inline_keyboard: [[{ text: "Yes", callback_data: "yes" }]],
+        },
+      },
+      SECOND_TOKEN,
+    );
+    const pending = (await api("getUpdates", {}, SECOND_TOKEN)).result;
+    const poll = api(
+      "getUpdates",
+      { offset: pending.at(-1).update_id + 1, timeout: 5 },
+      SECOND_TOKEN,
+    );
+    await fake.waitFor({
+      kind: "call",
+      botId: second.id,
+      method: "getUpdates",
+      params: { timeout: "5" },
+    });
+
+    expect(await fake.deleteBot(second.id)).toEqual({ deleted: true });
+
+    // Its waiting getUpdates answers at once; then its token is unknown.
+    expect((await poll).result).toEqual([]);
+    expect(await api("getMe", {}, SECOND_TOKEN)).toMatchObject({
+      status: 401,
+      description: "Unauthorized",
+    });
+    expect((await fake.getCalls()).rejected_requests.at(-1)).toMatchObject({
+      method: "getMe",
+      bot_id: second.id,
+      status: 401,
+    });
+    await expect
+      .poll(() =>
+        hook
+          .ofType("chat_member")
+          .filter((change) => change.new_chat_member.status === "left")
+          .map((change) => [
+            change.chat.id,
+            change.from.id,
+            change.old_chat_member.status,
+            change.new_chat_member.user.id,
+          ]),
+      )
+      .toEqual([
+        [GROUP, second.id, "administrator", second.id],
+        [channel, second.id, "administrator", second.id],
+      ]);
+    await expect
+      .poll(() =>
+        hook
+          .ofType("message")
+          .filter((message) => message.left_chat_member)
+          .map((message) => [message.from.id, message.left_chat_member.id]),
+      )
+      .toEqual([[second.id, second.id]]);
+    expect(
+      (await api("getChatMember", { chat_id: GROUP, user_id: second.id }))
+        .result.status,
+    ).toBe("left");
+    // A press on its button reaches no bot.
+    expect(
+      await fake.pressButton(GROUP, sent.result.message_id, OWNER, "yes"),
+    ).toEqual({ answered: false });
+    expect(hook.ofType("callback_query")).toEqual([]);
+    await expect(fake.deleteBot(me.id)).rejects.toThrow(
+      "the first bot can't be deleted",
+    );
+  });
+});
+
 describe("chats created during a run", () => {
   it("keeps the pinned messages and members a test can read", async () => {
     const { fake, api } = await setup();

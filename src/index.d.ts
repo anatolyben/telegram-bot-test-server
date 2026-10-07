@@ -464,6 +464,11 @@ export interface TelegramBotTestServer {
     /** Its Telegram Login client secret; default random. */
     loginClientSecret?: string;
   }): Promise<{ id: number; is_bot: true; username: string }>;
+  /**
+   * Delete a bot added with addBot: it leaves every chat it is in, and its
+   * token gets 401 Unauthorized from then on. The first bot can't be deleted.
+   */
+  deleteBot(botId: number): Promise<{ deleted: true }>;
   /** A group, forum or channel owned by `ownerId`, with no bot in it; returns its id. */
   createChat(chat: NewChat): Promise<number>;
   /**
@@ -515,6 +520,24 @@ export interface TelegramBotTestServer {
     chatId: number,
     botId: number,
     membership?: BotMembership,
+  ): Promise<ChatMember>;
+  /**
+   * A person (`by`, default the creator) makes a member an administrator with
+   * the rights given, e.g. { can_delete_messages: true }. Rights left out are
+   * not granted, and no right at all makes them a member. The chat's
+   * administrator bots get chat_member. Fails as Telegram refuses the person;
+   * in a basic group only the creator promotes, with the group's fixed rights.
+   */
+  promoteMember(
+    chatId: number,
+    userId: number,
+    promotion: { by?: number; rights: Record<string, boolean> },
+  ): Promise<ChatMember>;
+  /** A person (`by`, default the creator) makes an administrator a member again. */
+  demoteMember(
+    chatId: number,
+    userId: number,
+    options?: { by?: number },
   ): Promise<ChatMember>;
   /** Create a forum topic, with its service message; returns its message_thread_id. */
   createTopic(

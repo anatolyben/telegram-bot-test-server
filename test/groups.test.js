@@ -516,6 +516,183 @@ describe("people changing the chat", () => {
   });
 });
 
+describe("people promoting and demoting members", () => {
+  it("promotes a member with the rights chosen and demotes them, telling administrator bots", async () => {
+    const { fake, api, hook, me } = await setup();
+    const group = await fake.createChat({ ownerId: OWNER });
+    await fake.setBotMembership(group, me.id, { status: "administrator" });
+    const ann = await fake.createUser({ first_name: "Ann" });
+    await fake.join(group, ann);
+
+    const promoted = await fake.promoteMember(group, ann, {
+      rights: { can_delete_messages: true, can_restrict_members: true },
+    });
+
+    const admin = {
+      user: { id: ann },
+      status: "administrator",
+      can_be_edited: false,
+      can_manage_chat: true,
+      can_change_info: false,
+      can_delete_messages: true,
+      can_invite_users: false,
+      can_restrict_members: true,
+      can_promote_members: false,
+      is_anonymous: false,
+    };
+    expect(promoted).toMatchObject(admin);
+    expect(
+      (await api("getChatMember", { chat_id: group, user_id: ann })).result,
+    ).toMatchObject(admin);
+    const admins = async () =>
+      (await api("getChatAdministrators", { chat_id: group })).result.map(
+        (entry) => entry.user.id,
+      );
+    expect(await admins()).toContain(ann);
+
+    expect(await fake.demoteMember(group, ann)).toEqual({
+      user: expect.objectContaining({ id: ann }),
+      status: "member",
+    });
+    expect(await admins()).not.toContain(ann);
+    await expect
+      .poll(() =>
+        hook
+          .ofType("chat_member")
+          .filter((change) => change.new_chat_member.user.id === ann)
+          .map((change) => [
+            change.from.id,
+            change.old_chat_member.status,
+            change.new_chat_member.status,
+          ]),
+      )
+      .toEqual([
+        [ann, "left", "member"],
+        [OWNER, "member", "administrator"],
+        [OWNER, "administrator", "member"],
+      ]);
+    expect(hook.ofType("chat_member").at(-2).new_chat_member).toMatchObject(
+      admin,
+    );
+  });
+
+  it("lets an administrator with can_promote_members promote, and refuses what Telegram refuses", async () => {
+    const { fake, hook, me } = await setup();
+    const group = await fake.createChat({ ownerId: OWNER });
+    await fake.setBotMembership(group, me.id, { status: "administrator" });
+    const [ann, bob, carl, dave] = [
+      await fake.createUser(),
+      await fake.createUser(),
+      await fake.createUser(),
+      await fake.createUser(),
+    ];
+    for (const user of [ann, bob, carl]) await fake.join(group, user);
+    await fake.promoteMember(group, ann, {
+      rights: { can_promote_members: true, can_delete_messages: true },
+    });
+    await fake.promoteMember(group, carl, {
+      rights: { can_delete_messages: true },
+    });
+
+    await fake.promoteMember(group, bob, {
+      by: ann,
+      rights: { can_delete_messages: true },
+    });
+    await expect
+      .poll(() => hook.ofType("chat_member").at(-1))
+      .toMatchObject({
+        from: { id: ann },
+        new_chat_member: { status: "administrator", user: { id: bob } },
+      });
+    // Rights the promoter lacks, an administrator someone else promoted, the
+    // owner, themselves and someone outside the chat are refused, as is
+    // anyone without can_promote_members.
+    await expect(
+      fake.promoteMember(group, bob, {
+        by: ann,
+        rights: { can_change_info: true },
+      }),
+    ).rejects.toThrow("RIGHT_FORBIDDEN");
+    await expect(fake.demoteMember(group, carl, { by: ann })).rejects.toThrow(
+      "CHAT_ADMIN_REQUIRED",
+    );
+    await expect(fake.demoteMember(group, OWNER, { by: ann })).rejects.toThrow(
+      "Can't remove chat owner",
+    );
+    await expect(
+      fake.promoteMember(group, ann, {
+        by: ann,
+        rights: { can_delete_messages: true },
+      }),
+    ).rejects.toThrow("Can't promote self");
+    await expect(
+      fake.promoteMember(group, dave, {
+        by: ann,
+        rights: { can_delete_messages: true },
+      }),
+    ).rejects.toThrow("USER_NOT_PARTICIPANT");
+    await expect(
+      fake.promoteMember(group, carl, {
+        by: bob,
+        rights: { can_pin_messages: true },
+      }),
+    ).rejects.toThrow("Not enough rights");
+    await expect(
+      fake.promoteMember(group, bob, { rights: { can_delete_message: true } }),
+    ).rejects.toThrow('unknown administrator right "can_delete_message"');
+    // The owner edits any administrator; no right at all makes a member.
+    expect((await fake.promoteMember(group, bob, { rights: {} })).status).toBe(
+      "member",
+    );
+  });
+
+  it("lets only a basic group's creator promote, with the group's fixed rights", async () => {
+    const { fake, api, me } = await setup();
+    const group = await fake.createChat({ type: "group", ownerId: OWNER });
+    await fake.setBotMembership(group, me.id, { status: "administrator" });
+    const [ann, bob] = [await fake.createUser(), await fake.createUser()];
+    for (const user of [ann, bob]) await fake.join(group, user);
+
+    await fake.promoteMember(group, ann, {
+      rights: { can_promote_members: true },
+    });
+
+    expect(
+      (await api("getChatMember", { chat_id: group, user_id: ann })).result,
+    ).toEqual({
+      user: expect.objectContaining({ id: ann }),
+      status: "administrator",
+      can_be_edited: false,
+      can_manage_chat: true,
+      can_change_info: true,
+      can_delete_messages: true,
+      can_invite_users: true,
+      can_restrict_members: true,
+      can_pin_messages: true,
+      can_promote_members: false,
+      can_manage_video_chats: true,
+      can_post_stories: false,
+      can_edit_stories: false,
+      can_delete_stories: false,
+      can_manage_tags: true,
+      can_send_welcome_messages: true,
+      is_anonymous: false,
+    });
+    await expect(
+      fake.promoteMember(group, bob, {
+        by: ann,
+        rights: { can_delete_messages: true },
+      }),
+    ).rejects.toThrow("Need owner rights in the group chat");
+    await expect(
+      fake.promoteMember(group, OWNER, {
+        rights: { can_delete_messages: true },
+      }),
+    ).rejects.toThrow("Can't promote or demote self");
+    expect((await fake.demoteMember(group, ann)).status).toBe("member");
+  });
+});
+
 describe("member count and leaving", () => {
   it("counts members as they join and leave", async () => {
     const { fake, api, me } = await setup();

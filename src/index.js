@@ -281,6 +281,20 @@ const OWNER_ADMIN_RIGHTS = Object.freeze({
   can_restrict_members: true,
   can_pin_messages: true,
 });
+// A basic group's administrators all have the same rights: Telegram keeps only
+// whether someone is one (messages.editChatAdmin), and TDLib reads each with
+// these (DialogParticipant.cpp GroupAdministrator).
+const BASIC_GROUP_ADMIN_RIGHTS = Object.freeze({
+  can_manage_chat: true,
+  can_change_info: true,
+  can_delete_messages: true,
+  can_invite_users: true,
+  can_restrict_members: true,
+  can_pin_messages: true,
+  can_manage_video_chats: true,
+  can_manage_tags: true,
+  can_send_welcome_messages: true,
+});
 
 // The users the Bot API writes as `from` of a message sent on behalf of a
 // chat in a group: the group itself (an anonymous administrator) or a channel
@@ -1947,6 +1961,30 @@ export async function startTestServer({
     return chatMemberObject(chat, userId)[right] === true;
   }
 
+  /**
+   * TDLib drops the rights this kind of chat does not have before the server
+   * checks the rest; with none left, the user stays a member
+   * (DialogParticipant.cpp AdministratorRights and Administrator).
+   */
+  function dropRightsChatLacks(chat, rights) {
+    const kept = chatAdminRights(chat);
+    for (const right of ADMIN_RIGHTS) {
+      if (!kept.includes(right)) rights[right] = false;
+    }
+    return rights;
+  }
+
+  /** Whether a promotion grants a right the promoter does not hold. */
+  function grantsRightNotHeld(chat, rights, promoterId) {
+    return Object.entries(rights).some(
+      ([right, granted]) =>
+        granted &&
+        right !== "is_anonymous" &&
+        right !== "can_manage_chat" &&
+        !hasRight(chat, promoterId, right),
+    );
+  }
+
   function chatKind(chat) {
     return chat.type === "channel" || chat.type === "group"
       ? chat.type
@@ -3062,6 +3100,145 @@ export async function startTestServer({
       );
     }
     return Promise.all(handed).then(() => after);
+  }
+
+  /**
+   * A person makes a member an administrator with the rights given, or a
+   * member again when no right is given, as Telegram's apps do through TDLib's
+   * setChatMemberStatus (DialogParticipantManager.cpp). A change to nothing new
+   * succeeds at once (set_channel_participant_status_impl); demoting someone
+   * who is not an administrator changes nothing. In a supergroup or channel
+   * the owner can't be changed, nobody promotes themselves, and the promoter
+   * needs can_promote_members (promote_channel_participant); then
+   * channels.editAdmin checks what promoteChatMember checks. In a basic group
+   * only the creator promotes, never themselves (set_chat_participant_status),
+   * and messages.editChatAdmin says only whether someone is an administrator.
+   * The chat's administrator bots get chat_member from the person.
+   */
+  function promoteByPerson(chat, userId, { by, rights }) {
+    const actor = requireUser(by ?? creatorOf(chat));
+    const target = requireUser(userId);
+    if (!isObject(rights)) {
+      throw new TelegramError(
+        400,
+        "rights must be an object of administrator rights",
+      );
+    }
+    for (const right of Object.keys(rights)) {
+      if (!ADMIN_RIGHTS.includes(right)) {
+        throw new TelegramError(400, `unknown administrator right "${right}"`);
+      }
+    }
+    if (chat.migratedTo != null) {
+      throw new TelegramError(400, "Chat is deactivated");
+    }
+    const granted = dropRightsChatLacks(
+      chat,
+      Object.fromEntries(
+        ADMIN_RIGHTS.map((right) => [right, rights[right] === true]),
+      ),
+    );
+    const promote = Object.values(granted).some(Boolean);
+    const current = memberStatus(chat, target.id);
+    // TDLib sends channels.editAdmin with an empty rank, so an edit drops the
+    // custom title, as promoteChatMember does here. UNVERIFIED: that
+    // Telegram's server clears it.
+    const next = promote
+      ? {
+          status: "administrator",
+          rights:
+            chat.type === "group"
+              ? { ...BASIC_GROUP_ADMIN_RIGHTS }
+              : { ...granted, can_manage_chat: true },
+          promotedBy: actor.id,
+        }
+      : { status: "member" };
+    const unchanged = promote
+      ? current.status === "administrator" &&
+        JSON.stringify(
+          memberObject(chat, target.id, { ...current, customTitle: null }),
+        ) === JSON.stringify(memberObject(chat, target.id, next))
+      : !["administrator", "creator"].includes(current.status);
+    if (unchanged) return chatMemberObject(chat, target.id);
+    const isCreator = memberStatus(chat, actor.id).status === "creator";
+    if (chat.type === "group") {
+      if (!isCreator) {
+        throw new TelegramError(400, "Need owner rights in the group chat");
+      }
+      if (actor.id === target.id) {
+        throw new TelegramError(400, "Can't promote or demote self");
+      }
+    } else {
+      if (current.status === "creator") {
+        throw new TelegramError(400, "Can't remove chat owner");
+      }
+      if (actor.id === target.id && promote) {
+        throw new TelegramError(400, "Can't promote self");
+      }
+      // TDLib lets an administrator demote themselves. UNVERIFIED: that
+      // Telegram's server accepts it from one someone else promoted.
+      if (
+        actor.id !== target.id &&
+        !hasRight(chat, actor.id, "can_promote_members")
+      ) {
+        throw new TelegramError(400, "Not enough rights");
+      }
+    }
+    // UNVERIFIED: Telegram's apps add someone outside the chat first; here
+    // they must be in it, as promoteChatMember requires.
+    if (!isInChat(chat, target.id)) {
+      throw new TelegramError(400, "USER_NOT_PARTICIPANT");
+    }
+    if (chat.type !== "group") {
+      if (
+        current.status === "administrator" &&
+        current.promotedBy !== actor.id &&
+        actor.id !== target.id &&
+        !isCreator
+      ) {
+        throw new TelegramError(400, "CHAT_ADMIN_REQUIRED");
+      }
+      if (grantsRightNotHeld(chat, granted, actor.id)) {
+        throw new TelegramError(400, "RIGHT_FORBIDDEN");
+      }
+    }
+    chat.members.set(target.id, next);
+    const after = chatMemberObject(chat, target.id);
+    return memberChanged(chat, target.id, current, actor).then(() => after);
+  }
+
+  /**
+   * The test deletes a bot it added. Its token stops working at once: every
+   * call gets 401 Unauthorized, the Bot API server's answer once Telegram no
+   * longer accepts a token (Client.cpp get_closing_error). Its webhook goes,
+   * and a waiting getUpdates answers with what is pending, as the server does
+   * when it closes a bot (on_closed). UNVERIFIED: what Telegram does to a
+   * deleted bot's chats; here it leaves each one as leaveChat does, so the
+   * other bots get chat_member and a group the left_chat_member message, and
+   * it stays a user, whom earlier messages and member lists name.
+   */
+  function deleteBot(record) {
+    if (record.token === botToken) {
+      throw new TelegramError(400, "the first bot can't be deleted");
+    }
+    bots.delete(record.token);
+    users.set(record.id, {
+      ...userObject(record),
+      photos: record.photos,
+      deleted: true,
+    });
+    closeAttempts(record, "cancelled");
+    record.webhook = null;
+    wakePollers(record);
+    for (const key of [...sentUpdates.keys()]) {
+      if (key.startsWith(`${record.id}:`)) sentUpdates.delete(key);
+    }
+    const left = [...chats.values()]
+      .filter((chat) => chat.migratedTo == null && isInChat(chat, record.id))
+      .map((chat) =>
+        setBotMembership(chat, record, { status: "left", actor: record }),
+      );
+    return Promise.all(left).then(() => ({ deleted: true }));
   }
 
   /**
@@ -4547,22 +4724,9 @@ export async function startTestServer({
       ) {
         rights.can_restrict_members = true;
       }
-      // TDLib drops the rights this kind of chat does not have before the
-      // server checks the rest; with none left, the user stays a member
-      // (DialogParticipant.cpp AdministratorRights and Administrator).
-      const kept = chatAdminRights(chat);
-      for (const right of ADMIN_RIGHTS) {
-        if (!kept.includes(right)) rights[right] = false;
-      }
-      for (const [right, granted] of Object.entries(rights)) {
-        if (
-          granted &&
-          right !== "is_anonymous" &&
-          right !== "can_manage_chat" &&
-          !hasRight(chat, caller.id, right)
-        ) {
-          throw new TelegramError(400, "Bad Request: RIGHT_FORBIDDEN");
-        }
+      dropRightsChatLacks(chat, rights);
+      if (grantsRightNotHeld(chat, rights, caller.id)) {
+        throw new TelegramError(400, "Bad Request: RIGHT_FORBIDDEN");
       }
       if (Object.values(rights).some(Boolean)) {
         // Any right implies can_manage_chat, as on Telegram.
@@ -7255,6 +7419,9 @@ export async function startTestServer({
         login_client_secret: record.loginClientSecret,
       }));
     }
+    if (resource === "bots" && id && !sub && method === "DELETE") {
+      return deleteBot(requireBot(id));
+    }
     if (resource === "chats" && !id && method === "POST") {
       return chatObject(createChat(body));
     }
@@ -7520,6 +7687,15 @@ export async function startTestServer({
       }
       if (sub === "members" && method === "GET" && subId) {
         return chatMemberObject(chat, subId, bot);
+      }
+      if (sub === "members" && method === "POST" && subId) {
+        // A person (`by`, default the creator) promotes or demotes a member.
+        if (parts[4] === "promote") {
+          return promoteByPerson(chat, subId, body);
+        }
+        if (parts[4] === "demote") {
+          return promoteByPerson(chat, subId, { by: body.by, rights: {} });
+        }
       }
       if (sub === "topics") {
         if (!chat.topics) {
@@ -7791,6 +7967,11 @@ export async function startTestServer({
     const sender = [...bots.values()].find(
       (record) => record.id === (entry.keyboardBot ?? entry.author),
     );
+    // A deleted bot hears no press. UNVERIFIED: what Telegram's app then
+    // shows; here the press is unanswered at once.
+    if (!sender && users.get(entry.keyboardBot ?? entry.author)?.deleted) {
+      return { answered: false };
+    }
     openQueries.set(queryId, (sender ?? bot).id);
     for (const [id, query] of recentQueries) {
       if (clock.now() - query.at > EPHEMERAL_REPLY_MS) recentQueries.delete(id);
@@ -9414,6 +9595,7 @@ ${buttons}
         first_name: firstName,
         supports_join_request_queries: supportsJoinRequestQueries === true,
       }),
+    deleteBot: (botId) => act("DELETE", `bots/${botId}`),
     createChat: async ({ title, type, ownerId, ownerName, isForum } = {}) =>
       (
         await act("POST", "chats", {
@@ -9449,6 +9631,10 @@ ${buttons}
         rights,
         by,
       }),
+    promoteMember: (chatId, userId, { by, rights } = {}) =>
+      act("POST", `chats/${chatId}/members/${userId}/promote`, { by, rights }),
+    demoteMember: (chatId, userId, { by } = {}) =>
+      act("POST", `chats/${chatId}/members/${userId}/demote`, { by }),
     createTopic: async (chatId, name, { by } = {}) =>
       (await act("POST", `chats/${chatId}/topics`, { name, by }))
         .message_thread_id,

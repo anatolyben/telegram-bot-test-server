@@ -112,6 +112,22 @@ administrators it promoted. An administrator carries the rights its kind of chat
 writes them: `can_post_messages`, `can_edit_messages` and `can_manage_direct_messages` in channels,
 `can_pin_messages` and `can_manage_tags` in groups, and `can_manage_topics` in supergroups.
 
+People promote and demote members too (`promoteMember`, `demoteMember`), as Telegram's apps do
+through TDLib's `setChatMemberStatus`. In a supergroup or channel, the creator or an administrator
+with `can_promote_members` chooses the rights, which are dropped and checked as for
+`promoteChatMember`. The person grants only rights they hold (`RIGHT_FORBIDDEN`), and only the
+creator edits administrators someone else promoted (`CHAT_ADMIN_REQUIRED`). Nobody changes the
+owner (`Can't remove chat owner`) or promotes themselves (`Can't promote self`), and anyone else
+gets `Not enough rights`. In a basic group only the creator promotes
+(`Need owner rights in the group chat`), never themselves (`Can't promote or demote self`).
+There every administrator has the group's fixed rights, as TDLib reads them, since Telegram keeps
+only whether someone is one. A change to what the member already has succeeds without an update,
+and demoting someone who is not an administrator changes nothing. Otherwise the chat's
+administrator bots get `chat_member` from the person, and no bot may edit the new administrator
+(`can_be_edited` is false). Unverified: that an administrator may demote themselves, as TDLib
+allows; that someone outside the chat is refused (`USER_NOT_PARTICIPANT`), where Telegram's apps
+add them first; and that an edit drops the custom title, since TDLib sends an empty one.
+
 `setChatTitle`, `setChatDescription`, `setChatPhoto` and `deleteChatPhoto` need `can_change_info`
 and post Telegram's service messages to every bot in the chat, the bot that made the change
 included. A title is cut to 128 characters and a description to 255, after TDLib's cleaning: blank
@@ -175,6 +191,14 @@ keyboard on a message, by sending the message or by the last edit that set the k
 buttons pressed. Users write privately only to the first bot, so no other bot can message them
 (403), except a join requester: any bot that receives the request may message them for five
 minutes, as under [Private chats](#private-chats).
+
+A test may delete a bot it added (`deleteBot`). Every call with its token then gets
+`401 Unauthorized`, the Bot API server's answer once Telegram no longer accepts a token. Its webhook
+goes, and a waiting `getUpdates` answers at once with what is pending, as the server does when it
+closes a bot. Unverified, because Telegram does not document it: what a deleted bot's chats see.
+Here it leaves each chat it is in, as with `leaveChat`, so the chat's administrator bots get
+`chat_member` from it and a group gets `left_chat_member`. It stays a user that earlier messages and
+member lists name, and a press on its buttons reaches no bot and goes unanswered at once.
 
 ### Private chats
 
