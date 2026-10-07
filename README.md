@@ -235,6 +235,21 @@ resolves `{ answered: false }`. Vitest and Jest stop a test after 5 seconds by d
 test that may see no answer a longer timeout. Or start the press without awaiting it, then wait for
 the bot's `answerCallbackQuery` call with `waitFor`, which fails after a second.
 
+A bot can get the same press twice: when its webhook does not confirm an update, Telegram sends the
+same update again, with the same `update_id` and callback query id. `deliverTwice` does that, so a
+test can check that the bot acts on the press once:
+
+```js
+// Your bot, on a webhook, counts a "vote" press once per callback query id.
+await server.pressButton(GROUP, message.message_id, ann, "vote", {
+  deliverTwice: true,
+});
+expect(votes.get(ann)).toBe(1); // your app's own state
+```
+
+The press resolves with the bot's answer once the webhook has answered both deliveries. It needs a
+webhook: a polling bot gets an update again only by not confirming it, so the press is refused.
+
 The test can also call the Bot API as the bot, for example to make an invite link, and then have
 a user open it:
 
@@ -1543,17 +1558,19 @@ handed to the bot ([Make users act](#make-users-act)). The owner account actions
 
 **Buttons**
 
-- `pressButton(chatId, messageId, userId, data)`: the user presses the inline button whose
-  `callback_data` is `data` (not its label); resolves with the bot's `answerCallbackQuery` answer,
-  `{ answered, text, show_alert }`. It fails at once if the message has no button with that data.
-  Once the press has reached the bot (for a webhook, once it answered, within a minute), it waits
-  up to 10 seconds for the answer, and resolves `{ answered: false }` if none came. An answer
-  Telegram refuses, such as text over 200 characters, does not count. The bot that put the
-  keyboard on the message gets the press.
-- `pressEphemeralButton(chatId, ephemeralMessageId, userId, data)`: the receiver presses an inline
-  button on an ephemeral message; resolves like `pressButton`.
-- `pressDirectButton(userId, messageId, data)`: the user presses a button in their private chat
-  with the bot.
+- `pressButton(chatId, messageId, userId, data, { deliverTwice })`: the user presses the inline
+  button whose `callback_data` is `data` (not its label); resolves with the bot's
+  `answerCallbackQuery` answer, `{ answered, text, show_alert }`. It fails at once if the message
+  has no button with that data. Once the press has reached the bot (for a webhook, once it
+  answered, within a minute), it waits up to 10 seconds for the answer, and resolves
+  `{ answered: false }` if none came. An answer Telegram refuses, such as text over 200
+  characters, does not count. The bot that put the keyboard on the message gets the press. With
+  `deliverTwice: true` (default off), its webhook then gets the same update again, as Telegram
+  sends an update its webhook did not confirm; a bot without a webhook is refused.
+- `pressEphemeralButton(chatId, ephemeralMessageId, userId, data, { deliverTwice })`: the receiver
+  presses an inline button on an ephemeral message; works like `pressButton`.
+- `pressDirectButton(userId, messageId, data, { deliverTwice })`: the user presses a button in
+  their private chat with the bot.
 
 **Private chats**
 
@@ -1807,7 +1824,8 @@ API routes do; only the viewer (`/_fake/ui`) answers this computer alone. Keep t
 once. A press waits as `pressButton` does, up to 10 seconds once it has reached the bot, for the
 bot to call `answerCallbackQuery`, and returns `{ answered, text, show_alert }`, or
 `{ answered: false }`. An answer Telegram refuses, such as text over 200 characters, does not
-count.
+count. With `deliver_twice: true`, the bot's webhook gets the same update twice, as `deliverTwice`
+does; a bot without a webhook answers 409.
 
 **Private chats**
 
@@ -2229,6 +2247,10 @@ fields below.
   faster on long chats and journals, and work as before ([measurements][performance]).
   - Fixed: `getMessage`, `getMessages`, `getEphemeralMessage` and `getDirectMessages` return
     copies, as `getCalls` does. Changing what they returned used to change the stored message.
+  - New: `deliverTwice` on `pressButton`, `pressEphemeralButton` and `pressDirectButton`
+    (`deliver_twice` over HTTP) delivers one press twice, with the same `update_id` and callback
+    query id, so a test can check that the bot ignores the duplicate
+    ([Make users act](#make-users-act)).
   - Changed: when a person edits an administrator with `promoteMember`, the administrator keeps
     who promoted them. A bot that promoted them keeps `can_be_edited` and can still edit and
     title them; 0.12.0 made the person their promoter

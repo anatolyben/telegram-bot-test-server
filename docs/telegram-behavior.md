@@ -601,6 +601,13 @@ answer fails with `MESSAGE_TOO_LONG` and the query stays open, so the bot can an
 `chat_instance` is an opaque number that is the same for every press in a chat; it is not the chat
 id.
 
+A bot can get one press twice. Telegram sends an update again when the webhook did not confirm it,
+and a polling bot gets it again until it confirms it with its offset; either way it is the same
+update, with the same `update_id` and callback query id ([Update delivery](#update-delivery)). A
+test makes this happen with `deliverTwice` ([Redelivery](#redelivery)). Unverified: what Telegram
+answers a second `answerCallbackQuery` for a query already answered; here it fails with
+`query is too old and response timeout expired or query ID is invalid`.
+
 ### Ephemeral messages
 
 A send with `ephemeral_message_parameters: { receiver_user_id }` is shown to one member. It
@@ -839,7 +846,9 @@ than depend on response/update ordering; the Bot API does not promise that order
 
 A test can have Telegram deliver any update again, byte for byte, callback queries included, as it
 does when a webhook does not confirm one. It sends the saved update, so do not restore an earlier
-snapshot between the steps of a replay.
+snapshot between the steps of a replay. A press with `deliverTwice` does the same with its own
+update: once the webhook has answered the press, it gets that update again. Only a webhook gets an
+update again this way, so such a press to a bot without a webhook is refused before it is sent.
 
 [bot-api-chat-member-administrator]: https://core.telegram.org/bots/api#chatmemberadministrator
 [ephemeral-docs]: https://core.telegram.org/bots/api#ephemeral-messages-and-commands

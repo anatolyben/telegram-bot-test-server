@@ -424,6 +424,105 @@ it("drains fake deliveries separately from consumer work and preserves duplicate
     [updates[0].update_id, 2, "delivered"],
   ]);
 });
+it("delivers one button press twice, with the same update_id and callback query id", async () => {
+  const { fake, api, user } = await setup();
+  const presses = [];
+  const answers = [];
+  const url = await receiver(async (update, res) => {
+    if (update.callback_query) {
+      presses.push(update);
+      const answer = await api("answerCallbackQuery", {
+        callback_query_id: update.callback_query.id,
+        text: `seen ${presses.length}`,
+      });
+      answers.push(answer.description ?? answer.ok);
+    }
+    res.end();
+  });
+  await api("setWebhook", { url });
+  const keyboard = {
+    inline_keyboard: [[{ text: "OK", callback_data: "ok" }]],
+  };
+  const sent = await api("sendMessage", {
+    chat_id: CHAT,
+    text: "Verify",
+    reply_markup: keyboard,
+  });
+
+  expect(
+    await fake.pressButton(CHAT, sent.result.message_id, user, "ok", {
+      deliverTwice: true,
+    }),
+  ).toEqual({ answered: true, text: "seen 1", show_alert: false });
+  expect(presses).toHaveLength(2);
+  expect(presses[1]).toEqual(presses[0]);
+  // The query was answered, so the duplicate's answer is refused.
+  expect(answers).toEqual([
+    true,
+    "Bad Request: query is too old and response timeout expired or query ID is invalid",
+  ]);
+  const deliveries = (await fake.getDeliveries()).filter(
+    (entry) => entry.update_id === presses[0].update_id,
+  );
+  expect(deliveries.map((entry) => entry.attempt)).toEqual([1, 2]);
+
+  // Over HTTP, on an ephemeral message and in a private chat.
+  const control = async (path, body) => {
+    const response = await fetch(`${fake.origin}/_fake/${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return { status: response.status, body: await response.json() };
+  };
+  const ephemeral = await api("sendMessage", {
+    chat_id: CHAT,
+    text: "Just for you",
+    reply_markup: keyboard,
+    ephemeral_message_parameters: { receiver_user_id: user },
+  });
+  expect(
+    await control(
+      `chats/${CHAT}/ephemeral-messages/${ephemeral.result.ephemeral_message_id}/callback`,
+      { user_id: user, data: "ok", deliver_twice: true },
+    ),
+  ).toEqual({
+    status: 200,
+    body: { answered: true, text: "seen 3", show_alert: false },
+  });
+  expect(presses).toHaveLength(4);
+  expect(presses[3]).toEqual(presses[2]);
+  await fake.sendDirectMessage(user, "/start");
+  const direct = await api("sendMessage", {
+    chat_id: user,
+    text: "Verify",
+    reply_markup: keyboard,
+  });
+  expect(
+    (
+      await control(`users/${user}/dm/${direct.result.message_id}/callback`, {
+        data: "ok",
+        deliver_twice: true,
+      })
+    ).body,
+  ).toMatchObject({ answered: true, text: "seen 5" });
+  expect(presses).toHaveLength(6);
+  expect(presses[5]).toEqual(presses[4]);
+  // A press goes once without the option.
+  await fake.pressButton(CHAT, sent.result.message_id, user, "ok");
+  expect(presses).toHaveLength(7);
+
+  // Telegram sends an update again only to a webhook, so a polling bot's
+  // press is refused before anything is sent.
+  await api("deleteWebhook");
+  const before = (await fake.getBotUpdates(BOT)).updates.length;
+  await expect(
+    fake.pressButton(CHAT, sent.result.message_id, user, "ok", {
+      deliverTwice: true,
+    }),
+  ).rejects.toThrow(/webhook/);
+  expect((await fake.getBotUpdates(BOT)).updates).toHaveLength(before);
+});
 it("cancels pending exact waits on restore and stop and exposes controls over HTTP", async () => {
   const { fake, user } = await setup();
   const snapshot = await fake.snapshot();

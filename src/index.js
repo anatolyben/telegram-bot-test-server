@@ -8802,7 +8802,13 @@ export async function startTestServer({
               "Only the receiver of an ephemeral message can press its buttons",
             );
           }
-          return pressButton(chat, user, entry, body.data);
+          return pressButton(
+            chat,
+            user,
+            entry,
+            body.data,
+            body.deliver_twice === true,
+          );
         }
       }
       if (sub === "messages" && method === "GET" && subId) {
@@ -8912,6 +8918,7 @@ export async function startTestServer({
           requireUser(id),
           existing.messages.get(Number(subId)),
           body.data,
+          body.deliver_twice === true,
         );
       }
       if (method === "POST" && subId && parts[4] === "vote") {
@@ -8985,6 +8992,7 @@ export async function startTestServer({
         user,
         chat.messages.get(Number(subId)),
         body.data,
+        body.deliver_twice === true,
       );
     }
     if (
@@ -9085,9 +9093,12 @@ export async function startTestServer({
 
   /**
    * A member presses an inline button: Telegram sends the bot a callback_query
-   * and waits for its answer, which it hands back to the member.
+   * and waits for its answer, which it hands back to the member. With
+   * deliverTwice, the bot's webhook then gets the same update again, as
+   * Telegram sends one again when a webhook does not confirm it: the same
+   * update_id and callback query id, not a second press.
    */
-  async function pressButton(chat, user, entry, data) {
+  async function pressButton(chat, user, entry, data, deliverTwice = false) {
     if (!entry || entry.deleted) {
       throw new TelegramError(400, "MESSAGE_ID_INVALID");
     }
@@ -9114,33 +9125,47 @@ export async function startTestServer({
     if (!sender && users.get(entry.keyboardBot ?? entry.author)?.deleted) {
       return { answered: false };
     }
-    openQueries.set(queryId, (sender ?? bot).id);
+    const target = sender ?? bot;
+    // Telegram sends an update again only to a webhook; a polling bot gets
+    // one again by not confirming it with its offset.
+    const requireWebhook = () => {
+      if (!target.webhook?.ip_address) {
+        throw new TelegramError(
+          409,
+          "A press delivered twice needs a webhook: a polling bot gets an update again by not confirming it",
+        );
+      }
+    };
+    if (deliverTwice) requireWebhook();
+    openQueries.set(queryId, target.id);
     for (const [id, query] of recentQueries) {
       if (clock.now() - query.at > EPHEMERAL_REPLY_MS) recentQueries.delete(id);
     }
     recentQueries.set(queryId, {
-      botId: (sender ?? bot).id,
+      botId: target.id,
       userId: user.id,
       at: clock.now(),
     });
-    await emit(
-      "callback_query",
-      {
-        id: queryId,
-        from: userObject(user),
-        message: entry.message,
-        // An opaque global identifier of the chat, not its id: a signed
-        // 64-bit number, the same for every press in the chat.
-        chat_instance: createHash("sha256")
-          .update(String(chat.id))
-          .digest()
-          .readBigInt64BE(0)
-          .toString(),
-        data: String(data ?? ""),
-      },
-      { to: sender ? [sender] : [bot] },
-    );
+    waits.notify();
+    const sent = emitOne(target, "callback_query", {
+      id: queryId,
+      from: userObject(user),
+      message: entry.message,
+      // An opaque global identifier of the chat, not its id: a signed
+      // 64-bit number, the same for every press in the chat.
+      chat_instance: createHash("sha256")
+        .update(String(chat.id))
+        .digest()
+        .readBigInt64BE(0)
+        .toString(),
+      data: String(data ?? ""),
+    });
+    await sent.delivered;
     try {
+      if (deliverTwice && sent.updateId != null) {
+        requireWebhook();
+        await redeliver(sentUpdates.get(updateKey(target.id, sent.updateId)));
+      }
       const answer = await waits.wait(
         () => callbackAnswers.get(queryId) ?? null,
         10_000,
@@ -9148,7 +9173,7 @@ export async function startTestServer({
       callbackAnswers.delete(queryId);
       return { answered: true, ...answer };
     } catch (error) {
-      if (stopped) throw error;
+      if (stopped || error instanceof TelegramError) throw error;
       return { answered: false };
     } finally {
       openQueries.delete(queryId);
@@ -11110,16 +11135,23 @@ ${buttons}
       act("POST", `chats/${chatId}/messages/${messageId}/pin`, {
         user_id: userId,
       }),
-    pressButton: (chatId, messageId, userId, data) =>
+    pressButton: (chatId, messageId, userId, data, { deliverTwice } = {}) =>
       act("POST", `chats/${chatId}/messages/${messageId}/callback`, {
         user_id: userId,
         data,
+        deliver_twice: deliverTwice === true,
       }),
-    pressEphemeralButton: (chatId, ephemeralMessageId, userId, data) =>
+    pressEphemeralButton: (
+      chatId,
+      ephemeralMessageId,
+      userId,
+      data,
+      { deliverTwice } = {},
+    ) =>
       act(
         "POST",
         `chats/${chatId}/ephemeral-messages/${ephemeralMessageId}/callback`,
-        { user_id: userId, data },
+        { user_id: userId, data, deliver_twice: deliverTwice === true },
       ),
     sendDirectMessage: async (userId, message) =>
       (await act("POST", `users/${userId}/dm`, memberBody(message))).message_id,
@@ -11140,8 +11172,11 @@ ${buttons}
           text,
         })
       ).message_id,
-    pressDirectButton: (userId, messageId, data) =>
-      act("POST", `users/${userId}/dm/${messageId}/callback`, { data }),
+    pressDirectButton: (userId, messageId, data, { deliverTwice } = {}) =>
+      act("POST", `users/${userId}/dm/${messageId}/callback`, {
+        data,
+        deliver_twice: deliverTwice === true,
+      }),
     getMessages: (chatId) => act("GET", `chats/${chatId}/messages`),
     getMessage: (chatId, messageId) =>
       act("GET", `chats/${chatId}/messages/${messageId}`),

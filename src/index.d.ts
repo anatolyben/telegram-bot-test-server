@@ -111,6 +111,16 @@ export interface ButtonAnswer {
   show_alert?: boolean;
 }
 
+export interface PressOptions {
+  /**
+   * Deliver the press twice: once, then the same update again to the bot's
+   * webhook, with the same update_id and callback query id, as Telegram
+   * sends an update again when a webhook does not confirm it. Needs a
+   * webhook. Default false.
+   */
+  deliverTwice?: boolean;
+}
+
 export interface UserFields {
   first_name?: string;
   last_name?: string;
@@ -957,6 +967,7 @@ export interface TelegramBotTestServer {
     messageId: number,
     userId: number,
     data: string,
+    options?: PressOptions,
   ): Promise<ButtonAnswer>;
   /**
    * The receiver of an ephemeral message presses one of its inline buttons;
@@ -967,6 +978,7 @@ export interface TelegramBotTestServer {
     ephemeralMessageId: number,
     userId: number,
     data: string,
+    options?: PressOptions,
   ): Promise<ButtonAnswer>;
   /**
    * A user calls a guest bot (Bot API 10.0 guest mode) that is not a member of
@@ -1012,6 +1024,7 @@ export interface TelegramBotTestServer {
     userId: number,
     messageId: number,
     data: string,
+    options?: PressOptions,
   ): Promise<ButtonAnswer>;
   /**
    * Messages not deleted, newest first, with ephemeral messages (message_id 0,
