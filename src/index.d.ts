@@ -156,8 +156,8 @@ export interface PostedMessage {
   };
   /**
    * Where a forwarded message came from: a user, a hidden user's name, a
-   * channel post, or a group's own post (a group or supergroup chatId, no
-   * messageId). authorSignature goes with a channel or group origin.
+   * channel post, or a supergroup's own post (its chatId, no messageId).
+   * authorSignature goes with a channel or supergroup origin.
    */
   forwardFrom?: {
     userId?: number;
@@ -168,15 +168,18 @@ export interface PostedMessage {
   };
   /**
    * Entities for the text, in the Bot API's shape, checked as Telegram checks
-   * a user's. Types Telegram finds by itself are ignored, but phone_number.
+   * a user's. Types Telegram finds by itself are ignored, but phone_number
+   * and bank_card_number.
    */
   entities?: MessageEntity[];
   /** Entities for the caption, read like entities. */
   captionEntities?: MessageEntity[];
   /**
    * In a supergroup, post on behalf of a chat: the group itself (an anonymous
-   * administrator, who posts so anyway) or a channel the user created.
-   * Anything else fails with SEND_AS_PEER_INVALID.
+   * administrator, who posts so anyway) or a channel the user created, which
+   * needs Telegram Premium (PREMIUM_ACCOUNT_REQUIRED). A member who is not
+   * anonymous may name themselves. Anything else fails with
+   * SEND_AS_PEER_INVALID.
    */
   sendAs?: number;
   /** A contact, as a message of its own; needs can_send_messages. */
@@ -190,7 +193,8 @@ export interface PostedMessage {
   };
   /**
    * A location, as a message of its own; needs can_send_messages. A
-   * livePeriod other than 0 makes it a live location.
+   * livePeriod other than 0 makes it a live location. horizontalAccuracy is
+   * kept in whole meters, rounded up, at most 1500.
    */
   location?: {
     latitude: number;
@@ -524,9 +528,10 @@ export interface TelegramBotTestServer {
   /**
    * A person (`by`, default the creator) makes a member an administrator with
    * the rights given, e.g. { can_delete_messages: true }. Rights left out are
-   * not granted, and no right at all makes them a member. The chat's
-   * administrator bots get chat_member. Fails as Telegram refuses the person;
-   * in a basic group only the creator promotes, with the group's fixed rights.
+   * not granted, and no right at all makes them a member; an edit keeps the
+   * custom title. The chat's administrator bots get chat_member. Fails as
+   * Telegram refuses the person; in a basic group only the creator promotes,
+   * with the group's fixed rights.
    */
   promoteMember(
     chatId: number,

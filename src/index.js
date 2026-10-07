@@ -299,7 +299,9 @@ const BASIC_GROUP_ADMIN_RIGHTS = Object.freeze({
 // The users the Bot API writes as `from` of a message sent on behalf of a
 // chat in a group: the group itself (an anonymous administrator) or a channel
 // (Client.cpp, from TDLib's group_anonymous_bot_user_id and
-// channel_bot_user_id options; TDLib UserManager.cpp names them).
+// channel_bot_user_id options; TDLib UserManager.cpp names them). UNVERIFIED:
+// what a bot's call naming one answers, such as banChatMember on such a
+// post's from; here they are unknown users ("user not found").
 const GROUP_ANONYMOUS_BOT = Object.freeze({
   id: 1087968824,
   is_bot: true,
@@ -313,10 +315,12 @@ const CHANNEL_BOT = Object.freeze({
   username: "Channel_Bot",
 });
 // The entity types a member's message keeps from those the test gives,
-// though Telegram finds them itself: Telegram's server marks phone numbers by
-// rules it does not publish (TDLib's find_entities leaves them a TODO), so
-// this server finds none and takes them from the test.
-const MEMBER_FOUND_ENTITIES = new Set(["phone_number"]);
+// though Telegram finds them itself. A user's app sends Telegram only the
+// entities the user made (TDLib get_input_message_entities), and Telegram's
+// server marks phone numbers and bank card numbers by rules it does not
+// publish (TDLib's find_entities leaves phone numbers a TODO), so this server
+// finds neither and takes them from the test.
+const MEMBER_FOUND_ENTITIES = new Set(["phone_number", "bank_card_number"]);
 
 const CHAT_ACTIONS = new Set([
   "typing",
@@ -1964,14 +1968,29 @@ export async function startTestServer({
   /**
    * TDLib drops the rights this kind of chat does not have before the server
    * checks the rest; with none left, the user stays a member
-   * (DialogParticipant.cpp AdministratorRights and Administrator).
+   * (DialogParticipant.cpp AdministratorRights and Administrator). A channel
+   * has no anonymous administrators: is_anonymous is dropped there too,
+   * though the Bot API still writes it (json_store_administrator_rights).
    */
   function dropRightsChatLacks(chat, rights) {
     const kept = chatAdminRights(chat);
     for (const right of ADMIN_RIGHTS) {
       if (!kept.includes(right)) rights[right] = false;
     }
+    if (chat.type === "channel") rights.is_anonymous = false;
     return rights;
+  }
+
+  /**
+   * The custom title an administrator keeps when their rights are edited:
+   * TDLib's channels.editAdmin leaves the rank out (EditChannelAdminQuery,
+   * flags 0), and the title changes only through
+   * messages.editChatParticipantRank (set_dialog_participant_rank).
+   */
+  function keptTitle(current) {
+    return current.status === "administrator" && current.customTitle
+      ? { customTitle: current.customTitle }
+      : {};
   }
 
   /** Whether a promotion grants a right the promoter does not hold. */
@@ -3105,15 +3124,17 @@ export async function startTestServer({
   /**
    * A person makes a member an administrator with the rights given, or a
    * member again when no right is given, as Telegram's apps do through TDLib's
-   * setChatMemberStatus (DialogParticipantManager.cpp). A change to nothing new
-   * succeeds at once (set_channel_participant_status_impl); demoting someone
-   * who is not an administrator changes nothing. In a supergroup or channel
-   * the owner can't be changed, nobody promotes themselves, and the promoter
-   * needs can_promote_members (promote_channel_participant); then
-   * channels.editAdmin checks what promoteChatMember checks. In a basic group
-   * only the creator promotes, never themselves (set_chat_participant_status),
-   * and messages.editChatAdmin says only whether someone is an administrator.
-   * The chat's administrator bots get chat_member from the person.
+   * setChatMemberStatus (DialogParticipantManager.cpp). In a supergroup or
+   * channel a change to nothing new succeeds at once
+   * (set_channel_participant_status_impl); demoting someone who is not an
+   * administrator changes nothing. There the owner can't be changed, nobody
+   * promotes themselves, and the promoter needs can_promote_members
+   * (promote_channel_participant); then channels.editAdmin checks what
+   * promoteChatMember checks. In a basic group only the creator promotes,
+   * never themselves, checked before anything else
+   * (set_chat_participant_status), and messages.editChatAdmin says only
+   * whether someone is an administrator. An edit keeps the custom title. The
+   * chat's administrator bots get chat_member from the person.
    */
   function promoteByPerson(chat, userId, { by, rights }) {
     const actor = requireUser(by ?? creatorOf(chat));
@@ -3124,9 +3145,12 @@ export async function startTestServer({
         "rights must be an object of administrator rights",
       );
     }
-    for (const right of Object.keys(rights)) {
+    for (const [right, value] of Object.entries(rights)) {
       if (!ADMIN_RIGHTS.includes(right)) {
         throw new TelegramError(400, `unknown administrator right "${right}"`);
+      }
+      if (value !== undefined && typeof value !== "boolean") {
+        throw new TelegramError(400, `rights.${right} must be true or false`);
       }
     }
     if (chat.migratedTo != null) {
@@ -3140,9 +3164,6 @@ export async function startTestServer({
     );
     const promote = Object.values(granted).some(Boolean);
     const current = memberStatus(chat, target.id);
-    // TDLib sends channels.editAdmin with an empty rank, so an edit drops the
-    // custom title, as promoteChatMember does here. UNVERIFIED: that
-    // Telegram's server clears it.
     const next = promote
       ? {
           status: "administrator",
@@ -3151,15 +3172,14 @@ export async function startTestServer({
               ? { ...BASIC_GROUP_ADMIN_RIGHTS }
               : { ...granted, can_manage_chat: true },
           promotedBy: actor.id,
+          ...keptTitle(current),
         }
       : { status: "member" };
     const unchanged = promote
       ? current.status === "administrator" &&
-        JSON.stringify(
-          memberObject(chat, target.id, { ...current, customTitle: null }),
-        ) === JSON.stringify(memberObject(chat, target.id, next))
+        JSON.stringify(memberObject(chat, target.id, current)) ===
+          JSON.stringify(memberObject(chat, target.id, next))
       : !["administrator", "creator"].includes(current.status);
-    if (unchanged) return chatMemberObject(chat, target.id);
     const isCreator = memberStatus(chat, actor.id).status === "creator";
     if (chat.type === "group") {
       if (!isCreator) {
@@ -3168,7 +3188,12 @@ export async function startTestServer({
       if (actor.id === target.id) {
         throw new TelegramError(400, "Can't promote or demote self");
       }
-    } else {
+    }
+    // A change to nothing new succeeds without an update. UNVERIFIED for a
+    // basic group, where TDLib sends messages.editChatAdmin all the same:
+    // what Telegram answers.
+    if (unchanged) return chatMemberObject(chat, target.id);
+    if (chat.type !== "group") {
       if (current.status === "creator") {
         throw new TelegramError(400, "Can't remove chat owner");
       }
@@ -3184,9 +3209,18 @@ export async function startTestServer({
         throw new TelegramError(400, "Not enough rights");
       }
     }
-    // UNVERIFIED: Telegram's apps add someone outside the chat first; here
-    // they must be in it, as promoteChatMember requires.
     if (!isInChat(chat, target.id)) {
+      // TDLib adds someone outside a basic group first, then makes them an
+      // administrator (add_chat_participant); this server does not.
+      if (chat.type === "group") {
+        throw new TelegramError(
+          400,
+          "the user is not in the chat; add them first",
+        );
+      }
+      // TDLib sends channels.editAdmin directly. UNVERIFIED: what Telegram's
+      // server does for someone outside the chat; here USER_NOT_PARTICIPANT,
+      // as for promoteChatMember.
       throw new TelegramError(400, "USER_NOT_PARTICIPANT");
     }
     if (chat.type !== "group") {
@@ -4734,6 +4768,7 @@ export async function startTestServer({
           status: "administrator",
           rights: { ...rights, can_manage_chat: true },
           promotedBy: caller.id,
+          ...keptTitle(current),
         });
       } else {
         chat.members.set(userId, { status: "member" });
@@ -5756,8 +5791,10 @@ export async function startTestServer({
    * LinkManager::check_link and is kept as it rewrites it, a tg://user?id=
    * link becomes a text_mention, and a mentioned user must exist. The types
    * Telegram finds by itself are found here and ignored when given, but for
-   * phone_number (MEMBER_FOUND_ENTITIES). Errors carry TDLib's and the Bot
-   * API's texts without the Bot API's "Bad Request: ".
+   * phone_number and bank_card_number (MEMBER_FOUND_ENTITIES). Errors carry
+   * the Bot API's texts for reading a MessageEntity, and TDLib's as it gives
+   * them to an app (fix_formatted_text), without the Bot API's
+   * "Bad Request: " and "can't parse entities: ".
    */
   function memberFormatted(text, entities) {
     if (entities == null) return formatText(text);
@@ -5779,7 +5816,7 @@ export async function startTestServer({
       if (error instanceof FormattingError) {
         throw new TelegramError(
           400,
-          error.message.replace(/^Bad Request: /, ""),
+          error.message.replace(/^Bad Request: (can't parse entities: )?/, ""),
         );
       }
       throw error;
@@ -5906,12 +5943,16 @@ export async function startTestServer({
    * point off the map is refused, a live_period other than 0 makes it live,
    * from 60 seconds to a day or 0x7FFFFFFF for ever, with a heading of 1 to
    * 360 and an alert radius up to 100000 meters, and the accuracy is held to
-   * 0 to 1500 meters (fix_accuracy). It is written as the Bot API writes it
+   * 0 to 1500 meters (fix_accuracy) and sent in whole meters, rounded up
+   * (get_input_geo_point). It is written as the Bot API writes it
    * (Client.cpp JsonLocation, JsonLiveLocation).
    */
   function memberLocation(location) {
     if (!isObject(location)) {
       throw new TelegramError(400, "location must be an object");
+    }
+    if (location.latitude == null || location.longitude == null) {
+      throw new TelegramError(400, "a location needs latitude and longitude");
     }
     const number = (name) => {
       const value = location[name] ?? 0;
@@ -5953,7 +5994,9 @@ export async function startTestServer({
         "Wrong live location proximity alert radius specified",
       );
     }
-    const held = Number.isFinite(accuracy) ? Math.min(accuracy, 1500) : 0;
+    const held = Number.isFinite(accuracy)
+      ? Math.ceil(Math.min(Math.max(accuracy, 0), 1500))
+      : 0;
     return {
       latitude,
       longitude,
@@ -5975,11 +6018,17 @@ export async function startTestServer({
    * title as the signature, and may instead post as a channel they created
    * (TDLib MessagesManager create_message_to_send,
    * get_dialog_send_message_as_dialog_ids; DialogManager
-   * is_anonymous_administrator). Any other chat to send as, and any outside
-   * a supergroup, is SEND_AS_PEER_INVALID
+   * is_anonymous_administrator). A member who is not anonymous may name
+   * themselves, as TDLib lists their own account. Any other chat to send as,
+   * and any outside a supergroup, is SEND_AS_PEER_INVALID
    * (https://core.telegram.org/method/messages.sendMessage). Telegram offers
    * only public channels the user created; chats made in a test have no
-   * public username, so here any channel the member created counts.
+   * public username, so here any channel the member created counts. A
+   * channel needs Telegram Premium, unless it is verified or the group's
+   * linked channel, neither of which this server models
+   * (get_dialog_send_message_as_dialog_ids, needs_premium). UNVERIFIED: what
+   * Telegram answers without it; here PREMIUM_ACCOUNT_REQUIRED, which
+   * messages.sendMessage lists.
    */
   function memberSender(chat, user, sendAs) {
     if (chat.type !== "supergroup") {
@@ -5990,6 +6039,9 @@ export async function startTestServer({
     const anonymous =
       member.status === "administrator" &&
       hasRight(chat, user.id, "is_anonymous");
+    if (!anonymous && sendAs != null && Number(sendAs) === user.id) {
+      return null;
+    }
     const target =
       sendAs == null ? (anonymous ? chat : null) : chats.get(Number(sendAs));
     if (target === null) return null;
@@ -6001,6 +6053,9 @@ export async function startTestServer({
           memberStatus(target, user.id).status !== "creator")
     ) {
       throw new TelegramError(400, "SEND_AS_PEER_INVALID");
+    }
+    if (target !== chat && user.is_premium !== true) {
+      throw new TelegramError(403, "PREMIUM_ACCOUNT_REQUIRED");
     }
     return {
       from: { ...(target === chat ? GROUP_ANONYMOUS_BOT : CHANNEL_BOT) },
@@ -6471,10 +6526,15 @@ export async function startTestServer({
           : "Bad Request: the message can't be forwarded",
       );
     }
+    // A forward or copy is the bot's own message, so the signature of the
+    // post stays in forward_origin: TDLib's create_message_to_send signs only
+    // an anonymous administrator's message or a post in a channel that signs
+    // posts, which this server does not model.
     const {
       message_id: _id,
       from: _from,
       sender_chat: _senderChat,
+      author_signature: _signature,
       chat: _chat,
       date: _date,
       edit_date: _edited,
@@ -8100,10 +8160,13 @@ export async function startTestServer({
 
   /**
    * Where a member's forwarded message came from: a user, a user who hides
-   * their account (a name only), a channel post, or a post a group's
+   * their account (a name only), a channel post, or a post a supergroup's
    * anonymous administrator made on its behalf (MessageOriginChat, which has
-   * no message id). A channel's or group's origin may carry the post's
-   * author_signature (https://core.telegram.org/bots/api#messageorigin).
+   * no message id). Only a supergroup or channel posts on its own behalf:
+   * TDLib refuses any other chat in a forward header ("Forward from a
+   * non-channel", MessageOrigin::get_message_origin). A channel's or
+   * supergroup's origin may carry the post's author_signature
+   * (https://core.telegram.org/bots/api#messageorigin).
    */
   function forwardOrigin(from) {
     const date = now();
@@ -8114,10 +8177,16 @@ export async function startTestServer({
     if (from.chat_id != null) {
       const source = requireChat(from.chat_id);
       if (source.type !== "channel") {
+        if (source.type !== "supergroup") {
+          throw new TelegramError(
+            400,
+            "forward_from.chat_id must be a channel or supergroup",
+          );
+        }
         if (from.message_id != null) {
           throw new TelegramError(
             400,
-            "forward_from.message_id is for a channel post; a group's origin has none",
+            "forward_from.message_id is for a channel post; a supergroup's origin has none",
           );
         }
         return {
@@ -8142,7 +8211,7 @@ export async function startTestServer({
     if (from.author_signature != null) {
       throw new TelegramError(
         400,
-        "forward_from.author_signature is for a channel or group origin",
+        "forward_from.author_signature is for a channel or supergroup origin",
       );
     }
     if (from.user_id != null) {
@@ -8161,7 +8230,7 @@ export async function startTestServer({
     }
     throw new TelegramError(
       400,
-      "forward_from needs user_id, sender_name, or a channel or group chat_id",
+      "forward_from needs user_id, sender_name, or a channel or supergroup chat_id",
     );
   }
 

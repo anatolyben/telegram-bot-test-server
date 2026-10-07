@@ -1492,6 +1492,17 @@ describe("posts on behalf of a chat", () => {
     await fake.setBotMembership(GROUP, me.id, {
       rights: { can_promote_members: true },
     });
+    // An administrator without is_anonymous still posts as themselves.
+    await api("promoteChatMember", {
+      chat_id: GROUP,
+      user_id: member,
+      can_pin_messages: true,
+    });
+    const own = await fake.post(GROUP, member, "Mine");
+    const signed = (await fake.getMessage(GROUP, own)).message;
+    expect(signed.from.id).toBe(member);
+    expect(signed).not.toHaveProperty("sender_chat");
+    expect(signed).not.toHaveProperty("author_signature");
     await api("promoteChatMember", {
       chat_id: GROUP,
       user_id: member,
@@ -1541,6 +1552,10 @@ describe("posts on behalf of a chat", () => {
       from: GROUP_ANONYMOUS_BOT,
       sender_chat: { id: GROUP },
     });
+    // TDLib offers an anonymous administrator the group, not themselves.
+    await expect(
+      fake.post(GROUP, member, { text: "as me", sendAs: member }),
+    ).rejects.toThrow(/^SEND_AS_PEER_INVALID$/);
 
     const forward = await api("forwardMessage", {
       chat_id: GROUP,
@@ -1553,21 +1568,34 @@ describe("posts on behalf of a chat", () => {
       author_signature: "Mod",
       date: message.date,
     });
+    // The bot's forward and copy are its own messages: the signature stays
+    // in forward_origin only.
+    expect(forward.result).not.toHaveProperty("author_signature");
+    const copy = await api("copyMessage", {
+      chat_id: GROUP,
+      from_chat_id: GROUP,
+      message_id: id,
+    });
+    expect(
+      (await fake.getMessage(GROUP, copy.result.message_id)).message,
+    ).not.toHaveProperty("author_signature");
     expect(
       (await api("deleteMessage", { chat_id: GROUP, message_id: id })).result,
     ).toBe(true);
     expect((await fake.getMessage(GROUP, id)).deleted).toBe(true);
   });
 
-  it("posts as a channel the member created, and refuses any other chat to send as", async () => {
+  it("posts as a channel a Premium member created, and refuses any other chat to send as", async () => {
     const { fake, api, member } = await setup();
+    const star = await fake.createUser({ first_name: "Star", is_premium: true });
+    await fake.join(GROUP, star);
     const channel = await fake.createChat({
       type: "channel",
       title: "Member News",
-      ownerId: member,
+      ownerId: star,
     });
 
-    const id = await fake.post(GROUP, member, {
+    const id = await fake.post(GROUP, star, {
       text: "Follow us",
       sendAs: channel,
     });
@@ -1594,7 +1622,7 @@ describe("posts on behalf of a chat", () => {
     ).toBe(true);
 
     const others = await fake.createChat({ type: "channel", ownerId: OWNER });
-    const basic = await fake.createChat({ type: "group", ownerId: member });
+    const basic = await fake.createChat({ type: "group", ownerId: star });
     const before = await fake.getMessages(GROUP);
     for (const [chatId, sendAs] of [
       [GROUP, others],
@@ -1603,16 +1631,26 @@ describe("posts on behalf of a chat", () => {
       [basic, channel],
     ]) {
       await expect(
-        fake.post(chatId, member, { text: "as someone", sendAs }),
+        fake.post(chatId, star, { text: "as someone", sendAs }),
       ).rejects.toThrow(/^SEND_AS_PEER_INVALID$/);
     }
     await expect(
-      fake.sendDirectMessage(member, { text: "hi", sendAs: channel }),
+      fake.sendDirectMessage(star, { text: "hi", sendAs: channel }),
     ).rejects.toThrow(/^SEND_AS_PEER_INVALID$/);
+    // Without Premium, a group's member can't post as their own channel.
+    const own = await fake.createChat({ type: "channel", ownerId: member });
+    await expect(
+      fake.post(GROUP, member, { text: "as mine", sendAs: own }),
+    ).rejects.toThrow(/^PREMIUM_ACCOUNT_REQUIRED$/);
     expect(await fake.getMessages(GROUP)).toEqual(before);
+    // Naming themselves, a member posts as themselves.
+    const self = await fake.post(GROUP, member, { text: "me", sendAs: member });
+    const plain = (await fake.getMessage(GROUP, self)).message;
+    expect(plain.from.id).toBe(member);
+    expect(plain).not.toHaveProperty("sender_chat");
   });
 
-  it("forwards a post made on behalf of a group or supergroup", async () => {
+  it("forwards a post made on behalf of a supergroup, and a signed channel post", async () => {
     const { fake, member } = await setup();
     const other = await fake.createChat({
       title: "Other Group",
@@ -1621,6 +1659,11 @@ describe("posts on behalf of a chat", () => {
     const basic = await fake.createChat({
       type: "group",
       title: "Small Group",
+      ownerId: OWNER,
+    });
+    const channel = await fake.createChat({
+      type: "channel",
+      title: "News",
       ownerId: OWNER,
     });
     const read = async (forwardFrom) =>
@@ -1637,11 +1680,20 @@ describe("posts on behalf of a chat", () => {
       author_signature: "Admin",
       date: expect.any(Number),
     });
-    expect(await read({ chatId: basic })).toEqual({
-      type: "chat",
-      sender_chat: { id: basic, title: "Small Group", type: "group" },
+    expect(
+      await read({ chatId: channel, messageId: 7, authorSignature: "Editor" }),
+    ).toEqual({
+      type: "channel",
+      chat: { id: channel, title: "News", type: "channel" },
+      message_id: 7,
+      author_signature: "Editor",
       date: expect.any(Number),
     });
+    // Only a supergroup's administrators post on its behalf; TDLib refuses
+    // any other chat but a channel in a forward header.
+    await expect(
+      fake.post(GROUP, member, { text: "fwd", forwardFrom: { chatId: basic } }),
+    ).rejects.toThrow(/^forward_from\.chat_id must be a channel or supergroup$/);
     await expect(
       fake.post(GROUP, member, {
         text: "fwd",
@@ -1700,10 +1752,11 @@ describe("contacts and locations", () => {
       "vcard",
       "user_id",
     ]);
+    // Telegram keeps the accuracy in whole meters, rounded up.
     expect((await read(place)).location).toEqual({
       latitude: 51.5,
       longitude: -0.12,
-      horizontal_accuracy: 20.5,
+      horizontal_accuracy: 21,
     });
     const moving = await read(live);
     expect(moving.location).toEqual({
@@ -1786,6 +1839,18 @@ describe("contacts and locations", () => {
         "Wrong live location proximity alert radius specified",
       ],
       [{ contact: { ...contact, userId: 999999999 } }, "User not found"],
+      [
+        { contact: { phoneNumber: "+15550100" } },
+        "a contact needs phone_number and first_name",
+      ],
+      [
+        { location: { longitude: 0 } },
+        "a location needs latitude and longitude",
+      ],
+      [
+        { location: { latitude: "1", longitude: 2 } },
+        "location.latitude must be a number",
+      ],
     ];
     for (const [message, error] of refusals) {
       await expect(fake.post(GROUP, other, message)).rejects.toThrow(
@@ -1802,6 +1867,14 @@ describe("contacts and locations", () => {
     expect(
       (await fake.getMessage(GROUP, forever)).message.location.live_period,
     ).toBe(0x7fffffff);
+    // They need can_send_messages, not can_send_other_messages.
+    await api("restrictChatMember", {
+      chat_id: GROUP,
+      user_id: other,
+      use_independent_chat_permissions: true,
+      permissions: { can_send_messages: true, can_send_other_messages: false },
+    });
+    await fake.post(GROUP, other, { contact });
   });
 });
 
@@ -1886,6 +1959,21 @@ describe("entities members give", () => {
         (sent) => sent.message_id === direct,
       ).entities,
     ).toEqual([{ type: "phone_number", offset: 10, length: 11 }]);
+    // Bank card numbers are kept as phone numbers are, a pre keeps its
+    // language, and each entity only its own fields.
+    const card = await fake.post(GROUP, member, {
+      text: "card 4111 1111 1111 1111 and code",
+      entities: [
+        { type: "bank_card_number", offset: 5, length: 19 },
+        { type: "pre", offset: 29, length: 4, language: "js" },
+        { type: "italic", offset: 0, length: 4, url: "http://a.com" },
+      ],
+    });
+    expect((await fake.getMessage(GROUP, card)).message.entities).toEqual([
+      { type: "italic", offset: 0, length: 4 },
+      { type: "bank_card_number", offset: 5, length: 19 },
+      { type: "pre", offset: 29, length: 4, language: "js" },
+    ]);
   });
 
   it("refuses entities Telegram refuses", async () => {
@@ -1923,8 +2011,12 @@ describe("entities members give", () => {
         "Invalid custom emoji identifier specified",
       ],
       [
+        [{ type: "custom_emoji", offset: 0, length: 2, custom_emoji_id: "x" }],
+        `can't parse MessageEntity: Field "custom_emoji_id" must be a valid Number`,
+      ],
+      [
         [{ type: "phone_number", offset: 3, length: 5 }],
-        "can't parse entities: Entity beginning at UTF-16 offset 3 ends after the end of the text at UTF-16 offset 8",
+        "Entity beginning at UTF-16 offset 3 ends after the end of the text at UTF-16 offset 8",
       ],
       [
         [{ type: "sparkle", offset: 0, length: 2 }],
@@ -1934,11 +2026,14 @@ describe("entities members give", () => {
     for (const [entities, error] of refusals) {
       await expect(
         fake.post(GROUP, member, { text: "hello", entities }),
-      ).rejects.toThrow(error);
+      ).rejects.toHaveProperty("message", error);
     }
     await expect(
       fake.post(GROUP, member, { text: "hello", entities: "bold" }),
-    ).rejects.toThrow(/entities/);
+    ).rejects.toHaveProperty(
+      "message",
+      "entities must be a list of MessageEntity objects",
+    );
   });
 });
 
@@ -1985,10 +2080,32 @@ describe("files members post again", () => {
     ).toBe(document.file_unique_id);
     const file = await api("getFile", { file_id: document.file_id });
     expect(file.result.file_unique_id).toBe(document.file_unique_id);
+
+    // A live photo's video goes again as a video.
+    const [live] = (
+      await upload("sendMediaGroup", {
+        chat_id: String(GROUP),
+        media: [
+          {
+            type: "live_photo",
+            media: "attach://motion",
+            photo: "attach://still",
+          },
+        ],
+        motion: Buffer.from("motion"),
+        still: BYTES,
+      })
+    ).result;
+    const moving = await fake.post(GROUP, other, {
+      fileId: live.live_photo.file_id,
+    });
+    const video = (await fake.getMessage(GROUP, moving)).message;
+    expect(video.video.file_unique_id).toBe(live.live_photo.file_unique_id);
+    expect(video).not.toHaveProperty("live_photo");
   });
 
   it("refuses an unknown file, and needs the permission for the file's kind", async () => {
-    const { fake, api, member } = await setup();
+    const { fake, api, upload, member } = await setup();
     const other = await fake.createUser();
     await fake.join(GROUP, other);
     const first = await fake.post(GROUP, other, { photo: BYTES });
@@ -2009,6 +2126,12 @@ describe("files members post again", () => {
     await expect(
       fake.post(GROUP, other, { fileId: photo.file_id, text: "and text" }),
     ).rejects.toThrow(/one kind of content/);
+    // A chat photo is no message's file.
+    await upload("setChatPhoto", { chat_id: String(GROUP), photo: BYTES });
+    const chat = (await api("getChat", { chat_id: GROUP })).result;
+    await expect(
+      fake.post(GROUP, other, { fileId: chat.photo.small_file_id }),
+    ).rejects.toThrow(/^file_id names a chat photo, which no message carries$/);
   });
 });
 
@@ -2023,13 +2146,15 @@ describe("control routes for what members post", () => {
       });
       return { status: response.status, ...(await response.json()) };
     };
-    const channel = await fake.createChat({ type: "channel", ownerId: member });
+    const star = await fake.createUser({ is_premium: true });
+    await fake.join(GROUP, star);
+    const channel = await fake.createChat({ type: "channel", ownerId: star });
     const other = await fake.createChat({ ownerId: OWNER, title: "Other" });
     const photo = await fake.post(GROUP, member, { photo: BYTES });
     const [{ file_id }] = (await fake.getMessage(GROUP, photo)).message.photo;
 
     const posts = [
-      { text: "as channel", send_as: channel },
+      { user_id: star, text: "as channel", send_as: channel },
       {
         text: "fwd",
         forward_from: { chat_id: other, author_signature: "Admin" },
@@ -2103,5 +2228,13 @@ describe("control routes for what members post", () => {
         (message) => message.message_id === direct.message_id,
       ).location,
     ).toEqual({ latitude: 3, longitude: 4 });
+    const own = await fake.createChat({ type: "channel", ownerId: member });
+    expect(
+      await control(`chats/${GROUP}/messages`, {
+        user_id: member,
+        text: "as mine",
+        send_as: own,
+      }),
+    ).toEqual({ status: 403, error: "PREMIUM_ACCOUNT_REQUIRED" });
   });
 });

@@ -2380,16 +2380,17 @@ describe("deleting a bot", () => {
       SECOND_TOKEN,
     );
     const pending = (await api("getUpdates", {}, SECOND_TOKEN)).result;
+    // A long poll that only a wake-up ends within the test's time.
     const poll = api(
       "getUpdates",
-      { offset: pending.at(-1).update_id + 1, timeout: 5 },
+      { offset: pending.at(-1).update_id + 1, timeout: 50 },
       SECOND_TOKEN,
     );
     await fake.waitFor({
       kind: "call",
       botId: second.id,
       method: "getUpdates",
-      params: { timeout: "5" },
+      params: { timeout: "50" },
     });
 
     expect(await fake.deleteBot(second.id)).toEqual({ deleted: true });
