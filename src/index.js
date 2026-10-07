@@ -1450,13 +1450,24 @@ function readBody(request) {
 }
 
 /**
+ * V8's Serializer, refusing a value it cannot copy (a function, a symbol, a
+ * WeakMap) with the DataCloneError DOMException structuredClone throws, not
+ * a plain Error.
+ */
+class SnapshotSerializer extends Serializer {
+  _getDataCloneError(message) {
+    return new DOMException(message, "DataCloneError");
+  }
+}
+
+/**
  * A snapshot's state as bytes, written once when it is taken, with the
  * serialization structuredClone uses; each restore reads them into a new
  * copy. (Node's v8.serialize would read Buffers back as views of the
  * snapshot's bytes.)
  */
 function snapshotBytes(state) {
-  const serializer = new Serializer();
+  const serializer = new SnapshotSerializer();
   serializer.writeHeader();
   serializer.writeValue(state);
   return serializer.releaseBuffer();
