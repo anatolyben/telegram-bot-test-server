@@ -393,6 +393,41 @@ it("records only what happened between start and stop, with the older messages i
   expect(page.members.map((entry) => entry.user_id)).toContain(ann);
 });
 
+it("records each message's reactions as they are at the stop, an older message's included", async () => {
+  const { fake, api, ann } = await setup();
+  const quoted = await fake.post(CHAT, ann, "from before");
+  await fake.startRecording("reactions");
+  const reply = await fake.post(CHAT, ann, {
+    text: "a reply",
+    replyTo: quoted,
+  });
+  await fake.react(CHAT, quoted, ann, "🔥");
+  await fake.react(CHAT, reply, ann, "👀");
+  await api("setMessageReaction", {
+    chat_id: CHAT,
+    message_id: reply,
+    reaction: [{ type: "emoji", emoji: "👍" }],
+  });
+  await fake.react(CHAT, reply, ann, null);
+  const { json } = await fake.stopRecording("reactions");
+
+  expect(
+    json.pages[CHAT].items.map((item) => [
+      recorded({ items: [item] })[0],
+      item.reactions,
+    ]),
+  ).toEqual([
+    [
+      "before: from before",
+      [{ type: "emoji", emoji: "🔥", total_count: 1, user_ids: [ann] }],
+    ],
+    [
+      "a reply",
+      [{ type: "emoji", emoji: "👍", total_count: 1, user_ids: [BOT] }],
+    ],
+  ]);
+});
+
 it("records only the chats it names, a private chat that starts after it included", async () => {
   const { fake, api, ann } = await setup();
   const sam = await fake.createUser({ first_name: "Sam" });

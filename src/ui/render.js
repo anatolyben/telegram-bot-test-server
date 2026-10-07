@@ -932,6 +932,61 @@ function renderKeyboard(markup) {
   return `<div class="tv-keyboard">${html}</div>`;
 }
 
+// ── Reactions ──────────────────────────────────────────────────────────
+
+/**
+ * A message's reactions, drawn under it: a chip per reaction, its emoji (a
+ * custom emoji, whose image this server lacks, as a mark) and how many chose
+ * it, in the order the server gives (state.js reactionsOf). In the test's
+ * view a chip names who chose it on hover; seen as a member, it marks the
+ * member's own (td_api messageReaction.is_chosen) and names nobody. `meta`
+ * (the time) ends the row.
+ */
+function renderReactions(item, ctx, meta = "") {
+  const reactions = Array.isArray(item.reactions) ? item.reactions : [];
+  if (!reactions.length) return "";
+  const chips = reactions
+    .map((reaction) => {
+      const ids = (reaction.user_ids ?? []).map(Number);
+      const custom = reaction.type === "custom_emoji";
+      const mine = ctx.as != null && ids.includes(Number(ctx.as));
+      const count = String(Number(reaction.total_count) || 0);
+      const title = [
+        custom ? `custom emoji ${reaction.custom_emoji_id ?? ""}` : null,
+        ctx.as == null
+          ? ids.map((id) => personName(ctx, id)).join(", ")
+          : mine
+            ? "your reaction"
+            : null,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      return el(
+        "span",
+        {
+          class: "tv-reaction",
+          "data-reaction-type": custom ? "custom_emoji" : "emoji",
+          "data-reaction-emoji": custom ? null : String(reaction.emoji ?? ""),
+          "data-custom-emoji-id": custom ? reaction.custom_emoji_id : null,
+          "data-reaction-count": count,
+          "data-reaction-user-ids": ctx.as == null ? ids.join(" ") : null,
+          "data-reaction-mine": mine,
+          title: title || null,
+        },
+        custom
+          ? '<span class="tv-reaction-emoji tv-reaction-custom" aria-hidden="true">☺</span>'
+          : el(
+              "span",
+              { class: "tv-reaction-emoji" },
+              escapeHtml(reaction.emoji),
+            ),
+        el("span", { class: "tv-reaction-count" }, count),
+      );
+    })
+    .join("");
+  return `<div class="tv-reactions">${chips}${meta}</div>`;
+}
+
 // ── Messages ───────────────────────────────────────────────────────────
 
 const SERVICE_TYPES = [
@@ -1186,7 +1241,7 @@ function renderService(item, ctx, type) {
         )
       : "";
   const deleted = item.deleted && ctx.as == null ? deletedMark(item, ctx) : "";
-  return `<div class="tv-service-row"${messageAttrs(item, ctx, type)}><span class="tv-service">${serviceText(item, ctx, type)}${photo}${deleted}<span class="tv-service-time">${timeTag(item.at ?? m.date * 1000)}</span></span></div>`;
+  return `<div class="tv-service-row"${messageAttrs(item, ctx, type)}><span class="tv-service">${serviceText(item, ctx, type)}${photo}${deleted}<span class="tv-service-time">${timeTag(item.at ?? m.date * 1000)}</span></span>${renderReactions(item, ctx)}</div>`;
 }
 
 function deletedMark(item, ctx) {
@@ -1302,8 +1357,11 @@ export function renderMessage(item, ctx, position = {}) {
   const entities = m.text != null ? m.entities : m.caption_entities;
   // A bot's change of only the keyboard is not shown as an edit (edit_hidden).
   const meta = `<span class="tv-meta">${item.deleted ? deletedMark(item, ctx) : ""}${timeTag(item.at ?? m.date * 1000, m.edit_date != null && !item.edit_hidden ? '<span class="tv-edited">edited · </span>' : "")}</span>`;
-  const body =
-    text != null
+  // Reactions sit under the text, with the time at the end of their row.
+  const reactions = renderReactions(item, ctx, meta);
+  const body = reactions
+    ? `${text != null ? `<div class="tv-text">${renderText(text, entities)}</div>` : ""}${reactions}`
+    : text != null
       ? `<div class="tv-text">${renderText(text, entities)}${meta}</div>`
       : `<div class="tv-meta-row">${meta}</div>`;
   const bubbleClass = [
