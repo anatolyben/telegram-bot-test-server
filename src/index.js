@@ -1711,6 +1711,10 @@ export async function startTestServer({
   // The order of everything stored in any chat: messages, chat events and
   // deletions each take the next number.
   let nextSeq = 0;
+  // Bumped by every edit or deletion of a stored message: a message wait
+  // reads only newly stored messages while it stays the same
+  // (messageWaitRead).
+  let messageRewrites = 0;
 
   for (const config of chatConfigs) {
     const owner = {
@@ -4484,6 +4488,7 @@ export async function startTestServer({
       });
       entry.deleted = true;
       entry.deletion = deletionMark(caller, "deleteEphemeralMessage");
+      messageRewrites += 1;
       appliedCheckpoint();
       waits.notify();
       return true;
@@ -4681,6 +4686,7 @@ export async function startTestServer({
       requireDeleteRights(chat, entry, caller);
       entry.deleted = true;
       entry.deletion = deletionMark(caller, "deleteMessage");
+      messageRewrites += 1;
       appliedCheckpoint();
       waits.notify();
       return true;
@@ -4696,6 +4702,7 @@ export async function startTestServer({
         entry.deleted = true;
         entry.deletion = deletionMark(caller, "deleteMessages");
       }
+      messageRewrites += 1;
       appliedCheckpoint();
       waits.notify();
       return true;
@@ -6977,6 +6984,7 @@ export async function startTestServer({
       );
     }
     entry.message = edited;
+    messageRewrites += 1;
     // Telegram's apps show no "edited" for a bot's change of only the
     // keyboard (the message's edit_hide); the bot still gets edit_date.
     entry.editHidden = kind === "reply_markup";
@@ -7004,6 +7012,7 @@ export async function startTestServer({
     const entry = ownEphemeralMessage(p, caller, receiverId);
     requireButtonData(markup);
     entry.message = editedMessage(entry.message, markup, apply);
+    messageRewrites += 1;
     entry.editHidden = markupOnly;
     appliedCheckpoint();
     waits.notify();
@@ -7610,6 +7619,94 @@ export async function startTestServer({
     );
   }
 
+  /**
+   * A message wait's test of a stored message: author, text and caption, and
+   * the newer matchers, which find the oldest match in the order things were
+   * stored, ephemeral messages included.
+   */
+  function messageTest(condition) {
+    const newer =
+      condition.since != null ||
+      condition.contains != null ||
+      condition.matches != null ||
+      condition.buttonText != null ||
+      condition.buttonData != null;
+    const pattern = condition.matches
+      ? new RegExp(condition.matches.source, condition.matches.flags)
+      : null;
+    return {
+      newer,
+      matches: (entry) =>
+        (condition.userId == null || entry.author === condition.userId) &&
+        (condition.botId == null || entry.author === condition.botId) &&
+        (condition.text == null || entry.message.text === condition.text) &&
+        (condition.caption == null ||
+          entry.message.caption === condition.caption) &&
+        (!newer || matchesContent(entry.message, condition, pattern)),
+    };
+  }
+
+  /** A message wait's result in the 0.11.0 shape: what places it stays out. */
+  function messageView({
+    seq: _seq,
+    at: _at,
+    afterRequest: _after,
+    requestId: _request,
+    deletion: _deletion,
+    ...stored
+  }) {
+    return { exists: true, ...stored };
+  }
+
+  /**
+   * The read of a message wait without messageId. It looks at the whole chat
+   * once, then only at messages stored since, for as long as no stored
+   * message is edited or deleted and the chat is the same (a restore, or a
+   * private chat opened later, makes another). A message it looked at did not
+   * match and has not changed since, so the first match is the one observe
+   * finds: in stored order, or by seq with the newer matchers.
+   */
+  function messageWaitRead(condition) {
+    const { newer, matches } = messageTest(condition);
+    const found = (entry) =>
+      (!newer || entry.seq > (condition.since ?? 0)) &&
+      matches(entry) &&
+      (condition.deleted == null || entry.deleted === condition.deleted);
+    let read = null;
+    let rewrites = 0;
+    let nextId = 0;
+    let nextEphemeralId = 0;
+    return () => {
+      const chat =
+        chats.get(condition.chatId) ?? privateChats.get(condition.chatId);
+      if (!chat || chat !== read || rewrites !== messageRewrites) {
+        read = chat ?? null;
+        rewrites = messageRewrites;
+        nextId = chat?.nextMessageId;
+        nextEphemeralId = chat?.nextEphemeralMessageId ?? 1;
+        return observe(condition).result;
+      }
+      const stored = [];
+      while (nextId < chat.nextMessageId) {
+        stored.push(chat.messages.get(nextId++));
+      }
+      while (nextEphemeralId < chat.nextEphemeralMessageId) {
+        stored.push(chat.ephemeral.get(nextEphemeralId++));
+      }
+      let first = null;
+      for (const entry of stored) {
+        if (
+          entry &&
+          found(entry) &&
+          (first === null || (newer && entry.seq < first.seq))
+        ) {
+          first = entry;
+        }
+      }
+      return first && messageView(first);
+    };
+  }
+
   function observe(condition, describe = false) {
     if (condition.kind === "quiet") {
       const { busy, observed } = quietState(condition.botIds);
@@ -7694,47 +7791,20 @@ export async function startTestServer({
         condition.messageId == null
           ? [...chat.messages.values(), ...(chat.ephemeral?.values() ?? [])]
           : [chat.messages.get(condition.messageId)].filter(Boolean);
-      // The newer matchers find the oldest match in the order things were
-      // stored, ephemeral messages included.
-      const newer =
-        condition.since != null ||
-        condition.contains != null ||
-        condition.matches != null ||
-        condition.buttonText != null ||
-        condition.buttonData != null;
+      const { newer, matches } = messageTest(condition);
       if (newer) {
         entries = entries
           .filter((entry) => entry.seq > (condition.since ?? 0))
           .sort((left, right) => left.seq - right.seq);
       }
-      const pattern = condition.matches
-        ? new RegExp(condition.matches.source, condition.matches.flags)
-        : null;
-      const matching = entries.filter(
-        (entry) =>
-          (condition.userId == null || entry.author === condition.userId) &&
-          (condition.botId == null || entry.author === condition.botId) &&
-          (condition.text == null || entry.message.text === condition.text) &&
-          (condition.caption == null ||
-            entry.message.caption === condition.caption) &&
-          (!newer || matchesContent(entry.message, condition, pattern)),
-      );
+      const matching = entries.filter(matches);
       const entry = matching.find(
         (entry) =>
           condition.deleted == null || entry.deleted === condition.deleted,
       );
-      // The 0.11.0 shape: what places an entry stays out of it.
-      const view = ({
-        seq: _seq,
-        at: _at,
-        afterRequest: _after,
-        requestId: _request,
-        deletion: _deletion,
-        ...stored
-      }) => ({ exists: true, ...stored });
       return {
-        result: entry ? view(entry) : null,
-        observed: matching.slice(-4).map(view),
+        result: entry ? messageView(entry) : null,
+        observed: matching.slice(-4).map(messageView),
       };
     }
     const member = chatMemberObject(chat, condition.userId, bot);
@@ -7855,7 +7925,11 @@ export async function startTestServer({
     };
     return waits
       .wait(
-        condition.kind === "quiet" ? quiet : () => observe(condition).result,
+        condition.kind === "quiet"
+          ? quiet
+          : condition.kind === "message" && condition.messageId == null
+            ? messageWaitRead(condition)
+            : () => observe(condition).result,
         timeoutMs,
         () =>
           diagnostic(
@@ -9200,6 +9274,7 @@ export async function startTestServer({
       if (fields[key] !== undefined) message[key] = fields[key];
       else delete message[key];
     }
+    messageRewrites += 1;
     message.edit_date = now();
     entry.editHidden = false;
     await emit("edited_message", structuredClone(message));
