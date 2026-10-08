@@ -1309,6 +1309,10 @@ attributes for Playwright and its routes.
 
 ### Watch several servers at once
 
+<img src="https://raw.githubusercontent.com/anatolyben/telegram-bot-test-server/v0.15.1/docs/images/watch-five-servers.jpg"
+  alt="Five servers on one page, side by side: a book club, a running club, a study group, a garden
+  swap and a chess night, each with its own bot welcoming members and removing a spam link">
+
 When several servers run at the same time, for example one per parallel test worker, watch them on
 one page:
 

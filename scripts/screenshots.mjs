@@ -9,8 +9,16 @@
 import http from "node:http";
 import { mkdir, stat } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { Bot, GrammyError, InlineKeyboard, webhookCallback } from "grammy";
 import { startTestServer } from "../src/index.js";
+import { startWatch } from "../src/watch.js";
+
+// Only this script's servers appear on the watch page.
+const WATCH_DIR = mkdtempSync(path.join(tmpdir(), "screenshots-watch-"));
+process.env.TELEGRAM_TEST_SERVER_WATCH_DIR = WATCH_DIR;
 
 const { chromium } = await import(
   process.env.PLAYWRIGHT
@@ -40,6 +48,7 @@ const server = await startTestServer({
   ],
   clock: { now: START },
   ui: true,
+  name: "Book Club",
 });
 const later = (minutes) => server.advanceTime(minutes * MINUTE);
 
@@ -196,6 +205,79 @@ await server.react(CLUB, schedule, carol, "🙏");
 await server.react(CLUB, schedule, ANN, "🔥");
 await quiet();
 
+// ── Four more servers, as parallel test workers would run them ────────
+
+// Each has its own group and a bot that welcomes newcomers, removes a link
+// and mutes its author, played directly through the Bot API.
+const others = [];
+for (const [index, story] of [
+  {
+    title: "Running Club",
+    lines: ["Sunday long run: 8 am at the park gate 🏃", "Count me in!"],
+  },
+  {
+    title: "Study Group",
+    lines: ["Chapter 5 notes are up. Quiz on Thursday.", "Thanks! 🙏"],
+  },
+  {
+    title: "Garden Swap",
+    lines: ["Spare tomato seedlings, anyone? 🍅", "Yes please, two!"],
+  },
+  {
+    title: "Chess Night",
+    lines: ["Tonight 7 pm, bring a board ♟️", "I'll bring two."],
+  },
+].entries()) {
+  const token = `70000000${index}:watch-${index}`;
+  const chat = -1001900000000 - index;
+  const owner = 500000000 + index;
+  const other = await startTestServer({
+    botToken: token,
+    botUsername: `helper${index}_bot`,
+    botName: "Helper",
+    chats: [{ id: chat, title: story.title, ownerId: owner, ownerName: "Ann" }],
+    clock: { now: START },
+    ui: true,
+    name: story.title,
+  });
+  others.push(other);
+  const botId = Number(token.split(":")[0]);
+  await other.setBotMembership(chat, botId, {
+    rights: { can_delete_messages: true, can_restrict_members: true },
+  });
+  const api = (method, body) =>
+    fetch(`${other.origin}/bot${token}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }).then((response) => response.json());
+  const [first, second, spammer] = [
+    await other.createUser({ first_name: "Mia" }),
+    await other.createUser({ first_name: "Leo" }),
+    await other.createUser({ first_name: "Max" }),
+  ];
+  for (const member of [first, second, spammer]) {
+    await other.join(chat, member);
+    await api("sendMessage", {
+      chat_id: chat,
+      text: `Welcome to ${story.title}! 👋`,
+    });
+  }
+  await other.post(chat, first, story.lines[0]);
+  await other.post(chat, second, story.lines[1]);
+  const spam = await other.post(
+    chat,
+    spammer,
+    "Easy money, click here 👉 earn-fast.example.net",
+  );
+  await api("restrictChatMember", {
+    chat_id: chat,
+    user_id: spammer,
+    permissions: { can_send_messages: false },
+  });
+  await api("deleteMessage", { chat_id: chat, message_id: spam });
+}
+
 // ── The pictures ──────────────────────────────────────────────────────
 
 await mkdir(IMAGES, { recursive: true });
@@ -219,10 +301,39 @@ try {
     scale: 1.5,
     query: `chat=${CLUB}&as=${carol}&theme=light`,
   });
+  await shootWatch("watch-five-servers.jpg");
 } finally {
   await browser.close();
   await server.stop();
+  for (const other of others) await other.stop();
   receiver.close();
+  rmSync(WATCH_DIR, { recursive: true, force: true });
+}
+
+// The watch page with all five servers, each panel showing its own group.
+async function shootWatch(file) {
+  const watch = await startWatch({ port: 0 });
+  try {
+    const viewport = { width: 1800, height: 820 };
+    const page = await browser.newPage({
+      viewport,
+      deviceScaleFactor: 1600 / 1800 > 1 ? 1600 / 1800 : 1,
+    });
+    await page.goto(watch.url);
+    await page.waitForFunction(
+      () => document.querySelectorAll(".pane iframe").length === 5,
+    );
+    // Every viewer has drawn its chat.
+    for (const frame of page.frames().slice(1))
+      await frame.waitForSelector("[data-kind]", { timeout: 10_000 });
+    await page.waitForTimeout(800);
+    const target = `${IMAGES}${file}`;
+    await page.screenshot({ path: target, type: "jpeg", quality: 80 });
+    await page.close();
+    console.log(`${target}: ${Math.round((await stat(target)).size / 1024)} KB`);
+  } finally {
+    await watch.close();
+  }
 }
 
 async function shoot({ file, viewport, scale, query }) {
