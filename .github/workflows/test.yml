@@ -1,0 +1,48 @@
+# Runs the test suite on every push to main and on pull requests, on the
+# oldest supported Node and the current one. Its status is the README badge.
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  id-token: write # Codecov upload without a stored token
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: ["20", "24"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+      # pnpm itself needs Node 22.13 or newer: install with Node 24, then run
+      # the suite on the Node version under test.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+      - run: node --version && node node_modules/vitest/vitest.mjs run
+        if: matrix.node != '24'
+      # On Node 24 the same run also measures coverage for the README badge.
+      - run: >-
+          node --version && node node_modules/vitest/vitest.mjs run --coverage
+          --coverage.include='src/**' --coverage.reporter=lcov --coverage.reporter=text-summary
+        if: matrix.node == '24'
+      - uses: codecov/codecov-action@v5
+        if: matrix.node == '24'
+        with:
+          files: coverage/lcov.info
+          use_oidc: true
+          fail_ci_if_error: false
