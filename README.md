@@ -70,7 +70,7 @@ It never talks to Telegram and runs as often as you like in CI.
 ## Install
 
 ```sh
-npm install --save-dev --save-exact telegram-bot-test-server@0.14.0
+npm install --save-dev --save-exact telegram-bot-test-server
 ```
 
 Requires Node.js 20 or newer. No runtime dependencies. Everything lives in memory and is gone when
