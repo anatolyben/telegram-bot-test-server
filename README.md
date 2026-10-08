@@ -1305,6 +1305,11 @@ message stays, grayed and marked with who deleted it.
 The toolbar switches to the chat list, one chat, its members, or the chats as one member sees them.
 Click a call to mark what it touched. The view lives in the URL, so a link opens the same view.
 
+Each list follows its newest item as the test runs. Scrolling up to read pauses it; once you stop
+scrolling for 8 seconds, or reach the bottom, it returns to the newest and follows again. To watch
+several servers on one screen, frame their viewers in a page of your own: pages on this computer
+(`127.0.0.1`, `localhost`, `[::1]`) may frame the viewer, and no other page can.
+
 The [viewer reference][ref-viewer] lists everything it shows, its URL parameters, the data
 attributes for Playwright and its routes.
 
