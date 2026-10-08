@@ -364,7 +364,7 @@ The fake remains a documented Telegram subset. Complete methods/parameters,
 rate limits, automatic Telegram retry policies and exact callback expiry timing
 are not claimed. The existing owner client remains a fixture model of its stated
 API subset. Supported formatting/membership contracts are referenced in the
-[README](../README.md#how-closely-it-matches-telegram); all new test controls are
+[README](../README.md); all new test controls are
 package design choices rather than Telegram platform guarantees. No downstream
 E2E acceleration was measured or claimed.
 

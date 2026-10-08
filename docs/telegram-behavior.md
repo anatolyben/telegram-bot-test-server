@@ -1,4 +1,4 @@
-# How closely telegram-bot-test-server matches Telegram
+# Telegram behavior
 
 This page lists, area by area, how the local test server behaves where a bot can tell the difference
 from Telegram. The [README](https://github.com/anatolyben/telegram-bot-test-server#readme) covers
