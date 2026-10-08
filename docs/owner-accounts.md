@@ -155,6 +155,6 @@ or phone is recorded as `[redacted]`.
   deleting from the client, media downloads, drafts, forum topics, reactions and forwards in
   history, `messages.getDialogFilters` for chatlists, and every other GramJS method.
 - Unverified: Telegram does not document the order of dialogs with equal dates (this server breaks
-  ties by message id, then peer id), whether a cursor page without `excludePinned` repeats pinned
+  ties by message id, then peer id), whether a cursor page without `ignorePinned` repeats pinned
   dialogs (here it does not), or what GramJS raises for a response lost mid-call (here `TIMEOUT`).
   Unread counts are what a test sets; they are not derived from messages.

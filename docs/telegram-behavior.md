@@ -19,9 +19,10 @@ byte identical.
   [restrictions](#restrictions-stick), [protected members](#protected-members),
   [moderation rights](#moderation-rights), [bans](#bans), [unbanning](#unbanning),
   [administrators and chat settings](#administrators-and-chat-settings),
-  [join request queries](#join-request-queries-bot-api-10x), [invite links](#invite-links)
+  [join request queries](#join-request-queries-bot-api-101), [invite links](#invite-links)
 - [Bots and chats](#bots-and-chats): [which chats a bot may use](#which-chats-a-bot-may-use),
   [more than one bot](#more-than-one-bot), [private chats](#private-chats),
+  [privacy mode](#privacy-mode),
   [channels](#channels), [basic groups and the upgrade](#basic-groups-and-the-upgrade),
   [people changing the chat](#people-changing-the-chat),
   [adding the bot through a link](#adding-the-bot-through-a-link),
@@ -66,7 +67,12 @@ and supergroups, not for channels.
 A restricted user who leaves and rejoins is still restricted. An `until_date` from 30 seconds to 366
 days away ends the restriction or ban then, on the server's clock; any other date makes it
 permanent. When it ends, a restricted user is a member again, or `left` if they left meanwhile, and
-a banned user is `left`. No update is sent when a restriction or ban runs out.
+a banned user is `left`. No update is sent when a restriction or ban runs out: the Bot API server
+sends `chat_member` and `my_chat_member` only for TDLib's `updateChatMember`
+([Client.cpp][bot-api-server-client] `add_update_chat_member`), which TDLib makes only of an update
+from Telegram (`DialogParticipantManager::send_update_chat_member`). When a restriction of the
+bot's own ends, TDLib only changes its copy of the status (`ChatManager::on_channel_unban_timeout`),
+and no source shows Telegram sending an update when one ends.
 
 ### Protected members
 
@@ -113,7 +119,9 @@ edit keeps the custom title: TDLib's `channels.editAdmin` leaves the title out, 
 through `messages.editChatParticipantRank`. An administrator carries the rights its kind of chat
 has, as Telegram writes them: `can_post_messages`, `can_edit_messages` and
 `can_manage_direct_messages` in channels, `can_pin_messages` and `can_manage_tags` in groups, and
-`can_manage_topics` in supergroups.
+`can_manage_topics` in supergroups. The Bot API server also writes `can_manage_voice_chats`, the
+older name of `can_manage_video_chats`, in every `ChatMemberAdministrator`, and
+`promoteChatMember` takes either name.
 
 People promote and demote members too (`promoteMember`, `demoteMember`), as Telegram's apps do
 through TDLib's `setChatMemberStatus`. In a supergroup or channel, the creator or an administrator
@@ -159,7 +167,7 @@ trimmed, and in a title each run of spaces, newlines and no-break spaces becomes
 left empty fails with `title must be non-empty`. The current title set again succeeds without a
 service message, while an unchanged description or a missing photo is refused.
 
-### Join request queries (Bot API 10.x)
+### Join request queries (Bot API 10.1)
 
 A guard bot (`supportsJoinRequestQueries`) with `can_invite_users` gets each join request with a
 `query_id`, which it answers with `answerChatJoinRequestQuery` (`chat_join_request_query_id`,
@@ -211,9 +219,8 @@ or another bot changed it; the chat's administrator bots hear of it as `chat_mem
 `can_be_edited` is true only for the bot that promoted that administrator, and
 `getChatAdministrators` leaves out other bots unless `return_bots` is set. Only the bot that put a
 keyboard on a message, by sending the message or by the last edit that set the keyboard, hears its
-buttons pressed. Users write privately only to the first bot, so no other bot can message them
-(403), except a join requester: any bot that receives the request may message them for five
-minutes, as under [Private chats](#private-chats).
+buttons pressed. Each bot has its own private chat with a user, as under
+[Private chats](#private-chats).
 
 A test may delete a bot it added (`deleteBot`). Every call with its token then gets
 `401 Unauthorized`, the Bot API server's answer once Telegram no longer accepts a token. Its webhook
@@ -225,10 +232,55 @@ member lists name, and a press on its buttons reaches no bot and goes unanswered
 
 ### Private chats
 
+Every bot is an account of its own, so a user's private chat with each bot is a chat of its own:
+the Bot API server keeps one TDLib client, with its own messages, per bot token, and names a
+private chat by the other party's id. All of a bot's private chats draw their message ids from one
+sequence: "The sequence is shared by all private chats and basic group messages within the current
+account" ([updates](https://core.telegram.org/api/updates)). So a bot's messages with two users
+never share an id, and basic groups take ids from the same sequence
+([Basic groups and the upgrade](#basic-groups-and-the-upgrade)). A bot reaches only its own chat
+with a user, for sends, edits, deletions, pins, replies and forwards, and `getChat` shows its own
+pinned message. The test actions for private chats take
+the bot (`botId`), the first bot by default, and a `start` link to any bot opens that bot's chat.
+
 The bot cannot message a user who has not written to it first (403). The exception is a join
 request: a bot that receives it may message its `user_chat_id` for five minutes, until the request
 is approved or declined, as [ChatJoinRequest](https://core.telegram.org/bots/api#chatjoinrequest)
 documents. The five minutes follow the server's clock, so `advanceTime` can end them.
+
+Any other call, `sendChatAction` included, checks the chat with TDLib's `getChat`
+(`Client::check_chat`). It finds the private chat of a user the bot knows: one who has a private
+chat with it, shares or shared a chat with it, asked to join a chat it is in, or was named in an
+update it got. If that user never wrote to the bot, the chat is empty: `getChat` shows the user, and
+`deleteMessage`, `pinChatMessage` or `forwardMessage` from it get `message to delete not found` and
+the like (`Client::check_message`). For anyone else the call gets `400 Bad Request: chat not found`
+(`TdOnCheckChatCallback`).
+
+### Privacy mode
+
+A bot can run in privacy mode (`privacyMode`, off by default), as BotFather sets it. In a group or
+supergroup where it is not an administrator, it then gets only what the Bot API docs list
+([privacy mode][privacy-mode], [what messages will my bot get][bots-faq]): "All service messages",
+"Commands explicitly meant for them (e.g., /command@this_bot)", "General commands from users
+(e.g. /start) if the bot was the last bot to send a message to the group", and "Replies to any
+messages implicitly or explicitly meant for this bot". Note that "each particular message can only
+be available to one privacy-enabled bot at a time", and "Replies have the highest priority", so a
+reply goes to the bot it is meant for, then an explicit command to the bot it names, then a
+general command to the last bot that sent a message. An administrator bot gets every message, and
+privacy mode changes nothing in channels and private chats. `getMe` says
+`can_read_all_group_messages: false`. Not modeled: messages sent via the bot in inline mode.
+
+Where the docs do not decide, the server takes the narrowest reading of their examples:
+
+- A command is a text message that starts with one, as `/command@this_bot` and `/start` do. A
+  command later in the text, or in a caption, does not count.
+- A message is meant for a bot when the bot sent it, got it by these rules, or it is a command
+  that names the bot. So a reply to a command for the bot, or to a reply the bot got, reaches it.
+- The last bot to send a message is the last to send one itself. A service message its action
+  made, such as a pin, does not count.
+- A message in a forum topic is not a reply to the topic's creation message, which the Bot API
+  server adds as `reply_to_message` itself.
+- The bot gets the edits of only the messages it received.
 
 ### Channels
 
@@ -262,6 +314,19 @@ Telegram's server raises the upgrade error only for calls that write or read the
 Unverified: what it answers to other calls on the old id (`getChatMember` about the bot itself,
 `setMessageReaction`, edits), so this server keeps the upgrade error for them; and whether bots get
 `my_chat_member` on the upgrade, which this server does not send.
+
+Each account sees a basic group's messages under ids from its own common sequence, the one its
+private chats use ([updates](https://core.telegram.org/api/updates): "The sequence is shared by all
+private chats and basic group messages within the current account"). So two bots in one basic
+group know the same message by different ids, and every call a bot makes about one (reply, edit,
+delete, pin, reaction, stop a poll, forward or copy from the group) takes its own id; every update
+and answer it gets shows its own ids, a button press's message and a reaction included. Every
+account in the group when a message is posted gets an id for it, and so does the member a
+`left_chat_member` message names. A bot that joins later has none for what came before: an id it
+does not know is not found, and a reply to or pin of such a message shows without it, as the Bot
+API leaves out a message it cannot get. Unverified: whether a bot in privacy mode, or one that never
+gets another bot's messages, still takes an id for each message, as this server does. The
+supergroup an upgrade makes numbers its messages once, for every account.
 
 Telegram's docs: [migration](https://core.telegram.org/api/channel#migration).
 
@@ -299,17 +364,63 @@ own calls post, as Telegram's Bot API server delivers them.
 ### Forum topics
 
 In a forum, a send to a `message_thread_id` that is not a topic fails with
-`message thread not found`. A member's message in a topic that answers nothing replies to the
-topic's creation message, as on Telegram, and so does a bot's send to a topic without an explicit
-reply ([Replies and quotes](#replies-and-quotes)). Topics cannot be closed or deleted here.
+`message thread not found`, as does one to the General topic's id, 1. Every message in a topic other
+than General that answers nothing else, a service message included, replies to the topic's creation
+message while that is not deleted. The Bot API server adds that reply itself (Client.cpp
+`get_implicit_reply_to_message_id`). This covers a bot's send to a topic without an explicit reply
+too ([Replies and quotes](#replies-and-quotes)).
+
+Bots close, reopen, rename and delete topics, and close, reopen, rename, hide and unhide the General
+topic, as the Bot API server passes these methods to TDLib's `ForumTopicManager`. A chat that is no
+forum fails with `the chat is not a forum`, and a `message_thread_id` of 0 or less with
+`invalid forum topic identifier specified`. Closing, reopening and renaming need
+`can_manage_topics`, unless the bot created the topic, and deleting needs `can_delete_messages`,
+with no such exemption, as the Bot API docs say. TDLib refuses a bot without the right for a topic
+it knows the bot did not create (`not enough rights to close or open the topic`,
+`not enough rights to edit the topic`, `not enough rights to delete the topic`). A bot's TDLib
+knows a topic once one of its sends named it. It may also learn a topic from messages it fetches
+(`MessagesInfo.cpp`), and for a topic it does not know it passes the call on to Telegram, whose
+answer no source gives. So a call without the right on a topic the bot never sent to, the General
+topic included, and a deletion of the bot's own topic without the right are reported as
+unimplemented, with 404 `Not Found: method not found`. Hiding and unhiding always need
+`can_manage_topics`, with the first of those texts.
+
+Telegram answers `TOPIC_ID_INVALID` for a topic that does not exist, `TOPIC_NOT_MODIFIED` for a
+change to nothing new (closing a closed topic, a name it already has), and
+`GENERAL_MODIFY_ICON_FORBIDDEN` for an icon for the General topic. A name is cleaned as a chat title
+and cut to 128 characters; an empty name keeps the old one, and an edit with neither name nor icon
+does nothing. Every change posts its service message from the bot, which that bot gets too:
+`forum_topic_closed`, `forum_topic_reopened`, `forum_topic_edited` (with the new `name`),
+`general_forum_topic_hidden` and `general_forum_topic_unhidden`; the General topic's have no
+`message_thread_id`. Hiding the General topic also closes it, and reopening it also unhides it, as
+the Bot API docs say. That reopening posts `forum_topic_reopened`: TDLib shows an edit that both
+unhides and reopens a topic as reopened, not unhidden (`ForumTopicEditedData.cpp`,
+`get_edited_data_message_content_object`).
+
+A closed topic takes no messages from anyone but administrators with `can_manage_topics` and the
+topic's creator, as TDLib's `can_send_message_to_forum_topic` decides: a bot gets
+`Bad Request: TOPIC_CLOSED`, Telegram's 406, and `post()` fails with `TOPIC_CLOSED`. A message in
+no topic goes to the General topic. Deleting a topic deletes all its messages, its creation message
+included, and Telegram sends no update of its own for it ([forums][forum-docs]): bots get none, as
+for any deletion. "All topics except for the "General" topic can be deleted"
+([forums][forum-docs]), but no source gives Telegram's answer to deleting it, so that call is
+reported as unimplemented.
+`unpinAllForumTopicMessages` and `unpinAllGeneralForumTopicMessages` unpin a topic's messages with
+the pinning right; a chat with no topics fails with `chat doesn't have topics`.
+
+Not modeled: a custom emoji topic icon. `editForumTopic` with one gets the answer to a method this
+server lacks.
 
 ### Business connections
 
 An owner connects the bot to their account; the bot gets `business_connection` on every change, and
 `business_message` for each message in the owner's private chats while the connection is enabled,
-from the person or from the owner answering by hand. `sendMessage` with `business_connection_id`
-answers as the owner, with `sender_business_bot` set. It needs an enabled connection, `can_reply`,
-and a message from the person in the last 24 hours (`BUSINESS_PEER_USAGE_MISSING` otherwise, as
+from the person or from the owner answering by hand. Their ids come from the owner's own sequence,
+which the owner's private chats with bots and basic groups use too: such messages "will use the
+connected user's common message ID sequence" ([updates](https://core.telegram.org/api/updates)).
+`sendMessage` with `business_connection_id` answers as the owner, with `sender_business_bot` set.
+It needs an enabled connection, `can_reply`, and a message from the person in the last 24 hours
+(`BUSINESS_PEER_USAGE_MISSING` otherwise, as
 [documented](https://core.telegram.org/method/messages.sendMessage)). An unknown connection is
 `business connection not found`, as the Bot API says. Unverified: the error for a disabled
 connection (`BUSINESS_CONNECTION_INVALID`) and for a missing `can_reply`
@@ -321,7 +432,10 @@ without an inline keyboard only within 48 hours, as documented. Unverified: the 
 [messages.editMessage](https://core.telegram.org/method/messages.editMessage), for the person's
 message (`MESSAGE_AUTHOR_REQUIRED`), an unknown one (`MESSAGE_ID_INVALID`) and the 48 hours
 (`MESSAGE_EDIT_TIME_EXPIRED`). The connected bot may also message the owner's private chat
-(`user_chat_id`). `getMe` reports `can_connect_to_business`.
+(`user_chat_id`). `getMe` reports `can_connect_to_business`. When the person or the owner deletes a
+message of a business chat (`deleteBusinessMessage`), for both sides as in any private chat, the bot
+gets `deleted_business_messages` with the connection id, the chat and the message ids, while the
+connection is enabled, as for `business_message`.
 
 Telegram's docs: [BusinessConnection](https://core.telegram.org/bots/api#businessconnection),
 [connected business bots](https://core.telegram.org/api/bots/connected-business-bots).
@@ -388,9 +502,33 @@ group, which this server does not model. Unverified: what Telegram answers a mem
 `PREMIUM_ACCOUNT_REQUIRED` (403), which `messages.sendMessage` lists. Also unverified: what Bot API
 calls answer for the `@GroupAnonymousBot` and `@Channel_Bot` users, such as `banChatMember` on the
 `from` of such a post; here they are unknown users (`Bad Request: user not found`).
-`banChatSenderChat` is not supported. Not modeled: an anonymous administrator's reactions and poll
-votes, which the Bot API reports with `actor_chat` and `voter_chat` for anonymous ones; here they
-react and vote as themselves.
+
+An anonymous administrator reacts as the supergroup, and only the owner may react as the chat:
+TDLib offers no reaction at all to any other anonymous administrator
+(`get_my_reaction_dialog_id`, `get_message_available_reactions`), so `react()` fails with
+`The reaction isn't available for the message`. A group whose owner stays anonymous
+(`ownerAnonymous`) has `is_anonymous: true` in the owner's `ChatMember`; the owner posts as the
+group, and their reaction reaches administrator bots as `message_reaction` with `actor_chat`, not
+`user`. `deleteMessageReaction` removes it by `actor_chat_id`, not by the owner's `user_id`. An
+anonymous administrator or owner votes as the group ([Polls](#polls)). Not modeled: a member
+whose default sender is a channel, who TDLib has react as that channel. Nor the service messages of
+an anonymous owner or administrator: no source shows how Telegram shows their pins, new members,
+title and photo changes or topics, so these test actions fail for such a person
+(`... by an anonymous owner or administrator is not modeled`).
+
+`banChatSenderChat` and `unbanChatSenderChat` need `can_restrict_members` in a supergroup or
+channel and a `sender_chat_id` the bot can see (`member not found` otherwise); a basic group's id
+there is refused (`can't restrict the chat`). A basic group bans no chat
+(`can't ban chats in basic groups`) and unbans one as a no-op, and a private chat refuses both.
+A user's id is banned or unbanned as that user, as TDLib does: a ban takes `until_date` as
+`banChatMember` does, which the Bot API server reads for this method too, and in a basic group an
+unban removes the user, as a ban does there (`DialogParticipantManager` sets the status to left
+with `delete_chat_participant`). No `chat_member` update is sent for a chat. While a channel is
+banned, its owner posts on behalf of none of their channels there. Unverified: the error such a
+post gets; here `USER_BANNED_IN_CHANNEL`. A chat's ban lasts "Until the chat is unbanned", as the
+Bot API docs say. They list no `until_date` for it, and no source shows what Telegram does with one,
+so a chat's ban with `until_date` bans nothing and is reported as unimplemented, with 404
+`Not Found: method not found`. Without `until_date` the chat is banned.
 
 ### Entities
 
@@ -415,11 +553,27 @@ without Premium.
 
 ### Deleting messages
 
-A bot deletes its own messages, others' with `can_delete_messages`, and any message in a private
+A bot deletes its own messages, others' with `can_delete_messages`, and any message in its private
 chat. A message sent 48 hours ago or earlier, the service message that created a supergroup, channel
 or forum topic, and a dice in a private chat less than a day old can't be deleted
 (`message can't be deleted`). `deleteMessages` skips ids it does not find and, as TDLib does, checks
 every other message before deleting any, so one it can't delete fails the whole call.
+
+People delete messages too (`deleteMessage`, `deleteDirectMessage`), for everyone, as TDLib's
+`can_delete_message` and `can_revoke_message` allow. In a supergroup or channel, someone with
+`can_delete_messages` deletes any message but the chat's first, its creation and upgrade messages
+and a topic's creation message; anyone else only their own message that is not a service message,
+in a channel only with `can_post_messages`. A person has no 48-hour limit; only bots do. In a basic
+group, a person deletes their own message that is not a service message, and an administrator any
+message. In a private chat with a bot, a user deletes any message for both sides but a dice less
+than a day old. Refusals read `Message can't be deleted` or `Message can't be deleted for
+everyone`; TDLib would delete such a message only for that person, which nobody else sees. A
+message that is not there is skipped.
+
+No bot gets an update when a message is deleted, by a bot or by a person: the Bot API server only
+drops deleted messages from its cache (`updateDeleteMessages` in
+[Client.cpp][bot-api-server-client]), and no `Update` field reports one, but
+`deleted_business_messages` for a business chat ([Business connections](#business-connections)).
 
 Telegram's docs: [deleteMessage](https://core.telegram.org/bots/api#deletemessage).
 
@@ -452,7 +606,12 @@ photo or video, and an audio or document keeps its kind. Other messages' media c
 
 ### Forwards and copies
 
-A forward carries `forward_origin`; a copy does not. A forward of a forward keeps the first origin
+A forward carries `forward_origin`; a copy does not. Beside it, the Bot API server still writes the
+older fields ([Client.cpp][bot-api-server-client] `JsonMessage`): `forward_from` for a user;
+`forward_from_chat`, and `forward_signature` when signed, for a post on behalf of a chat;
+`forward_sender_name`, when not empty, for a hidden user; `forward_from_chat`,
+`forward_from_message_id` and `forward_signature` for a channel post; then `forward_date`, the
+origin's date. A forward of a forward keeps the first origin
 and its date. A message sent on behalf of a chat in a group (see
 [Posts on behalf of a chat](#posts-on-behalf-of-a-chat)) is forwarded with a `chat` origin, as
 TDLib's `MessageOrigin` reads Telegram's forward header. Its `author_signature` stays in the
@@ -473,10 +632,10 @@ the 1024-character limit applies only to media.
 
 Pinned messages are kept newest first by sending date. `getChat` returns the most recent one that
 was not deleted as `pinned_message`, and `unpinChatMessage` without `message_id` unpins it. This
-works in groups, channels and private chats; a private chat's pin shows only to the first bot, since
-that is the bot users write to. The message is checked before the bot's rights: a missing message
-fails with `message to pin not found` or `message to unpin not found` (also when nothing is pinned),
-and only an existing one with `not enough rights to manage pinned messages in the chat`. Each pin,
+works in groups, channels and private chats; each bot pins in its own private chat with a user.
+The message is checked before the bot's rights: a missing message fails with
+`message to pin not found` or `message to unpin not found` (also when nothing is pinned), and only
+an existing one with `not enough rights to manage pinned messages in the chat`. Each pin,
 by a bot or by a person (`pinMessage`), posts the `pinned_message` service message, which reaches
 every bot in the chat, the pinning bot included. Neither `pinned_message` carries the pinned
 message's `reply_to_message`.
@@ -509,7 +668,10 @@ does not exist, a changed or retracted vote where revoting is off (every quiz, b
 voter who is not in the chat are refused with TDLib's texts. Bots get votes only in the polls they
 sent ([Update](https://core.telegram.org/bots/api#update)): that bot gets the poll's new counts as
 a `poll` update and, for a poll that is not anonymous, a `poll_answer` with the voter, `option_ids`
-and `option_persistent_ids` (empty when the vote is taken back). Both wait in the poll's own
+and `option_persistent_ids` (empty when the vote is taken back). An anonymous administrator or
+owner of a supergroup votes as the group: `voter_chat` is the group, "if the voter is anonymous"
+([PollAnswer](https://core.telegram.org/bots/api#pollanswer)), and `user` is the Channel bot, which
+the Bot API server writes for older bots (`JsonPollAnswer`). Both wait in the poll's own
 webhook queue, as the Bot API server queues them by poll id. Unverified, because Telegram does not
 document it: the order of the two updates (`poll_answer` comes first here), and that a vote that
 changes nothing sends no update. Members also post polls of their own, and may send one to a bot
@@ -529,10 +691,11 @@ fails with `REACTION_INVALID`, and a paid reaction is refused) or a custom emoji
 `custom_emoji_id` must be an integer. A custom emoji is accepted without checking that it is already
 on the message or allowed by the chat's administrators. A reaction on an album lands on its first
 message that is not deleted. The bot removes a member's reaction with `deleteMessageReaction` and
-`can_delete_messages`; `actor_chat_id` may stand in for `user_id`, though members here never react
-as a chat. A user's id there removes that user's reaction, and a chat this server does not know
-fails with `reaction sender not found`. The ids and the message are checked before the bot's rights.
-Reaction counts (`message_reaction_count`) are not sent.
+`can_delete_messages`; `actor_chat_id` may stand in for `user_id`, and removes a reaction made as
+that chat ([Posts on behalf of a chat](#posts-on-behalf-of-a-chat)). A user's id there removes
+that user's reaction, and a chat this server does not know fails with `reaction sender not found`.
+The ids and the message are checked before the bot's rights. Reaction counts
+(`message_reaction_count`) are not sent.
 
 ### Media
 
@@ -647,8 +810,7 @@ The parameter is hidden from the user. TDLib's `sendBotStartMessage` keeps the u
 plain `/start` (`/start@<bot>` in a group), while the bot gets the parameter. This server keeps one
 copy, the bot's, so `getDirectMessages`, `getMessages` and the viewer show the parameter.
 
-A `start` link to a bot other than the first fails, since users write privately only to the first
-bot here. Unverified, since the app asks Telegram nothing: only the receiver of an ephemeral
+Unverified, since the app asks Telegram nothing: only the receiver of an ephemeral
 message opens its buttons, and a button that is not a URL button is refused. Anyone else opens a
 button, someone outside the chat included, as anyone presses one. Also unverified: a link to a
 deleted bot, which does nothing here.
@@ -703,7 +865,7 @@ entity offsets. Formatting also applies to album captions, media edits, copy cap
 and business text sends. Links, mentions, commands, hashtags and cashtags can be detected inside
 styles; code, pre and explicit links suppress overlapping automatic detection.
 
-The contract cases cover malformed markup, crossed Markdown delimiters, invalid entity ranges
+The tests cover malformed markup, crossed Markdown delimiters, invalid entity ranges
 (including surrogate-pair boundaries), style splitting around code, and overlapping blockquote
 normalization. These rules follow
 [Bot API formatting options](https://core.telegram.org/bots/api#formatting-options) and Telegram's
@@ -802,7 +964,7 @@ parameter fails with Telegram's text, such as `chat_id is empty` or `invalid use
 this server itself fails, the bot gets Telegram's bare `500 Internal Server Error`, and the cause
 goes to `log`.
 
-How request bodies are read is in the README, under [Supported Bot API methods][readme-methods].
+How request bodies are read is in the reference, under [Supported Bot API methods][readme-methods].
 
 ### Update delivery
 
@@ -901,10 +1063,13 @@ snapshot between the steps of a replay. A press with `deliverTwice` does the sam
 update: once the webhook has answered the press, it gets that update again. Only a webhook gets an
 update again this way, so such a press to a bot without a webhook is refused before it is sent.
 
+[privacy-mode]: https://core.telegram.org/bots/features#privacy-mode
+[bots-faq]: https://core.telegram.org/bots/faq#what-messages-will-my-bot-get
+[forum-docs]: https://core.telegram.org/api/forum
 [bot-api-chat-member-administrator]: https://core.telegram.org/bots/api#chatmemberadministrator
 [ephemeral-docs]: https://core.telegram.org/bots/api#ephemeral-messages-and-commands
 [tdlib-entities]: https://github.com/tdlib/td/blob/master/td/telegram/MessageEntity.cpp
 [tdlib-participants]: https://github.com/tdlib/td/blob/master/td/telegram/DialogParticipantManager.cpp
 [bot-api-server-client]: https://github.com/tdlib/telegram-bot-api/blob/master/telegram-bot-api/Client.cpp
-[readme-methods]: https://github.com/anatolyben/telegram-bot-test-server#supported-bot-api-methods
+[readme-methods]: reference.md#supported-bot-api-methods
 [tdesktop-participants]: https://github.com/telegramdesktop/tdesktop/blob/dev/Telegram/SourceFiles/boxes/peers/edit_participants_box.cpp
