@@ -478,7 +478,7 @@ describe("opening a URL button", () => {
     expect(await fake.getDirectMessages(ann)).toEqual([]);
   });
 
-  it("refuses a button that is not a URL button, a link without the chat it needs, and a start link to another bot", async () => {
+  it("refuses a button that is not a URL button and a link without the chat it needs", async () => {
     const { fake, api, me } = await setup();
     await fake.addBot({ token: OTHER_TOKEN, username: "otherbot" });
     const { group, ann } = await groupWithAnn(fake, me);
@@ -500,8 +500,6 @@ describe("opening a URL button", () => {
       open(OWNER, "Add me", { addToChatId: channel }),
     ).rejects.toThrow(/group/);
     expect((await fake.getMember(channel, me.id)).status).toBe("left");
-    // Only the first bot has private chats here.
-    await expect(open(ann, "Other")).rejects.toThrow(/first bot/);
 
     await api("deleteMessage", { chat_id: group, message_id });
     await expect(open(ann, 1)).rejects.toThrow(/MESSAGE_ID_INVALID/);
@@ -703,8 +701,12 @@ describe("basic groups and the upgrade to a supergroup", () => {
     const { fake, api, me } = await setup();
     const group = await fake.createChat({ type: "group", ownerId: OWNER });
     await fake.setBotMembership(group, me.id, { status: "administrator" });
-    const message = await fake.post(group, OWNER, "old history");
+    const posted = await fake.post(group, OWNER, "old history");
     const supergroup = await fake.migrateToSupergroup(group, { by: OWNER });
+    // The bot names the message by its own id, as in any basic group.
+    const message = (await fake.getMessage(group, posted)).bot_message_ids[
+      me.id
+    ];
     const from = { from_chat_id: group, message_id: message };
 
     for (const [method, params] of [
@@ -1088,6 +1090,7 @@ describe("people promoting and demoting members", () => {
       can_manage_tags: true,
       can_send_welcome_messages: true,
       is_anonymous: false,
+      can_manage_voice_chats: true,
     });
     await expect(
       fake.promoteMember(group, bob, {

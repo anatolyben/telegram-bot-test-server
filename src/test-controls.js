@@ -67,7 +67,7 @@ export function createClock(options) {
     busy: () => advances > 0 || [...tasks].some((t) => !t.passive),
     async advance(ms) {
       if (mode === "real")
-        throw new Error("advanceTime requires a manual clock");
+        throw new Error("advanceTime requires a manual or running clock");
       if (
         !Number.isSafeInteger(ms) ||
         ms < 0 ||

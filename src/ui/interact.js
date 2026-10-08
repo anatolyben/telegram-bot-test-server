@@ -147,9 +147,10 @@ function resizePair(divider, proposed, onResize) {
 /**
  * Wires every control by delegation on the root, once: toggles, layout,
  * view-as, topic, theme, hide, the chat list, paging buttons, phone
- * navigation, dividers and message links. `actions` are the page's handlers.
+ * navigation, dividers and message links. `actions` are the page's handlers;
+ * `recording` is true in a recording.
  */
-export function bindViewer(root, actions) {
+export function bindViewer(root, actions, { recording = false } = {}) {
   let drag = null;
   root.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target : null;
@@ -166,6 +167,12 @@ export function bindViewer(root, actions) {
         return;
       event.preventDefault();
       actions.selectChat(row.getAttribute("data-chat-key"));
+      return;
+    }
+    const evidence = target.closest("[data-role='show-evidence']");
+    if (evidence) {
+      const marker = evidence.closest("[data-kind='scenario']");
+      if (marker) highlightEvidence(root, marker, { recording });
       return;
     }
     const call = target.closest("[data-kind='call']");
@@ -245,6 +252,7 @@ export function bindViewer(root, actions) {
     if (role === "view-as") actions.setAs(target.value);
     else if (role === "topic-filter") actions.setTopic(target.value);
     else if (role === "theme") actions.setTheme(target.value);
+    else if (role === "run-filter") actions.setRun(target.value);
   });
   root.addEventListener("input", (event) => {
     const target = event.target;
@@ -458,10 +466,7 @@ function revealMessage(origin, messageId) {
  * call's column.
  */
 export function highlightCall(root, callElement) {
-  for (const element of root.querySelectorAll("[data-highlighted]"))
-    element.removeAttribute("data-highlighted");
-  for (const note of root.querySelectorAll("[data-role='pane-note']"))
-    note.remove();
+  clearHighlights(root);
   const read = (name) => callElement.getAttribute(name);
   const all = (selector) => [...root.querySelectorAll(selector)];
   const key = read("data-chat-key");
@@ -495,10 +500,26 @@ export function highlightCall(root, callElement) {
         `[data-request-id="${CSS.escape(request)}"]:not([data-kind='call'])`,
       ),
     );
-  callElement.setAttribute("data-highlighted", "true");
+  showHighlights(root, callElement, found, notes);
+}
+
+function clearHighlights(root) {
+  for (const element of root.querySelectorAll("[data-highlighted]"))
+    element.removeAttribute("data-highlighted");
+  for (const note of root.querySelectorAll("[data-role='pane-note']"))
+    note.remove();
+}
+
+/**
+ * Marks `origin` and what it points at (`found`) with
+ * data-highlighted="true", scrolls to the first, and puts the `notes` on
+ * what is not on the page at the top of origin's column.
+ */
+function showHighlights(root, origin, found, notes) {
+  origin.setAttribute("data-highlighted", "true");
   for (const element of found) element.setAttribute("data-highlighted", "true");
   found[0]?.scrollIntoView({ block: "center" });
-  const column = callElement.closest("section[data-column-id]");
+  const column = origin.closest("section[data-column-id]");
   const body = column?.querySelector(".tv-pane-body");
   if (notes.length && body) {
     const note = root.ownerDocument.createElement("p");
@@ -508,6 +529,47 @@ export function highlightCall(root, callElement) {
     note.textContent = notes.join("; ");
     body.prepend(note);
   }
+}
+
+/**
+ * Marks the evidence a failed scenario's runner named, as highlightCall
+ * marks a call's targets: messages and events by seq (one sequence across
+ * every chat), calls by request id. Evidence not on the page gets a note,
+ * which points to Activity unless this is a recording (which has none).
+ */
+export function highlightEvidence(root, marker, { recording = false } = {}) {
+  clearHighlights(root);
+  const all = (selector) => [...root.querySelectorAll(selector)];
+  const found = [];
+  let missing = 0;
+  for (const seq of (marker.getAttribute("data-evidence-seqs") ?? "")
+    .split(" ")
+    .filter(Boolean)) {
+    const items = all(
+      `[data-kind='message'][data-seq="${CSS.escape(seq)}"], [data-kind='event'][data-seq="${CSS.escape(seq)}"]`,
+    );
+    if (items.length) found.push(...items);
+    else missing += 1;
+  }
+  for (const request of (marker.getAttribute("data-evidence-requests") ?? "")
+    .split(" ")
+    .filter(Boolean)) {
+    const calls = all(
+      `[data-kind='call'][data-request-id="${CSS.escape(request)}"]`,
+    );
+    if (calls.length) found.push(...calls);
+    else missing += 1;
+  }
+  showHighlights(
+    root,
+    marker,
+    found,
+    missing
+      ? [
+          `${missing} ${missing === 1 ? "piece of evidence is" : "pieces of evidence are"} not on this page: open ${missing === 1 ? "its chat" : "their chats"}${recording ? "" : " or Activity"}`,
+        ]
+      : [],
+  );
 }
 
 /** Why a message a call names is not on the page. */

@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import http from "node:http";
 import https from "node:https";
 import { gzipSync } from "node:zlib";
@@ -1320,5 +1321,97 @@ describe("messages, buttons and files", () => {
     expect(
       (await control("GET", `users/${user}/dm`)).body.map((m) => m.text),
     ).toEqual(["hello human", "hello bot"]);
+  });
+});
+
+describe("command line", () => {
+  /**
+   * Starts the command-line server on a free port with these flags; resolves
+   * with its origin, or with its exit code and error output when it stops.
+   */
+  async function runCli(flags) {
+    const child = spawn(
+      process.execPath,
+      [
+        new URL("../bin/telegram-bot-test-server.js", import.meta.url).pathname,
+        "--token",
+        TOKEN,
+        "--port",
+        "0",
+        ...flags,
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    cleanups.push(async () => {
+      if (child.exitCode === null) {
+        child.kill("SIGTERM");
+        await new Promise((resolve) => child.once("exit", resolve));
+      }
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => (stderr += chunk));
+    return new Promise((resolve) => {
+      let stdout = "";
+      child.stdout.on("data", (chunk) => {
+        stdout += chunk;
+        const match = / listening at (\S+)/.exec(stdout);
+        if (match) resolve({ origin: match[1] });
+      });
+      child.once("exit", (code) => resolve({ code, stderr }));
+    });
+  }
+
+  it("starts a manual or running clock and pushes it to --clock-webhook", async () => {
+    const pushes = [];
+    const receiver = http.createServer((request, response) => {
+      let body = "";
+      request.on("data", (chunk) => (body += chunk));
+      request.on("end", () => {
+        pushes.push(JSON.parse(body));
+        response.end();
+      });
+    });
+    await new Promise((resolve) => receiver.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise((resolve) => receiver.close(resolve)));
+    const hook = `http://127.0.0.1:${receiver.address().port}/clock`;
+
+    const manual = await runCli([
+      "--clock-now",
+      "2027-01-01T00:00:00Z",
+      "--clock-webhook",
+      hook,
+    ]);
+    const clockAt = async (origin) =>
+      (await fetch(`${origin}/_fake/clock`)).json();
+    expect(await clockAt(manual.origin)).toMatchObject({
+      mode: "manual",
+      now: Date.parse("2027-01-01T00:00:00Z"),
+    });
+    await fetch(`${manual.origin}/_fake/clock`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ms: 1000 }),
+    });
+    expect(pushes).toEqual([
+      { now: Date.parse("2027-01-01T00:00:01Z"), mode: "manual" },
+    ]);
+
+    const byMs = await runCli(["--clock-now", "1800000000000"]);
+    expect((await clockAt(byMs.origin)).now).toBe(1_800_000_000_000);
+    const running = await runCli(["--clock-offset", "60000"]);
+    expect(await clockAt(running.origin)).toMatchObject({
+      mode: "running",
+      offset: 60000,
+    });
+  });
+
+  it("refuses a clock flag it cannot read", async () => {
+    expect(await runCli(["--clock-now", "soon"])).toMatchObject({
+      code: 2,
+      stderr: expect.stringContaining("--clock-now"),
+    });
+    expect(
+      await runCli(["--clock-now", "1", "--clock-offset", "1"]),
+    ).toMatchObject({ code: 2, stderr: expect.stringContaining("not both") });
   });
 });

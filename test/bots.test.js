@@ -237,6 +237,206 @@ describe("more than one bot", () => {
   });
 });
 
+describe("privacy mode", () => {
+  it("says in getMe whether the bot reads every group message", async () => {
+    const { fake, api } = await setup();
+    await fake.addBot({
+      token: "777777:PRIVATE",
+      username: "private_bot",
+      privacyMode: true,
+    });
+    expect((await api("getMe")).result.can_read_all_group_messages).toBe(true);
+    expect(
+      (await api("getMe", {}, "777777:PRIVATE")).result
+        .can_read_all_group_messages,
+    ).toBe(false);
+  });
+
+  it("gives a bot in privacy mode that is no administrator only commands for it, replies to it and service messages", async () => {
+    const { fake, api } = await setup();
+    const quiet = await fake.addBot({
+      token: "777777:PRIVATE",
+      username: "private_bot",
+      privacyMode: true,
+    });
+    const hook = await startReceiver();
+    await api("setWebhook", { url: hook.url }, "777777:PRIVATE");
+    await fake.setBotMembership(GROUP, quiet.id, { status: "member" });
+    const user = await fake.createUser({ first_name: "Ann" });
+    await fake.join(GROUP, user);
+    // The first bot spoke last, so a general command is not for this one.
+    await api("sendMessage", { chat_id: GROUP, text: "welcome" });
+    await fake.post(GROUP, user, "hello everyone");
+    await fake.post(GROUP, user, "/help");
+    await fake.post(GROUP, user, "/help@private_bot");
+    await fake.post(GROUP, user, "/help@example_bot");
+    const own = await api(
+      "sendMessage",
+      { chat_id: GROUP, text: "I am here" },
+      "777777:PRIVATE",
+    );
+    await fake.post(GROUP, user, "/rules");
+    await fake.post(GROUP, user, {
+      text: "thanks",
+      replyTo: own.result.message_id,
+    });
+    await fake.drainDeliveries();
+
+    const got = hook
+      .ofType("message")
+      .map((message) => message.text ?? (message.new_chat_members ? "joined" : "?"));
+    // Its own join, then Ann's.
+    expect(got).toEqual([
+      "joined",
+      "joined",
+      "/help@private_bot",
+      "/rules",
+      "thanks",
+    ]);
+
+    // As an administrator it gets every message.
+    await fake.setBotMembership(GROUP, quiet.id, { status: "administrator" });
+    await fake.post(GROUP, user, "hello again");
+    await fake.drainDeliveries();
+    expect(hook.ofType("message").at(-1).text).toBe("hello again");
+  });
+
+  it("gives a message to only one bot in privacy mode, a reply before a command", async () => {
+    const { fake, api } = await setup();
+    const one = await fake.addBot({
+      token: "777771:ONE",
+      username: "one_bot",
+      privacyMode: true,
+    });
+    const two = await fake.addBot({
+      token: "777772:TWO",
+      username: "two_bot",
+      privacyMode: true,
+    });
+    const hookOne = await startReceiver();
+    const hookTwo = await startReceiver();
+    await api("setWebhook", { url: hookOne.url }, "777771:ONE");
+    await api("setWebhook", { url: hookTwo.url }, "777772:TWO");
+    await fake.setBotMembership(GROUP, one.id, { status: "member" });
+    await fake.setBotMembership(GROUP, two.id, { status: "member" });
+    const user = await fake.createUser();
+    await fake.join(GROUP, user);
+    const fromOne = await api(
+      "sendMessage",
+      { chat_id: GROUP, text: "one speaks" },
+      "777771:ONE",
+    );
+    await fake.post(GROUP, user, {
+      text: "/ping@two_bot",
+      replyTo: fromOne.result.message_id,
+    });
+    await fake.drainDeliveries();
+    const texts = (hook) =>
+      hook.ofType("message").map((message) => message.text).filter(Boolean);
+    expect(texts(hookOne)).toEqual(["/ping@two_bot"]);
+    expect(texts(hookTwo)).toEqual([]);
+  });
+
+  /** A bot in privacy mode, a member of GROUP, with Ann and Bob there. */
+  async function privateBotInGroup() {
+    const { fake, api } = await setup();
+    const quiet = await fake.addBot({
+      token: "777777:PRIVATE",
+      username: "private_bot",
+      privacyMode: true,
+    });
+    const hook = await startReceiver();
+    await api("setWebhook", { url: hook.url }, "777777:PRIVATE");
+    await fake.setBotMembership(GROUP, quiet.id, { status: "member" });
+    const ann = await fake.createUser({ first_name: "Ann" });
+    const bob = await fake.createUser({ first_name: "Bob" });
+    await fake.join(GROUP, ann);
+    await fake.join(GROUP, bob);
+    const texts = async (type = "message") => {
+      await fake.drainDeliveries();
+      return hook
+        .ofType(type)
+        .map((message) => message.text ?? message.caption)
+        .filter(Boolean);
+    };
+    return { fake, api, quiet, ann, bob, texts };
+  }
+
+  it("gives a bot in privacy mode replies to messages meant for it", async () => {
+    const { fake, api, ann, bob, texts } = await privateBotInGroup();
+    const command = await fake.post(GROUP, ann, "/help@private_bot");
+    const reply = await fake.post(GROUP, bob, {
+      text: "reply to the command",
+      replyTo: command,
+    });
+    await fake.post(GROUP, ann, { text: "reply to the reply", replyTo: reply });
+    const plain = await fake.post(GROUP, bob, "plain");
+    await fake.post(GROUP, ann, { text: "reply to plain", replyTo: plain });
+    await api("sendMessage", { chat_id: GROUP, text: "x" }, "777777:PRIVATE");
+    const general = await fake.post(GROUP, ann, "/rules");
+    await fake.post(GROUP, bob, { text: "reply to /rules", replyTo: general });
+
+    expect(await texts()).toEqual([
+      "/help@private_bot",
+      "reply to the command",
+      "reply to the reply",
+      "/rules",
+      "reply to /rules",
+    ]);
+  });
+
+  it("counts only a command that starts a text message", async () => {
+    const { fake, api, ann, texts } = await privateBotInGroup();
+    await fake.post(GROUP, ann, "please run /help@private_bot now");
+    await fake.post(GROUP, ann, {
+      photo: PHOTO,
+      caption: "/help@private_bot",
+    });
+    await fake.post(GROUP, ann, "/help@private_bot now");
+    await api("sendMessage", { chat_id: GROUP, text: "x" }, "777777:PRIVATE");
+    await fake.post(GROUP, ann, "and /rules");
+
+    expect(await texts()).toEqual(["/help@private_bot now"]);
+  });
+
+  it("gives a bot in privacy mode edits of only the messages it received", async () => {
+    const { fake, ann, texts } = await privateBotInGroup();
+    const plain = await fake.post(GROUP, ann, "plain");
+    await fake.editMessage(GROUP, plain, ann, { text: "/x@private_bot" });
+    const command = await fake.post(GROUP, ann, "/y@private_bot");
+    await fake.editMessage(GROUP, command, ann, { text: "no command now" });
+
+    expect(await texts("edited_message")).toEqual(["no command now"]);
+  });
+
+  it("does not count a bot's service messages toward the last bot to send a message", async () => {
+    const { fake, api, ann, texts } = await privateBotInGroup();
+    const me = (await api("getMe")).result;
+    await fake.setBotMembership(GROUP, me.id, {
+      status: "administrator",
+      rights: { can_pin_messages: true },
+    });
+    const plain = await fake.post(GROUP, ann, "plain");
+    await api("sendMessage", { chat_id: GROUP, text: "x" }, "777777:PRIVATE");
+    await api("pinChatMessage", { chat_id: GROUP, message_id: plain });
+    await fake.post(GROUP, ann, "/rules");
+
+    expect(await texts()).toEqual(["/rules"]);
+  });
+
+  it("does not count a message in a topic as a reply to the bot that created the topic", async () => {
+    const { fake, quiet, ann, texts } = await privateBotInGroup();
+    const forum = await fake.createChat({ ownerId: OWNER, isForum: true });
+    await fake.setBotMembership(forum, quiet.id, { status: "member" });
+    await fake.join(forum, ann);
+    const topic = await fake.createTopic(forum, "Bots", { by: quiet.id });
+    await fake.post(forum, ann, { text: "in the topic", threadId: topic });
+    await fake.post(forum, ann, { text: "an explicit reply", replyTo: topic, threadId: topic });
+
+    expect(await texts()).toEqual([]);
+  });
+});
+
 describe("channels and rights", () => {
   it("lets a bot post in a channel only with the right to", async () => {
     const { fake, api } = await setup();
@@ -1695,6 +1895,291 @@ describe("forum topics", () => {
     });
   });
 
+  it("closes, reopens and renames a topic with can_manage_topics, posting Telegram's service messages", async () => {
+    const { fake, api } = await setup();
+    const me = (await api("getMe")).result;
+    const hook = await startReceiver();
+    await api("setWebhook", { url: hook.url });
+    const forum = await fake.createChat({ ownerId: OWNER, isForum: true });
+    await fake.setBotMembership(forum, me.id, {
+      rights: { can_manage_topics: true },
+    });
+    const thread = await fake.createTopic(forum, "News");
+    const user = await fake.createUser();
+    await fake.join(forum, user);
+    const call = (method, params = {}) =>
+      api(method, { chat_id: forum, message_thread_id: thread, ...params });
+
+    expect((await call("closeForumTopic")).ok).toBe(true);
+    expect(await call("closeForumTopic")).toMatchObject({
+      status: 400,
+      description: "Bad Request: TOPIC_NOT_MODIFIED",
+    });
+    await expect(
+      fake.post(forum, user, { text: "hello?", threadId: thread }),
+    ).rejects.toThrow("TOPIC_CLOSED");
+    // The bot manages topics, so it still writes there.
+    expect((await call("sendMessage", { text: "closed for now" })).ok).toBe(
+      true,
+    );
+    expect((await call("reopenForumTopic")).ok).toBe(true);
+    await fake.post(forum, user, { text: "open again", threadId: thread });
+
+    expect((await call("editForumTopic", { name: "  " })).status).toBe(400);
+    expect((await call("editForumTopic", {})).ok).toBe(true);
+    expect(await call("editForumTopic", { name: "News" })).toMatchObject({
+      description: "Bad Request: TOPIC_NOT_MODIFIED",
+    });
+    expect((await call("editForumTopic", { name: "Updates" })).ok).toBe(true);
+    expect(await call("closeForumTopic", { message_thread_id: 0 })).toMatchObject(
+      { description: "Bad Request: invalid forum topic identifier specified" },
+    );
+    expect(
+      await call("closeForumTopic", { message_thread_id: 999 }),
+    ).toMatchObject({ description: "Bad Request: TOPIC_ID_INVALID" });
+    expect(
+      await api("closeForumTopic", { chat_id: GROUP, message_thread_id: 5 }),
+    ).toMatchObject({ description: "Bad Request: the chat is not a forum" });
+
+    await fake.drainDeliveries();
+    const service = hook
+      .ofType("message")
+      .filter(
+        (message) =>
+          message.forum_topic_closed ||
+          message.forum_topic_reopened ||
+          message.forum_topic_edited,
+      );
+    expect(service).toEqual([
+      expect.objectContaining({
+        from: expect.objectContaining({ id: me.id }),
+        message_thread_id: thread,
+        is_topic_message: true,
+        forum_topic_closed: {},
+      }),
+      expect.objectContaining({ forum_topic_reopened: {} }),
+      expect.objectContaining({ forum_topic_edited: { name: "Updates" } }),
+    ]);
+  });
+
+  it("has a topic's service messages answer the topic's creation message", async () => {
+    const { fake, api } = await setup();
+    const me = (await api("getMe")).result;
+    const hook = await startReceiver();
+    await api("setWebhook", { url: hook.url });
+    const forum = await fake.createChat({ ownerId: OWNER, isForum: true });
+    await fake.setBotMembership(forum, me.id, {
+      rights: { can_manage_topics: true },
+    });
+    const thread = await fake.createTopic(forum, "News");
+
+    await api("closeForumTopic", { chat_id: forum, message_thread_id: thread });
+    await fake.renameTopic(forum, thread, "Updates");
+
+    await fake.drainDeliveries();
+    const service = hook
+      .ofType("message")
+      .filter((message) => message.forum_topic_closed || message.forum_topic_edited);
+    expect(service).toEqual([
+      expect.objectContaining({
+        forum_topic_closed: {},
+        reply_to_message: expect.objectContaining({
+          message_id: thread,
+          forum_topic_created: { name: "News", icon_color: 7322096 },
+        }),
+      }),
+      expect.objectContaining({
+        forum_topic_edited: { name: "Updates" },
+        reply_to_message: expect.objectContaining({ message_id: thread }),
+      }),
+    ]);
+  });
+
+  it("refuses a bot without can_manage_topics as TDLib does once it knows the topic, and reports the rest as unimplemented", async () => {
+    const { fake, api } = await setup();
+    const me = (await api("getMe")).result;
+    const forum = await fake.createChat({ ownerId: OWNER, isForum: true });
+    await fake.setBotMembership(forum, me.id, {
+      rights: { can_delete_messages: true },
+    });
+    const thread = await fake.createTopic(forum, "News");
+    const close = () =>
+      api("closeForumTopic", { chat_id: forum, message_thread_id: thread });
+    const notFound = {
+      status: 404,
+      description: "Not Found: method not found",
+    };
+    // TDLib may know the topic from fetched messages, or pass the call to
+    // Telegram, whose answer no source gives.
+    expect(await close()).toMatchObject(notFound);
+    expect(
+      await api("closeGeneralForumTopic", { chat_id: forum }),
+    ).toMatchObject(notFound);
+    expect((await fake.getCalls()).unimplemented).toEqual([
+      "closeForumTopic without can_manage_topics on a topic the bot has not sent to",
+      "closeGeneralForumTopic without can_manage_topics",
+    ]);
+    await api("sendMessage", {
+      chat_id: forum,
+      message_thread_id: thread,
+      text: "hi",
+    });
+    expect(await close()).toMatchObject({
+      description: "Bad Request: not enough rights to close or open the topic",
+    });
+    expect(
+      await api("hideGeneralForumTopic", { chat_id: forum }),
+    ).toMatchObject({
+      description: "Bad Request: not enough rights to close or open the topic",
+    });
+  });
+
+  it("deletes a topic with all its messages and sends no update for it", async () => {
+    const { fake, api } = await setup();
+    const me = (await api("getMe")).result;
+    const hook = await startReceiver();
+    await api("setWebhook", { url: hook.url });
+    const forum = await fake.createChat({ ownerId: OWNER, isForum: true });
+    await fake.setBotMembership(forum, me.id, {
+      rights: { can_delete_messages: true },
+    });
+    const thread = await fake.createTopic(forum, "Old");
+    const inside = await fake.post(forum, OWNER, { text: "a", threadId: thread });
+    const outside = await fake.post(forum, OWNER, "b");
+    await fake.drainDeliveries();
+    const before = hook.ofType("message").length;
+
+    expect(
+      (
+        await api("deleteForumTopic", {
+          chat_id: forum,
+          message_thread_id: thread,
+        })
+      ).ok,
+    ).toBe(true);
+    expect((await fake.getMessage(forum, thread)).deleted).toBe(true);
+    expect((await fake.getMessage(forum, inside)).deleted).toBe(true);
+    expect((await fake.getMessage(forum, outside)).deleted).toBe(false);
+    expect(
+      await api("sendMessage", {
+        chat_id: forum,
+        message_thread_id: thread,
+        text: "x",
+      }),
+    ).toMatchObject({ description: "Bad Request: message thread not found" });
+    // No source gives Telegram's answer for the General topic.
+    expect(
+      await api("deleteForumTopic", { chat_id: forum, message_thread_id: 1 }),
+    ).toMatchObject({ status: 404, description: "Not Found: method not found" });
+    expect((await fake.getCalls()).unimplemented).toEqual([
+      "deleteForumTopic with the General topic",
+    ]);
+    await fake.drainDeliveries();
+    expect(hook.ofType("message")).toHaveLength(before);
+  });
+
+  it("needs can_delete_messages to delete a topic, also the bot's own", async () => {
+    const { fake, api } = await setup();
+    const me = (await api("getMe")).result;
+    const forum = await fake.createChat({ ownerId: OWNER, isForum: true });
+    await fake.setBotMembership(forum, me.id, {
+      rights: { can_manage_topics: true, can_delete_messages: false },
+    });
+    const theirs = await fake.createTopic(forum, "Theirs");
+    const own = await fake.createTopic(forum, "Own", { by: me.id });
+    const remove = (thread) =>
+      api("deleteForumTopic", { chat_id: forum, message_thread_id: thread });
+    await api("sendMessage", {
+      chat_id: forum,
+      message_thread_id: theirs,
+      text: "hi",
+    });
+
+    expect(await remove(theirs)).toMatchObject({
+      status: 400,
+      description: "Bad Request: not enough rights to delete the topic",
+    });
+    // TDLib passes the bot's own topic on to Telegram, whose answer no
+    // source gives.
+    expect(await remove(own)).toMatchObject({
+      status: 404,
+      description: "Not Found: method not found",
+    });
+    expect((await fake.getCalls()).unimplemented).toEqual([
+      "deleteForumTopic without can_delete_messages on a topic the bot created",
+    ]);
+    expect((await fake.getMessage(forum, own)).deleted).toBe(false);
+  });
+
+  it("closes, hides and renames the General topic, and unpins a topic's messages", async () => {
+    const { fake, api } = await setup();
+    const me = (await api("getMe")).result;
+    const hook = await startReceiver();
+    await api("setWebhook", { url: hook.url });
+    const forum = await fake.createChat({ ownerId: OWNER, isForum: true });
+    await fake.setBotMembership(forum, me.id, {
+      rights: { can_manage_topics: true, can_pin_messages: true },
+    });
+    const user = await fake.createUser();
+    await fake.join(forum, user);
+    const call = (method, params = {}) =>
+      api(method, { chat_id: forum, ...params });
+
+    expect((await call("hideGeneralForumTopic")).ok).toBe(true);
+    // Hiding closed it too.
+    await expect(fake.post(forum, user, "in General")).rejects.toThrow(
+      "TOPIC_CLOSED",
+    );
+    expect(await call("closeGeneralForumTopic")).toMatchObject({
+      description: "Bad Request: TOPIC_NOT_MODIFIED",
+    });
+    expect((await call("reopenGeneralForumTopic")).ok).toBe(true);
+    // Reopening unhid it too.
+    expect(await call("unhideGeneralForumTopic")).toMatchObject({
+      description: "Bad Request: TOPIC_NOT_MODIFIED",
+    });
+    await fake.post(forum, user, "in General");
+    expect(
+      await call("editForumTopic", {
+        message_thread_id: 1,
+        icon_custom_emoji_id: "",
+      }),
+    ).toMatchObject({
+      description: "Bad Request: GENERAL_MODIFY_ICON_FORBIDDEN",
+    });
+    expect((await call("editGeneralForumTopic", { name: "Lobby" })).ok).toBe(
+      true,
+    );
+
+    await fake.drainDeliveries();
+    const service = hook
+      .ofType("message")
+      .filter((message) => message.from?.id === me.id);
+    expect(service.map((message) => Object.keys(message).at(-1))).toEqual([
+      "general_forum_topic_hidden",
+      "forum_topic_reopened",
+      "forum_topic_edited",
+    ]);
+    expect(service.every((message) => !("message_thread_id" in message))).toBe(
+      true,
+    );
+
+    const thread = await fake.createTopic(forum, "Pins");
+    const inTopic = (
+      await call("sendMessage", { message_thread_id: thread, text: "t" })
+    ).result.message_id;
+    const inGeneral = (await call("sendMessage", { text: "g" })).result
+      .message_id;
+    await call("pinChatMessage", { message_id: inTopic });
+    await call("pinChatMessage", { message_id: inGeneral });
+    expect(
+      await call("unpinAllForumTopicMessages", { message_thread_id: thread }),
+    ).toMatchObject({ ok: true });
+    expect((await fake.getChat(forum)).pinned).toEqual([inGeneral]);
+    await call("unpinAllGeneralForumTopicMessages");
+    expect((await fake.getChat(forum)).pinned).toEqual([]);
+  });
+
   it("sends a member's message in a topic as a reply to the topic's creation", async () => {
     const { fake } = await setup();
     const forum = await fake.createChat({ ownerId: OWNER, isForum: true });
@@ -1827,6 +2312,220 @@ describe("each bot is itself", () => {
       status: 403,
       description: "Forbidden: bot can't initiate conversation with a user",
     });
+  });
+
+  it("finds a private chat it never had only with a user the bot knows", async () => {
+    const { fake, api, second } = await setup();
+    await fake.setBotMembership(GROUP, second.id);
+    // Known to the second bot through the group; never wrote to it.
+    const known = await fake.createUser({ first_name: "Ann" });
+    await fake.join(GROUP, known);
+    // Wrote only to the first bot, and shares nothing with the second.
+    const unknown = await fake.createUser({ first_name: "Bob" });
+    await fake.sendDirectMessage(unknown, "/start");
+    const notFound = { status: 400, description: "Bad Request: chat not found" };
+    const calls = (user) => [
+      ["getChat", { chat_id: user }],
+      ["deleteMessage", { chat_id: user, message_id: 1 }],
+      ["pinChatMessage", { chat_id: user, message_id: 1 }],
+      ["unpinAllChatMessages", { chat_id: user }],
+      ["editMessageText", { chat_id: user, message_id: 1, text: "x" }],
+      ["setMessageReaction", { chat_id: user, message_id: 1 }],
+      [
+        "forwardMessage",
+        { chat_id: GROUP, from_chat_id: user, message_id: 1 },
+      ],
+      ["sendChatAction", { chat_id: user, action: "typing" }],
+    ];
+
+    for (const [method, params] of calls(unknown)) {
+      expect(await api(method, params, SECOND_TOKEN)).toMatchObject(notFound);
+    }
+    const answers = {};
+    for (const [method, params] of calls(known)) {
+      const { status, ok, description, result } = await api(
+        method,
+        params,
+        SECOND_TOKEN,
+      );
+      answers[method] = ok ? result : { status, description };
+    }
+    expect(answers).toEqual({
+      getChat: expect.objectContaining({
+        id: known,
+        type: "private",
+        first_name: "Ann",
+      }),
+      deleteMessage: {
+        status: 400,
+        description: "Bad Request: message to delete not found",
+      },
+      pinChatMessage: {
+        status: 400,
+        description: "Bad Request: message to pin not found",
+      },
+      unpinAllChatMessages: true,
+      editMessageText: {
+        status: 400,
+        description: "Bad Request: message to edit not found",
+      },
+      setMessageReaction: {
+        status: 400,
+        description: "Bad Request: MESSAGE_ID_INVALID",
+      },
+      forwardMessage: {
+        status: 400,
+        description: "Bad Request: message to forward not found",
+      },
+      sendChatAction: true,
+    });
+    // Sends still need the user to have written to the bot.
+    expect(
+      await api("sendMessage", { chat_id: known, text: "hi" }, SECOND_TOKEN),
+    ).toMatchObject({
+      status: 403,
+      description: "Forbidden: bot can't initiate conversation with a user",
+    });
+    expect(await api("getChat", { chat_id: unknown })).toMatchObject({
+      ok: true,
+    });
+  });
+
+  it("keeps a user's private chat with each bot apart, with its own message ids", async () => {
+    const { fake, api, second } = await setup();
+    const first = await startReceiver();
+    const other = await startReceiver();
+    await api("setWebhook", { url: first.url });
+    await api("setWebhook", { url: other.url }, SECOND_TOKEN);
+    const user = await fake.createUser({ first_name: "Ann" });
+
+    const toFirst = await fake.sendDirectMessage(user, "hi first");
+    const toSecond = await fake.sendDirectMessage(user, "hi second", {
+      botId: second.id,
+    });
+    expect([toFirst, toSecond]).toEqual([1, 1]);
+    expect(first.ofType("message").map((m) => m.text)).toEqual(["hi first"]);
+    expect(other.ofType("message").map((m) => m.text)).toEqual(["hi second"]);
+
+    // The second bot's message 1 is its own, not the first bot's.
+    const pinned = await api(
+      "pinChatMessage",
+      { chat_id: user, message_id: 1 },
+      SECOND_TOKEN,
+    );
+    expect(pinned.ok).toBe(true);
+    expect((await api("getChat", { chat_id: user })).result).not.toHaveProperty(
+      "pinned_message",
+    );
+    expect(
+      (await api("getChat", { chat_id: user }, SECOND_TOKEN)).result
+        .pinned_message,
+    ).toMatchObject({ text: "hi second" });
+    expect(
+      (
+        await api(
+          "deleteMessage",
+          { chat_id: user, message_id: 1 },
+          SECOND_TOKEN,
+        )
+      ).ok,
+    ).toBe(true);
+    expect((await fake.getDirectMessages(user)).map((m) => m.text)).toEqual([
+      "hi first",
+    ]);
+    // What is left of the second bot's chat: the pin's service message.
+    expect(await fake.getDirectMessages(user, { botId: second.id })).toEqual([
+      expect.objectContaining({ message_id: 2, pinned_message: expect.anything() }),
+    ]);
+    const { messages } = await fake.getMessageLog(user, {
+      botId: second.id,
+      includeDeleted: true,
+    });
+    expect(messages.map((entry) => entry.deleted)).toEqual([true, false]);
+    await fake.waitFor({
+      kind: "message",
+      chatId: user,
+      botId: second.id,
+      userId: user,
+      text: "hi second",
+      deleted: true,
+    });
+  });
+
+  it("names the bot of each private message in the log, and needs bot_id for a user with two bot chats", async () => {
+    const { fake, second } = await setup();
+    const me = Number(TOKEN.split(":")[0]);
+    const ann = await fake.createUser();
+    await fake.sendDirectMessage(ann, "to the first");
+
+    expect(
+      (await fake.getMessageLog(ann)).messages.map((entry) => entry.bot_id),
+    ).toEqual([me]);
+    await fake.sendDirectMessage(ann, "to the second", { botId: second.id });
+    await expect(fake.getMessageLog(ann)).rejects.toThrow(/bot_id/);
+    expect(
+      (await fake.getMessageLog(ann, { botId: second.id })).messages.map(
+        (entry) => [entry.bot_id, entry.message.text],
+      ),
+    ).toEqual([[second.id, "to the second"]]);
+  });
+
+  it("draws the message ids of all of a bot's private chats from one sequence", async () => {
+    const { fake, api, second } = await setup();
+    const ann = await fake.createUser({ first_name: "Ann" });
+    const bob = await fake.createUser({ first_name: "Bob" });
+
+    expect(await fake.sendDirectMessage(ann, "/start")).toBe(1);
+    expect(await fake.sendDirectMessage(bob, "/start")).toBe(2);
+    const toAnn = await api("sendMessage", { chat_id: ann, text: "hi Ann" });
+    expect(toAnn.result.message_id).toBe(3);
+    expect(
+      await fake.sendDirectMessage(ann, "/start", { botId: second.id }),
+    ).toBe(1);
+    expect(await fake.sendDirectMessage(bob, "thanks")).toBe(4);
+    // Each chat keeps only its own: Bob's chat has no message 3.
+    expect(
+      await api("deleteMessage", { chat_id: bob, message_id: 3 }),
+    ).toMatchObject({ status: 400 });
+  });
+
+  it("lets a user start any bot by its link, and only that bot then writes to them", async () => {
+    const { fake, api, second } = await setup();
+    await fake.setBotMembership(GROUP, second.id);
+    const user = await fake.createUser();
+    await fake.join(GROUP, user);
+    const { message_id } = (
+      await api("sendMessage", {
+        chat_id: GROUP,
+        text: "Start the other bot",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "Go", url: "https://t.me/second_bot?start=hello" }],
+          ],
+        },
+      })
+    ).result;
+
+    const opened = await fake.openUrlButton(GROUP, message_id, user, "Go");
+    expect(opened).toMatchObject({
+      link: "start",
+      bot_id: second.id,
+      chat_id: user,
+      message_id: 1,
+    });
+    expect(
+      (await fake.getDirectMessages(user, { botId: second.id }))[0].text,
+    ).toBe("/start hello");
+    expect(
+      (await api("sendMessage", { chat_id: user, text: "hi" }, SECOND_TOKEN))
+        .ok,
+    ).toBe(true);
+    expect(await api("sendMessage", { chat_id: user, text: "hi" })).toMatchObject(
+      {
+        status: 403,
+        description: "Forbidden: bot can't initiate conversation with a user",
+      },
+    );
   });
 
   it("sends a button press only to the bot that sent the message, ephemeral or not", async () => {
@@ -2794,6 +3493,55 @@ describe("poll votes", () => {
     expect(other.ofType("poll")).toEqual([]);
   });
 
+  it("names the group, not the person, as the voter for an anonymous administrator or owner", async () => {
+    const { fake, api, hook, poll, ann } = await pollSetup({
+      is_anonymous: false,
+    });
+    await fake.promoteMember(GROUP, ann, { rights: { is_anonymous: true } });
+    await fake.vote(GROUP, poll.message_id, ann, [1]);
+    const olga = await fake.createUser({ first_name: "Olga" });
+    const group = await fake.createChat({ ownerId: olga, ownerAnonymous: true });
+    const me = (await api("getMe")).result;
+    const named = await fake.createUser();
+    await fake.join(group, named);
+    await fake.promoteMember(group, named, {
+      rights: { can_invite_users: true, can_promote_members: true },
+    });
+    await fake.setBotMembership(group, me.id, {
+      status: "administrator",
+      by: named,
+    });
+    const second = (
+      await api("sendPoll", {
+        chat_id: group,
+        question: "Tea?",
+        options: ["Yes", "No"],
+        is_anonymous: false,
+      })
+    ).result;
+    await fake.vote(group, second.message_id, olga, [0]);
+
+    const channelBot = {
+      id: 136817688,
+      is_bot: true,
+      first_name: "Channel",
+      username: "Channel_Bot",
+    };
+    expect(hook.ofType("poll_answer")).toEqual([
+      {
+        poll_id: poll.poll.id,
+        user: channelBot,
+        voter_chat: expect.objectContaining({ id: GROUP, type: "supergroup" }),
+        option_ids: [1],
+        option_persistent_ids: [poll.poll.options[1].persistent_id],
+      },
+      expect.objectContaining({
+        user: channelBot,
+        voter_chat: expect.objectContaining({ id: group }),
+      }),
+    ]);
+  });
+
   it("sends only the new counts for an anonymous poll", async () => {
     const { fake, hook, poll, ann } = await pollSetup({});
     await fake.vote(GROUP, poll.message_id, ann, [1]);
@@ -2915,5 +3663,236 @@ describe("polls in channels", () => {
         "Bad Request: non-anonymous polls can't be sent to channel chats",
     });
     expect((await send(true)).ok).toBe(true);
+  });
+});
+
+describe("basic group message ids", () => {
+  /** The message ids a bot was sent in a chat, in order. */
+  async function seenIds(fake, botId, chatId) {
+    const { updates } = await fake.getBotUpdates(botId, {
+      chatId,
+      type: "message",
+    });
+    return updates.map((entry) => entry.update.message.message_id);
+  }
+
+  /** A basic group with both bots in it as administrators. */
+  async function basicGroup() {
+    const context = await setup();
+    const { fake, api, second } = context;
+    const me = (await api("getMe")).result;
+    const group = await fake.createChat({ type: "group", ownerId: OWNER });
+    await fake.setBotMembership(group, me.id); // first bot: 1
+    await fake.setBotMembership(group, second.id); // first: 2, second: 1
+    return { ...context, me, group };
+  }
+
+  it("numbers a basic group's messages for each bot from that bot's own sequence, shared with its private chats", async () => {
+    const { fake, api, second } = await setup();
+    const me = (await api("getMe")).result;
+    const ann = await fake.createUser({ first_name: "Ann" });
+    // The first bot's private chat with Ann takes its ids 1 and 2.
+    await fake.sendDirectMessage(ann, "/start");
+    await api("sendMessage", { chat_id: ann, text: "hi" });
+    const group = await fake.createChat({ type: "group", ownerId: OWNER });
+    await fake.setBotMembership(group, me.id, { status: "member" });
+    await fake.setBotMembership(group, second.id, { status: "member" });
+    const hello = await fake.post(group, OWNER, "hello");
+
+    expect(await seenIds(fake, me.id, group)).toEqual([3, 4, 5]);
+    expect(await seenIds(fake, second.id, group)).toEqual([1, 2]);
+    // The first bot's next private message continues the same sequence.
+    expect(await fake.sendDirectMessage(ann, "thanks")).toBe(6);
+    // Tests name the message by the chat's own id, and the log gives each
+    // bot's.
+    const entry = (await fake.getMessageLog(group)).messages.at(-1);
+    expect(entry.message).toMatchObject({ message_id: hello, text: "hello" });
+    expect(entry.bot_message_ids).toEqual({ [me.id]: 5, [second.id]: 2 });
+  });
+
+  it("takes and shows each bot's own ids in its calls about a basic group's messages", async () => {
+    const { fake, api, second, me, group } = await basicGroup();
+    const hello = await fake.post(group, OWNER, "hello"); // first: 3, second: 2
+
+    // The second bot replies to its message 2, which the first bot knows
+    // as 3.
+    const reply = await api(
+      "sendMessage",
+      { chat_id: group, text: "re", reply_parameters: { message_id: 2 } },
+      SECOND_TOKEN,
+    );
+    expect(reply.result).toMatchObject({
+      message_id: 3,
+      reply_to_message: { message_id: 2, text: "hello" },
+    });
+    // A person's reply reaches each bot under its own ids.
+    await fake.post(group, OWNER, { text: "me too", replyTo: hello });
+    const last = async (botId) =>
+      (
+        await fake.getBotUpdates(botId, { chatId: group, type: "message" })
+      ).updates.at(-1).update.message;
+    expect(await last(me.id)).toMatchObject({
+      message_id: 5,
+      reply_to_message: { message_id: 3, text: "hello" },
+    });
+    expect(await last(second.id)).toMatchObject({
+      message_id: 4,
+      reply_to_message: { message_id: 2, text: "hello" },
+    });
+
+    // The first bot pins hello by its id 3; each bot reads the pin by its own.
+    expect(
+      (await api("pinChatMessage", { chat_id: group, message_id: 3 })).ok,
+    ).toBe(true);
+    expect(
+      (await api("getChat", { chat_id: group }, SECOND_TOKEN)).result
+        .pinned_message,
+    ).toMatchObject({ message_id: 2, text: "hello" });
+    expect(await last(second.id)).toMatchObject({
+      message_id: 5,
+      pinned_message: { message_id: 2 },
+    });
+
+    // A copy answers with the copying bot's id of the new message.
+    expect(
+      (
+        await api(
+          "copyMessage",
+          { chat_id: group, from_chat_id: group, message_id: 2 },
+          SECOND_TOKEN,
+        )
+      ).result,
+    ).toEqual({ message_id: 6 });
+
+    // The second bot deletes hello by its id 2; the first bot's id 3 for it
+    // then names a deleted message.
+    expect(
+      (
+        await api(
+          "deleteMessage",
+          { chat_id: group, message_id: 2 },
+          SECOND_TOKEN,
+        )
+      ).ok,
+    ).toBe(true);
+    await fake.waitFor({
+      kind: "message",
+      chatId: group,
+      messageId: hello,
+      deleted: true,
+    });
+    expect(
+      await api("deleteMessage", { chat_id: group, message_id: 3 }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: message to delete not found",
+    });
+  });
+
+  it("shows a button press and a reaction to each bot with its own id", async () => {
+    const { fake, api, second, me, group } = await basicGroup();
+    await api("getUpdates", {
+      allowed_updates: ["message", "message_reaction", "callback_query"],
+    });
+    const sent = await api(
+      "sendMessage",
+      {
+        chat_id: group,
+        text: "Pick",
+        reply_markup: {
+          inline_keyboard: [[{ text: "Yes", callback_data: "yes" }]],
+        },
+      },
+      SECOND_TOKEN,
+    ); // first: 3, second: 2
+    expect(sent.result.message_id).toBe(2);
+    const [entry] = (await fake.getMessageLog(group)).messages.slice(-1);
+    const pick = entry.message.message_id;
+
+    const pressing = fake.pressButton(group, pick, OWNER, "yes");
+    const press = await fake.waitFor({
+      kind: "update",
+      botId: second.id,
+      type: "callback_query",
+    });
+    expect(press.update.callback_query.message.message_id).toBe(2);
+    await api(
+      "answerCallbackQuery",
+      { callback_query_id: press.update.callback_query.id },
+      SECOND_TOKEN,
+    );
+    await pressing;
+
+    await fake.react(group, pick, OWNER, "👍");
+    const reactions = await fake.getBotUpdates(me.id, {
+      type: "message_reaction",
+    });
+    expect(reactions.updates[0].update.message_reaction).toMatchObject({
+      chat: { id: group },
+      message_id: 3,
+    });
+  });
+
+  it("names a basic group's messages in waits and failure rules by the chat's own ids", async () => {
+    const { fake, api, second, group } = await basicGroup();
+    // A message the second bot knows as 2 and the first as 3.
+    const hello = await fake.post(group, OWNER, "hello");
+    await fake.failNext({
+      method: "deleteMessage",
+      botId: second.id,
+      messageId: hello,
+      errorCode: 400,
+    });
+
+    expect(
+      (
+        await api(
+          "deleteMessage",
+          { chat_id: group, message_id: 2 },
+          SECOND_TOKEN,
+        )
+      ).ok,
+    ).toBe(false);
+    const call = await fake.waitFor({
+      kind: "call",
+      botId: second.id,
+      method: "deleteMessage",
+      messageId: hello,
+    });
+    expect(call).toMatchObject({ fault_injected: true });
+    expect(
+      (
+        await api(
+          "deleteMessage",
+          { chat_id: group, message_id: 2 },
+          SECOND_TOKEN,
+        )
+      ).ok,
+    ).toBe(true);
+    expect((await fake.getMessage(group, hello)).deleted).toBe(true);
+  });
+
+  it("gives a bot no id for what was posted before it joined, so a reply to it shows none", async () => {
+    const { fake, api, second } = await setup();
+    const me = (await api("getMe")).result;
+    const group = await fake.createChat({ type: "group", ownerId: OWNER });
+    await fake.setBotMembership(group, me.id); // first: 1
+    const early = await fake.post(group, OWNER, "early"); // first: 2
+    await fake.setBotMembership(group, second.id); // first: 3, second: 1
+
+    await fake.post(group, OWNER, { text: "about that", replyTo: early });
+    const { updates } = await fake.getBotUpdates(second.id, {
+      chatId: group,
+      type: "message",
+    });
+    expect(updates.at(-1).update.message.text).toBe("about that");
+    expect(updates.at(-1).update.message).not.toHaveProperty(
+      "reply_to_message",
+    );
+    expect(
+      (await fake.getMessageLog(group)).messages.find(
+        (entry) => entry.message.message_id === early,
+      ).bot_message_ids,
+    ).toEqual({ [me.id]: 2 });
   });
 });

@@ -87,6 +87,11 @@ export function parseView(search) {
       ),
     ),
   ];
+  const runs = [
+    ...new Set(
+      listParam(params.get("runs")).filter((run) => run.length <= 200),
+    ),
+  ];
   const topicParam = params.get("topic");
   const topic =
     topicParam === "general" ? "general" : positiveInteger(topicParam);
@@ -100,6 +105,7 @@ export function parseView(search) {
     as: positiveInteger(params.get("as")),
     bots: bots.length ? bots : null,
     methods: methods.length ? methods : null,
+    runs: runs.length ? runs : null,
     topic,
     theme,
   };
@@ -126,6 +132,8 @@ export function viewToSearch(view) {
     parts.push(`bots=${view.bots.map(searchValue).join(",")}`);
   if (view.methods?.length)
     parts.push(`methods=${view.methods.map(searchValue).join(",")}`);
+  if (view.runs?.length)
+    parts.push(`runs=${view.runs.map(searchValue).join(",")}`);
   if (view.topic != null) parts.push(`topic=${searchValue(view.topic)}`);
   if (view.theme) parts.push(`theme=${searchValue(view.theme)}`);
   return `?${parts.join("&")}`;
@@ -1015,6 +1023,8 @@ const SERVICE_TYPES = [
   "forum_topic_edited",
   "forum_topic_closed",
   "forum_topic_reopened",
+  "general_forum_topic_hidden",
+  "general_forum_topic_unhidden",
   "group_chat_created",
   "supergroup_chat_created",
   "channel_chat_created",
@@ -1136,7 +1146,9 @@ function messageAttrs(item, ctx, service) {
     "data-author-id": item.author ?? m.from?.id ?? m.sender_chat?.id,
     "data-author-kind": authorKind(item, ctx),
     "data-deleted": item.deleted === true,
-    "data-deleted-by": item.deleted ? item.deleted_by?.bot_id : null,
+    "data-deleted-by": item.deleted
+      ? (item.deleted_by?.bot_id ?? item.deleted_by?.user_id)
+      : null,
     "data-edited": m.edit_date != null,
     "data-edit-hidden": m.edit_date != null && item.edit_hidden === true,
     "data-service": service,
@@ -1232,6 +1244,10 @@ function serviceText(item, ctx, type) {
       return `${actor} closed the topic`;
     case "forum_topic_reopened":
       return `${actor} reopened the topic`;
+    case "general_forum_topic_hidden":
+      return `${actor} hid the General topic`;
+    case "general_forum_topic_unhidden":
+      return `${actor} unhid the General topic`;
     case "group_chat_created":
     case "supergroup_chat_created":
       return `${actor} created the group`;
@@ -1259,6 +1275,10 @@ function renderService(item, ctx, type) {
 
 function deletedMark(item, ctx) {
   const by = item.deleted_by;
+  // A person deleted it (a test action), not a bot's Bot API call.
+  if (by?.user_id != null) {
+    return `<span class="tv-deleted" title="${escapeAttr(`deleted at ${isoTime(by.at)}`)}">Deleted · ${escapeHtml(personName(ctx, by.user_id))}</span>`;
+  }
   const bot = by ? userOf(ctx, by.bot_id) : null;
   const name = bot?.username
     ? `@${bot.username}`
@@ -1538,6 +1558,125 @@ export function renderEvent(event, ctx) {
     "data-request-id": event.request_id,
     "data-before-window": event.before_window === true,
   })}><span class="tv-event-text">${eventText(event, ctx)}</span>${timeTag(event.at)}</div>`;
+}
+
+// ── Scenarios ──────────────────────────────────────────────────────────
+
+const SCENARIO_RESULTS = {
+  passed: "Passed",
+  failed: "Failed",
+  skipped: "Skipped",
+};
+
+/** Whether the view's `runs` filter lets an item through: any but another run's mark. */
+export function scenarioShown(item, view) {
+  return (
+    item.kind !== "scenario" ||
+    !view?.runs?.length ||
+    view.runs.includes(String(item.run_id))
+  );
+}
+
+/** A label chip: "key: value". */
+function labelChip(key, value) {
+  return `<span class="tv-label"${attrs({ "data-label-key": key, "data-label-unknown": value == null })}>${escapeHtml(`${key}: ${value ?? "unknown"}`)}</span>`;
+}
+
+/** A message named as evidence, in words: its sender and a short quote, or what happened. */
+function evidenceMessage(item, ctx) {
+  const m = item.message ?? {};
+  const type = serviceType(m);
+  if (type) return serviceText(item, ctx, type);
+  const text = m.text ?? m.caption;
+  const label = contentLabel(m);
+  const content = [
+    label ? escapeHtml(label) : "",
+    text ? quoteText(text) : "",
+  ].filter(Boolean);
+  return `${actorName(m, ctx)}: ${content.join(" ") || "a message"}`;
+}
+
+/**
+ * What a piece of failure evidence is, in words, from what the server
+ * stored (state.js evidenceFound): a message's sender, a short quote and
+ * its chat; a call's bot, method and outcome; an event as the chat shows
+ * it. A call or event in another chat names that chat. Evidence that is
+ * gone keeps its raw id.
+ */
+function evidenceText(evidence, ctx) {
+  const subject = evidence.subject;
+  const chat = escapeHtml(evidence.chat_label ?? evidence.chat_ref ?? "");
+  const elsewhere =
+    evidence.chat_ref && evidence.chat_ref !== ctx.key ? ` in ${chat}` : "";
+  let what;
+  if (!subject) {
+    what = escapeHtml(
+      evidence.kind === "call"
+        ? `call ${evidence.request_id}`
+        : evidence.kind === "event"
+          ? `event ${evidence.event_id}`
+          : `message seq ${evidence.seq}`,
+    );
+  } else if (evidence.kind === "call") {
+    what = `${callBot(subject, ctx)} called <code>${escapeHtml(subject.method)}</code>: ${escapeHtml(callOutcome(subject))}${elsewhere}`;
+  } else if (evidence.kind === "event") {
+    what = `${eventText(subject, ctx)}${elsewhere}`;
+  } else {
+    what = `${evidenceMessage(subject, ctx)}${chat ? ` in ${chat}` : ""}`;
+  }
+  const labels = Object.entries(evidence.labels ?? {})
+    .map(([key, value]) => labelChip(key, value))
+    .join("");
+  return `<li class="tv-evidence">${what}${labels ? ` ${labels}` : ""}</li>`;
+}
+
+/**
+ * Where a scenario a test runner reported started or finished: its run,
+ * title, the status and result the runner gave, its labels (each label its
+ * run uses, "unknown" where it gave none) and, for a failure, the runner's
+ * explanation and a button that marks the evidence it named.
+ */
+export function renderScenario(item, ctx) {
+  const finish = item.phase === "finish";
+  const keys = [
+    ...new Set([...(item.label_keys ?? []), ...Object.keys(item.labels ?? {})]),
+  ];
+  const labels = keys.length
+    ? keys.map((key) => labelChip(key, item.labels?.[key])).join("")
+    : labelChip("labels", null);
+  const evidence = item.failure?.evidence ?? [];
+  const seqs = evidence
+    .filter((each) => each.kind !== "call")
+    .map((each) => each.seq ?? each.event_id);
+  const requests = evidence
+    .filter((each) => each.kind === "call")
+    .map((each) => each.request_id);
+  const badge = finish
+    ? (SCENARIO_RESULTS[item.result] ?? "Finished")
+    : "Started";
+  const failure =
+    finish && item.failure
+      ? `<p class="tv-scenario-failure">${escapeHtml(item.failure.message)}</p>${
+          evidence.length
+            ? `<button type="button" class="tv-pill-button" data-role="show-evidence">Show evidence (${evidence.length})</button><ul class="tv-evidence-list">${evidence.map((each) => evidenceText(each, ctx)).join("")}</ul>`
+            : ""
+        }`
+      : "";
+  return `<div class="tv-scenario"${attrs({
+    "data-kind": "scenario",
+    "data-chat-key": ctx.key,
+    "data-seq": item.seq,
+    "data-scenario-phase": item.phase,
+    "data-run-id": item.run_id,
+    "data-scenario-id": item.scenario_id,
+    "data-scenario-status": item.status,
+    "data-scenario-result": item.result,
+    "data-evidence-seqs": seqs.join(" ") || null,
+    "data-evidence-requests": requests.join(" ") || null,
+    "data-before-window": item.before_window === true,
+    role: "group",
+    "aria-label": `Scenario ${item.title}: ${finish ? badge.toLowerCase() : "started"}`,
+  })}><div class="tv-scenario-head"><span class="tv-scenario-badge"${attrs({ "data-result": finish ? (item.result ?? "") : "started" })}>${escapeHtml(badge)}</span><span class="tv-scenario-title">${escapeHtml(item.title)}</span>${timeTag(item.at)}</div><div class="tv-scenario-run">${escapeHtml(`Run ${item.run_id} · ${item.scenario_id}`)}</div><div class="tv-scenario-labels">${labels}</div>${failure}</div>`;
 }
 
 // ── Calls ──────────────────────────────────────────────────────────────
@@ -1886,11 +2025,13 @@ function groupKeyOf(item, ctx) {
 
 function entryKey(item) {
   if (item.kind === "call") return `c${item.request_id}`;
+  if (item.kind === "scenario") return `s${item.seq}`;
   return `${item.kind === "event" ? "e" : "m"}${item.seq}`;
 }
 
 function drawn(item, ctx, position) {
   if (item.kind === "event") return renderEvent(item, ctx);
+  if (item.kind === "scenario") return renderScenario(item, ctx);
   if (item.kind === "call") return renderCall(item, ctx);
   return renderMessage(item, ctx, position);
 }
@@ -1930,7 +2071,9 @@ export function streamEntries(list, ctx, options = {}) {
       lastDay = day;
       lastChat = null;
     }
-    // In the "all" feed, a header names the chat each run of items is in.
+    // In the "all" feed, a header names the chat each run of items is in,
+    // again after a scenario's mark, which is in no chat.
+    if (item.kind === "scenario") lastChat = null;
     if (item.chat_label != null && item.chat_ref !== lastChat) {
       out.push({
         key: `c${entryKey(item)}`,
@@ -1981,6 +2124,7 @@ export function chatStream(
   );
   const list = items.filter((item) => {
     if (item.kind === "message") return true;
+    if (item.kind === "scenario") return ctx.as == null;
     if (
       item.kind !== "event" ||
       !inline ||
@@ -2191,7 +2335,7 @@ const TYPE_LABELS = {
  */
 function listPreview(entry, ctx) {
   if (entry.type === "calls")
-    return `${escapeHtml(entry.call_count ?? 0)} calls without a chat`;
+    return `${escapeHtml(entry.call_count ?? 0)} call${entry.call_count === 1 ? "" : "s"} without a chat`;
   const last = entry.last;
   if (!last)
     return entry.access === "none"
@@ -2362,8 +2506,11 @@ const PANEL_LABELS = {
   members: "Members",
 };
 
-/** The toolbar's controls: panel toggles, layout, view-as and theme. */
-export function renderToolbar(view, { people = [] } = {}) {
+/**
+ * The toolbar's controls: panel toggles, layout, view-as, the run filter
+ * (when a runner reported scenarios) and theme.
+ */
+export function renderToolbar(view, { people = [], runs = [] } = {}) {
   const shown = new Set(view.show ?? PANELS);
   const viewAs = view.as != null;
   const toggles = PANELS.map((panel) => {
@@ -2392,6 +2539,19 @@ export function renderToolbar(view, { people = [] } = {}) {
         `<option value="${value}"${(view.theme ?? "") === value ? " selected" : ""}>${label}</option>`,
     )
     .join("");
+  const runIds = [
+    ...new Set([...runs.map((run) => run.run_id), ...(view.runs ?? [])]),
+  ];
+  const chosen = view.runs?.length === 1 ? view.runs[0] : "";
+  const runOptions = [
+    ["", "All runs"],
+    ...runIds.map((id) => [id, `Run ${id}`]),
+  ]
+    .map(
+      ([value, label]) =>
+        `<option value="${escapeAttr(value)}"${chosen === value ? " selected" : ""}>${escapeHtml(label)}</option>`,
+    )
+    .join("");
   const select = (label, role, html) =>
     el(
       "label",
@@ -2415,6 +2575,7 @@ export function renderToolbar(view, { people = [] } = {}) {
       layouts,
     ),
     select("View as", "view-as", options),
+    runIds.length ? select("Run", "run-filter", runOptions) : "",
     select("Theme", "theme", themes),
   ].join("");
 }

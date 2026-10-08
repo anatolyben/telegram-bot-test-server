@@ -1796,6 +1796,7 @@ export async function startTestServer({
   botUsername = "example_bot",
   botName = "Example Bot",
   supportsJoinRequestQueries = false,
+  privacyMode = false,
   chats: chatConfigs = [],
   publicChats = [],
   unimplemented: unimplementedMode = "error",
@@ -1874,6 +1875,12 @@ export async function startTestServer({
   const recordings = new Map();
   // Loaded with the first recording, whether the viewer is on or not.
   let recorder = null;
+  // Scenarios a test runner reports, by run and scenario id, in the order
+  // first reported, and the marks their start and finish put among the
+  // stored items. Test-only, never part of Telegram's behavior; like
+  // recordings, they are not state, so each mark keeps its epoch.
+  const scenarios = new Map();
+  const scenarioMarks = [];
   const joinDecisions = new Map();
   const expiryTasks = new Map();
   const users = new Map();
@@ -1889,6 +1896,7 @@ export async function startTestServer({
     firstName,
     joinRequestQueries = false,
     loginClientSecret: secret,
+    privacy = false,
   }) {
     const id = Number(String(token).split(":")[0]);
     if (!Number.isSafeInteger(id) || !String(token).includes(":")) {
@@ -1921,14 +1929,19 @@ export async function startTestServer({
       // The waiting getUpdates call and webhook attempts, by update_id.
       pollWaiters: new Set(),
       sending: new Map(),
+      // The users an update the bot got named (knowsUser).
+      namedUsers: new Set(),
       // When Telegram next answers a getUpdates conflict at once.
       nextConflictAt: 0,
       // When floodControl next lets setWebhook set a URL.
       nextSetWebhookAt: 0,
       // Command lists by scope and language (see commandsKey).
       commands: new Map(),
-      // A guard bot that gets join request queries (Bot API 10.x).
+      // A guard bot that gets join request queries (Bot API 10.1).
       joinRequestQueries: joinRequestQueries === true,
+      // Privacy mode, as BotFather sets it: in a group where it is not an
+      // administrator, the bot gets only some messages (privacyRecipient).
+      privacyMode: privacy === true,
       // The Telegram Login client secret BotFather shows for the bot.
       loginClientSecret:
         typeof secret === "string" && secret !== ""
@@ -1946,6 +1959,7 @@ export async function startTestServer({
     firstName: botName,
     joinRequestQueries: supportsJoinRequestQueries,
     loginClientSecret,
+    privacy: privacyMode,
   });
   // Join request queries awaiting answerChatJoinRequestQuery, by query id.
   const joinQueries = new Map();
@@ -1982,8 +1996,18 @@ export async function startTestServer({
       title: entry.title ?? username,
     });
   }
-  // A member's private chat with the bot, keyed by the member's id.
+  // Each user's private chat with each bot, keyed "<user id>:<bot id>"
+  // (privateKey). Every bot is an account of its own on Telegram, so each
+  // (user, bot) pair is a chat of its own, and the Bot API names it by the
+  // user's id from either side (https://core.telegram.org/bots/api#chat): a
+  // bot reaches only its own.
   const privateChats = new Map();
+  // The next id of each account's common message id sequence, by user or
+  // bot id: "The sequence is shared by all private chats and basic group
+  // messages within the current account", and business messages use the
+  // connected user's (https://core.telegram.org/api/updates). Private chats,
+  // business chats and every account's view of a basic group draw from it.
+  const accountMessageIds = new Map();
   // Business connections (Bot API 7.2+), by id: an account owner connects a
   // bot to answer their private chats.
   // https://core.telegram.org/bots/api#businessconnection
@@ -2015,6 +2039,15 @@ export async function startTestServer({
     if (unimplemented.has(name)) return;
     unimplemented.add(name);
     log(`unimplemented Bot API method ${name}`);
+  }
+  /**
+   * Reports a case of a method this server does not have, because no source
+   * gives Telegram's answer to it, and returns the error to throw: Telegram's
+   * answer to a method it does not know.
+   */
+  function unimplementedCase(name) {
+    reportUnimplemented(name);
+    return new TelegramError(404, "Not Found: method not found");
   }
   // Calls a test asked to fail: the next `times` calls of a method (to one
   // chat, from one bot, when named) answer the error, or take effect and never
@@ -2086,44 +2119,107 @@ export async function startTestServer({
     return chat;
   }
 
-  /** The group, or a member's private chat with the bot, holding a message. */
-  function messageChat(chatId) {
+  function privateKey(userId, botId) {
+    return `${Number(userId)}:${Number(botId)}`;
+  }
+
+  /** The user's private chat with one bot, if it was ever opened. */
+  function privateChatOf(userId, botId) {
+    return privateChats.get(privateKey(userId, botId));
+  }
+
+  /**
+   * The group, or a member's private chat with a bot (by default the first),
+   * holding a message.
+   */
+  function messageChat(chatId, botId = bot.id) {
     const id = Number(chatId);
     if (chats.has(id)) return chats.get(id);
     const user = users.get(id);
     if (!user || user.is_bot) {
       throw new TelegramError(400, "Bad Request: chat not found");
     }
-    if (!privateChats.has(id)) {
-      privateChats.set(id, {
+    const key = privateKey(id, botId);
+    if (!privateChats.has(key)) {
+      privateChats.set(key, {
         id,
         type: "private",
         user,
+        botId: Number(botId),
         messages: new Map(),
         nextMessageId: 1,
       });
     }
-    const chat = privateChats.get(id);
+    const chat = privateChats.get(key);
     // The user opened it, so it no longer depends on a join request.
     delete chat.contactOnly;
     return chat;
   }
 
   /**
+   * The bots a private chat's updates go to: the bot it is with, unless that
+   * bot was deleted.
+   */
+  function pairRecipients(chat) {
+    return chat.type === "private"
+      ? { to: [...bots.values()].filter((record) => record.id === chat.botId) }
+      : {};
+  }
+
+  /**
+   * Whether the bot's TDLib knows a user, so that its getChat finds their
+   * private chat (UserManager::get_input_user, which a bot may use with a zero
+   * access hash): they have a private chat with the bot, share or shared a
+   * chat with it, asked to join a chat it is in, or an update it got named
+   * them.
+   */
+  function knowsUser(userId, record) {
+    const id = Number(userId);
+    if (!users.has(id)) return false;
+    if (privateChatOf(id, record.id) || record.namedUsers.has(id)) return true;
+    return [...chats.values()].some(
+      (chat) =>
+        chat.members.has(record.id) &&
+        (chat.members.has(id) || chat.joinRequests.has(id)),
+    );
+  }
+
+  /** Every user an update names, as a User or as a private chat. */
+  function usersNamed(value, into) {
+    if (Array.isArray(value)) {
+      for (const item of value) usersNamed(item, into);
+    } else if (value !== null && typeof value === "object") {
+      if (
+        typeof value.id === "number" &&
+        (typeof value.is_bot === "boolean" || value.type === "private")
+      ) {
+        into.add(value.id);
+      }
+      for (const item of Object.values(value)) usersNamed(item, into);
+    }
+    return into;
+  }
+
+  /**
    * The chat a Bot API call addresses; a group or channel is checked as
    * requireChat checks it. A bot cannot open a private chat: it can only
    * write to users who have messaged it first, as on Telegram, or, for a send
-   * (`send`), to someone whose join request it may answer.
+   * (`send`), to someone whose join request it may answer. Any other call
+   * names a private chat as Client::check_chat does, through TDLib's getChat:
+   * with a user the bot knows (knowsUser) it is found, and empty if they never
+   * wrote, so its messages are not found (Client::check_message); with
+   * anyone else it fails with "chat not found" (TdOnCheckChatCallback).
    */
   function botChat(chatId, caller, { send = false, ...access } = {}) {
     requireChatId(chatId);
     const id = Number(chatId);
     if (chats.has(id)) return requireChat(id, caller, access);
-    if (privateChats.has(id)) return privateChats.get(id);
+    const own = privateChatOf(id, caller.id);
+    if (own) return own;
     const user = users.get(id);
-    if (user && !user.is_bot) {
-      if (send && joinRequestContact(id, caller)) {
-        const chat = messageChat(id);
+    if (user && !user.is_bot && send) {
+      if (joinRequestContact(id, caller)) {
+        const chat = messageChat(id, caller.id);
         chat.contactOnly = true;
         return chat;
       }
@@ -2131,6 +2227,17 @@ export async function startTestServer({
         403,
         "Forbidden: bot can't initiate conversation with a user",
       );
+    }
+    if (user && knowsUser(id, caller)) {
+      // Not stored: nothing was written in it.
+      return {
+        id,
+        type: "private",
+        user,
+        botId: caller.id,
+        messages: new Map(),
+        nextMessageId: 1,
+      };
     }
     throw new TelegramError(400, "Bad Request: chat not found");
   }
@@ -2376,10 +2483,15 @@ export async function startTestServer({
         ...Object.fromEntries(
           rights.map((right) => [right, granted[right] === true]),
         ),
+        // The Bot API server still writes the older name beside it
+        // (Client.cpp:5837, JsonChatMember).
+        can_manage_voice_chats: granted.can_manage_video_chats === true,
         ...(member.customTitle ? { custom_title: member.customTitle } : {}),
       };
     }
-    if (member.status === "creator") return { ...base, is_anonymous: false };
+    if (member.status === "creator") {
+      return { ...base, is_anonymous: member.anonymous === true };
+    }
     if (member.status === "restricted") {
       return {
         ...base,
@@ -2510,15 +2622,11 @@ export async function startTestServer({
 
   /** Refuse a bot's send the way Telegram does when it may not post there. */
   function requireCanSend(chat, caller) {
-    // A private chat here is with the first bot: users write only to it, and
-    // no other bot may message someone who never wrote to that bot.
+    // A private chat is the caller's own with the user (botChat). One opened
+    // only for a join request stays open while the request may be answered.
     if (chat.type === "private") {
       if (joinRequestContact(chat.id, caller)) return;
-      // A business connection gives its bot the owner's private chat
-      // (BusinessConnection.user_chat_id).
-      if (
-        caller.id === bot.id ? chat.contactOnly : !chat.openTo?.has(caller.id)
-      ) {
+      if (chat.contactOnly) {
         throw new TelegramError(
           403,
           "Forbidden: bot can't initiate conversation with a user",
@@ -2561,6 +2669,316 @@ export async function startTestServer({
     if (!chat.topics.has(Number(threadId))) {
       throw new TelegramError(400, "Bad Request: message thread not found");
     }
+  }
+
+  /**
+   * The forum a topic method names. telegram-bot-api checks the chat for
+   * writing (Client.cpp process_close_forum_topic_query and its kin), then
+   * TDLib refuses a chat that is no forum (ForumTopicManager.cpp is_forum).
+   */
+  function forumChat(p, caller) {
+    const chat = botChat(p.chat_id, caller);
+    if (!chat.topics) {
+      throw new TelegramError(400, "Bad Request: the chat is not a forum");
+    }
+    return chat;
+  }
+
+  /**
+   * A topic by its id: 1 is the General topic every forum has
+   * (https://core.telegram.org/api/forum), kept apart from the topics
+   * created by a forum_topic_created message.
+   */
+  function forumTopic(chat, id) {
+    if (id === 1) {
+      chat.generalTopic ??= { name: "General", closed: false, hidden: false };
+      return chat.generalTopic;
+    }
+    return chat.topics.get(id) ?? null;
+  }
+
+  /**
+   * Whether a bot may manage a topic with `method`, and the refusal when it
+   * may not. With the right (can_manage_topics, or can_delete_messages to
+   * delete) TDLib passes the call on to Telegram, which answers
+   * TOPIC_ID_INVALID for a topic that does not exist
+   * (https://core.telegram.org/method/channels.editForumTopic,
+   * channels.deleteTopicHistory). So it does for the topic's creator,
+   * whom the Bot API docs let close, reopen and edit it without the right,
+   * but not delete it (`creatorMay`).
+   * Without the right TDLib refuses a topic it knows that the bot did not
+   * create (ForumTopicManager.cpp toggle_forum_topic_is_closed,
+   * edit_forum_topic, delete_forum_topic). It knows a topic once a send
+   * named it (Client.cpp check_message_topic loads it with getForumTopic),
+   * but may also have learned it from fetched messages (MessagesInfo.cpp
+   * get_messages_info, on_get_forum_topic_infos), and otherwise passes the
+   * call on to Telegram, whose answer no source gives. Any other case is
+   * reported as unimplemented.
+   */
+  function requireTopicRights(
+    chat,
+    caller,
+    id,
+    right,
+    refusal,
+    method,
+    creatorMay = true,
+  ) {
+    if (id <= 0) {
+      throw new TelegramError(
+        400,
+        "Bad Request: invalid forum topic identifier specified",
+      );
+    }
+    const topic = forumTopic(chat, id);
+    const creator = id !== 1 && topic != null && topic.creatorId === caller.id;
+    if (hasRight(chat, caller.id, right) || (creator && creatorMay)) {
+      if (!topic) throw new TelegramError(400, "Bad Request: TOPIC_ID_INVALID");
+      return topic;
+    }
+    if (creator) {
+      throw unimplementedCase(
+        `${method} without ${right} on a topic the bot created`,
+      );
+    }
+    if (id !== 1 && topic?.knownTo?.includes(caller.id)) {
+      throw new TelegramError(400, `Bad Request: ${refusal}`);
+    }
+    throw unimplementedCase(
+      id === 1 && method.includes("General")
+        ? `${method} without ${right}`
+        : `${method} without ${right} on a topic the bot has not sent to`,
+    );
+  }
+
+  /**
+   * A topic's service message from the bot, in the topic (the General
+   * topic's messages have no message_thread_id: Client.cpp
+   * get_forum_topic_id), answering its creation message (topicReply). The bot that made the change gets it too
+   * (Client.cpp need_skip_update_message keeps outgoing
+   * messageForumTopicEdited, IsClosedToggled and IsHiddenToggled).
+   */
+  function topicService(chat, caller, id, fields) {
+    const message = addMessage(chat, caller, {
+      ...fields,
+      ...(id !== 1 ? { message_thread_id: id, is_topic_message: true } : {}),
+    });
+    void emit("message", message);
+  }
+
+  /**
+   * Closes or reopens a topic: TOPIC_NOT_MODIFIED when it already is so,
+   * which TDLib passes on to a bot (ForumTopicManager.cpp EditForumTopicQuery
+   * on_error). Reopening the General topic unhides it, as the Bot API docs
+   * say (reopenGeneralForumTopic). Its service message is then
+   * forum_topic_reopened: TDLib shows an edit that both unhides and reopens
+   * a topic as messageForumTopicIsClosedToggled, not as IsHiddenToggled
+   * (ForumTopicEditedData.cpp:11-13,
+   * get_edited_data_message_content_object).
+   */
+  function toggleTopicClosed(chat, caller, id, closed, method) {
+    const topic = requireTopicRights(
+      chat,
+      caller,
+      id,
+      "can_manage_topics",
+      "not enough rights to close or open the topic",
+      method,
+    );
+    if (topic.closed === closed) {
+      throw new TelegramError(400, "Bad Request: TOPIC_NOT_MODIFIED");
+    }
+    topic.closed = closed;
+    if (id === 1 && !closed) topic.hidden = false;
+    topicService(chat, caller, id, {
+      [closed ? "forum_topic_closed" : "forum_topic_reopened"]: {},
+    });
+    return true;
+  }
+
+  /**
+   * Renames a topic (TDLib edit_forum_topic): an empty name keeps it, and
+   * with no icon either nothing is sent. The name is cleaned as a chat title
+   * and cut to 128 characters (clean_name with MAX_FORUM_TOPIC_TITLE_LENGTH).
+   * Telegram answers TOPIC_NOT_MODIFIED to a change to nothing new, and
+   * GENERAL_MODIFY_ICON_FORBIDDEN to an icon for the General topic
+   * (https://core.telegram.org/method/channels.editForumTopic).
+   * Not modeled: a custom emoji icon. Topics here have none, so removing it
+   * changes nothing, and setting one gets the answer to a method this server
+   * lacks.
+   */
+  function editTopic(chat, caller, id, name, editIcon, iconId, method) {
+    const topic = requireTopicRights(
+      chat,
+      caller,
+      id,
+      "can_manage_topics",
+      "not enough rights to edit the topic",
+      method,
+    );
+    const editTitle = name !== "";
+    const title = trimSpaces(
+      stripEmpty(name, 128).replace(/[ \n\u00a0]+/g, " "),
+    );
+    if (editTitle && !title) {
+      throw new TelegramError(400, "Bad Request: name must be non-empty");
+    }
+    if (!editTitle && !editIcon) return true;
+    if (editIcon && iconId !== "0") {
+      throw unimplementedCase("editForumTopic with icon_custom_emoji_id");
+    }
+    if (editIcon && id === 1) {
+      throw new TelegramError(400, "Bad Request: GENERAL_MODIFY_ICON_FORBIDDEN");
+    }
+    if (!editTitle || title === topic.name) {
+      throw new TelegramError(400, "Bad Request: TOPIC_NOT_MODIFIED");
+    }
+    topic.name = title;
+    topicService(chat, caller, id, { forum_topic_edited: { name: title } });
+    return true;
+  }
+
+  /**
+   * The custom emoji id td::to_integer reads (its leading digits; none is 0),
+   * as text so a 64-bit id stays exact.
+   */
+  function emojiIdParam(value) {
+    const digits = /^\d*/.exec(String(value ?? ""))[0].replace(/^0+/, "");
+    return digits === "" ? "0" : digits;
+  }
+
+  /**
+   * A closed topic takes no messages, but from administrators with
+   * can_manage_topics and the topic's creator ("preventing further messages
+   * from being sent to the topic", https://core.telegram.org/api/forum; who
+   * still may, as TDLib's can_send_message_to_forum_topic decides).
+   * Telegram's error is 406 TOPIC_CLOSED
+   * (https://core.telegram.org/method/messages.sendMessage), which reaches a
+   * bot as Bad Request (Client.cpp fail_query_with_error). A message in no
+   * topic goes to the General topic.
+   */
+  function requireOpenTopic(chat, userId, threadId, refuse) {
+    if (!chat.topics) return;
+    const topic = forumTopic(chat, threadId || 1);
+    if (
+      topic?.closed &&
+      topic.creatorId !== userId &&
+      !hasRight(chat, userId, "can_manage_topics")
+    ) {
+      refuse("TOPIC_CLOSED");
+    }
+  }
+
+  /** Hides or unhides a forum's General topic. */
+  function toggleGeneralHidden(p, caller, hidden) {
+    const chat = forumChat(p, caller);
+    if (!hasRight(chat, caller.id, "can_manage_topics")) {
+      throw new TelegramError(
+        400,
+        "Bad Request: not enough rights to close or open the topic",
+      );
+    }
+    const topic = forumTopic(chat, 1);
+    if (topic.hidden === hidden) {
+      throw new TelegramError(400, "Bad Request: TOPIC_NOT_MODIFIED");
+    }
+    topic.hidden = hidden;
+    if (hidden) topic.closed = true;
+    topicService(chat, caller, 1, {
+      [hidden ? "general_forum_topic_hidden" : "general_forum_topic_unhidden"]:
+        {},
+    });
+    return true;
+  }
+
+  function unpinTopic(p, caller, id) {
+    const chat = botChat(p.chat_id, caller);
+    if (id === 0) {
+      throw new TelegramError(
+        400,
+        "Bad Request: invalid forum topic identifier specified",
+      );
+    }
+    requirePinRights(chat, caller);
+    if (!chat.topics) {
+      throw new TelegramError(400, "Bad Request: chat doesn't have topics");
+    }
+    const inTopic = (messageId) => {
+      const message = chat.messages.get(messageId)?.message;
+      return id === 1
+        ? message?.message_thread_id === undefined
+        : message?.message_thread_id === id || messageId === id;
+    };
+    chat.pinned = (chat.pinned ?? []).filter((each) => !inTopic(each));
+    logEvent(chat, {
+      type: "unpin",
+      messageId: null,
+      all: true,
+      botId: caller.id,
+    });
+    return true;
+  }
+
+  /** banChatSenderChat (`ban`) or unbanChatSenderChat. */
+  function senderChatBan(p, caller, ban) {
+    const chat = botChat(p.chat_id, caller);
+    const senderId = actorChatId(p.sender_chat_id);
+    if (chat.type === "private") {
+      throw new TelegramError(
+        400,
+        ban
+          ? "Bad Request: can't ban members in private chats"
+          : "Bad Request: chat member status can't be changed in private chats",
+      );
+    }
+    // A user's id is their private chat's: TDLib bans or unbans the user as
+    // banChatMember and unbanChatMember do, with the until_date the Bot API
+    // server reads for a ban (Client.cpp process_ban_chat_sender_chat_query).
+    // In a basic group setting the user's status to left removes them, the
+    // way a ban does there (DialogParticipantManager.cpp
+    // set_dialog_participant_status, set_chat_participant_status,
+    // ban_dialog_participant: delete_chat_participant). For a chat the docs
+    // list no until_date: a banned chat stays banned "Until the chat is
+    // unbanned" (https://core.telegram.org/bots/api#banchatsenderchat). The
+    // Bot API server still passes one on, and no source shows what
+    // Telegram's server does with it, so a chat's ban with one is refused as
+    // a method this server does not have.
+    if (senderId > 0) {
+      const params = { chat_id: p.chat_id, user_id: senderId };
+      if (ban || chat.type === "group") {
+        return methods.banChatMember(
+          ban ? { ...params, until_date: p.until_date } : params,
+          caller,
+        );
+      }
+      return methods.unbanChatMember(params, caller);
+    }
+    if (chat.type === "group") {
+      if (!ban) return true;
+      throw new TelegramError(400, "Bad Request: can't ban chats in basic groups");
+    }
+    const sender = chats.get(senderId);
+    if (!sender) throw new TelegramError(400, "Bad Request: member not found");
+    if (sender.type === "group") {
+      throw new TelegramError(400, "Bad Request: can't restrict the chat");
+    }
+    requireRight(
+      chat,
+      caller,
+      "can_restrict_members",
+      "not enough rights to restrict/unrestrict chat member",
+    );
+    if (ban && clampedInteger(p.until_date, 0, -(2 ** 31), 2 ** 31 - 1) !== 0) {
+      throw unimplementedCase("banChatSenderChat with until_date for a chat");
+    }
+    chat.bannedSenderChats ??= [];
+    chat.bannedSenderChats = chat.bannedSenderChats.filter(
+      (id) => id !== senderId,
+    );
+    if (ban) chat.bannedSenderChats.push(senderId);
+    appliedCheckpoint();
+    waits.notify();
+    return true;
   }
 
   /** A group pins with can_pin_messages, a channel with can_edit_messages. */
@@ -2889,6 +3307,20 @@ export async function startTestServer({
     const chat = chatId == null ? null : chats.get(Number(chatId));
     const kind =
       chat?.type === "channel" ? (CHANNEL_UPDATES[type] ?? type) : type;
+    // The stored message an update is about: the very one for a new message.
+    const stored = chat?.messages.get(payload?.message_id);
+    const entry =
+      type === "edited_message" || stored?.message === payload ? stored : null;
+    const privateTo =
+      chat && type === "message" ? privacyRecipient(chat, payload) : undefined;
+    // A bot in privacy mode gets the edits of only the messages it received.
+    const hears = (record) =>
+      type === "edited_message"
+        ? !inPrivacyMode(chat, record) ||
+          (entry?.receivedBy ?? []).includes(record.id)
+        : privateTo === undefined ||
+          !inPrivacyMode(chat, record) ||
+          privateTo === record.id;
     const recipients = (
       to ??
       (chat
@@ -2896,10 +3328,94 @@ export async function startTestServer({
             (record) => record.id !== except && isInChat(chat, record.id),
           )
         : [bot])
-    ).filter((record) => !chat || receives(chat, record, type));
+    ).filter(
+      (record) => !chat || (receives(chat, record, type) && hears(record)),
+    );
+    if (entry && type === "message") {
+      entry.privacyTo = privateTo;
+      entry.receivedBy = recipients.map((record) => record.id);
+    }
     return Promise.all(
       recipients.map((record) => emitTo(record, kind, payload)),
     );
+  }
+
+  /**
+   * Whether a bot reads a group in privacy mode: privacy mode is on and it is
+   * not an administrator there, since "bot admins always receive all
+   * messages" (https://core.telegram.org/bots/features#privacy-mode).
+   */
+  function inPrivacyMode(chat, record) {
+    return (
+      record.privacyMode &&
+      (chat.type === "group" || chat.type === "supergroup") &&
+      !["administrator", "creator"].includes(memberStatus(chat, record.id).status)
+    );
+  }
+
+  /**
+   * The one bot in privacy mode a group message reaches, if any (-1 for
+   * none), as the Bot API docs list what such a bot receives
+   * (https://core.telegram.org/bots/features#privacy-mode,
+   * https://core.telegram.org/bots/faq#what-messages-will-my-bot-get): every
+   * service message (undefined: every bot gets it); "Commands explicitly meant
+   * for them (e.g., /command@this_bot)"; "General commands from users (e.g.
+   * /start) if the bot was the last bot to send a message to the group"; and
+   * "Replies to any messages implicitly or explicitly meant for this bot".
+   * Note that "each particular message can only be available to one
+   * privacy-enabled bot at a time" and "Replies have the highest priority", so a reply comes
+   * before an explicit command, and that before a general one. Messages sent
+   * via a bot (inline mode) are not modeled.
+   * Where the docs do not decide, the narrowest reading of their examples: a
+   * command is a text message that starts with one, as both examples do; the
+   * messages meant for a bot are its own, those it got by these rules, and
+   * commands that name it; and a message in a topic does not reply to the topic's
+   * creation message, which the Bot API server adds itself (topicReply).
+   */
+  function privacyRecipient(chat, message) {
+    if (chat.type !== "group" && chat.type !== "supergroup") return undefined;
+    if (contentType(message) === null) return undefined;
+    const candidates = [...bots.values()].filter(
+      (record) => isInChat(chat, record.id) && inPrivacyMode(chat, record),
+    );
+    const candidate = (id) =>
+      candidates.some((record) => record.id === id) ? id : undefined;
+    const replied = message.reply_to_message;
+    const topicStart =
+      message.is_topic_message &&
+      replied?.message_id === message.message_thread_id;
+    if (replied && !topicStart) {
+      const entry = chat.messages.get(replied.message_id);
+      const meant =
+        candidate(replied.from?.id) ??
+        candidate(entry?.privacyTo) ??
+        candidate(commandTarget(replied, candidates));
+      if (meant !== undefined) return meant;
+    }
+    const target = commandTarget(message, candidates);
+    if (target === null) return -1;
+    return target === undefined
+      ? (candidate(chat.lastBotId) ?? -1)
+      : (candidate(target) ?? -1);
+  }
+
+  /**
+   * The command a text message starts with: null for none, undefined for a
+   * general command, or else the id of the bot in `candidates` it names
+   * (/command@this_bot), -1 when none is that bot.
+   */
+  function commandTarget(message, candidates) {
+    const command = (message.entities ?? []).find(
+      (entity) => entity.type === "bot_command" && entity.offset === 0,
+    );
+    if (message.text == null || !command) return null;
+    const [, name] = message.text.slice(0, command.length).split("@");
+    if (name === undefined) return undefined;
+    const named = candidates.find(
+      (record) =>
+        String(record.username ?? "").toLowerCase() === name.toLowerCase(),
+    );
+    return named ? named.id : -1;
   }
 
   /**
@@ -2968,7 +3484,9 @@ export async function startTestServer({
       // Given up by Telegram without the bot confirming it.
       dropped: false,
     });
-    record.queue.push(JSON.parse(body));
+    const update = JSON.parse(body);
+    usersNamed(update, record.namedUsers);
+    record.queue.push(update);
     if (!record.webhook || stopped) {
       wakePollers(record);
       return { updateId, delivered: Promise.resolve() };
@@ -3852,6 +4370,7 @@ export async function startTestServer({
    */
   async function addBotViaLink(chat, record, { by, startParameter, rights }) {
     const actor = requireUser(by ?? creatorOf(chat));
+    requireNamedActor(chat, actor, "Adding a bot");
     const asAdmin = rights != null;
     if (chat.type === "channel" && !asAdmin) {
       throw new TelegramError(400, "a startchannel link needs admin rights");
@@ -3939,6 +4458,8 @@ export async function startTestServer({
       migratedFrom: chat.id,
     };
     delete supergroup.migratedTo;
+    // A supergroup numbers its messages once, for every account.
+    delete supergroup.viewIds;
     chats.set(supergroup.id, supergroup);
     chat.migratedTo = supergroup.id;
     await emit(
@@ -3955,6 +4476,7 @@ export async function startTestServer({
   /** A person renames the chat; bots get the new_chat_title service message. */
   async function renameByPerson(chat, { by, title }) {
     const actor = requireUser(by ?? creatorOf(chat));
+    requireNamedActor(chat, actor, "A title change");
     if (!personHasRight(chat, actor.id, "can_change_info")) {
       throw new TelegramError(400, "CHAT_ADMIN_REQUIRED");
     }
@@ -3972,6 +4494,7 @@ export async function startTestServer({
   /** A person sets the chat photo; bots get the new_chat_photo service message. */
   async function changePhotoByPerson(chat, { by, base64 }) {
     const actor = requireUser(by ?? creatorOf(chat));
+    requireNamedActor(chat, actor, "A photo change");
     if (!personHasRight(chat, actor.id, "can_change_info")) {
       throw new TelegramError(400, "CHAT_ADMIN_REQUIRED");
     }
@@ -3992,6 +4515,7 @@ export async function startTestServer({
    */
   async function pinByPerson(chat, messageId, { user_id: userId }) {
     const actor = requireUser(userId);
+    requireNamedActor(chat, actor, "A pin");
     const entry = chat.messages.get(Number(messageId));
     if (!entry || entry.deleted) {
       throw new TelegramError(400, "MESSAGE_ID_INVALID");
@@ -4019,6 +4543,94 @@ export async function startTestServer({
     return record;
   }
 
+  /** The next id of an account's common message id sequence. */
+  function takeAccountMessageId(accountId) {
+    const id = accountMessageIds.get(Number(accountId)) ?? 1;
+    accountMessageIds.set(Number(accountId), id + 1);
+    return id;
+  }
+
+  /**
+   * The id of a new message in a chat. A private chat draws it from its bot's
+   * common sequence, which the user's sequence follows too, and keeps
+   * nextMessageId one past its own last message. A basic group stores it
+   * under the chat's own count, which no account sees (viewMessageIds).
+   */
+  function takeMessageId(chat) {
+    if (chat.type !== "private") return chat.nextMessageId++;
+    const id = takeAccountMessageId(chat.botId);
+    takeAccountMessageId(chat.id);
+    chat.nextMessageId = id + 1;
+    return id;
+  }
+
+  /**
+   * Each account's own id of a new basic group message: every account in the
+   * group sees it under the next id of its common sequence
+   * (https://core.telegram.org/api/updates), the member a left_chat_member
+   * message names too. The entry keeps them by account (`ids`), and the chat
+   * the other way round (`viewIds`: account, then its id, to the stored id).
+   */
+  function viewMessageIds(chat, entry) {
+    const gone = entry.message.left_chat_member?.id;
+    const accounts = [...chat.members.keys()].filter(
+      (id) => id === gone || isInChat(chat, id),
+    );
+    entry.ids = {};
+    for (const id of accounts) giveViewId(chat, entry, id);
+  }
+
+  function giveViewId(chat, entry, accountId) {
+    const own = takeAccountMessageId(accountId);
+    entry.ids[accountId] = own;
+    chat.viewIds ??= new Map();
+    if (!chat.viewIds.has(accountId)) chat.viewIds.set(accountId, new Map());
+    chat.viewIds.get(accountId).set(own, entry.message.message_id);
+    return own;
+  }
+
+  /**
+   * The stored id of the message a bot names by `id` in a chat: in a basic
+   * group, the message the bot knows by that id, or null for none; elsewhere
+   * the id itself.
+   */
+  function storedMessageId(chat, id, botId) {
+    const number = Number(id);
+    if (chat?.type !== "group") return number;
+    return chat.viewIds?.get(Number(botId))?.get(number) ?? null;
+  }
+
+  /** The stored entry of the message a bot names by `id` in a chat. */
+  function botMessage(chat, id, caller) {
+    const stored = storedMessageId(chat, id, caller.id);
+    return stored === null ? undefined : chat.messages.get(stored);
+  }
+
+  /**
+   * A bot's own id of a stored message: in a basic group, the one it saw the
+   * message under, or null when it never saw it; elsewhere the stored id.
+   */
+  function ownMessageId(chat, id, botId) {
+    if (chat?.type !== "group") return id;
+    return chat.messages.get(id)?.ids?.[botId] ?? null;
+  }
+
+  /**
+   * The message a message in a forum topic answers when it answers nothing
+   * else: the topic's creation message, unless deleted. The General topic
+   * has none (Client.cpp get_same_chat_reply_to_message_id,
+   * get_implicit_reply_to_message_id, and JsonMessage, which shows it only
+   * while the Bot API server still has it).
+   */
+  function topicReply(chat, threadId) {
+    const id = Number(threadId);
+    if (chat.type !== "supergroup" || !chat.topics || !(id > 1)) return null;
+    const entry = chat.messages.get(id);
+    if (!entry || entry.deleted) return null;
+    const { reply_to_message: _nested, ...original } = entry.message;
+    return original;
+  }
+
   /**
    * Store a new message. A channel's messages are sent by the channel itself,
    * with sender_chat and no from (Bot API server Client.cpp); who posted it is
@@ -4027,21 +4639,38 @@ export async function startTestServer({
    * behalf of a chat (memberSender).
    */
   function addMessage(chat, from, fields, sender = null) {
+    const implicit =
+      fields.reply_to_message === undefined
+        ? topicReply(chat, fields.message_thread_id)
+        : null;
     const message = {
-      message_id: chat.nextMessageId++,
+      message_id: takeMessageId(chat),
       ...(chat.type === "channel"
         ? { sender_chat: chatObject(chat) }
         : (sender ?? { from: userObject(from) })),
       chat: chatObject(chat),
       date: now(),
+      ...(implicit ? { reply_to_message: implicit } : {}),
       ...fields,
     };
-    chat.messages.set(message.message_id, {
+    const entry = {
       message,
       deleted: false,
       author: from.id,
       ...entryMarks(),
-    });
+    };
+    chat.messages.set(message.message_id, entry);
+    if (chat.type === "group") viewMessageIds(chat, entry);
+    // The last bot to send a message to the group hears general commands
+    // in privacy mode (privacyRecipient). A service message its action made
+    // is not one it sent, in the narrowest reading of the docs.
+    if (
+      from.is_bot &&
+      contentType(message) !== null &&
+      [...bots.values()].some((each) => each === from)
+    ) {
+      chat.lastBotId = from.id;
+    }
     appliedCheckpoint();
     waits.notify();
     return message;
@@ -4117,15 +4746,34 @@ export async function startTestServer({
   }
 
   /**
-   * Who deleted a message and when. Only bots delete messages here; the seq
-   * puts the deletion in the same order as everything stored.
+   * Who deleted a message and when: a bot, by a Bot API method, or a person
+   * (a test action, with no method). The seq puts the deletion in the same
+   * order as everything stored.
    */
   function deletionMark(caller, method) {
     return {
       seq: ++nextSeq,
-      botId: caller.id,
+      botId: method ? caller.id : null,
+      userId: method ? null : caller.id,
       method,
       requestId: execution.getStore()?.request_id ?? null,
+      at: clock.now(),
+    };
+  }
+
+  /**
+   * Who last edited a message and when, for the message log: a bot, by a
+   * Bot API method, or a person (a test action). The seq puts the edit in
+   * the same order as everything stored.
+   */
+  function editMark(editor, byBot) {
+    const receipt = execution.getStore();
+    return {
+      seq: ++nextSeq,
+      botId: byBot ? editor.id : null,
+      userId: byBot ? null : editor.id,
+      method: byBot ? (receipt?.method ?? null) : null,
+      requestId: receipt?.request_id ?? null,
       at: clock.now(),
     };
   }
@@ -4248,17 +4896,20 @@ export async function startTestServer({
 
   /**
    * A Bot API payload as one bot sees it: every file_id in it that bot's own,
-   * and an open quiz whose correct options it does not know (knowsAnswers)
-   * without them and its explanation, in a forward, a reply or a pin too.
-   * Stored messages carry the first bot's file_ids and every quiz's answers,
-   * as the control API shows them. Returned as JSON text, which the caller
-   * sends as it is, so a payload is serialized once.
+   * an open quiz whose correct options it does not know (knowsAnswers)
+   * without them and its explanation, and every basic group message under
+   * the bot's own id (seenInGroup), in a forward, a reply or a pin too.
+   * Stored messages carry the first bot's file_ids, every quiz's answers and
+   * a basic group's own ids, as the control API shows them. Returned as JSON
+   * text, which the caller sends as it is, so a payload is serialized once.
    */
   function seenBy(record, payload) {
     const json = JSON.stringify(payload);
     if (
       json === undefined ||
-      (record.id === bot.id && !json.includes('"type":"quiz"'))
+      (record.id === bot.id &&
+        !json.includes('"type":"quiz"') &&
+        !json.includes('"type":"group"'))
     ) {
       return json;
     }
@@ -4266,6 +4917,7 @@ export async function startTestServer({
       if (FILE_ID_FIELDS.has(key) && files.has(value)) {
         return fileIdFor(files.get(value).file, record.id);
       }
+      let shown = value;
       if (value?.poll && !knowsAnswers(value, stored(value), record.id)) {
         const {
           correct_option_id: _id,
@@ -4274,11 +4926,35 @@ export async function startTestServer({
           explanation_entities: _entities,
           ...poll
         } = value.poll;
-        return { ...value, poll };
+        shown = { ...value, poll };
       }
-      return value;
+      if (shown?.chat?.type === "group" && shown.message_id > 0) {
+        return seenInGroup(record, key, shown);
+      }
+      return shown;
     });
     return JSON.stringify(seen);
+  }
+
+  /**
+   * A basic group's message, or a reference to one, under the bot's own id.
+   * A message the bot never saw, posted before it joined, has none: a reply
+   * to it or a pin of it shows without it, as the Bot API leaves out a
+   * message it cannot get. Any other message it is shown now reaches it, and
+   * takes the next id of its sequence.
+   */
+  function seenInGroup(record, key, value) {
+    const chat = chats.get(value.chat.id);
+    const entry = chat?.messages.get(value.message_id);
+    if (!entry?.ids) return value;
+    let own = entry.ids[record.id];
+    if (own === undefined) {
+      if (key === "reply_to_message" || key === "pinned_message") {
+        return undefined;
+      }
+      own = giveViewId(chat, entry, record.id);
+    }
+    return { ...value, message_id: own };
   }
 
   /** The stored entry of a message or reply a payload shows, if known. */
@@ -4489,7 +5165,7 @@ export async function startTestServer({
     getMe: (_p, caller) => ({
       ...userObject(caller),
       can_join_groups: true,
-      can_read_all_group_messages: true,
+      can_read_all_group_messages: !caller.privacyMode,
       supports_inline_queries: false,
       supports_join_request_queries: caller.joinRequestQueries,
       // Every bot here can be connected to a business account.
@@ -4688,17 +5364,16 @@ export async function startTestServer({
           accepted_gift_types: { ...NO_GIFTS },
         };
       }
-      // A user the bot shares a group with; the bio shows as under
-      // Telegram's default privacy (everybody).
+      // A user the bot knows (knowsUser); the bio shows as under Telegram's
+      // default privacy (everybody).
       const user = users.get(id);
-      if (!user) throw new TelegramError(400, "Bad Request: chat not found");
+      if (!user || !knowsUser(id, caller)) {
+        throw new TelegramError(400, "Bad Request: chat not found");
+      }
       const photo = user.photos?.[0];
-      // The pin is in the user's private chat with the first bot, which users
-      // write to; another bot's private chat with them is another chat.
-      const pinned =
-        caller.id === bot.id && privateChats.has(id)
-          ? latestPin(privateChats.get(id))
-          : undefined;
+      // The pin is the one in the caller's own private chat with the user.
+      const own = privateChatOf(id, caller.id);
+      const pinned = own ? latestPin(own) : undefined;
       return {
         id: user.id,
         type: "private",
@@ -4851,7 +5526,7 @@ export async function startTestServer({
     stopPoll: (p, caller) => {
       const markup = inlineMarkup(p.reply_markup);
       const chat = botChat(p.chat_id, caller);
-      const entry = chat.messages.get(Number(p.message_id));
+      const entry = botMessage(chat, p.message_id, caller);
       if (!entry || entry.deleted || !entry.message.poll) {
         throw new TelegramError(
           400,
@@ -4892,7 +5567,7 @@ export async function startTestServer({
         caller,
         {
           ...content,
-          forward_origin: messageOrigin(source.chat, source.message),
+          ...forwardFields(messageOrigin(source.chat, source.message)),
         },
       );
     },
@@ -4914,13 +5589,20 @@ export async function startTestServer({
       const copy = await sendFrom(p, caller, () =>
         replaced ? { ...content, ...caption() } : content,
       );
-      return { message_id: copy.message_id };
+      // A MessageId names no chat, so it is the copying bot's own here.
+      return {
+        message_id: ownMessageId(
+          chats.get(copy.chat.id),
+          copy.message_id,
+          caller.id,
+        ),
+      };
     },
     // The message is looked up before the rights: the Bot API server's
     // check_message, then TDLib's can_pin_message.
     pinChatMessage: (p, caller) => {
       const chat = botChat(p.chat_id, caller);
-      const entry = chat.messages.get(Number(p.message_id));
+      const entry = botMessage(chat, p.message_id, caller);
       if (!entry || entry.deleted) {
         throw new TelegramError(400, "Bad Request: message to pin not found");
       }
@@ -4939,7 +5621,8 @@ export async function startTestServer({
       const chat = botChat(p.chat_id, caller);
       // No message_id (or 0) means the most recent pin.
       const asked = Number(p.message_id);
-      const entry = asked > 0 ? chat.messages.get(asked) : latestPin(chat);
+      const entry =
+        asked > 0 ? botMessage(chat, asked, caller) : latestPin(chat);
       if (!entry || entry.deleted) {
         throw new TelegramError(400, "Bad Request: message to unpin not found");
       }
@@ -4966,6 +5649,131 @@ export async function startTestServer({
       });
       return true;
     },
+    // Forum topics (Client.cpp process_*_forum_topic_query, which reads
+    // message_thread_id with get_forum_topic_id, then TDLib's
+    // ForumTopicManager).
+    closeForumTopic: (p, caller) =>
+      toggleTopicClosed(
+        forumChat(p, caller),
+        caller,
+        topicParam(p),
+        true,
+        "closeForumTopic",
+      ),
+    reopenForumTopic: (p, caller) =>
+      toggleTopicClosed(
+        forumChat(p, caller),
+        caller,
+        topicParam(p),
+        false,
+        "reopenForumTopic",
+      ),
+    closeGeneralForumTopic: (p, caller) =>
+      toggleTopicClosed(
+        forumChat(p, caller),
+        caller,
+        1,
+        true,
+        "closeGeneralForumTopic",
+      ),
+    reopenGeneralForumTopic: (p, caller) =>
+      toggleTopicClosed(
+        forumChat(p, caller),
+        caller,
+        1,
+        false,
+        "reopenGeneralForumTopic",
+      ),
+    editForumTopic: (p, caller) =>
+      editTopic(
+        forumChat(p, caller),
+        caller,
+        topicParam(p),
+        String(p.name ?? ""),
+        p.icon_custom_emoji_id !== undefined,
+        emojiIdParam(p.icon_custom_emoji_id),
+        "editForumTopic",
+      ),
+    editGeneralForumTopic: (p, caller) =>
+      editTopic(
+        forumChat(p, caller),
+        caller,
+        1,
+        String(p.name ?? ""),
+        false,
+        "0",
+        "editGeneralForumTopic",
+      ),
+    // Hiding the General topic closes it too, as the Bot API docs say; its
+    // service message is general_forum_topic_hidden, which TDLib makes of an
+    // edit that hides (ForumTopicEditedData.cpp
+    // get_edited_data_message_content_object). TDLib always checks the right
+    // first (toggle_forum_topic_is_hidden).
+    hideGeneralForumTopic: (p, caller) => toggleGeneralHidden(p, caller, true),
+    unhideGeneralForumTopic: (p, caller) =>
+      toggleGeneralHidden(p, caller, false),
+    // Deleting a topic deletes all its messages, its creation message
+    // included, and Telegram sends no update of its own for it
+    // (https://core.telegram.org/api/forum): bots get nothing, as for any
+    // deletion (Client.cpp updateDeleteMessages). It needs
+    // can_delete_messages, with no exemption for the topic's creator (Bot
+    // API docs, deleteForumTopic). "All topics except for the "General"
+    // topic can be deleted" (https://core.telegram.org/api/forum), but no
+    // source gives Telegram's answer for the General topic.
+    deleteForumTopic: (p, caller) => {
+      const chat = forumChat(p, caller);
+      const id = topicParam(p);
+      if (id === 1) {
+        throw unimplementedCase("deleteForumTopic with the General topic");
+      }
+      requireTopicRights(
+        chat,
+        caller,
+        id,
+        "can_delete_messages",
+        "not enough rights to delete the topic",
+        "deleteForumTopic",
+        false,
+      );
+      for (const entry of chat.messages.values()) {
+        if (
+          !entry.deleted &&
+          (entry.message.message_id === id ||
+            entry.message.message_thread_id === id)
+        ) {
+          entry.deleted = true;
+          entry.deletion = deletionMark(caller, "deleteForumTopic");
+        }
+      }
+      chat.topics.delete(id);
+      messageRewrites += 1;
+      appliedCheckpoint();
+      waits.notify();
+      return true;
+    },
+    // Unpins a topic's messages (TDLib unpin_all_dialog_messages: the
+    // pinning right, then a forum; Requests.cpp refuses topic 0). The
+    // General topic's messages are those in no topic.
+    unpinAllForumTopicMessages: (p, caller) =>
+      unpinTopic(p, caller, topicParam(p)),
+    unpinAllGeneralForumTopicMessages: (p, caller) => unpinTopic(p, caller, 1),
+    // banChatSenderChat and unbanChatSenderChat check the chat for writing,
+    // then read sender_chat_id (Client.cpp:16601-16634, check_chat_no_fail
+    // at 8901), and TDLib bans or unbans the chat as a member
+    // (banChatMember and setChatMemberStatus with a chat sender,
+    // Requests.cpp:6192-6214): an id TDLib cannot read is refused
+    // (MessageSender.cpp get_message_sender_dialog_id); a private chat
+    // can't ban (DialogParticipantManager.cpp:2394); a basic group bans no
+    // chat but unbans one as a no-op (2344-2346, 2397); in a supergroup or
+    // channel the sender must be a chat the bot can see ("Member not
+    // found"), a supergroup or channel ("Can't restrict the chat"), and the
+    // bot needs can_restrict_members (restrict_channel_participant,
+    // 2967-3035). A user's id is banned or unbanned as that user (2817:
+    // only another chat takes the chat path). No chat_member update is sent
+    // for a chat (Client.cpp:18707-18710). A user's ban takes until_date; a
+    // chat's is refused with one (senderChatBan).
+    banChatSenderChat: (p, caller) => senderChatBan(p, caller, true),
+    unbanChatSenderChat: (p, caller) => senderChatBan(p, caller, false),
     // The permissions are read before the chat (get_chat_permissions).
     setChatPermissions: (p, caller) => {
       const permissions = normalizePermissions(
@@ -5006,7 +5814,7 @@ export async function startTestServer({
     // A bot deletes its own messages, and others' with can_delete_messages.
     deleteMessage: (p, caller) => {
       const chat = botChat(p.chat_id, caller);
-      const entry = chat.messages.get(Number(p.message_id));
+      const entry = botMessage(chat, p.message_id, caller);
       if (!entry || entry.deleted) {
         throw new TelegramError(
           400,
@@ -5025,7 +5833,7 @@ export async function startTestServer({
       const ids = messageIds(p.message_ids);
       const chat = botChat(p.chat_id, caller);
       const entries = ids
-        .map((id) => chat.messages.get(id))
+        .map((id) => botMessage(chat, id, caller))
         .filter((entry) => entry && !entry.deleted);
       for (const entry of entries) requireDeleteRights(chat, entry, caller);
       for (const entry of entries) {
@@ -5284,7 +6092,9 @@ export async function startTestServer({
           "Bad Request: wrong parameter action in request",
         );
       }
-      const chat = botChat(p.chat_id, caller, { send: true });
+      // Not a send: the Bot API server checks the chat as any other call's
+      // (Client::process_send_chat_action_query).
+      const chat = botChat(p.chat_id, caller);
       requireCanSend(chat, caller);
       return true;
     },
@@ -5398,6 +6208,8 @@ export async function startTestServer({
       const rights = Object.fromEntries(
         ADMIN_RIGHTS.map((right) => [right, isTrue(p[right])]),
       );
+      // The older name still grants it (Client.cpp:16410-16411).
+      rights.can_manage_video_chats ||= isTrue(p.can_manage_voice_chats);
       // "For backward compatibility, defaults to True for promotions of
       // channel administrators."
       if (
@@ -5570,7 +6382,7 @@ export async function startTestServer({
           ? []
           : jsonList(p.reaction, "reaction types", "ReactionType", reactionType);
       const chat = botChat(p.chat_id, caller, { readOnly: true });
-      let entry = chat.messages.get(Number(p.message_id));
+      let entry = botMessage(chat, p.message_id, caller);
       if (!entry || entry.deleted) {
         throw new TelegramError(400, "Bad Request: MESSAGE_ID_INVALID");
       }
@@ -5622,7 +6434,7 @@ export async function startTestServer({
       const byUser = p.user_id != null && p.user_id !== "";
       let senderId = byUser ? userIdParam(p.user_id) : null;
       const chat = requireChat(p.chat_id, caller);
-      const entry = chat.messages.get(Number(p.message_id));
+      const entry = botMessage(chat, p.message_id, caller);
       if (!entry || entry.deleted) {
         throw new TelegramError(400, "Bad Request: MESSAGE_ID_INVALID");
       }
@@ -5643,10 +6455,22 @@ export async function startTestServer({
           "Bad Request: not enough rights to delete reactions",
         );
       }
-      // Members react as themselves here, so no chat's reaction is ever
-      // there to remove.
-      if (user && entry.reactions?.has(user.id)) {
-        void changeReaction(chat, entry, user, []);
+      // A reaction made as a chat is that chat's: actor_chat_id removes it,
+      // and its member's user_id does not.
+      const actors = entry.reactionActors ?? new Map();
+      let reactor = null;
+      let actor = null;
+      if (user) {
+        if (!actors.has(user.id)) reactor = user;
+      } else {
+        const found = [...actors].find(([, id]) => id === senderId);
+        if (found) {
+          reactor = requireUser(found[0]);
+          actor = chats.get(senderId);
+        }
+      }
+      if (reactor && entry.reactions?.has(reactor.id)) {
+        void changeReaction(chat, entry, reactor, [], actor);
       }
       return true;
     },
@@ -5873,6 +6697,12 @@ export async function startTestServer({
     const chat = botChat(p.chat_id, caller, { send: true });
     requireCanSend(chat, caller);
     requireTopic(chat, topicParam(p));
+    // Checking the topic loads it into the bot's TDLib (Client.cpp
+    // check_message_topic, getForumTopic), which then knows it.
+    const sentTopic = chat.topics?.get(topicParam(p));
+    if (sentTopic && !sentTopic.knownTo?.includes(caller.id)) {
+      (sentTopic.knownTo ??= []).push(caller.id);
+    }
     const reply = replyFields(chat, p, caller, parameters);
     // Content given as a function is read only now, after the chat and reply
     // checks, as TDLib reads a file or live location only when it sends.
@@ -5884,6 +6714,9 @@ export async function startTestServer({
         ? ephemeralReceiver(chat, caller, ephemeral, body)
         : null;
     requireButtonData(markup);
+    requireOpenTopic(chat, caller.id, topicParam(p), (text) => {
+      throw new TelegramError(400, `Bad Request: ${text}`);
+    });
     const bodies = Array.isArray(body) ? body : [body];
     if (floodControl === true) await waitForFlood(chat, caller, bodies.length);
     const sent = bodies.map((item) => {
@@ -6059,11 +6892,8 @@ export async function startTestServer({
    */
   function replyFields(chat, p, caller, parameters) {
     if (parameters?.message_id == null || Number(parameters.message_id) <= 0) {
-      const topic =
-        topicParam(p) && chat.topics ? chat.messages.get(topicParam(p)) : null;
-      if (!topic) return {};
-      const { reply_to_message: _nested, ...original } = topic.message;
-      return { reply_to_message: original };
+      const original = topicReply(chat, topicParam(p));
+      return original ? { reply_to_message: original } : {};
     }
     // A chat_id naming the send's own chat is an ordinary reply (Client.cpp
     // check_reply_parameters).
@@ -6072,7 +6902,7 @@ export async function startTestServer({
       String(parameters.chat_id) === String(p.chat_id)
         ? chat
         : (chats.get(Number(parameters.chat_id)) ??
-          privateChats.get(Number(parameters.chat_id)));
+          privateChatOf(parameters.chat_id, caller.id));
     if (!source) throw new TelegramError(400, "Bad Request: chat not found");
     // Another group or channel is checked for reading (check_chat with
     // AccessRights::Read in Client.cpp check_reply_parameters). Only a public
@@ -6081,7 +6911,7 @@ export async function startTestServer({
     if (source !== chat && source.type !== "private") {
       checkChatAccess(source, caller, { readOnly: true, readsUpgraded: true });
     }
-    const entry = source.messages.get(Number(parameters.message_id));
+    const entry = botMessage(source, parameters.message_id, caller);
     if (
       !entry ||
       entry.deleted ||
@@ -6191,6 +7021,39 @@ export async function startTestServer({
       text,
       ...(entities.length > 0 ? { entities } : {}),
       position: 0,
+    };
+  }
+
+  /**
+   * A forward's fields: forward_origin, then the older fields the Bot API
+   * server still writes beside it, as JsonMessage writes them
+   * (Client.cpp:4772-4813): forward_from for a user; forward_from_chat and
+   * forward_signature, when signed, for a chat; forward_sender_name, when
+   * not empty, for a hidden user; forward_from_chat, forward_from_message_id
+   * and forward_signature for a channel post; then forward_date, the
+   * origin's date.
+   */
+  function forwardFields(origin) {
+    const signature = origin.author_signature
+      ? { forward_signature: origin.author_signature }
+      : {};
+    return {
+      forward_origin: origin,
+      ...(origin.type === "user" ? { forward_from: origin.sender_user } : {}),
+      ...(origin.type === "chat"
+        ? { forward_from_chat: origin.sender_chat, ...signature }
+        : {}),
+      ...(origin.type === "hidden_user" && origin.sender_user_name
+        ? { forward_sender_name: origin.sender_user_name }
+        : {}),
+      ...(origin.type === "channel"
+        ? {
+            forward_from_chat: origin.chat,
+            forward_from_message_id: origin.message_id,
+            ...signature,
+          }
+        : {}),
+      forward_date: origin.date,
     };
   }
 
@@ -6682,9 +7545,7 @@ export async function startTestServer({
       return null;
     }
     const member = memberStatus(chat, user.id);
-    const anonymous =
-      member.status === "administrator" &&
-      hasRight(chat, user.id, "is_anonymous");
+    const anonymous = isAnonymousAdmin(chat, user.id);
     if (!anonymous && sendAs != null && Number(sendAs) === user.id) {
       return null;
     }
@@ -6703,6 +7564,20 @@ export async function startTestServer({
     if (target !== chat && user.is_premium !== true) {
       throw new TelegramError(403, "PREMIUM_ACCOUNT_REQUIRED");
     }
+    // "Until the chat is unbanned, the owner of the banned chat won't be
+    // able to send messages on behalf of any of their channels"
+    // (https://core.telegram.org/bots/api#banchatsenderchat).
+    // UNVERIFIED: the error; here USER_BANNED_IN_CHANNEL, which
+    // messages.sendMessage lists for one banned from sending.
+    if (
+      target !== chat &&
+      [...(chat.bannedSenderChats ?? [])].some(
+        (id) =>
+          chats.has(id) && memberStatus(chats.get(id), user.id).status === "creator",
+      )
+    ) {
+      throw new TelegramError(400, "USER_BANNED_IN_CHANNEL");
+    }
     return {
       from: { ...(target === chat ? GROUP_ANONYMOUS_BOT : CHANNEL_BOT) },
       ...(target === chat && member.customTitle
@@ -6710,6 +7585,37 @@ export async function startTestServer({
         : {}),
       sender_chat: chatObject(target),
     };
+  }
+
+  /**
+   * Whether a member of a supergroup acts as the group: an administrator
+   * with is_anonymous, or an owner who stays anonymous. TDLib reads both from
+   * the status's is_anonymous (DialogManager.cpp:1917
+   * is_anonymous_administrator).
+   */
+  function isAnonymousAdmin(chat, userId) {
+    if (chat.type !== "supergroup") return false;
+    const member = memberStatus(chat, userId);
+    return member.status === "creator"
+      ? member.anonymous === true
+      : member.status === "administrator" &&
+          hasRight(chat, userId, "is_anonymous");
+  }
+
+  /**
+   * Refuses a test action that posts a service message from a person who acts
+   * as the group (isAnonymousAdmin): no source shows how Telegram shows an
+   * anonymous owner's or administrator's pin, new member, title or photo
+   * change, or topic, so it is not modeled.
+   */
+  function requireNamedActor(chat, actor, action) {
+    if (isAnonymousAdmin(chat, actor.id)) {
+      throw new TelegramError(
+        400,
+        `${action} by an anonymous owner or administrator is not modeled: ` +
+          "no source shows how Telegram shows it",
+      );
+    }
   }
 
   /**
@@ -6889,11 +7795,7 @@ export async function startTestServer({
   function businessChat(connection, userId) {
     const key = Number(userId);
     if (!connection.chats.has(key)) {
-      connection.chats.set(key, {
-        entries: [],
-        nextMessageId: 1,
-        lastInboundAt: null,
-      });
+      connection.chats.set(key, { entries: [], lastInboundAt: null });
     }
     return connection.chats.get(key);
   }
@@ -6910,10 +7812,17 @@ export async function startTestServer({
     };
   }
 
+  /**
+   * A message of a business chat, under the owner's id: messages in private
+   * chats "will use the connected user's common message ID sequence"
+   * (https://core.telegram.org/api/updates). The person's sequence moves on
+   * too, as for any private chat.
+   */
   function addBusinessMessage(connection, userId, direction, from, fields) {
     const chat = businessChat(connection, userId);
+    takeAccountMessageId(userId);
     const message = {
-      message_id: chat.nextMessageId++,
+      message_id: takeAccountMessageId(connection.ownerId),
       from: userObject(from),
       chat: businessChatObject(userId),
       date: now(),
@@ -7000,8 +7909,7 @@ export async function startTestServer({
       // the gap reported by GET /_fake/calls and the log.
       const method =
         kind === "caption" ? "editMessageCaption" : "editMessageMedia";
-      reportUnimplemented(`${method} with business_connection_id`);
-      throw new TelegramError(404, "Not Found: method not found");
+      throw unimplementedCase(`${method} with business_connection_id`);
     }
     const { chat } = businessReplyChat(p, caller);
     const entry = chat.entries.find(
@@ -7061,9 +7969,7 @@ export async function startTestServer({
         : (existing?.isEnabled ?? true);
     businessConnections.set(connection.id, connection);
     // The owner's private chat with the bot is open to it from now on.
-    const privateChat = messageChat(ownerId);
-    privateChat.openTo ??= new Set();
-    privateChat.openTo.add(record.id);
+    messageChat(ownerId, record.id);
     const sent = emitOne(
       record,
       "business_connection",
@@ -7149,7 +8055,7 @@ export async function startTestServer({
       readOnly: true,
       readsUpgraded: true,
     });
-    const entry = sourceChat.messages.get(Number(p.message_id));
+    const entry = botMessage(sourceChat, p.message_id, caller);
     if (
       !entry ||
       entry.deleted ||
@@ -7191,6 +8097,12 @@ export async function startTestServer({
       receiver_user: _receiver,
       ephemeral_message_id: _ephemeral,
       forward_origin: _origin,
+      forward_from: _forwardFrom,
+      forward_from_chat: _forwardChat,
+      forward_from_message_id: _forwardId,
+      forward_signature: _forwardSignature,
+      forward_sender_name: _forwardName,
+      forward_date: _forwardDate,
       message_thread_id: _thread,
       is_topic_message: _topic,
       media_group_id: _album,
@@ -7286,7 +8198,7 @@ export async function startTestServer({
       entry = businessEditEntry(p, caller, kind);
     } else {
       const chat = botChat(p.chat_id, caller);
-      entry = chat.messages.get(Number(p.message_id));
+      entry = botMessage(chat, p.message_id, caller);
       if (!entry || entry.deleted) {
         throw new TelegramError(400, "Bad Request: message to edit not found");
       }
@@ -7312,6 +8224,7 @@ export async function startTestServer({
     }
     entry.message = edited;
     messageRewrites += 1;
+    if (!p.business_connection_id) entry.edit = editMark(caller, true);
     // Telegram's apps show no "edited" for a bot's change of only the
     // keyboard (the message's edit_hide); the bot still gets edit_date.
     entry.editHidden = kind === "reply_markup";
@@ -7340,6 +8253,7 @@ export async function startTestServer({
     requireButtonData(markup);
     entry.message = editedMessage(entry.message, markup, apply);
     messageRewrites += 1;
+    entry.edit = editMark(caller, true);
     entry.editHidden = markupOnly;
     appliedCheckpoint();
     waits.notify();
@@ -7581,6 +8495,7 @@ export async function startTestServer({
     owner_id: ownerId,
     owner_name,
     is_forum,
+    owner_anonymous,
   }) {
     if (
       type !== undefined &&
@@ -7592,6 +8507,9 @@ export async function startTestServer({
       );
     }
     const kind = type ?? "supergroup";
+    if (owner_anonymous === true && kind !== "supergroup") {
+      throw new TelegramError(400, "only a supergroup's owner stays anonymous");
+    }
     const owner = Number(ownerId);
     if (!Number.isSafeInteger(owner) || owner <= 0) {
       throw new TelegramError(400, "chat needs an owner_id");
@@ -7613,7 +8531,17 @@ export async function startTestServer({
           : -(1_000_000_000_000 + nextChatId),
       title: String(title ?? (kind === "channel" ? "Channel" : "Group")),
       type: kind,
-      members: new Map([[owner, { status: "creator" }]]),
+      members: new Map([
+        [
+          owner,
+          {
+            status: "creator",
+            // The owner's "Remain anonymous" (chatMemberStatusCreator
+            // is_anonymous).
+            ...(owner_anonymous === true ? { anonymous: true } : {}),
+          },
+        ],
+      ]),
       messages: new Map(),
       nextMessageId: Math.max(1, startSeconds - 1_700_000_000),
       inviteLinks: new Map(),
@@ -7693,27 +8621,58 @@ export async function startTestServer({
   }
 
   /**
-   * Every message of a chat stored after the mark `since` (a seq), oldest
-   * first; with include_deleted also the deleted ones, and those stored before
-   * the mark but deleted after it. `pair` keeps one bot's private chat.
+   * Whether a private chat's messages read asks for the log after a mark:
+   * there bot_id alone names whose chat to list.
    */
-  function messageLog(chat, chatId, query, pair = null) {
+  function isDmLogQuery(query) {
+    return ["since", "include_deleted", "epoch"].some(
+      (name) => query[name] !== undefined,
+    );
+  }
+
+  /**
+   * Every message of a chat, or of a user's private chats (a list), stored
+   * after the mark `since` (a seq), oldest first; with include_deleted also
+   * the deleted ones, and those stored before the mark but deleted after it.
+   */
+  function messageLog(chat, chatId, query) {
     const since = countParam(query, "since", 0);
     requireEpoch(query);
     const withDeleted = ["true", "1"].includes(String(query.include_deleted));
-    const entries = chat
-      ? [...chat.messages.values(), ...(chat.ephemeral?.values() ?? [])]
-      : [];
+    // A private chat's entries name its bot.
+    const botOf = new Map();
+    const entries = [chat]
+      .flat()
+      .filter(Boolean)
+      .flatMap((each) => {
+        const stored = [
+          ...each.messages.values(),
+          ...(each.ephemeral?.values() ?? []),
+        ];
+        if (each.type === "private") {
+          for (const entry of stored) botOf.set(entry, each.botId);
+        }
+        return stored;
+      });
+    // An edit after the mark lists a message stored before it, as a
+    // deletion does.
     const messages = entries
-      .filter(
-        (entry) =>
-          (pair === null || privatePairOf(chat, entry) === pair.id) &&
-          (entry.deleted
-            ? withDeleted && (entry.seq > since || entry.deletion?.seq > since)
-            : entry.seq > since),
+      .filter((entry) =>
+        entry.deleted
+          ? withDeleted &&
+            (entry.seq > since ||
+              entry.deletion?.seq > since ||
+              entry.edit?.seq > since)
+          : entry.seq > since || entry.edit?.seq > since,
       )
       .sort((left, right) => left.seq - right.seq)
-      .map(messageLogEntry);
+      .map((entry) => {
+        const json = messageLogEntry(entry);
+        if (!botOf.has(entry)) return json;
+        const { seq, at, after_request, request_id, author, ...rest } = json;
+        const head = { seq, at, after_request, request_id, author };
+        return { ...head, bot_id: botOf.get(entry), ...rest };
+      });
     return structuredClone({
       chat_id: chatId,
       epoch,
@@ -7736,17 +8695,36 @@ export async function startTestServer({
         ? {
             seq: deletion.seq,
             bot_id: deletion.botId,
+            user_id: deletion.userId ?? null,
             method: deletion.method,
             request_id: deletion.requestId,
             at: deletion.at,
           }
         : null,
+      edited_by: entry.edit
+        ? {
+            seq: entry.edit.seq,
+            bot_id: entry.edit.botId,
+            user_id: entry.edit.userId,
+            method: entry.edit.method,
+            request_id: entry.edit.requestId,
+            at: entry.edit.at,
+          }
+        : null,
       ephemeral: entry.message.ephemeral_message_id !== undefined,
       message: entry.message,
+      ...(entry.ids ? { bot_message_ids: botMessageIds(entry) } : {}),
       ...(entry.votes && Object.keys(entry.votes).length
         ? { votes: entry.votes }
         : {}),
     };
+  }
+
+  /** The id each bot knows a basic group message by, by bot id. */
+  function botMessageIds(entry) {
+    return Object.fromEntries(
+      Object.entries(entry.ids).filter(([id]) => users.get(Number(id))?.is_bot),
+    );
   }
 
   /** A chat event as the viewer shows it: its fields in snake_case. */
@@ -7758,22 +8736,6 @@ export async function startTestServer({
     }
     json.service_seq = event.serviceSeq ?? null;
     return json;
-  }
-
-  /**
-   * The bot whose private chat with the user a stored message or event
-   * belongs to. A user's stored private chat holds their messages to the first
-   * bot, which users write to, and any bot's messages to them, a deleted
-   * bot's included.
-   */
-  function privatePairOf(chat, item) {
-    if (item.message) {
-      return deletedBots.has(item.author) ||
-        [...bots.values()].some((record) => record.id === item.author)
-        ? item.author
-        : bot.id;
-    }
-    return item.botId ?? bot.id;
   }
 
   /** One update a bot was sent, as GET bots/:id/updates lists it. */
@@ -7885,8 +8847,9 @@ export async function startTestServer({
       (condition.userId == null ||
         String(call.target_user_id) === String(condition.userId)) &&
       (condition.messageId == null ||
-        Number(call.params.message_id) === condition.messageId ||
-        call.params.message_ids?.map(Number).includes(condition.messageId)) &&
+        namedMessageIds(call.method, call.params, call.bot_id)
+          .map(Number)
+          .includes(condition.messageId)) &&
       (condition.requestId == null ||
         call.request_id === condition.requestId) &&
       Object.entries(condition.params ?? {}).every(
@@ -7969,16 +8932,31 @@ export async function startTestServer({
     const pattern = condition.matches
       ? new RegExp(condition.matches.source, condition.matches.flags)
       : null;
+    // In a private chat botId names the bot's chat with the user (waitChat),
+    // and only the author too when no userId does.
+    const authorBot =
+      condition.chatId > 0 && condition.userId != null ? null : condition.botId;
     return {
       newer,
       matches: (entry) =>
         (condition.userId == null || entry.author === condition.userId) &&
-        (condition.botId == null || entry.author === condition.botId) &&
+        (authorBot == null || entry.author === authorBot) &&
         (condition.text == null || entry.message.text === condition.text) &&
         (condition.caption == null ||
           entry.message.caption === condition.caption) &&
         (!newer || matchesContent(entry.message, condition, pattern)),
     };
+  }
+
+  /**
+   * The chat a message wait reads: a group, or the user's private chat with
+   * the bot botId names (by default the first).
+   */
+  function waitChat(condition) {
+    return (
+      chats.get(condition.chatId) ??
+      privateChatOf(condition.chatId, condition.botId ?? bot.id)
+    );
   }
 
   /** A message wait's result in the 0.11.0 shape: what places it stays out. */
@@ -7988,6 +8966,7 @@ export async function startTestServer({
     afterRequest: _after,
     requestId: _request,
     deletion: _deletion,
+    edit: _edit,
     ...stored
   }) {
     return { exists: true, ...stored };
@@ -8012,8 +8991,7 @@ export async function startTestServer({
     let nextId = 0;
     let nextEphemeralId = 0;
     return () => {
-      const chat =
-        chats.get(condition.chatId) ?? privateChats.get(condition.chatId);
+      const chat = waitChat(condition);
       if (!chat || chat !== read || rewrites !== messageRewrites) {
         read = chat ?? null;
         rewrites = messageRewrites;
@@ -8164,8 +9142,7 @@ export async function startTestServer({
       }
       return { result, observed: { matching } };
     }
-    const chat =
-      chats.get(condition.chatId) ?? privateChats.get(condition.chatId);
+    const chat = waitChat(condition);
     if (!chat)
       return {
         result: null,
@@ -8479,6 +9456,7 @@ export async function startTestServer({
       sentUpdates: fixtureUpdates,
       chats,
       privateChats,
+      accountMessageIds,
       businessConnections,
       joinQueries,
       files,
@@ -8528,6 +9506,7 @@ export async function startTestServer({
       [sentUpdates, state.sentUpdates],
       [chats, state.chats],
       [privateChats, state.privateChats],
+      [accountMessageIds, state.accountMessageIds],
       [businessConnections, state.businessConnections],
       [joinQueries, state.joinQueries],
       [files, state.files],
@@ -8681,6 +9660,287 @@ export async function startTestServer({
     }
   }
 
+  /** A scenario report's id, run id or title: text of 1 to `max` characters. */
+  function reportText(value, name, max) {
+    if (typeof value !== "string" || value === "" || value.length > max) {
+      throw new TelegramError(
+        400,
+        `${name} must be text of 1 to ${max} characters`,
+      );
+    }
+    return value;
+  }
+
+  /**
+   * Labels a runner gives: an object of up to 50 keys, each of 1 to 100
+   * characters, with text, number or boolean values, kept as text of up to
+   * 500 characters.
+   */
+  function reportLabels(value, name = "labels") {
+    if (value === undefined) return {};
+    if (!isObject(value) || Object.keys(value).length > 50) {
+      throw new TelegramError(
+        400,
+        `${name} must be an object of at most 50 labels`,
+      );
+    }
+    const labels = {};
+    for (const [key, raw] of Object.entries(value)) {
+      if (key === "" || key.length > 100) {
+        throw new TelegramError(400, `a label key must be 1 to 100 characters`);
+      }
+      if (!["string", "number", "boolean"].includes(typeof raw)) {
+        throw new TelegramError(
+          400,
+          `label ${key} must be text, a number or a boolean`,
+        );
+      }
+      const text = String(raw);
+      if (text.length > 500) {
+        throw new TelegramError(
+          400,
+          `label ${key} is longer than 500 characters`,
+        );
+      }
+      labels[key] = text;
+    }
+    return labels;
+  }
+
+  /** The scenario a report names, by run and scenario id. */
+  function scenarioKey(body) {
+    const runId = reportText(body.run_id, "run_id", 200);
+    const scenarioId = reportText(body.scenario_id, "scenario_id", 200);
+    return { runId, scenarioId, key: JSON.stringify([runId, scenarioId]) };
+  }
+
+  /** Marks a scenario's start or finish among the stored items. */
+  function markScenario(scenario, phase) {
+    const mark = {
+      key: scenario.key,
+      phase,
+      seq: ++nextSeq,
+      at: clock.now(),
+      afterRequest: requestSequence,
+      epoch,
+    };
+    scenarioMarks.push(mark);
+    scenario[phase === "start" ? "started" : "finished"] = mark;
+  }
+
+  /**
+   * A test runner starts a scenario of a run: its title, labels and the
+   * chats it happens in (viewer references), if given. A run's scenario is
+   * reported once.
+   */
+  function startScenario(body = {}) {
+    const { runId, scenarioId, key } = scenarioKey(body);
+    const title =
+      body.title === undefined
+        ? scenarioId
+        : reportText(body.title, "title", 500);
+    const labels = reportLabels(body.labels);
+    if (
+      body.chats !== undefined &&
+      (!Array.isArray(body.chats) ||
+        body.chats.length === 0 ||
+        body.chats.length > 20)
+    ) {
+      throw new TelegramError(400, "chats must list 1 to 20 chats");
+    }
+    for (const ref of body.chats ?? []) {
+      if (
+        (typeof ref !== "string" && typeof ref !== "number") ||
+        !CHAT_REF.test(String(ref))
+      ) {
+        throw new TelegramError(400, `bad chat reference: ${ref}`);
+      }
+    }
+    if (scenarios.has(key)) {
+      throw new TelegramError(
+        409,
+        `scenario ${scenarioId} of run ${runId} is already reported`,
+      );
+    }
+    const scenario = {
+      key,
+      runId,
+      scenarioId,
+      title,
+      labels,
+      chats: body.chats === undefined ? null : body.chats.map(String),
+      status: "running",
+      result: null,
+      failure: null,
+      started: null,
+      finished: null,
+    };
+    scenarios.set(key, scenario);
+    markScenario(scenario, "start");
+    return scenarioJson(scenario);
+  }
+
+  /**
+   * A test runner finishes a scenario with the result it decided: passed,
+   * failed or skipped. A failed one may say why and point at the evidence:
+   * messages by their message log seq, calls by request id and chat events
+   * by id, each of which must exist. Labels given are added to the
+   * scenario's. A scenario that never started (a skipped one) is reported
+   * here for the first time.
+   */
+  function finishScenario(body = {}) {
+    const { runId, scenarioId, key } = scenarioKey(body);
+    if (!["passed", "failed", "skipped"].includes(body.result)) {
+      throw new TelegramError(
+        400,
+        'result must be "passed", "failed" or "skipped"',
+      );
+    }
+    if (body.failure !== undefined && body.result !== "failed") {
+      throw new TelegramError(400, "only a failed scenario has a failure");
+    }
+    const labels = reportLabels(body.labels);
+    const failure =
+      body.failure === undefined ? null : reportFailure(body.failure);
+    const known = scenarios.get(key);
+    if (known?.status === "finished") {
+      throw new TelegramError(
+        409,
+        `scenario ${scenarioId} of run ${runId} already finished`,
+      );
+    }
+    const scenario = known ?? {
+      key,
+      runId,
+      scenarioId,
+      title: scenarioId,
+      labels: {},
+      chats: null,
+      started: null,
+    };
+    if (body.title !== undefined) {
+      scenario.title = reportText(body.title, "title", 500);
+    }
+    Object.assign(scenario, {
+      labels: { ...scenario.labels, ...labels },
+      status: "finished",
+      result: body.result,
+      failure,
+    });
+    scenarios.set(key, scenario);
+    markScenario(scenario, "finish");
+    return scenarioJson(scenario);
+  }
+
+  /** A failure's explanation and evidence, each piece checked to exist. */
+  function reportFailure(value) {
+    if (!isObject(value)) {
+      throw new TelegramError(400, "failure must be an object");
+    }
+    const message = reportText(value.message, "failure.message", 4000);
+    const given = value.evidence ?? [];
+    if (!Array.isArray(given) || given.length > 100) {
+      throw new TelegramError(
+        400,
+        "failure.evidence must list at most 100 items",
+      );
+    }
+    const evidence = given.map((each) => {
+      if (!isObject(each)) {
+        throw new TelegramError(
+          400,
+          "each piece of evidence must be an object",
+        );
+      }
+      const labels = reportLabels(each.labels, "evidence labels");
+      if (each.kind === "message") {
+        const seq = Number(each.seq);
+        if (!storedSeqExists(seq, false)) {
+          throw new TelegramError(
+            400,
+            `evidence message seq ${each.seq} is not in the message log`,
+          );
+        }
+        return { kind: "message", seq, labels };
+      }
+      if (each.kind === "event") {
+        const id = Number(each.event_id);
+        if (!storedSeqExists(id, true)) {
+          throw new TelegramError(
+            400,
+            `evidence event ${each.event_id} is not logged`,
+          );
+        }
+        return { kind: "event", event_id: id, labels };
+      }
+      if (each.kind === "call") {
+        const requestId = String(each.request_id ?? "");
+        if (
+          ![...calls, ...rejectedRequests].some(
+            (call) => call.request_id === requestId,
+          )
+        ) {
+          throw new TelegramError(
+            400,
+            `evidence call ${requestId} was not received`,
+          );
+        }
+        return { kind: "call", request_id: requestId, labels };
+      }
+      throw new TelegramError(
+        400,
+        'evidence kind must be "message", "call" or "event"',
+      );
+    });
+    return { message, evidence };
+  }
+
+  /** Whether a stored message (or, with `event`, a chat event) has this seq. */
+  function storedSeqExists(seq, event) {
+    if (!Number.isSafeInteger(seq)) return false;
+    for (const chat of [...chats.values(), ...privateChats.values()]) {
+      const found = event
+        ? (chat.events ?? []).some((each) => each.seq === seq)
+        : [...chat.messages.values(), ...(chat.ephemeral?.values() ?? [])].some(
+            (entry) => entry.seq === seq,
+          );
+      if (found) return true;
+    }
+    return false;
+  }
+
+  /** A scenario as GET /_fake/scenarios lists it. */
+  function scenarioJson(scenario) {
+    const mark = (each) =>
+      each ? { seq: each.seq, at: each.at, epoch: each.epoch } : null;
+    return structuredClone({
+      run_id: scenario.runId,
+      scenario_id: scenario.scenarioId,
+      title: scenario.title,
+      labels: scenario.labels,
+      chats: scenario.chats,
+      status: scenario.status,
+      result: scenario.result,
+      failure: scenario.failure,
+      started: mark(scenario.started),
+      finished: mark(scenario.finished),
+    });
+  }
+
+  /** GET /_fake/scenarios: every scenario reported, or one run's. */
+  function listScenarios(query = {}) {
+    const runId =
+      query.run_id === undefined
+        ? null
+        : reportText(query.run_id, "run_id", 200);
+    return {
+      epoch,
+      scenarios: [...scenarios.values()]
+        .filter((scenario) => runId === null || scenario.runId === runId)
+        .map(scenarioJson),
+    };
+  }
+
   async function drainDeliveries({ botId, timeoutMs = 1000 } = {}) {
     if (
       botId != null &&
@@ -8757,6 +10017,15 @@ export async function startTestServer({
     if (resource === "record" && id === "stop" && method === "POST") {
       return stopRecording(body);
     }
+    if (resource === "scenarios" && id === "start" && method === "POST") {
+      return startScenario(body);
+    }
+    if (resource === "scenarios" && id === "finish" && method === "POST") {
+      return finishScenario(body);
+    }
+    if (resource === "scenarios" && !id && method === "GET") {
+      return listScenarios(query);
+    }
     if (resource === "restore" && method === "POST") {
       clockWork += 1;
       try {
@@ -8807,6 +10076,7 @@ export async function startTestServer({
             firstName: body.first_name,
             joinRequestQueries: body.supports_join_request_queries === true,
             loginClientSecret: body.login_client_secret,
+            privacy: body.privacy_mode === true,
           }),
         );
       } catch (error) {
@@ -8855,10 +10125,15 @@ export async function startTestServer({
           'status must be "administrator", "member", "left" or "kicked"',
         );
       }
+      const actor = requireUser(body.by ?? creatorOf(chat));
+      const joins = status === "administrator" || status === "member";
+      if (joins !== isInChat(chat, record.id)) {
+        requireNamedActor(chat, actor, "Adding or removing a member");
+      }
       return setBotMembership(chat, record, {
         status,
         rights: body.rights ?? null,
-        actor: requireUser(body.by ?? creatorOf(chat)),
+        actor,
       });
     }
     if (resource === "chats" && id && sub === "migrate" && method === "POST") {
@@ -8949,6 +10224,16 @@ export async function startTestServer({
           );
         }
         return businessConnectionObject(connection);
+      }
+      if (
+        chatsPart === "chats" &&
+        userId &&
+        messagesPart === "messages" &&
+        parts[6] &&
+        parts[7] === "delete" &&
+        method === "POST"
+      ) {
+        return deleteInBusinessChat(connectionId, userId, parts[6], body);
       }
       if (chatsPart === "chats" && userId && messagesPart === "messages") {
         const connection = businessConnections.get(String(connectionId));
@@ -9111,6 +10396,7 @@ export async function startTestServer({
               deleted: entry.deleted,
               message: entry.message,
               reactions: Object.fromEntries(entry.reactions ?? []),
+              ...(entry.ids ? { bot_message_ids: botMessageIds(entry) } : {}),
             })
           : { exists: false, deleted: false };
       }
@@ -9180,17 +10466,30 @@ export async function startTestServer({
       };
     }
     if (resource === "users" && id && sub === "dm") {
-      // Only the user writing to the bot opens their private chat; reading it
+      // The user's private chat with one bot: bot_id names it, by default
+      // the first bot. Only the user writing to the bot opens it; reading it
       // must not, or the bot could then message a user who never wrote.
-      const existing = privateChats.get(Number(id));
-      if (method === "GET" && !subId && isLogQuery(query)) {
+      const botParam = method === "GET" ? query.bot_id : body.bot_id;
+      const chatBot =
+        botParam == null || botParam === ""
+          ? bot
+          : (deletedBots.get(Number(botParam)) ?? requireBot(botParam));
+      const existing = privateChatOf(id, chatBot.id);
+      if (method === "GET" && !subId && isDmLogQuery(query)) {
         const user = requireUser(id);
-        const pair =
+        // Without bot_id, the log reads the user's one private chat: the
+        // message ids of two bots' chats overlap, so two need bot_id.
+        const pairs =
           query.bot_id === undefined
-            ? null
-            : (deletedBots.get(Number(query.bot_id)) ??
-              requireBot(query.bot_id));
-        return messageLog(existing, user.id, query, pair);
+            ? [...privateChats.values()].filter((chat) => chat.id === user.id)
+            : [existing].filter(Boolean);
+        if (pairs.length > 1) {
+          throw new TelegramError(
+            400,
+            "bot_id is needed: the user has private chats with more than one bot",
+          );
+        }
+        return messageLog(pairs, user.id, query);
       }
       if (method === "GET" && !subId) {
         requireUser(id);
@@ -9222,13 +10521,25 @@ export async function startTestServer({
           body,
         );
       }
+      if (method === "POST" && subId && parts[4] === "delete") {
+        const user = requireUser(id);
+        if (!existing) return { message_id: Number(subId), deleted: false };
+        return deleteByMember(existing, subId, user);
+      }
       if (method === "POST" && subId && parts[4] === "vote") {
         if (!existing) throw new TelegramError(400, "Message not found");
         return vote(existing, requireUser(id), subId, body.option_ids);
       }
       if (method === "POST" && !subId) {
         requireUser(id);
-        return post(messageChat(id), { ...body, user_id: Number(id) });
+        if (deletedBots.has(chatBot.id)) {
+          throw new TelegramError(400, "Bad Request: bot not found");
+        }
+        const { bot_id: _bot, ...message } = body;
+        return post(messageChat(id, chatBot.id), {
+          ...message,
+          user_id: Number(id),
+        });
       }
     }
     if (resource === "chats" && id && sub === "albums" && method === "POST") {
@@ -9248,6 +10559,16 @@ export async function startTestServer({
         subId,
         body.option_ids,
       );
+    }
+    if (
+      resource === "chats" &&
+      id &&
+      sub === "messages" &&
+      subId &&
+      parts[4] === "delete" &&
+      method === "POST"
+    ) {
+      return deleteByMember(requireChat(id), subId, requireUser(body.user_id));
     }
     if (
       resource === "chats" &&
@@ -9376,6 +10697,7 @@ export async function startTestServer({
       }));
     }
     const actor = requireUser(body.by ?? creatorOf(chat));
+    requireNamedActor(chat, actor, "A topic change");
     const name = body.name == null ? null : String(body.name).trim();
     if (name !== null && (name === "" || name.length > 128)) {
       throw new TelegramError(400, "Bad Request: TOPIC_TITLE_EMPTY");
@@ -9389,7 +10711,7 @@ export async function startTestServer({
         is_topic_message: true,
       });
       message.message_thread_id = message.message_id;
-      chat.topics.set(message.message_id, { name });
+      chat.topics.set(message.message_id, { name, creatorId: actor.id });
       await emit("message", message);
       return { message_thread_id: message.message_id, name };
     }
@@ -9566,17 +10888,11 @@ export async function startTestServer({
       );
     if (!record) return { url };
     if (link.kind === "start") {
-      if (record !== bot) {
-        throw new TelegramError(
-          400,
-          `Users write privately only to the first bot here, not to @${record.username}`,
-        );
-      }
       const text = link.parameter ? `/start ${link.parameter}` : "/start";
-      const { message_id: messageId } = await post(messageChat(user.id), {
-        user_id: user.id,
-        text,
-      });
+      const { message_id: messageId } = await post(
+        messageChat(user.id, record.id),
+        { user_id: user.id, text },
+      );
       return {
         url,
         link: "start",
@@ -9837,9 +11153,117 @@ export async function startTestServer({
     }
     messageRewrites += 1;
     message.edit_date = now();
+    entry.edit = editMark(requireUser(userId), false);
     entry.editHidden = false;
     await emit("edited_message", structuredClone(message));
     return { message_id: message.message_id, edit_date: message.edit_date };
+  }
+
+  /**
+   * A person deletes a message for everyone, as Telegram's apps do through
+   * TDLib's deleteMessages with revoke (MessagesManager.cpp delete_messages,
+   * can_delete_message, can_delete_channel_message, can_revoke_message):
+   * - a supergroup or channel: anyone with can_delete_messages (the creator
+   *   too), any message but its first, the creation and upgrade service
+   *   messages and a topic's creation message; others only their own
+   *   message, not a service message, and in a channel only with
+   *   can_post_messages. A person has no 48-hour limit, which only bots have.
+   * - a basic group: their own message that is not a service message, or
+   *   any message if they are an administrator or the creator.
+   * - their private chat with a bot: any message, except a dice less than a
+   *   day old (revoke_pm_inbox, Telegram's default).
+   * A message that does not exist, or is already deleted, is skipped, as
+   * TDLib skips it. Bots get no update: telegram-bot-api only drops the
+   * messages from its cache on updateDeleteMessages (Client.cpp:9565).
+   * TDLib deletes a message a person may not revoke only for that person,
+   * which other members never see; this action refuses it instead.
+   */
+  async function deleteByMember(chat, messageId, user) {
+    if (chat.type !== "private" && !isInChat(chat, user.id)) {
+      throw new TelegramError(400, "Can't access the chat");
+    }
+    const entry = chat.messages.get(Number(messageId));
+    if (!entry || entry.deleted) {
+      return { message_id: Number(messageId), deleted: false };
+    }
+    const message = entry.message;
+    const service = contentType(message) === null;
+    const own = entry.author === user.id;
+    let allowed;
+    let refusal = "Message can't be deleted for everyone";
+    if (chat.type === "private") {
+      allowed = !(message.dice && now() - message.date < 86400);
+    } else if (chat.type === "group") {
+      const status = memberStatus(chat, user.id).status;
+      allowed =
+        (own && !service) ||
+        status === "creator" ||
+        status === "administrator";
+    } else {
+      refusal = "Message can't be deleted";
+      allowed =
+        message.message_id !== 1 &&
+        !message.migrate_from_chat_id &&
+        !message.supergroup_chat_created &&
+        !message.channel_chat_created &&
+        !message.forum_topic_created &&
+        (hasRight(chat, user.id, "can_delete_messages") ||
+          (own &&
+            (chat.type === "channel"
+              ? hasRight(chat, user.id, "can_post_messages")
+              : !service)));
+    }
+    if (!allowed) throw new TelegramError(400, refusal);
+    entry.deleted = true;
+    entry.deletion = deletionMark(user, null);
+    messageRewrites += 1;
+    waits.notify();
+    return { message_id: message.message_id, deleted: true };
+  }
+
+  /**
+   * The person or the owner deletes messages in a business chat, which is a
+   * private chat, where either side deletes any message for both
+   * (can_revoke_message). The connected bot gets deleted_business_messages
+   * (Client.cpp:6231, add_update_business_messages_deleted at 18784) while
+   * the connection is enabled, as it gets business_message.
+   */
+  async function deleteInBusinessChat(connectionId, userId, messageId, body) {
+    const connection = businessConnections.get(String(connectionId));
+    if (!connection) {
+      throw new TelegramError(404, `No business connection ${connectionId}`);
+    }
+    if (body.sender !== "person" && body.sender !== "owner") {
+      throw new TelegramError(400, 'sender must be "person" or "owner"');
+    }
+    requireUser(userId);
+    const entry = businessChat(connection, userId).entries.find(
+      (each) => each.message.message_id === Number(messageId),
+    );
+    if (!entry || entry.deleted) {
+      return { message_id: Number(messageId), deleted: false, update_id: null };
+    }
+    entry.deleted = true;
+    let updateId = null;
+    if (connection.isEnabled) {
+      const sent = emitOne(
+        requireBot(connection.botId),
+        "deleted_business_messages",
+        {
+          business_connection_id: connection.id,
+          chat: businessChatObject(userId),
+          message_ids: [entry.message.message_id],
+        },
+      );
+      updateId = sent.updateId;
+      await sent.delivered;
+    }
+    waits.notify();
+    return {
+      message_id: entry.message.message_id,
+      deleted: true,
+      update_id: updateId,
+    };
   }
 
   /**
@@ -9862,28 +11286,51 @@ export async function startTestServer({
     if (!isInChat(chat, user.id)) {
       throw new TelegramError(403, "CHAT_WRITE_FORBIDDEN");
     }
-    if (emoji && !REACTION_EMOJI.has(String(emoji))) {
+    // An anonymous administrator reacts as the supergroup, and only its
+    // owner may react as the chat: for anyone else TDLib offers no reaction
+    // at all (MessagesManager.cpp:20184-20192 get_message_available_reactions,
+    // 20251 get_my_reaction_dialog_id, 20278 add_message_reaction).
+    const asChat = isAnonymousAdmin(chat, user.id);
+    if (
+      (emoji && !REACTION_EMOJI.has(String(emoji))) ||
+      (asChat && memberStatus(chat, user.id).status !== "creator")
+    ) {
       throw new TelegramError(
         400,
         "The reaction isn't available for the message",
       );
     }
-    return changeReaction(chat, entry, user, emoji ? [String(emoji)] : []);
+    return changeReaction(
+      chat,
+      entry,
+      user,
+      emoji ? [String(emoji)] : [],
+      asChat ? chat : null,
+    );
   }
 
   function reactionList(emojis) {
     return emojis.map((emoji) => ({ type: "emoji", emoji }));
   }
 
-  async function changeReaction(chat, entry, user, emojis) {
+  /**
+   * Sets a member's reaction, kept by who chose it. One made as a chat
+   * (`actor`) reaches bots with actor_chat instead of user, as the Bot API
+   * server writes a chat sender (Client.cpp:6118, json_store_message_sender
+   * at 18221); entry.reactionActors keeps that chat by the member's id.
+   */
+  async function changeReaction(chat, entry, user, emojis, actor = null) {
     entry.reactions ??= new Map();
     const before = entry.reactions.get(user.id) ?? [];
     if (emojis.length) entry.reactions.set(user.id, emojis);
     else entry.reactions.delete(user.id);
+    entry.reactionActors ??= new Map();
+    if (actor && emojis.length) entry.reactionActors.set(user.id, actor.id);
+    else entry.reactionActors.delete(user.id);
     await emit("message_reaction", {
       chat: chatObject(chat),
       message_id: entry.message.message_id,
-      user: userObject(user),
+      ...(actor ? { actor_chat: chatObject(actor) } : { user: userObject(user) }),
       date: now(),
       old_reaction: reactionList(before),
       new_reaction: reactionList(emojis),
@@ -9914,6 +11361,9 @@ export async function startTestServer({
   ) {
     const user = requireUser(userId);
     requireTopic(chat, threadId);
+    requireOpenTopic(chat, user.id, Number(threadId) || 0, (text) => {
+      throw new TelegramError(406, text);
+    });
     // A contact, a location or a file posted again is a message of its own.
     const given = [
       text !== undefined,
@@ -10003,15 +11453,10 @@ export async function startTestServer({
       Object.assign(fields, memberText(text, entities));
     }
     if (mediaGroupId) fields.media_group_id = mediaGroupId;
-    if (forwardFrom) fields.forward_origin = forwardOrigin(forwardFrom);
+    if (forwardFrom) Object.assign(fields, forwardFields(forwardOrigin(forwardFrom)));
     // A message in a topic that answers nothing replies to the topic's
-    // creation message, which is how a bot learns the topic's name.
-    const replied =
-      replyTo != null
-        ? chat.messages.get(Number(replyTo))
-        : threadId
-          ? chat.messages.get(Number(threadId))
-          : null;
+    // creation message (addMessage), which is how a bot learns its name.
+    const replied = replyTo != null ? chat.messages.get(Number(replyTo)) : null;
     if (replied) {
       const { reply_to_message: _nested, ...original } = replied.message;
       fields.reply_to_message = original;
@@ -10021,7 +11466,7 @@ export async function startTestServer({
       fields.is_topic_message = true;
     }
     const message = addMessage(chat, user, fields, sender);
-    await emit("message", message);
+    await emit("message", message, pairRecipients(chat));
     return { message_id: message.message_id };
   }
 
@@ -10140,6 +11585,20 @@ export async function startTestServer({
   }
 
   /**
+   * Who a poll_answer names as the voter. An anonymous administrator or owner
+   * votes as the group: "voter_chat ... The chat that changed the answer to
+   * the poll, if the voter is anonymous"
+   * (https://core.telegram.org/bots/api#pollanswer). For a chat the Bot API
+   * server also writes the Channel bot as user, for older bots (Client.cpp
+   * JsonPollAnswer, json_store_message_sender with channel_bot_user_id).
+   */
+  function voterFields(chat, user) {
+    return isAnonymousAdmin(chat, user.id)
+      ? { user: { ...CHANNEL_BOT }, voter_chat: chatObject(chat) }
+      : { user: userObject(user) };
+  }
+
+  /**
    * A person's vote in a poll from the Telegram app, checked as TDLib checks
    * it (MessagesManager::get_message_poll_id, then
    * PollManager::set_poll_answer, with their error texts). An empty choice
@@ -10212,7 +11671,7 @@ export async function startTestServer({
               "poll_answer",
               {
                 poll_id: poll.id,
-                user: userObject(user),
+                ...voterFields(chat, user),
                 option_ids: ids,
                 option_persistent_ids: ids.map(
                   (id) => poll.options[id].persistent_id,
@@ -10651,9 +12110,7 @@ ${buttons}
     // telegram:bot_access "allows your bot to send direct messages to the
     // user after login".
     if (code.scopes.includes("telegram:bot_access")) {
-      const chat = messageChat(user.id);
-      chat.openTo ??= new Set();
-      chat.openTo.add(record.id);
+      messageChat(user.id, record.id);
     }
     response.writeHead(200, {
       "Content-Type": "application/json",
@@ -11115,7 +12572,9 @@ ${buttons}
   }
 
   function recordCall(receipt, response, journal = calls) {
-    const target = Number(targetUser(receipt.method, receipt.params));
+    const target = Number(
+      targetUser(receipt.method, receipt.params, receipt.bot_id),
+    );
     if (Number.isSafeInteger(target)) receipt.target_user_id = target;
     receipt.seq = journal.length + 1;
     receipt.request_id = `${instanceId}:${epoch}:${++requestSequence}`;
@@ -11173,18 +12632,40 @@ ${buttons}
     waits.notify();
   }
 
-  function targetUser(method, params) {
+  /** The user a call by the bot `botId` is about (receipt.target_user_id). */
+  function targetUser(method, params, botId) {
+    const chat =
+      method.toLowerCase() === "deletemessage"
+        ? (chats.get(Number(params.chat_id)) ??
+          privateChatOf(params.chat_id, botId))
+        : null;
     return (
       params.user_id ??
       params.receiver_user_id ??
       params.ephemeral_message_parameters?.receiver_user_id ??
-      (method.toLowerCase() === "deletemessage"
-        ? (
-            chats.get(Number(params.chat_id)) ??
-            privateChats.get(Number(params.chat_id))
-          )?.messages.get(Number(params.message_id))?.author
-        : undefined)
+      chat?.messages.get(storedMessageId(chat, params.message_id, botId))
+        ?.author
     );
+  }
+
+  /**
+   * The messages a call by the bot `botId` names (message_id and
+   * message_ids, in the chat a forward or copy reads from), as test controls
+   * name them: in a basic group by the chat's own ids (null for an id the
+   * bot does not know), elsewhere as the call gave them.
+   */
+  function namedMessageIds(method, params, botId) {
+    const ids = [
+      params.message_id,
+      ...(Array.isArray(params.message_ids) ? params.message_ids : []),
+    ].filter((id) => id != null);
+    const source = /^(forward|copy)message$/i.test(method)
+      ? params.from_chat_id
+      : params.chat_id;
+    const chat = chats.get(Number(source));
+    return chat?.type === "group"
+      ? ids.map((id) => storedMessageId(chat, id, botId))
+      : ids;
   }
 
   function takeFailure(method, caller, params, trace) {
@@ -11194,11 +12675,11 @@ ${buttons}
         (rule.chat_id === null || rule.chat_id === String(params.chat_id)) &&
         (rule.bot_id === null || rule.bot_id === caller.id) &&
         (rule.user_id === null ||
-          rule.user_id === String(targetUser(method, params))) &&
+          rule.user_id === String(targetUser(method, params, caller.id))) &&
         (rule.message_id === null ||
-          rule.message_id === String(params.message_id) ||
-          (Array.isArray(params.message_ids) &&
-            params.message_ids.some((id) => String(id) === rule.message_id))),
+          namedMessageIds(method, params, caller.id).some(
+            (id) => String(id) === rule.message_id,
+          )),
     );
     if (index < 0) return null;
     const rule = failures[index];
@@ -11261,8 +12742,7 @@ ${buttons}
     chats: () => chats.values(),
     chat: (id) => chats.get(Number(id)),
     privateChats: () => privateChats.values(),
-    privateChat: (id) => privateChats.get(Number(id)),
-    privatePairOf,
+    privateChat: (userId, botId) => privateChatOf(userId, botId),
     member: (chat, userId) => peekMember(chat, userId),
     memberJson: (chat, userId) =>
       memberWithoutUser(
@@ -11278,10 +12758,16 @@ ${buttons}
       }
     },
     messageLogEntry,
+    namedMessageIds,
     eventJson,
     fileBytes: (fileId) => files.get(String(fileId))?.file.data ?? null,
     calls: () => calls,
     rejectedRequests: () => rejectedRequests,
+    // The scenario marks of this epoch, each with its scenario as reported.
+    scenarioMarks: () =>
+      scenarioMarks
+        .filter((mark) => mark.epoch === epoch)
+        .map((mark) => ({ ...mark, scenario: scenarios.get(mark.key) })),
     sentUpdates: () => sentUpdates,
     chatOfQuery: (queryId) => queryChats.get(String(queryId)) ?? null,
     knownMethod: (name) => methodsByLowerName.has(String(name).toLowerCase()),
@@ -11318,19 +12804,77 @@ ${buttons}
         ...(chats !== undefined ? { chats } : {}),
       }),
     stopRecording: (name) => act("POST", "record/stop", { name }),
+    startScenario: ({ runId, scenarioId, title, labels, chats } = {}) =>
+      act("POST", "scenarios/start", {
+        run_id: runId,
+        scenario_id: scenarioId,
+        title,
+        labels,
+        chats,
+      }),
+    finishScenario: ({
+      runId,
+      scenarioId,
+      title,
+      result,
+      labels,
+      failure,
+    } = {}) =>
+      act("POST", "scenarios/finish", {
+        run_id: runId,
+        scenario_id: scenarioId,
+        title,
+        result,
+        labels,
+        failure:
+          failure === undefined
+            ? undefined
+            : {
+                ...failure,
+                evidence: failure.evidence?.map(
+                  ({ requestId, eventId, ...each }) => ({
+                    ...each,
+                    ...(requestId !== undefined
+                      ? { request_id: requestId }
+                      : {}),
+                    ...(eventId !== undefined ? { event_id: eventId } : {}),
+                  }),
+                ),
+              },
+      }),
+    getScenarios: ({ runId } = {}) =>
+      act("GET", "scenarios", {}, runId === undefined ? {} : { run_id: runId }),
     getClock: () => act("GET", "clock"),
     advanceTime: (ms) => act("POST", "clock", { ms }),
     drainDeliveries,
     getDeliveries: () => act("GET", "deliveries"),
-    addBot: ({ token, username, firstName, supportsJoinRequestQueries } = {}) =>
+    addBot: ({
+      token,
+      username,
+      firstName,
+      supportsJoinRequestQueries,
+      loginClientSecret,
+      privacyMode: privacy,
+    } = {}) =>
       act("POST", "bots", {
         token,
         username,
         first_name: firstName,
         supports_join_request_queries: supportsJoinRequestQueries === true,
+        ...(loginClientSecret != null
+          ? { login_client_secret: loginClientSecret }
+          : {}),
+        privacy_mode: privacy === true,
       }),
     deleteBot: (botId) => act("DELETE", `bots/${botId}`),
-    createChat: async ({ title, type, ownerId, ownerName, isForum } = {}) =>
+    createChat: async ({
+      title,
+      type,
+      ownerId,
+      ownerName,
+      isForum,
+      ownerAnonymous,
+    } = {}) =>
       (
         await act("POST", "chats", {
           title,
@@ -11338,6 +12882,7 @@ ${buttons}
           owner_id: ownerId,
           owner_name: ownerName,
           is_forum: isForum,
+          owner_anonymous: ownerAnonymous === true,
         })
       ).id,
     getChat: (chatId) => act("GET", `chats/${chatId}`),
@@ -11560,6 +13105,22 @@ ${buttons}
         })),
         ...(threadId != null ? { message_thread_id: threadId } : {}),
       }),
+    deleteMessage: (chatId, messageId, userId) =>
+      act("POST", `chats/${chatId}/messages/${messageId}/delete`, {
+        user_id: userId,
+      }),
+    deleteDirectMessage: (userId, messageId, { botId } = {}) =>
+      act(
+        "POST",
+        `users/${userId}/dm/${messageId}/delete`,
+        botId != null ? { bot_id: botId } : {},
+      ),
+    deleteBusinessMessage: (connectionId, userId, messageId, sender) =>
+      act(
+        "POST",
+        `business/connections/${connectionId}/chats/${userId}/messages/${messageId}/delete`,
+        { sender },
+      ),
     editMessage: (chatId, messageId, userId, { text, caption } = {}) =>
       act("POST", `chats/${chatId}/messages/${messageId}/edit`, {
         user_id: userId,
@@ -11593,16 +13154,22 @@ ${buttons}
         `chats/${chatId}/ephemeral-messages/${ephemeralMessageId}/callback`,
         { user_id: userId, data, deliver_twice: deliverTwice === true },
       ),
-    sendDirectMessage: async (userId, message) =>
-      (await act("POST", `users/${userId}/dm`, memberBody(message))).message_id,
+    sendDirectMessage: async (userId, message, { botId } = {}) =>
+      (
+        await act("POST", `users/${userId}/dm`, {
+          ...memberBody(message),
+          ...(botId != null ? { bot_id: botId } : {}),
+        })
+      ).message_id,
     vote: (chatId, messageId, userId, optionIds) =>
       act("POST", `chats/${chatId}/messages/${messageId}/vote`, {
         user_id: userId,
         option_ids: optionIds,
       }),
-    voteDirect: (userId, messageId, optionIds) =>
+    voteDirect: (userId, messageId, optionIds, { botId } = {}) =>
       act("POST", `users/${userId}/dm/${messageId}/vote`, {
         option_ids: optionIds,
+        ...(botId != null ? { bot_id: botId } : {}),
       }),
     postGuestBotReply: async (chatId, callerUserId, botUsername, text) =>
       (
@@ -11612,10 +13179,16 @@ ${buttons}
           text,
         })
       ).message_id,
-    pressDirectButton: (userId, messageId, data, { deliverTwice } = {}) =>
+    pressDirectButton: (
+      userId,
+      messageId,
+      data,
+      { deliverTwice, botId } = {},
+    ) =>
       act("POST", `users/${userId}/dm/${messageId}/callback`, {
         data,
         deliver_twice: deliverTwice === true,
+        ...(botId != null ? { bot_id: botId } : {}),
       }),
     openUrlButton: (chatId, messageId, userId, button, { addToChatId } = {}) =>
       act("POST", `chats/${chatId}/messages/${messageId}/open-url`, {
@@ -11639,17 +13212,29 @@ ${buttons}
           ...(addToChatId != null ? { add_to_chat_id: addToChatId } : {}),
         },
       ),
-    openDirectUrlButton: (userId, messageId, button, { addToChatId } = {}) =>
+    openDirectUrlButton: (
+      userId,
+      messageId,
+      button,
+      { addToChatId, botId } = {},
+    ) =>
       act("POST", `users/${userId}/dm/${messageId}/open-url`, {
         button,
         ...(addToChatId != null ? { add_to_chat_id: addToChatId } : {}),
+        ...(botId != null ? { bot_id: botId } : {}),
       }),
     getMessages: (chatId) => act("GET", `chats/${chatId}/messages`),
     getMessage: (chatId, messageId) =>
       act("GET", `chats/${chatId}/messages/${messageId}`),
     getEphemeralMessage: (chatId, ephemeralMessageId) =>
       act("GET", `chats/${chatId}/ephemeral-messages/${ephemeralMessageId}`),
-    getDirectMessages: (userId) => act("GET", `users/${userId}/dm`),
+    getDirectMessages: (userId, { botId } = {}) =>
+      act(
+        "GET",
+        `users/${userId}/dm`,
+        {},
+        botId != null ? { bot_id: String(botId) } : {},
+      ),
     getMember: (chatId, userId) =>
       act("GET", `chats/${chatId}/members/${userId}`),
     getJoinRequests: (chatId) => act("GET", `chats/${chatId}/join-requests`),

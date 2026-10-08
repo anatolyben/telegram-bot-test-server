@@ -240,6 +240,19 @@ describe("what the login refuses", () => {
     expect((await response.json()).error).toBe("invalid_client");
   });
 
+  it("uses the login secret given to an added bot", async () => {
+    const { fake } = await setup();
+    const added = await fake.addBot({
+      token: "654321:SECOND",
+      username: "second_bot",
+      loginClientSecret: "second-secret",
+    });
+    const bots = await (await fetch(`${fake.origin}/_fake/bots`)).json();
+    expect(
+      bots.find((bot) => bot.id === added.id).login_client_secret,
+    ).toBe("second-secret");
+  });
+
   it("answers invalid_grant for an unknown, used or expired code", async () => {
     const { fake, user } = await setup();
     const unknown = await exchange(fake, { code: "nope", code_verifier: "x" });

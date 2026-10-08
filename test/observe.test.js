@@ -185,6 +185,43 @@ it("records deleteMessages and deleteEphemeralMessage, and logs ephemeral messag
   expect(log.messages[1].request_id).toMatch(/:\d+$/);
 });
 
+it("lists a message edited after a mark, with who edited it and when", async () => {
+  const { fake, api, user } = await setup();
+  const own = (
+    await api("sendMessage", { chat_id: CHAT, text: "draft" })
+  ).result.message_id;
+  const theirs = await fake.post(CHAT, user, "typo");
+  const untouched = await fake.post(CHAT, user, "fine");
+  const mark = await fake.getMessageLog(CHAT);
+
+  await api("editMessageText", { chat_id: CHAT, message_id: own, text: "final" });
+  await fake.editMessage(CHAT, theirs, user, { text: "fixed" });
+
+  const log = await fake.getMessageLog(CHAT, { since: mark.cursor });
+  expect(ids(log)).toEqual([own, theirs]);
+  const [bot, person] = log.messages;
+  expect(bot.message.text).toBe("final");
+  expect(bot.edited_by).toMatchObject({
+    bot_id: BOT,
+    user_id: null,
+    method: "editMessageText",
+  });
+  expect(bot.edited_by.seq).toBeGreaterThan(mark.cursor);
+  expect(person.edited_by).toMatchObject({
+    bot_id: null,
+    user_id: user,
+    method: null,
+    request_id: null,
+  });
+  expect(person.edited_by.seq).toBeGreaterThan(bot.edited_by.seq);
+  expect(log.cursor).toBe(person.edited_by.seq);
+  const all = await fake.getMessageLog(CHAT);
+  expect(
+    all.messages.find((entry) => entry.message.message_id === untouched)
+      .edited_by,
+  ).toBeNull();
+});
+
 it("reads a user's private chat after a mark, split by bot", async () => {
   const { fake, api } = await setup();
   const second = await secondBot(fake);
@@ -206,9 +243,13 @@ it("reads a user's private chat after a mark, split by bot", async () => {
     SECOND_TOKEN,
   );
   const text = (log) => log.messages.map((entry) => entry.message.text);
-  expect(text(await fake.getMessageLog(carol, { since: mark.cursor }))).toEqual(
-    ["hello first bot", "first bot answers", "answer 2+2 to join"],
-  );
+  // Two bots' chats with Carol: the log needs bot_id to name one.
+  await expect(
+    fake.getMessageLog(carol, { since: mark.cursor }),
+  ).rejects.toThrow("bot_id is needed");
+  expect(
+    text(await fake.getMessageLog(carol, { since: mark.cursor, botId: BOT })),
+  ).toEqual(["hello first bot", "first bot answers"]);
   expect(
     text(
       await fake.getMessageLog(carol, {

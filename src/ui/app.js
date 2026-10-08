@@ -611,7 +611,13 @@ export function startViewer({ render, interact, views, source, root }) {
           `User ${user.id}`,
       }))
       .sort((a, b) => a.name.localeCompare(b.name));
-    patchHtml(controls, render.renderToolbar(ui.view, { people: list }));
+    patchHtml(
+      controls,
+      render.renderToolbar(ui.view, {
+        people: list,
+        runs: ui.state?.runs ?? [],
+      }),
+    );
     patchHtml(statusSlot, render.renderStatus(ui.status, recording));
   }
 
@@ -739,11 +745,15 @@ export function startViewer({ render, interact, views, source, root }) {
               })
             : "",
         );
-        const list = render.chatStream(slot.items, ctx, {
-          layout: ui.view.layout,
-          show: ui.view.show,
-          calls: shownCalls(slot),
-        });
+        const list = render.chatStream(
+          slot.items.filter((item) => render.scenarioShown(item, ui.view)),
+          ctx,
+          {
+            layout: ui.view.layout,
+            show: ui.view.show,
+            calls: shownCalls(slot),
+          },
+        );
         const empty = notMember
           ? ""
           : '<p class="tv-empty" data-role="no-messages">No messages in this chat yet</p>';
@@ -862,6 +872,9 @@ export function startViewer({ render, interact, views, source, root }) {
             : null;
       setView({ ...ui.view, topic });
     },
+    setRun(value) {
+      setView({ ...ui.view, runs: value ? [String(value)] : null });
+    },
     setTheme(value) {
       setView({
         ...ui.view,
@@ -905,7 +918,7 @@ export function startViewer({ render, interact, views, source, root }) {
       interact.layoutColumns(workspace, ui.weights, ui.widths);
     },
   };
-  interact.bindViewer(root, actions);
+  interact.bindViewer(root, actions, { recording: recording !== null });
   win.addEventListener("popstate", () => {
     const next = render.parseView(win.location.search);
     if (!next.chats.length) next.chats = ui.view.chats;
@@ -1180,7 +1193,10 @@ export function staticSource(json, viewsApi) {
       if (params.as != null) ({ items, as } = viewOf(full, Number(params.as)));
       let calls = full.calls ?? [];
       if (params.topic != null && full.chat?.is_forum) {
-        items = items.filter((item) => viewsApi.inTopic(item, params.topic));
+        items = items.filter(
+          (item) =>
+            item.kind === "scenario" || viewsApi.inTopic(item, params.topic),
+        );
         calls = viewsApi.callsInTopic(calls, full.items ?? [], params.topic);
       }
       const callsBefore = params.calls_before ?? null;

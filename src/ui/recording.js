@@ -95,7 +95,7 @@ export async function createRecorder(model) {
    * data: URI, in the top-level files table.
    */
   function twin(recording, stop) {
-    const { state, pages, files, missing } = ui.recorded({
+    const { state, pages, files, missing, scenarios } = ui.recorded({
       refs: recording.chats,
       startSeq: recording.startSeq,
       startRequest: recording.startRequest,
@@ -126,6 +126,7 @@ export async function createRecorder(model) {
       pages,
       files: inline,
       missing_chats: missing,
+      scenarios,
     };
   }
 

@@ -195,6 +195,23 @@ it("puts each call in the chat it acted on, and calls without one under calls", 
   });
 });
 
+it("points a call in a basic group at the message the calling bot names by its own id", async () => {
+  const { fake, api, page } = await setup();
+  const group = await fake.createChat({ type: "group", ownerId: OWNER });
+  await fake.setBotMembership(group, BOT); // the bot's message 1
+  const hello = await fake.post(group, OWNER, "hello"); // the bot's 2
+  expect(
+    (await api("deleteMessage", { chat_id: group, message_id: 2 })).ok,
+  ).toBe(true);
+
+  const { calls } = await page(group);
+  expect(calls.at(-1)).toMatchObject({
+    method: "deleteMessage",
+    params: { message_id: "2" },
+    targets: { messages: [{ chat_id: group, message_id: hello }] },
+  });
+});
+
 it("reads a call's permissions as Telegram does, those left out off", async () => {
   const { api, page, ann } = await setup();
   await api("restrictChatMember", {

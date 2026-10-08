@@ -594,7 +594,7 @@ it("answers failed HTTP waits, drains, clock advances and bad media as control e
   ]);
   expect(await control("clock", { ms: 5 })).toEqual([
     409,
-    "advanceTime requires a manual clock",
+    "advanceTime requires a manual or running clock",
   ]);
   expect(
     await control(`chats/${CHAT}/messages`, { user_id: user, photo_base64: 5 }),

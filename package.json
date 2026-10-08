@@ -1,6 +1,6 @@
 {
   "name": "telegram-bot-test-server",
-  "version": "0.13.1",
+  "version": "0.14.0",
   "description": "A local Telegram Bot API server for end-to-end tests: groups, members, moderation, buttons, webhooks and a live chat viewer. No Telegram account needed.",
   "license": "MIT",
   "author": "Anatoly Ben",

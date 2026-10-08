@@ -39,6 +39,14 @@ export interface TelegramBotTestServerOptions {
    */
   supportsJoinRequestQueries?: boolean;
   /**
+   * The first bot runs in privacy mode: in a group where it is not an
+   * administrator it gets only service messages, commands meant for it,
+   * replies to messages meant for it, and general commands when it was the
+   * last bot to send a message there. getMe then says can_read_all_group_messages:
+   * false. Default false.
+   */
+  privacyMode?: boolean;
+  /**
    * The first bot's Telegram Login client secret (its client id is the bot
    * id). Default: a random secret, readable from GET /_fake/bot.
    */
@@ -124,6 +132,16 @@ export interface PressOptions {
    * webhook. Default false.
    */
   deliverTwice?: boolean;
+}
+
+/**
+ * The bot whose private chat with the user an action happens in. Each
+ * (user, bot) pair is a chat of its own; all of a bot's private chats share
+ * one message id sequence.
+ */
+export interface DirectChatOptions {
+  /** The bot's user id. Default: the first bot. */
+  botId?: number;
 }
 
 export interface OpenUrlOptions {
@@ -281,6 +299,14 @@ export interface NewChat {
   ownerName?: string;
   /** A supergroup with forum topics. */
   isForum?: boolean;
+  /**
+   * The supergroup's owner stays anonymous: they post and react as the
+   * group, and getChatMember says is_anonymous: true. Their pins, title and
+   * photo changes, topics, and adding or removing members fail, as no source
+   * shows how Telegram shows them. So setBotMembership in such a group needs
+   * `by`: an administrator who is not anonymous. Default false.
+   */
+  ownerAnonymous?: boolean;
 }
 
 export interface BotMembership {
@@ -354,7 +380,7 @@ export interface RecordedCall {
    */
   params: Record<string, unknown>;
   at: number;
-  /** Rejected status, including actual permission/validation failures. */
+  /** The HTTP status of a refused call, by Telegram's rules or a failure rule. */
   failed?: number;
   /**
    * The description the answer carried: Telegram's error text for a refusal,
@@ -384,9 +410,14 @@ export type PatternSource = RegExp | { source: string; flags?: string };
 export type FakeWaitCondition =
   | {
       kind: "message";
+      /** A group, or a user id for their private chat with botId's bot. */
       chatId: number;
       messageId?: number;
       userId?: number;
+      /**
+       * The author; in a private chat, the bot whose chat with the user to
+       * read (default the first), and the author only without userId.
+       */
       botId?: number;
       text?: string;
       caption?: string;
@@ -491,16 +522,43 @@ export interface MessageLogEntry {
   request_id: string | null;
   /** Who posted it (in a channel, the person or bot behind the channel). */
   author: number;
+  /** In a user's private chats: the bot whose chat it is in. */
+  bot_id?: number;
   deleted: boolean;
   deleted_by: {
     seq: number;
-    bot_id: number;
-    method: "deleteMessage" | "deleteMessages" | "deleteEphemeralMessage";
+    /** The bot that deleted it; null when a person did. */
+    bot_id: number | null;
+    /** The person who deleted it (deleteMessage and its kin); null for a bot. */
+    user_id: number | null;
+    method:
+      | "deleteMessage"
+      | "deleteMessages"
+      | "deleteEphemeralMessage"
+      | null;
+    request_id: string | null;
+    at: number;
+  } | null;
+  /**
+   * The latest edit: by a bot (bot_id, method) or a person (user_id). A
+   * message edited after a mark is listed after it, edited_by.seq above it.
+   */
+  edited_by: {
+    seq: number;
+    bot_id: number | null;
+    user_id: number | null;
+    method: string | null;
     request_id: string | null;
     at: number;
   } | null;
   ephemeral: boolean;
+  /** In a basic group, message_id is the chat's own id, which no bot sees. */
   message: Message;
+  /**
+   * In a basic group: the id each bot knows the message by, by bot id. A bot
+   * that was not in the group when it was posted has none.
+   */
+  bot_message_ids?: Record<string, number>;
   /** A poll's votes by user id, when anyone voted. */
   votes?: Record<string, number[]>;
 }
@@ -533,7 +591,10 @@ export interface FakeClockState {
   offset?: number;
   scheduled: number;
 }
-/** A chat as the viewer and recordings name it: a group's id, "<user id>:<bot id>", a user id (their chat with the first bot) or "calls". */
+/**
+ * A chat as the viewer and recordings name it: a group's id, "<user id>:<bot id>", a user id (their
+ * chat with the first bot) or "calls".
+ */
 export type ChatRef = number | string;
 
 export interface RecordingStarted {
@@ -583,6 +644,49 @@ export interface RecordingJson {
   >;
   /** Chats asked for that did not exist when the recording stopped. */
   missing_chats: string[];
+  /**
+   * Every scenario with a start or finish in the window, as it stood at the
+   * stop, whether or not a recorded chat shows it.
+   */
+  scenarios: Record<string, unknown>[];
+}
+
+/** Labels a test runner gives: text, numbers and booleans, kept as text. */
+export type ScenarioLabels = Record<string, string | number | boolean>;
+
+/**
+ * A piece of evidence for a failure: a message by its message log seq, a
+ * call by its request id, or a chat event by its id (the viewer's
+ * data-event-id). Each must exist when the scenario finishes.
+ */
+export type ScenarioEvidence =
+  | { kind: "message"; seq: number; labels?: ScenarioLabels }
+  | { kind: "call"; requestId: string; labels?: ScenarioLabels }
+  | { kind: "event"; eventId: number; labels?: ScenarioLabels };
+
+/** A scenario as a test runner reported it. Test-only, never Telegram's. */
+export interface ScenarioReport {
+  run_id: string;
+  scenario_id: string;
+  title: string;
+  labels: Record<string, string>;
+  /** The chats the runner named, as viewer references; null for none. */
+  chats: string[] | null;
+  /** Running from its start until the runner finishes it. */
+  status: "running" | "finished";
+  /** The runner's result; null while running. The server never infers one. */
+  result: "passed" | "failed" | "skipped" | null;
+  failure: {
+    message: string;
+    evidence: Array<
+      | { kind: "message"; seq: number; labels: Record<string, string> }
+      | { kind: "call"; request_id: string; labels: Record<string, string> }
+      | { kind: "event"; event_id: number; labels: Record<string, string> }
+    >;
+  } | null;
+  /** Its marks on the message log's sequence; null when not reported. */
+  started: { seq: number; at: number; epoch: number } | null;
+  finished: { seq: number; at: number; epoch: number } | null;
 }
 
 export interface Recording {
@@ -683,12 +787,39 @@ export interface TelegramBotTestServer {
    * started before a restore is dropped with an error.
    */
   stopRecording(name: string): Promise<Recording>;
+  /**
+   * A test runner starts a scenario of a run. Test-only: Telegram knows
+   * nothing of it. Each run's scenario id is reported once.
+   */
+  startScenario(scenario: {
+    runId: string;
+    scenarioId: string;
+    title?: string;
+    labels?: ScenarioLabels;
+    chats?: ChatRef[];
+  }): Promise<ScenarioReport>;
+  /**
+   * A test runner finishes a scenario with its result; a failed one may say
+   * why and name its evidence. A skipped scenario need not have started.
+   */
+  finishScenario(scenario: {
+    runId: string;
+    scenarioId: string;
+    result: "passed" | "failed" | "skipped";
+    title?: string;
+    labels?: ScenarioLabels;
+    failure?: { message: string; evidence?: ScenarioEvidence[] };
+  }): Promise<ScenarioReport>;
+  /** Every scenario reported, or one run's, in the order first reported. */
+  getScenarios(options?: {
+    runId?: string;
+  }): Promise<{ epoch: number; scenarios: ScenarioReport[] }>;
   getClock(): Promise<FakeClockState>;
   advanceTime(ms: number): Promise<FakeClockState>;
   /**
-   * Wait for queued/in-flight webhook attempts, including retries Telegram
-   * would still make and calls a webhook answered with, not downstream
-   * enforcement or queued getUpdates consumption.
+   * Wait until queued and in-flight webhook attempts settle, retries still due
+   * and calls a webhook answered with included. It does not empty getUpdates
+   * queues or wait for what the bot does after answering.
    */
   drainDeliveries(
     options?: FakeWaitOptions & { botId?: number },
@@ -713,6 +844,8 @@ export interface TelegramBotTestServer {
     supportsJoinRequestQueries?: boolean;
     /** Its Telegram Login client secret; default random. */
     loginClientSecret?: string;
+    /** It runs in privacy mode, as the privacyMode option. Default false. */
+    privacyMode?: boolean;
   }): Promise<{ id: number; is_bot: true; username: string }>;
   /**
    * Delete a bot added with addBot: it leaves every chat it is in, and its
@@ -903,6 +1036,17 @@ export interface TelegramBotTestServer {
     sender: "person" | "owner",
     text: string,
   ): Promise<{ message_id: number; date: number; update_id: number | null }>;
+  /**
+   * The person or the owner deletes a message of the business chat, for
+   * both. The bot gets deleted_business_messages unless the connection is
+   * disabled. A message that is not there is skipped (deleted: false).
+   */
+  deleteBusinessMessage(
+    connectionId: string,
+    userId: number,
+    messageId: number,
+    sender: "person" | "owner",
+  ): Promise<{ message_id: number; deleted: boolean; update_id: number | null }>;
   /** The business chat with a person, newest first. */
   getBusinessChat(
     connectionId: string,
@@ -954,6 +1098,27 @@ export interface TelegramBotTestServer {
     }>,
     options?: { threadId?: number },
   ): Promise<{ media_group_id: string; message_ids: number[] }>;
+  /**
+   * The user deletes a message for everyone: their own, or, with
+   * can_delete_messages (an administrator or the creator in a basic group),
+   * anyone's. Refused as Telegram refuses it ("Message can't be deleted").
+   * Bots get no update. A message that is not there is skipped
+   * (deleted: false).
+   */
+  deleteMessage(
+    chatId: number,
+    messageId: number,
+    userId: number,
+  ): Promise<{ message_id: number; deleted: boolean }>;
+  /**
+   * The user deletes any message of their private chat with the bot, for
+   * both. Bots get no update.
+   */
+  deleteDirectMessage(
+    userId: number,
+    messageId: number,
+    options?: DirectChatOptions,
+  ): Promise<{ message_id: number; deleted: boolean }>;
   /**
    * The author edits their message's text or caption, trimmed as when posted;
    * bots get edited_message (edited_channel_post in a channel). Text that shows
@@ -1029,6 +1194,7 @@ export interface TelegramBotTestServer {
   sendDirectMessage(
     userId: number,
     message: string | Omit<PostedMessage, "threadId" | "sendAs">,
+    options?: DirectChatOptions,
   ): Promise<number>;
   /**
    * The user votes in a poll: option indexes, or an empty list to retract.
@@ -1047,18 +1213,19 @@ export interface TelegramBotTestServer {
     userId: number,
     messageId: number,
     optionIds: number[],
+    options?: DirectChatOptions,
   ): Promise<Poll>;
   /** The user presses an inline button in their private chat with the bot. */
   pressDirectButton(
     userId: number,
     messageId: number,
     data: string,
-    options?: PressOptions,
+    options?: PressOptions & DirectChatOptions,
   ): Promise<ButtonAnswer>;
   /**
    * The user opens a URL button, named by its text or its index (row by row,
-   * from 0). A t.me/<bot>?start=<parameter> link to the first bot sends
-   * "/start <parameter>" in the user's private chat; a startgroup or
+   * from 0). A t.me/<bot>?start=<parameter> link to one of the server's bots
+   * sends "/start <parameter>" in the user's private chat with it; a startgroup or
    * startchannel link to one of the server's bots adds it to addToChatId as
    * addBotViaLink does. Any other URL changes nothing. Refused for a button
    * that is not a URL button.
@@ -1083,7 +1250,7 @@ export interface TelegramBotTestServer {
     userId: number,
     messageId: number,
     button: string | number,
-    options?: OpenUrlOptions,
+    options?: OpenUrlOptions & DirectChatOptions,
   ): Promise<OpenedUrl>;
   /**
    * Messages not deleted, newest first, with ephemeral messages (message_id 0,
@@ -1093,19 +1260,29 @@ export interface TelegramBotTestServer {
   getMessages(chatId: number): Promise<Message[]>;
   /**
    * A regular message by its message_id; an ephemeral one (message_id 0) is
-   * found with getEphemeralMessage.
+   * found with getEphemeralMessage. In a basic group, by the chat's own id,
+   * with the id each bot knows it by.
    */
   getMessage(
     chatId: number,
     messageId: number,
-  ): Promise<{ exists: boolean; deleted: boolean; message?: Message }>;
+  ): Promise<{
+    exists: boolean;
+    deleted: boolean;
+    message?: Message;
+    reactions?: Record<string, string[]>;
+    bot_message_ids?: Record<string, number>;
+  }>;
   /** An ephemeral message by its ephemeral_message_id. */
   getEphemeralMessage(
     chatId: number,
     ephemeralMessageId: number,
   ): Promise<{ exists: boolean; deleted: boolean; message?: Message }>;
-  /** The private chat's messages, newest first. */
-  getDirectMessages(userId: number): Promise<Message[]>;
+  /** The user's private chat with the bot, newest first. */
+  getDirectMessages(
+    userId: number,
+    options?: DirectChatOptions,
+  ): Promise<Message[]>;
   /** The member as getChatMember would return them to the first bot. */
   getMember(chatId: number, userId: number): Promise<ChatMember>;
   /** User ids with a pending join request. */
@@ -1123,9 +1300,10 @@ export interface TelegramBotTestServer {
   /**
    * The chat's messages stored after a mark (`since`, a cursor), oldest first;
    * with includeDeleted also those deleted, and those deleted after the mark.
-   * A positive chat id reads the user's private chat, all bots' messages in
-   * it or one bot's (botId, a deleted bot's too). Read the cursor once as the
-   * mark; pass its epoch to refuse a mark from before a restore.
+   * A user id reads their private chat with a bot: botId names it (a deleted
+   * bot's too), and is needed when they have private chats with more than one
+   * bot. Read the cursor once as the mark; pass its epoch to refuse a mark
+   * from before a restore.
    */
   getMessageLog(
     chatId: number,
@@ -1163,7 +1341,10 @@ export type OwnerDialogKind =
 
 export interface OwnerDialogFields {
   kind: OwnerDialogKind;
-  /** The raw id; the dialog's peer id is derived from it (-id for a group, -100<id> for a supergroup or channel). */
+  /**
+   * The raw id; the dialog's peer id is derived from it (-id for a group, -100<id> for a supergroup
+   * or channel).
+   */
   id?: number;
   /** Groups, supergroups and channels. */
   title?: string;
@@ -1188,7 +1369,9 @@ export interface OwnerMessageFields {
   id: number;
   /** Unix seconds. */
   date: number;
-  /** The owner's id or a user added with addOwnerUser; omit in a private chat or for a channel post. */
+  /**
+   * The owner's id or a user added with addOwnerUser; omit in a private chat or for a channel post.
+   */
   fromId?: number;
   out?: boolean;
   text?: string;

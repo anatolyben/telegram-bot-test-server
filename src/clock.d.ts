@@ -7,7 +7,9 @@
  * set, it throws until refreshFakeClock has read that server's clock once.
  */
 export function fakeClockNow(): number;
-/** Read GET /_fake/clock now; caches and returns its time (Date.now() when the variable is unset). */
+/**
+ * Read GET /_fake/clock now; caches and returns its time (Date.now() when the variable is unset).
+ */
 export function refreshFakeClock(): Promise<number>;
 /** Take a clockWebhook push ({ now, mode }, and a running clock's offset) into the cache. */
 export function receiveFakeClock(body: {
@@ -25,7 +27,10 @@ export interface FakeClockRequest {
   on(event: "data", listener: (chunk: Uint8Array) => void): unknown;
   on(event: "end", listener: () => void): unknown;
 }
-/** What fakeClockHandler writes of a response: a Node ServerResponse, or anything with writeHead(...).end(). */
+/**
+ * What fakeClockHandler writes of a response: a Node ServerResponse, or anything with
+ * writeHead(...).end().
+ */
 export interface FakeClockResponse {
   writeHead(
     statusCode: number,

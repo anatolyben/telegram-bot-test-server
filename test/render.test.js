@@ -15,6 +15,7 @@ import {
   renderMessage,
   renderCall,
   renderPaneHeader,
+  renderScenario,
   renderText,
   renderToolbar,
   serviceLinks,
@@ -443,6 +444,7 @@ describe("render", () => {
       as: null,
       bots: null,
       methods: null,
+      runs: null,
       topic: null,
       theme: null,
     });
@@ -454,7 +456,7 @@ describe("render", () => {
       "members",
     ]);
     const view = parseView(
-      `?chat=1&chats=${GROUP},${GROUP},8800000000:123456&show=bogus,calls,list,chat&layout=split&as=8800000000&bots=123456&methods=deleteMessage,banChatMember&topic=general&theme=dark`,
+      `?chat=1&chats=${GROUP},${GROUP},8800000000:123456&show=bogus,calls,list,chat&layout=split&as=8800000000&bots=123456&methods=deleteMessage,banChatMember&runs=ci-1,ci-2&topic=general&theme=dark`,
     );
     expect(view).toEqual({
       chats: [String(GROUP), "8800000000:123456"],
@@ -463,12 +465,13 @@ describe("render", () => {
       as: 8800000000,
       bots: [123456],
       methods: ["deleteMessage", "banChatMember"],
+      runs: ["ci-1", "ci-2"],
       topic: "general",
       theme: "dark",
     });
     expect(parseView(viewToSearch(view))).toEqual(view);
     expect(viewToSearch(view)).toBe(
-      `?chats=${GROUP},8800000000:123456&show=list,chat,calls&layout=split&as=8800000000&bots=123456&methods=deleteMessage,banChatMember&topic=general&theme=dark`,
+      `?chats=${GROUP},8800000000:123456&show=list,chat,calls&layout=split&as=8800000000&bots=123456&methods=deleteMessage,banChatMember&runs=ci-1,ci-2&topic=general&theme=dark`,
     );
     expect(viewToSearch(parseView(`?chat=${GROUP}`))).toBe(`?chat=${GROUP}`);
     expect(
@@ -665,6 +668,27 @@ describe("render", () => {
     expect(deletedHtml).toContain('data-deleted="true"');
     expect(deletedHtml).toContain(`data-deleted-by="${SECOND.id}"`);
     expect(deletedHtml).toContain('data-author-kind="user"');
+
+    // A person who deleted a message is named, as a bot is.
+    const byPerson = renderMessage(
+      message(
+        { from: EVE, text: "my typo" },
+        {
+          deleted: true,
+          deleted_by: {
+            seq: 10,
+            bot_id: null,
+            user_id: EVE.id,
+            method: null,
+            request_id: null,
+            at: 1,
+          },
+        },
+      ),
+      ctx,
+    );
+    expect(byPerson).toContain(`data-deleted-by="${EVE.id}"`);
+    expect(byPerson).toMatch(/Deleted · Eve/);
 
     const ephemeralHtml = renderMessage(ephemeral, ctx);
     expect(ephemeralHtml).toContain('data-ephemeral-id="1"');
@@ -1304,5 +1328,96 @@ describe("render", () => {
     expect(chipsOf(draw(post, ANN.id))[0]["data-reaction-mine"]).toBe(
       undefined,
     );
+  });
+
+  it("names failure evidence by what it is, escaped, and keeps the raw id of evidence that is gone", () => {
+    const spam = message({
+      from: EVE,
+      text: 'cheap followers <script>alert("x")</script>',
+    });
+    const ban = {
+      kind: "event",
+      seq: 91,
+      at: 1,
+      type: "member",
+      user_id: EVE.id,
+      actor_id: SECOND.id,
+      old: { status: "member" },
+      new: { status: "kicked", until_date: 0 },
+      reason: "change",
+    };
+    const finish = {
+      kind: "scenario",
+      seq: 92,
+      at: 1,
+      phase: "finish",
+      run_id: "r",
+      scenario_id: "spam",
+      title: "spam",
+      status: "finished",
+      result: "failed",
+      labels: {},
+      label_keys: [],
+      failure: {
+        message: "kept the spam",
+        evidence: [
+          {
+            kind: "message",
+            seq: spam.seq,
+            chat_ref: String(GROUP),
+            chat_label: CHAT.title,
+            labels: { role: "<b>bad</b>" },
+            subject: spam,
+          },
+          {
+            kind: "call",
+            request_id: "a1:0:2",
+            chat_ref: String(CHANNEL),
+            chat_label: NEWS.title,
+            labels: {},
+            subject: {
+              bot_id: SECOND.id,
+              method: "deleteMessage",
+              outcome: "rejected",
+              status: 400,
+            },
+          },
+          {
+            kind: "event",
+            event_id: 91,
+            chat_ref: String(GROUP),
+            chat_label: CHAT.title,
+            labels: {},
+            subject: ban,
+          },
+          {
+            kind: "message",
+            seq: 7,
+            chat_ref: null,
+            chat_label: null,
+            labels: {},
+            subject: null,
+          },
+        ],
+      },
+    };
+    const html = renderScenario(finish, makeContext(pageOf([])));
+    expectSafe(html);
+    const items = [...html.matchAll(/<li class="tv-evidence">(.*?)<\/li>/g)];
+    const words = items.map(([, item]) =>
+      item
+        .replace(/<[^>]+>/g, "")
+        .replaceAll("&lt;", "<")
+        .replaceAll("&gt;", ">")
+        .replaceAll("&quot;", '"')
+        .replaceAll("&amp;", "&"),
+    );
+    expect(words).toEqual([
+      `${EVE.first_name}: “cheap followers <script>alert("x")</script>” in ${CHAT.title} role: <b>bad</b>`,
+      `Second Bot added bot called deleteMessage: rejected 400 in ${NEWS.title}`,
+      `${EVE.first_name} banned forever by Second Bot added bot`,
+      "message seq 7",
+    ]);
+    expect(html).toContain('data-role="show-evidence"');
   });
 });

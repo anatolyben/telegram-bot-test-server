@@ -168,6 +168,94 @@ describe("what members post", () => {
     });
   });
 
+  it("writes the older forward fields beside forward_origin, as the Bot API server does", async () => {
+    const { fake, api, member, me } = await setup();
+    const source = await fake.createUser({ first_name: "Source" });
+    const channel = await fake.createChat({ type: "channel", ownerId: OWNER });
+    await fake.setBotMembership(channel, me.id, { status: "administrator" });
+    const post = (
+      await api("sendMessage", { chat_id: channel, text: "news" })
+    ).result;
+    const legacy = (message) =>
+      Object.fromEntries(
+        Object.entries(message).filter(([key]) =>
+          key.startsWith("forward_") && key !== "forward_origin",
+        ),
+      );
+    const forward = async (forwardFrom) => {
+      const id = await fake.post(GROUP, member, { text: "fwd", forwardFrom });
+      return (await fake.getMessage(GROUP, id)).message;
+    };
+
+    const fromUser = await forward({ userId: source });
+    expect(legacy(fromUser)).toEqual({
+      forward_from: fromUser.forward_origin.sender_user,
+      forward_date: fromUser.forward_origin.date,
+    });
+    const hidden = await forward({ senderName: "Seller" });
+    expect(legacy(hidden)).toEqual({
+      forward_sender_name: "Seller",
+      forward_date: hidden.forward_origin.date,
+    });
+    const fromGroup = await forward({ chatId: GROUP, authorSignature: "Mod" });
+    expect(legacy(fromGroup)).toEqual({
+      forward_from_chat: fromGroup.forward_origin.sender_chat,
+      forward_signature: "Mod",
+      forward_date: fromGroup.forward_origin.date,
+    });
+    const fromChannel = await forward({
+      chatId: channel,
+      messageId: post.message_id,
+    });
+    expect(legacy(fromChannel)).toEqual({
+      forward_from_chat: post.chat,
+      forward_from_message_id: post.message_id,
+      forward_date: post.date,
+    });
+
+    // A bot's forward has them too; a copy has none.
+    const forwarded = await api("forwardMessage", {
+      chat_id: GROUP,
+      from_chat_id: channel,
+      message_id: post.message_id,
+    });
+    expect(legacy(forwarded.result)).toEqual({
+      forward_from_chat: post.chat,
+      forward_from_message_id: post.message_id,
+      forward_date: post.date,
+    });
+    const copied = await api("copyMessage", {
+      chat_id: GROUP,
+      from_chat_id: GROUP,
+      message_id: forwarded.result.message_id,
+    });
+    expect(
+      legacy((await fake.getMessage(GROUP, copied.result.message_id)).message),
+    ).toEqual({});
+  });
+
+  it("writes can_manage_voice_chats beside can_manage_video_chats, and takes it to promote", async () => {
+    const { fake, api, member, me } = await setup();
+    await fake.setBotMembership(GROUP, me.id, {
+      rights: { can_promote_members: true, can_manage_video_chats: true },
+    });
+    await api("promoteChatMember", {
+      chat_id: GROUP,
+      user_id: member,
+      can_manage_voice_chats: true,
+    });
+    expect(
+      (await api("getChatMember", { chat_id: GROUP, user_id: member })).result,
+    ).toMatchObject({
+      status: "administrator",
+      can_manage_video_chats: true,
+      can_manage_voice_chats: true,
+    });
+    expect(
+      (await api("getChatMember", { chat_id: GROUP, user_id: OWNER })).result,
+    ).not.toHaveProperty("can_manage_voice_chats");
+  });
+
   it("sends an album as messages that share a media_group_id", async () => {
     const { fake, api, member } = await setup();
     const hook = await startReceiver();
@@ -248,6 +336,74 @@ describe("what members post", () => {
     expect((await fake.getMessage(GROUP, photo)).message).not.toHaveProperty(
       "caption",
     );
+  });
+
+  it("lets a member delete their own message and an administrator with can_delete_messages any, and tells no bot", async () => {
+    const { fake, api, member } = await setup();
+    const hook = await startReceiver();
+    await api("setWebhook", {
+      url: hook.url,
+      allowed_updates: ["message", "edited_message", "chat_member"],
+    });
+    const other = await fake.createUser({ first_name: "Other" });
+    await fake.join(GROUP, other);
+    const own = await fake.post(GROUP, member, "mine");
+    const theirs = await fake.post(GROUP, other, "theirs");
+    const sent = hook.ofType("message").length;
+
+    await expect(fake.deleteMessage(GROUP, theirs, member)).rejects.toThrow(
+      "Message can't be deleted",
+    );
+    expect(await fake.deleteMessage(GROUP, own, member)).toEqual({
+      message_id: own,
+      deleted: true,
+    });
+    await fake.promoteMember(GROUP, member, {
+      rights: { can_delete_messages: true },
+    });
+    await fake.deleteMessage(GROUP, theirs, member);
+
+    expect((await fake.getMessage(GROUP, own)).deleted).toBe(true);
+    expect((await fake.getMessage(GROUP, theirs)).deleted).toBe(true);
+    const { messages } = await fake.getMessageLog(GROUP, {
+      includeDeleted: true,
+    });
+    expect(
+      messages
+        .filter((entry) => [own, theirs].includes(entry.message.message_id))
+        .map((entry) => entry.deleted_by),
+    ).toEqual([
+      expect.objectContaining({ bot_id: null, user_id: member, method: null }),
+      expect.objectContaining({ bot_id: null, user_id: member, method: null }),
+    ]);
+    // The Bot API sends nothing for a deletion: the bot only finds the
+    // message gone.
+    await fake.drainDeliveries();
+    expect(hook.ofType("message")).toHaveLength(sent);
+    expect(
+      await api("deleteMessage", { chat_id: GROUP, message_id: own }),
+    ).toMatchObject({
+      status: 400,
+      description: "Bad Request: message to delete not found",
+    });
+  });
+
+  it("lets a user delete any message of their private chat with a bot, for both", async () => {
+    const { fake, api, member } = await setup();
+    await fake.sendDirectMessage(member, "/start");
+    const answer = (await api("sendMessage", { chat_id: member, text: "hi" }))
+      .result.message_id;
+    await fake.deleteDirectMessage(member, answer);
+    expect((await fake.getDirectMessages(member)).map((m) => m.text)).toEqual([
+      "/start",
+    ]);
+    expect(
+      await api("editMessageText", {
+        chat_id: member,
+        message_id: answer,
+        text: "edited",
+      }),
+    ).toMatchObject({ status: 400 });
   });
 
   it("tells administrator bots that asked for it when a member reacts", async () => {
@@ -864,6 +1020,8 @@ describe("administrators and chat settings", () => {
       "can_delete_stories",
       "can_send_welcome_messages",
       "is_anonymous",
+      // The older name the Bot API server still writes (Client.cpp:5837).
+      "can_manage_voice_chats",
     ];
     const channelAdmin = await fake.getMember(channel, reader);
     expect(channelAdmin).toMatchObject({
@@ -1691,6 +1849,203 @@ describe("posts on behalf of a chat", () => {
     const plain = (await fake.getMessage(GROUP, self)).message;
     expect(plain.from.id).toBe(member);
     expect(plain).not.toHaveProperty("sender_chat");
+  });
+
+  it("lets an anonymous owner post and react as the group, and no other anonymous administrator react", async () => {
+    const { fake, api, me } = await setup();
+    const hook = await startReceiver();
+    await api("setWebhook", {
+      url: hook.url,
+      allowed_updates: ["message", "message_reaction"],
+    });
+    const owner = await fake.createUser({ first_name: "Olga" });
+    const group = await fake.createChat({
+      ownerId: owner,
+      ownerAnonymous: true,
+    });
+    // The anonymous owner adds no bot here: an administrator who is not
+    // anonymous does.
+    const named = await fake.createUser();
+    await fake.join(group, named);
+    await fake.promoteMember(group, named, {
+      rights: { can_invite_users: true, can_promote_members: true },
+    });
+    await fake.setBotMembership(group, me.id, {
+      by: named,
+      rights: { can_delete_messages: true, can_promote_members: true },
+    });
+    const admin = await fake.createUser();
+    await fake.join(group, admin);
+    await fake.promoteMember(group, admin, {
+      rights: { is_anonymous: true, can_pin_messages: true },
+    });
+
+    expect(
+      (await api("getChatMember", { chat_id: group, user_id: owner })).result,
+    ).toMatchObject({ status: "creator", is_anonymous: true });
+    const post = await fake.post(group, owner, "From the group");
+    expect((await fake.getMessage(group, post)).message).toMatchObject({
+      from: GROUP_ANONYMOUS_BOT,
+      sender_chat: { id: group },
+    });
+
+    await fake.react(group, post, owner, "👍");
+    await expect(fake.react(group, post, admin, "👍")).rejects.toThrow(
+      "The reaction isn't available for the message",
+    );
+    // The owner's user id names no reaction: it is the group's.
+    await api("deleteMessageReaction", {
+      chat_id: group,
+      message_id: post,
+      user_id: owner,
+    });
+    await api("deleteMessageReaction", {
+      chat_id: group,
+      message_id: post,
+      actor_chat_id: group,
+    });
+    await fake.drainDeliveries();
+    const reactions = hook.ofType("message_reaction");
+    expect(reactions).toHaveLength(2);
+    expect(reactions[0]).toMatchObject({
+      actor_chat: { id: group, type: "supergroup" },
+      new_reaction: [{ type: "emoji", emoji: "👍" }],
+    });
+    expect(reactions[0]).not.toHaveProperty("user");
+    expect(reactions[1]).toMatchObject({
+      actor_chat: { id: group },
+      old_reaction: [{ type: "emoji", emoji: "👍" }],
+      new_reaction: [],
+    });
+  });
+
+  it("refuses the service actions of an anonymous owner or administrator, whose look no source shows", async () => {
+    const { fake, api, me } = await setup();
+    const owner = await fake.createUser({ first_name: "Olga" });
+    const forum = await fake.createChat({
+      ownerId: owner,
+      ownerAnonymous: true,
+      isForum: true,
+    });
+    const named = await fake.createUser();
+    await fake.join(forum, named);
+    await fake.promoteMember(forum, named, {
+      rights: { can_invite_users: true, can_promote_members: true },
+    });
+    await fake.setBotMembership(forum, me.id, { by: named });
+    const post = await fake.post(forum, named, "hello");
+    const second = await fake.addBot({ token: "777777:B", username: "b_bot" });
+    const refused = /anonymous owner or administrator/;
+
+    await expect(fake.renameChat(forum, { title: "New" })).rejects.toThrow(
+      refused,
+    );
+    await expect(
+      fake.changeChatPhoto(forum, { bytes: Buffer.from("photo") }),
+    ).rejects.toThrow(refused);
+    await expect(fake.pinMessage(forum, post, owner)).rejects.toThrow(refused);
+    await expect(fake.setBotMembership(forum, second.id)).rejects.toThrow(
+      refused,
+    );
+    await expect(fake.addBotViaLink(forum, second.id)).rejects.toThrow(refused);
+    await expect(fake.createTopic(forum, "News")).rejects.toThrow(refused);
+
+    // Nothing happened.
+    expect((await api("getChat", { chat_id: forum })).result.title).toBe(
+      "Group",
+    );
+    expect(
+      (await api("getChatMember", { chat_id: forum, user_id: second.id }))
+        .result.status,
+    ).toBe("left");
+  });
+
+  it("bans and unbans a channel members post as, with Telegram's errors", async () => {
+    const { fake, api, me } = await setup();
+    const cy = await fake.createUser({ first_name: "Cy", is_premium: true });
+    await fake.join(GROUP, cy);
+    const news = await fake.createChat({ type: "channel", ownerId: cy });
+    const call = (method, params) =>
+      api(method, { chat_id: GROUP, sender_chat_id: news, ...params });
+
+    await fake.setBotMembership(GROUP, me.id, {
+      rights: { can_restrict_members: false },
+    });
+    expect(await call("banChatSenderChat")).toMatchObject({
+      description:
+        "Bad Request: not enough rights to restrict/unrestrict chat member",
+    });
+    await fake.setBotMembership(GROUP, me.id, {
+      rights: { can_restrict_members: true },
+    });
+    expect(await call("banChatSenderChat", { sender_chat_id: "" })).toMatchObject(
+      { description: "Bad Request: sender_chat_id is empty" },
+    );
+    expect(
+      await call("banChatSenderChat", { sender_chat_id: -1009999999999 }),
+    ).toMatchObject({ description: "Bad Request: member not found" });
+    // What Telegram does with a chat's until_date is unknown: refused, and
+    // nothing is banned.
+    expect(
+      await call("banChatSenderChat", {
+        until_date: Math.floor(Date.now() / 1000) + 3600,
+      }),
+    ).toMatchObject({
+      status: 404,
+      description: "Not Found: method not found",
+    });
+    await fake.post(GROUP, cy, { text: "still news", sendAs: news });
+
+    expect((await call("banChatSenderChat")).ok).toBe(true);
+    await expect(
+      fake.post(GROUP, cy, { text: "news", sendAs: news }),
+    ).rejects.toThrow("USER_BANNED_IN_CHANNEL");
+    // Cy still writes as himself.
+    await fake.post(GROUP, cy, "hello");
+    expect((await call("unbanChatSenderChat")).ok).toBe(true);
+    await fake.post(GROUP, cy, { text: "news", sendAs: news });
+
+    const basic = await fake.createChat({ type: "group", ownerId: OWNER });
+    await fake.setBotMembership(basic, me.id);
+    expect(
+      await api("banChatSenderChat", { chat_id: basic, sender_chat_id: news }),
+    ).toMatchObject({ description: "Bad Request: can't ban chats in basic groups" });
+    expect(
+      (await api("unbanChatSenderChat", { chat_id: basic, sender_chat_id: news }))
+        .ok,
+    ).toBe(true);
+  });
+
+  it("bans and unbans a user given as sender_chat_id as banChatMember does", async () => {
+    const { fake, api, member, me } = await setup();
+    await fake.setBotMembership(GROUP, me.id, {
+      rights: { can_restrict_members: true },
+    });
+    const until = Math.floor(Date.now() / 1000) + 3600;
+    expect(
+      (
+        await api("banChatSenderChat", {
+          chat_id: GROUP,
+          sender_chat_id: member,
+          until_date: until,
+        })
+      ).ok,
+    ).toBe(true);
+    expect(
+      (await api("getChatMember", { chat_id: GROUP, user_id: member })).result,
+    ).toMatchObject({ status: "kicked", until_date: until });
+
+    // In a basic group TDLib removes the user, as banChatMember does there.
+    const basic = await fake.createChat({ type: "group", ownerId: OWNER });
+    await fake.setBotMembership(basic, me.id, { status: "administrator" });
+    const bob = await fake.createUser();
+    await fake.join(basic, bob);
+    expect(
+      await api("unbanChatSenderChat", { chat_id: basic, sender_chat_id: bob }),
+    ).toMatchObject({ ok: true, result: true });
+    expect(
+      (await api("getChatMember", { chat_id: basic, user_id: bob })).result,
+    ).toMatchObject({ status: "left" });
   });
 
   it("forwards a post made on behalf of a supergroup, and a signed channel post", async () => {

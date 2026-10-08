@@ -306,10 +306,8 @@ export function createUiState(model) {
   }
 
   /**
-   * A user's private chat with one bot. Users write only to the first bot,
-   * and any bot's messages to them are kept in the same stored chat, so each
-   * bot's chat is a part of it (model.privatePairOf). It exists, empty, for
-   * any person and bot: nothing is stored to open it.
+   * A user's private chat with one bot, a stored chat of its own. It exists,
+   * empty, for any person and bot: nothing is stored to open it.
    */
   function privatePair(userId, botId) {
     const user = model.user(userId);
@@ -318,7 +316,7 @@ export function createUiState(model) {
     return {
       key: `${userId}:${botId}`,
       kind: "private",
-      chat: model.privateChat(userId) ?? null,
+      chat: model.privateChat(userId, botId) ?? null,
       user,
       userId,
       botId,
@@ -360,17 +358,9 @@ export function createUiState(model) {
     }
     for (const chat of model.privateChats()) {
       if (as !== null && chat.id !== as) continue;
-      const pairs = new Set();
-      for (const stored of [
-        ...chat.messages.values(),
-        ...(chat.events ?? []),
-      ]) {
-        pairs.add(model.privatePairOf(chat, stored));
-      }
-      for (const botId of pairs) {
-        const target = privatePair(chat.id, botId);
-        if (target) targets.push(target);
-      }
+      if (!chat.messages.size && !chat.events?.length) continue;
+      const target = privatePair(chat.id, chat.botId);
+      if (target) targets.push(target);
     }
     return targets;
   }
@@ -385,35 +375,194 @@ export function createUiState(model) {
     return "Bot calls without a chat";
   }
 
-  /** Every item of a chat or private pair (or of all of them, "all"), oldest first. */
-  function itemsOf(target) {
+  /**
+   * Every item of a chat or private pair (or of all of them, "all"), oldest
+   * first, with the marks of the scenarios a test runner reported there
+   * (scenarioItems); `marks: false` leaves those out.
+   */
+  function itemsOf(target, { marks = true } = {}) {
     if (target.kind === "all") {
       const items = [];
       for (const each of everyTarget()) {
         const label = labelOf(each);
-        for (const item of itemsOf(each)) {
+        for (const item of itemsOf(each, { marks: false })) {
           items.push({ ...item, chat_ref: each.key, chat_label: label });
         }
       }
+      if (marks) items.push(...scenarioItems());
       return items.sort((left, right) => left.seq - right.seq);
     }
     const { chat } = target;
     if (!chat) return [];
-    const keep =
-      target.kind === "private"
-        ? (stored) => model.privatePairOf(chat, stored) === target.botId
-        : () => true;
     const items = [];
     for (const entry of chat.messages.values()) {
-      if (keep(entry)) items.push(messageItem(chat, entry));
+      items.push(messageItem(chat, entry));
     }
     for (const entry of chat.ephemeral?.values() ?? []) {
-      if (keep(entry)) items.push(messageItem(chat, entry));
+      items.push(messageItem(chat, entry));
     }
     for (const event of chat.events ?? []) {
-      if (keep(event)) items.push({ kind: "event", ...model.eventJson(event) });
+      items.push({ kind: "event", ...model.eventJson(event) });
     }
-    return items.sort((left, right) => left.seq - right.seq);
+    items.sort((left, right) => left.seq - right.seq);
+    if (!marks) return items;
+    const shown = scenarioItems().filter((item) =>
+      scenarioIn(item, target.key, items),
+    );
+    return shown.length
+      ? [...items, ...shown].sort((left, right) => left.seq - right.seq)
+      : items;
+  }
+
+  /**
+   * The marks of the scenarios a runner reported (index.js startScenario,
+   * finishScenario) as page items: where each started or finished, with the
+   * scenario as it stands. `label_keys` lists every label key its run uses,
+   * so the viewer shows a missing one as unknown. Each piece of failure
+   * evidence names its chat (`chat_ref`), null when it is gone.
+   */
+  function scenarioItems() {
+    const marks = model.scenarioMarks();
+    const keys = new Map();
+    for (const { scenario } of marks) {
+      if (!keys.has(scenario.runId)) keys.set(scenario.runId, new Set());
+      for (const key of Object.keys(scenario.labels)) {
+        keys.get(scenario.runId).add(key);
+      }
+    }
+    return marks.map(({ scenario, ...mark }) => ({
+      kind: "scenario",
+      seq: mark.seq,
+      at: mark.at,
+      after_request: mark.afterRequest,
+      request_id: null,
+      phase: mark.phase,
+      run_id: scenario.runId,
+      scenario_id: scenario.scenarioId,
+      title: scenario.title,
+      status: scenario.status,
+      result: scenario.result,
+      labels: { ...scenario.labels },
+      label_keys: [...keys.get(scenario.runId)],
+      chats: scenario.chats ? [...scenario.chats] : null,
+      window: {
+        start_seq:
+          scenario.started?.epoch === model.epoch()
+            ? scenario.started.seq
+            : null,
+        finish_seq:
+          scenario.finished?.epoch === model.epoch()
+            ? scenario.finished.seq
+            : null,
+      },
+      failure: scenario.failure
+        ? {
+            message: scenario.failure.message,
+            evidence: scenario.failure.evidence.map((each) => ({
+              ...each,
+              labels: { ...each.labels },
+              ...evidenceFound(each),
+            })),
+          }
+        : null,
+    }));
+  }
+
+  /**
+   * Whether a scenario's mark shows in the chat `key`, whose items (without
+   * marks) are `items`: the runner named the chat; or named none, and the
+   * chat has an item between the scenario's start and finish; or a piece of
+   * its failure evidence is in the chat.
+   */
+  function scenarioIn(item, key, items) {
+    if (item.failure?.evidence.some((each) => each.chat_ref === key)) {
+      return true;
+    }
+    if (item.chats) {
+      return item.chats.some((ref) => resolve(ref)?.key === key);
+    }
+    const { start_seq: start, finish_seq: finish } = item.window;
+    if (start === null) return false;
+    return items.some(
+      (each) => each.seq > start && (finish === null || each.seq < finish),
+    );
+  }
+
+  /**
+   * Where a piece of failure evidence is and what it is: its chat as a
+   * viewer reference (`chat_ref`) and by name (`chat_label`), and the thing
+   * itself (`subject`): the message or event as a page item, or the call's
+   * bot, method and outcome. All null when it is gone.
+   */
+  function evidenceFound(evidence) {
+    if (evidence.kind === "call") {
+      const botIds = new Set(model.bots().map((record) => record.id));
+      const named = (each) => each.request_id === evidence.request_id;
+      const call = model.calls().find(named);
+      // A refused request (rejected_requests) belongs to "calls", as in
+      // callsByChat.
+      const found = call ?? model.rejectedRequests().find(named);
+      if (!found) {
+        return { chat_ref: "calls", chat_label: null, subject: null };
+      }
+      const key = (call && callChat(call, botIds)?.key) ?? "calls";
+      return {
+        chat_ref: key,
+        chat_label: labelOf(resolve(key) ?? { kind: "calls" }),
+        subject: {
+          bot_id: found.bot_id ?? null,
+          method: String(found.method),
+          outcome: found.outcome,
+          status: found.status ?? null,
+        },
+      };
+    }
+    const seq = evidence.kind === "event" ? evidence.event_id : evidence.seq;
+    for (const target of everyTarget()) {
+      for (const stored of storedIn(target.chat)) {
+        if (stored.seq !== seq) continue;
+        const isEvent = stored.message === undefined;
+        if (isEvent !== (evidence.kind === "event")) continue;
+        return {
+          chat_ref: target.key,
+          chat_label: labelOf(target),
+          subject: isEvent
+            ? { kind: "event", ...model.eventJson(stored) }
+            : messageItem(target.chat, stored),
+        };
+      }
+    }
+    return { chat_ref: null, chat_label: null, subject: null };
+  }
+
+  /**
+   * The runs of the scenarios whose marks `items` hold, in the order first
+   * reported: how many scenarios each has, and how many are running or
+   * finished with each result.
+   */
+  function runsOf(items) {
+    const runs = new Map();
+    const seen = new Set();
+    for (const item of items) {
+      if (item.kind !== "scenario") continue;
+      if (!runs.has(item.run_id)) {
+        runs.set(item.run_id, {
+          run_id: item.run_id,
+          scenarios: 0,
+          running: 0,
+          passed: 0,
+          failed: 0,
+          skipped: 0,
+        });
+      }
+      const id = JSON.stringify([item.run_id, item.scenario_id]);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const run = runs.get(item.run_id);
+      run.scenarios += 1;
+      run[item.result ?? "running"] += 1;
+    }
+    return [...runs.values()];
   }
 
   /** The page's description of the chat. */
@@ -657,10 +806,9 @@ export function createUiState(model) {
         ? raw.from_chat_id
         : raw.chat_id,
     );
-    const ids = [
-      raw.message_id,
-      ...(Array.isArray(raw.message_ids) ? raw.message_ids : []),
-    ]
+    // In a basic group, by the chat's own ids: the call gave the bot's.
+    const ids = model
+      .namedMessageIds(method, raw, call.bot_id)
       .map(idOf)
       .filter((id) => id !== null);
     const stored = created.get(call.request_id) ?? [];
@@ -753,7 +901,10 @@ export function createUiState(model) {
   function row(target, items, as) {
     const chat = chatJson(target);
     const seen = as === null ? null : seenBy(target, items, as);
-    const shown = seen === null ? items : seen.items;
+    // A scenario mark is the runner's, not part of the chat.
+    const shown = (seen === null ? items : seen.items).filter(
+      (item) => item.kind !== "scenario",
+    );
     const messages = shown.filter((item) => item.kind === "message");
     const group = target.kind === "group" ? target.chat : null;
     return {
@@ -810,7 +961,7 @@ export function createUiState(model) {
     const as = integer(query, "as", null, 1);
     const rows = [];
     for (const target of everyTarget(as)) {
-      rows.push(row(target, itemsOf(target), as));
+      rows.push(row(target, itemsOf(target, { marks: false }), as));
     }
     // Most recent first; chats with nothing in them last, in creation order.
     rows.sort(
@@ -822,9 +973,10 @@ export function createUiState(model) {
     // "Activity" (every chat in one feed) comes first in the test view.
     if (as === null) {
       const all = { key: "all", kind: "all", chat: null };
-      rows.unshift(row(all, itemsOf(all), null));
+      rows.unshift(row(all, itemsOf(all, { marks: false }), null));
     }
     return {
+      runs: as === null ? runsOf(scenarioItems()) : [],
       instance: model.instance(),
       epoch: model.epoch(),
       version: model.version(),
@@ -895,8 +1047,11 @@ export function createUiState(model) {
     } else if (read.as !== null) {
       ({ items, as } = seenBy(target, items, read.as));
     }
+    // A scenario mark shows in every topic.
     if (read.topic !== null) {
-      items = items.filter((item) => inTopic(item, read.topic));
+      items = items.filter(
+        (item) => item.kind === "scenario" || inTopic(item, read.topic),
+      );
     }
     const window =
       read.callsBefore !== null
@@ -963,6 +1118,17 @@ export function createUiState(model) {
         ids.add(item.message.receiver_user?.id);
         for (const reaction of item.reactions ?? []) {
           for (const id of reaction.user_ids) ids.add(id);
+        }
+      } else if (item.kind === "scenario") {
+        // The people its failure evidence names, for the evidence list.
+        for (const { subject } of item.failure?.evidence ?? []) {
+          for (const id of [
+            subject?.author,
+            subject?.user_id,
+            subject?.actor_id,
+          ]) {
+            ids.add(id);
+          }
         }
       } else {
         for (const id of [item.user_id, item.actor_id, item.bot_id]) {
@@ -1062,7 +1228,7 @@ export function createUiState(model) {
       for (const chat of model.privateChats()) {
         for (const stored of storedIn(chat)) {
           if (stored.seq > startSeq) {
-            add(privatePair(chat.id, model.privatePairOf(chat, stored)));
+            add(privatePair(chat.id, chat.botId));
           }
         }
       }
@@ -1079,12 +1245,32 @@ export function createUiState(model) {
       }
       return named.get(chatId);
     };
+    // Failure evidence from before the start comes along as context: its
+    // messages and events by seq, its calls by request id.
+    const evidence = { seqs: new Set(), requests: new Set() };
+    for (const item of scenarioItems()) {
+      if (item.seq <= startSeq) continue;
+      for (const each of item.failure?.evidence ?? []) {
+        if (each.kind === "call") evidence.requests.add(each.request_id);
+        else evidence.seqs.add(each.seq ?? each.event_id);
+      }
+    }
+    const older = evidence.requests.size ? callsByChat() : new Map();
     for (const target of targets.values()) {
       const items = itemsOf(target);
       const created = storedBy(items);
-      const drawn = (found.get(target.key) ?? []).map((each) =>
-        callItem(each, created),
+      const before = (older.get(target.key) ?? []).filter(
+        (each) =>
+          each.request_number <= startRequest &&
+          evidence.requests.has(each.call.request_id),
       );
+      const drawn = [
+        ...before.map((each) => ({
+          ...callItem(each, created),
+          before_window: true,
+        })),
+        ...(found.get(target.key) ?? []).map((each) => callItem(each, created)),
+      ];
       all.set(target.key, items);
       calls.set(target.key, drawn);
       for (const call of drawn) {
@@ -1119,10 +1305,11 @@ export function createUiState(model) {
         .slice(0, start)
         .filter(
           (item) =>
-            item.kind === "message" &&
-            (item.ephemeral
-              ? ephemeral.has(item.message.ephemeral_message_id)
-              : messages.has(item.message.message_id)),
+            (item.kind !== "scenario" && evidence.seqs.has(item.seq)) ||
+            (item.kind === "message" &&
+              (item.ephemeral
+                ? ephemeral.has(item.message.ephemeral_message_id)
+                : messages.has(item.message.message_id))),
         )
         .map((item) => ({ ...item, before_window: true }));
       const kept = [...context, ...window];
@@ -1148,6 +1335,22 @@ export function createUiState(model) {
       pages[target.key] = page;
       if (target.kind !== "calls") rows.push(row(target, kept, null));
     }
+    // Every scenario with a mark in the window, as it stood at the stop,
+    // whether or not a recorded chat shows it.
+    const marks = scenarioItems().filter((item) => item.seq > startSeq);
+    const reported = new Map();
+    for (const item of marks) {
+      const {
+        kind: _kind,
+        seq: _seq,
+        at: _at,
+        phase: _phase,
+        ...scenario
+      } = item;
+      delete scenario.after_request;
+      delete scenario.request_id;
+      reported.set(JSON.stringify([item.run_id, item.scenario_id]), scenario);
+    }
     rows.sort(
       (left, right) => (right.last?.seq ?? -1) - (left.last?.seq ?? -1),
     );
@@ -1166,10 +1369,12 @@ export function createUiState(model) {
         chats: rows,
         users: rowUsers(rows),
         files: {},
+        runs: runsOf(marks),
       },
       pages,
       files,
       missing,
+      scenarios: [...reported.values()],
     };
   }
 

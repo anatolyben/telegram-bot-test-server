@@ -205,6 +205,67 @@ describe("business chats", () => {
     ).toEqual(["owner", "inbound"]);
   });
 
+  it("tells the bot through deleted_business_messages when either side deletes a message", async () => {
+    const { fake, hook, connection, person } = await connected();
+    const { message_id } = await fake.sayInBusinessChat(
+      connection.id,
+      person,
+      "person",
+      "oops",
+    );
+    const deleted = await fake.deleteBusinessMessage(
+      connection.id,
+      person,
+      message_id,
+      "person",
+    );
+    expect(deleted).toMatchObject({
+      message_id,
+      deleted: true,
+      update_id: expect.any(Number),
+    });
+    await expect
+      .poll(() => hook.ofType("deleted_business_messages").length)
+      .toBe(1);
+    expect(hook.ofType("deleted_business_messages")[0]).toEqual({
+      business_connection_id: connection.id,
+      chat: { id: person, type: "private", first_name: "Sam" },
+      message_ids: [message_id],
+    });
+    expect(
+      (await fake.getBusinessChat(connection.id, person))[0].deleted,
+    ).toBe(true);
+  });
+
+  it("numbers business messages from the owner's own sequence, shared with the owner's other chats", async () => {
+    const { fake, api, connection, owner, person } = await connected();
+    const other = await fake.createUser({ first_name: "Kim" });
+    // Ids 1 and 2 of the owner's sequence: a basic group and a chat with a bot.
+    const group = await fake.createChat({ type: "group", ownerId: owner });
+    await fake.post(group, owner, "hello group");
+    await fake.sendDirectMessage(owner, "/start");
+
+    const said = await fake.sayInBusinessChat(
+      connection.id,
+      person,
+      "person",
+      "hi",
+    );
+    expect(said.message_id).toBe(3);
+    // The person's own chats take none of the owner's ids.
+    await fake.sendDirectMessage(person, "/start");
+    expect(
+      (await fake.sayInBusinessChat(connection.id, other, "person", "hey"))
+        .message_id,
+    ).toBe(4);
+    const answer = await api("sendMessage", {
+      business_connection_id: connection.id,
+      chat_id: person,
+      text: "yes",
+    });
+    expect(answer.result.message_id).toBe(5);
+  });
+
   it("sends nothing while the connection is disabled", async () => {
     const { fake, hook, owner, connection, person } = await connected();
     await fake.connectBusiness({

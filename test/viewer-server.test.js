@@ -238,6 +238,9 @@ it("lists every chat, each private chat once per bot, and opens a private chat w
   );
   const dave = await fake.createUser({ first_name: "Dave" });
   await fake.sendDirectMessage(dave, "/start");
+  // Each bot has its own private chat with Dave: the second bot's is opened
+  // by Dave writing to it.
+  await fake.sendDirectMessage(dave, "/start", { botId: second.id });
   await api("unpinAllChatMessages", { chat_id: dave }, SECOND_TOKEN);
   const eve = await fake.createUser({ first_name: "Eve" });
 
@@ -292,7 +295,7 @@ it("lists every chat, each private chat once per bot, and opens a private chat w
     message_count: 1,
   });
   expect(rows[`${dave}:${second.id}`]).toMatchObject({
-    message_count: 0,
+    message_count: 1,
     last: { kind: "event", media: "unpin" },
   });
   expect(rows[CHAT]).toMatchObject({ pending_join_requests: 1 });

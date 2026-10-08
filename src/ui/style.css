@@ -1789,6 +1789,136 @@ select {
   background: color-mix(in srgb, var(--tv-accent) 18%, transparent);
 }
 
+/* ── Scenarios a test runner reported ───────────────────────────────── */
+
+/* A start or finish mark: a card across the chat, apart from its messages. */
+.tv-scenario {
+  align-self: stretch;
+  background: var(--tv-surface);
+  border: 1px solid var(--tv-border);
+  border-left: 4px solid var(--tv-accent);
+  border-radius: var(--tv-radius-control);
+  color: var(--tv-text);
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+  gap: 4px;
+  line-height: 16px;
+  margin: 6px 10px;
+  padding: 6px 10px;
+}
+
+.tv-scenario[data-scenario-phase="finish"][data-scenario-result="passed"] {
+  border-left-color: var(--tv-success);
+}
+
+.tv-scenario[data-scenario-phase="finish"][data-scenario-result="failed"] {
+  border-left-color: var(--tv-danger);
+}
+
+.tv-scenario[data-scenario-phase="finish"][data-scenario-result="skipped"] {
+  border-left-color: var(--tv-border-strong);
+}
+
+.tv-scenario-head {
+  align-items: baseline;
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+
+.tv-scenario-head .tv-time {
+  color: var(--tv-muted);
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
+.tv-scenario-badge {
+  background: var(--tv-accent-soft);
+  border-radius: 999px;
+  color: var(--tv-accent-text);
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 0 8px;
+}
+
+.tv-scenario-badge[data-result="passed"] {
+  background: var(--tv-success-soft);
+  color: var(--tv-success);
+}
+
+.tv-scenario-badge[data-result="failed"] {
+  background: var(--tv-danger-soft);
+  color: var(--tv-danger);
+}
+
+.tv-scenario-badge[data-result="skipped"] {
+  background: var(--tv-surface-subtle);
+  color: var(--tv-muted);
+}
+
+.tv-scenario-title {
+  font-weight: 600;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.tv-scenario-run {
+  color: var(--tv-muted);
+  overflow-wrap: anywhere;
+}
+
+.tv-scenario-labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.tv-label {
+  background: var(--tv-surface-subtle);
+  border: 1px solid var(--tv-border);
+  border-radius: 999px;
+  color: var(--tv-text);
+  font-size: 11px;
+  line-height: 16px;
+  overflow-wrap: anywhere;
+  padding: 0 6px;
+}
+
+.tv-label[data-label-unknown="true"] {
+  border-style: dashed;
+  color: var(--tv-muted);
+}
+
+.tv-scenario-failure {
+  color: var(--tv-danger);
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.tv-scenario [data-role="show-evidence"] {
+  align-self: flex-start;
+  color: var(--tv-text);
+  padding: 3px 12px;
+}
+
+.tv-evidence-list {
+  color: var(--tv-muted);
+  margin: 0;
+  padding-left: 18px;
+}
+
+.tv-evidence {
+  overflow-wrap: anywhere;
+}
+
+/* A label chip wraps to the next line whole. */
+.tv-evidence .tv-label {
+  display: inline-block;
+}
+
 /* ── Bot calls ───────────────────────────────────────────────────────── */
 
 /* The call filters' bar above a chat or calls column. */
@@ -2190,6 +2320,7 @@ select {
   .tv-service,
   .tv-event,
   .tv-call,
+  .tv-scenario,
   .tv-member,
   .tv-list-item[aria-current="true"] {
     border: 1px solid CanvasText;
@@ -2253,4 +2384,21 @@ select {
   color: var(--tv-muted);
   font-size: 11px;
   text-align: right;
+}
+
+/* A highlight shows on the chat's call bubbles and event pills too. */
+.tv-stream > .tv-call[data-highlighted="true"],
+.tv-stream > .tv-event[data-highlighted="true"] {
+  box-shadow: 0 0 0 2px var(--tv-accent);
+}
+
+/* On a phone, the run filter takes a row of its own under the toolbar. */
+@media (max-width: 799px) {
+  .tv-toolbar:has([data-role="run-filter"]) {
+    flex-wrap: wrap;
+  }
+  .tv-toolbar-controls > .tv-select:has([data-role="run-filter"]) {
+    flex: 1 0 100%;
+    order: 3;
+  }
 }

@@ -43,6 +43,8 @@ const PREVIEW_SERVICE = [
   "forum_topic_edited",
   "forum_topic_closed",
   "forum_topic_reopened",
+  "general_forum_topic_hidden",
+  "general_forum_topic_unhidden",
 ];
 
 /**
