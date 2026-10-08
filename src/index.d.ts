@@ -73,6 +73,8 @@ export interface TelegramBotTestServerOptions {
   floodControl?: boolean;
   /** Serve the live chat viewer at `${origin}/_fake/ui`, to this computer only. Default false. */
   ui?: boolean;
+  /** This server's label in `telegram-bot-test-server watch`. Default its viewer address. */
+  name?: string;
   /**
    * POST { now, mode } here whenever a manual clock is set or advanced, and
    * { now, mode, offset } whenever a running clock's offset is. Default none.

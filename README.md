@@ -1307,6 +1307,20 @@ Click a call to mark what it touched. The view lives in the URL, so a link opens
 The [viewer reference][ref-viewer] lists everything it shows, its URL parameters, the data
 attributes for Playwright and its routes.
 
+### Watch several servers at once
+
+When several servers run at the same time, for example one per parallel test worker, watch them on
+one page:
+
+```sh
+npx telegram-bot-test-server watch   # http://127.0.0.1:8090/
+```
+
+Every server started with `ui: true` on this computer appears as its own panel, side by side with
+draggable dividers, and disappears when it stops. Give a server a `name` (`--name` on the command
+line) to label its panel. `--port` changes the page's port, and `--exit-when-idle <seconds>` closes
+it once no server has run for that long.
+
 ### Record a scenario
 
 A recording keeps what happened in Telegram between two points of a test, as one HTML page that

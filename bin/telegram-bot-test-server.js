@@ -13,6 +13,41 @@ import { readFile } from "node:fs/promises";
 import { parseArgs } from "node:util";
 import { startTestServer } from "../src/index.js";
 
+// telegram-bot-test-server watch [--port 8090] [--exit-when-idle seconds]:
+// every running server's viewer on one page.
+if (process.argv[2] === "watch") {
+  const { startWatch } = await import("../src/watch.js");
+  let options;
+  try {
+    ({ values: options } = parseArgs({
+      args: process.argv.slice(3),
+      options: {
+        port: { type: "string", default: "8090" },
+        host: { type: "string", default: "127.0.0.1" },
+        "exit-when-idle": { type: "string" },
+      },
+    }));
+  } catch (error) {
+    console.error(`telegram-bot-test-server watch: ${error.message}`);
+    process.exit(2);
+  }
+  const idle = options["exit-when-idle"];
+  const watch = await startWatch({
+    port: Number(options.port),
+    host: options.host,
+    idleExitMs: idle === undefined ? null : Number(idle) * 1000,
+  }).catch((error) => {
+    // Another watch page already serves this port: nothing to do.
+    if (error.code === "EADDRINUSE") process.exit(0);
+    throw error;
+  });
+  console.log(`[telegram-bot-test-server] watching at ${watch.url}`);
+  for (const signal of ["SIGINT", "SIGTERM"])
+    process.on(signal, () => watch.close().then(() => process.exit(0)));
+  await watch.closed;
+  process.exit(0);
+}
+
 let values;
 try {
   ({ values } = parseArgs({
@@ -24,6 +59,7 @@ try {
       config: { type: "string" },
       "unimplemented-ok": { type: "boolean", default: false },
       ui: { type: "boolean", default: false },
+      name: { type: "string" },
       "record-dir": { type: "string" },
       "clock-now": { type: "string" },
       "clock-offset": { type: "string" },
@@ -62,7 +98,7 @@ if (values["clock-offset"] !== undefined) {
 
 if (!values.token) {
   console.error(
-    "Usage: telegram-bot-test-server --token <id>:<secret> [--port 8081] [--host 127.0.0.1] [--username name] [--config chats.json] [--unimplemented-ok] [--ui] [--record-dir dir] [--clock-now ms|date | --clock-offset ms] [--clock-webhook url]",
+    "Usage: telegram-bot-test-server --token <id>:<secret> [--port 8081] [--host 127.0.0.1] [--username name] [--config chats.json] [--unimplemented-ok] [--ui] [--name label] [--record-dir dir] [--clock-now ms|date | --clock-offset ms] [--clock-webhook url]",
   );
   process.exit(2);
 }
@@ -84,6 +120,7 @@ const fake = await startTestServer({
   publicChats: config.publicChats ?? [],
   unimplemented: values["unimplemented-ok"] ? "ok" : "error",
   ui: values.ui,
+  ...(values.name !== undefined ? { name: values.name } : {}),
   ...(values["record-dir"] !== undefined
     ? { recordDir: values["record-dir"] }
     : {}),

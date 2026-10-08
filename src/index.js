@@ -1804,6 +1804,7 @@ export async function startTestServer({
   clock: clockOptions,
   floodControl = false,
   ui = false,
+  name,
   clockWebhook,
   recordDir,
   log = () => {},
@@ -12779,6 +12780,14 @@ ${buttons}
       model: uiModel,
       log,
     }) ?? null;
+  // `telegram-bot-test-server watch` shows every announced viewer at once.
+  const withdrawViewer = viewerUrl
+    ? (await import("./watch.js")).announceViewer({
+        url: viewerUrl,
+        name,
+        port: address.port,
+      })
+    : () => {};
   /** Run a control action in-process, with the same checks as /_fake/*. */
   async function act(method, path, body = {}, query = {}) {
     try {
@@ -13269,6 +13278,7 @@ ${buttons}
     stop: () =>
       (stopPromise ??= (async () => {
         stopped = true;
+        withdrawViewer();
         viewer?.close();
         waits.cancel("Server stopped", true);
         for (const record of bots.values()) {
