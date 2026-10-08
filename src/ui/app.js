@@ -60,10 +60,79 @@ function patchKeyed(container, entries) {
   for (const node of byKey.values()) node.remove();
 }
 
+const following = new WeakMap();
+
+/** How long the reader may look back before the list returns to the newest. */
+const RESUME_FOLLOW_MS = 8_000;
+
+/**
+ * Whether the list follows the newest item. Only the reader stops it, by
+ * scrolling up (wheel, touch, keys or the scrollbar), and only for a while:
+ * once they stop scrolling for RESUME_FOLLOW_MS, or reach the bottom, the
+ * list returns to the newest item and follows again. Nothing the page does
+ * on its own (an image loading, a batch arriving, items dropped, the tab in
+ * the background) unpins it: while following, it stays at the bottom.
+ */
+function follows(scroller, container) {
+  if (!following.has(scroller)) {
+    following.set(scroller, true);
+    const atBottom = () =>
+      scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= 24;
+    let readerScrolling = false;
+    let resume = null;
+    const pause = () => {
+      following.set(scroller, false);
+      clearTimeout(resume);
+      resume = setTimeout(() => {
+        following.set(scroller, true);
+        scroller.scrollTop = scroller.scrollHeight;
+      }, RESUME_FOLLOW_MS);
+    };
+    const reader = () => {
+      readerScrolling = true;
+    };
+    scroller.addEventListener(
+      "wheel",
+      (event) => {
+        if (event.deltaY < 0 || !following.get(scroller)) pause();
+      },
+      { passive: true },
+    );
+    for (const type of ["touchmove", "pointerdown"])
+      scroller.addEventListener(type, reader, { passive: true });
+    scroller.addEventListener("keydown", (event) => {
+      if (["ArrowUp", "PageUp", "Home"].includes(event.key)) pause();
+    });
+    scroller.addEventListener(
+      "scroll",
+      () => {
+        if (atBottom()) {
+          clearTimeout(resume);
+          following.set(scroller, true);
+        } else if (readerScrolling) pause();
+      },
+      { passive: true },
+    );
+    for (const type of ["touchend", "pointerup", "pointercancel"])
+      scroller.addEventListener(
+        type,
+        () => {
+          readerScrolling = false;
+        },
+        { passive: true },
+      );
+    if (typeof ResizeObserver === "function")
+      new ResizeObserver(() => {
+        if (following.get(scroller)) scroller.scrollTop = scroller.scrollHeight;
+      }).observe(container);
+  }
+  return following.get(scroller);
+}
+
 /**
  * Patches a scrolled list and keeps the reader's place: pinned to the
- * bottom when it was at the bottom, else the first visible item stays where
- * it was (older items prepended, far ones dropped).
+ * bottom while it follows the newest item, else the first visible item stays
+ * where it was (older items prepended, far ones dropped).
  */
 function patchScrolled(
   scroller,
@@ -72,8 +141,7 @@ function patchScrolled(
   { toBottom = false, keepPlace = false } = {},
 ) {
   if (!scroller || !container) return;
-  const atBottom =
-    scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= 24;
+  const atBottom = follows(scroller, container);
   let anchor = null;
   let offset = 0;
   if (!toBottom)

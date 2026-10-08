@@ -19,9 +19,10 @@ const ASSETS = {
   "interact.js": "text/javascript; charset=utf-8",
   "style.css": "text/css; charset=utf-8",
 };
-// The page loads only its own scripts, styles, images and data.
+// The page loads only its own scripts, styles, images and data. Only pages
+// on this computer may frame it (several viewers side by side).
 const PAGE_POLICY =
-  "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+  "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors http://127.0.0.1:* http://localhost:* http://[::1]:*";
 const HEADERS = {
   "X-Content-Type-Options": "nosniff",
   "Referrer-Policy": "no-referrer",

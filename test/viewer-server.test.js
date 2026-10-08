@@ -610,7 +610,7 @@ it("serves the page under its policy with every file it loads, and no other file
   expect(response.status).toBe(200);
   expect(response.headers.get("content-type")).toBe("text/html; charset=utf-8");
   expect(response.headers.get("content-security-policy")).toBe(
-    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors http://127.0.0.1:* http://localhost:* http://[::1]:*",
   );
   const html = await response.text();
   const loads = [...html.matchAll(/\s(?:src|href)="([^"]+)"/g)]
