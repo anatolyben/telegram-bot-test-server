@@ -11,7 +11,9 @@ Develop and test your bot offline: no Telegram account, no phone number, no real
 [![License: MIT](https://img.shields.io/npm/l/telegram-bot-test-server)](https://github.com/anatolyben/telegram-bot-test-server/blob/main/LICENSE)
 [![Node >= 20](https://img.shields.io/node/v/telegram-bot-test-server)](https://github.com/anatolyben/telegram-bot-test-server/blob/main/package.json)
 
-<img src="https://raw.githubusercontent.com/anatolyben/telegram-bot-test-server/v0.13.1/docs/images/viewer-desktop.jpg" alt="The chat viewer: every chat in one feed, with the bot's calls and member changes beside the messages" width="880">
+<img src="https://raw.githubusercontent.com/anatolyben/telegram-bot-test-server/v0.13.1/docs/images/viewer-desktop.jpg"
+  alt="The chat viewer: every chat in one feed, with the bot's calls and member changes beside the
+  messages" width="880">
 
 [Install](#install) · [Quick start](#quick-start) · [Guide](#write-a-test) ·
 [Viewer](#watch-the-chats-in-a-browser) · [Reference](#reference)
@@ -37,6 +39,12 @@ It never talks to Telegram and runs as often as you like in CI.
 
 **Start:** [Install](#install) · [Quick start](#quick-start) · [How it works](#how-it-works)
 
+**Recipes:** [Delete a spam link and ban](#delete-a-spam-link-and-ban) ·
+[Approve a join request after a button press](#approve-a-join-request-after-a-button-press) ·
+[Check that a mute ends](#check-that-a-mute-ends) ·
+[Prove a bot did not receive something](#prove-a-bot-did-not-receive-something) ·
+[Report a scenario to the viewer](#report-a-scenario-to-the-viewer)
+
 **Guide:** [Write a test](#write-a-test) · [Make users act](#make-users-act) ·
 [Check what the bot did](#check-what-the-bot-did) ·
 [Message log and delivered updates](#message-log-and-delivered-updates) ·
@@ -45,26 +53,30 @@ It never talks to Telegram and runs as often as you like in CI.
 [Failures, flood control and time](#failures-flood-control-and-time) ·
 [Testing time-based app logic](#testing-time-based-app-logic) · [Snapshots](#snapshots) ·
 [Watch the chats in a browser](#watch-the-chats-in-a-browser) ·
-[Record a scenario](#record-a-scenario) · [Telegram Login](#telegram-login) ·
-[Owner accounts (GramJS)](#owner-accounts-gramjs) ·
+[Record a scenario](#record-a-scenario) · [Report scenarios](#report-scenarios) ·
+[Telegram Login](#telegram-login) · [Owner accounts (GramJS)](#owner-accounts-gramjs) ·
 [Other languages](#other-languages-command-line-and-http)
 
-**Reference:** [Options](#options) · [Test actions](#test-actions) ·
-[Wait conditions](#wait-conditions) · [Control API](#control-api) ·
-[Supported Bot API methods](#supported-bot-api-methods) · [Call receipts](#call-receipts)
+**[Reference](#reference)** ([docs/reference.md][ref]): [Options][ref-options] ·
+[Test actions][ref-actions] · [Wait conditions][ref-waits] · [Control API][ref-control] ·
+[Supported Bot API methods][ref-methods] · [Call receipts][ref-receipts] · [Viewer][ref-viewer]
 
-**More:** [Development](#development)
+**More:** [Development](#development) · [License](#license)
 
 </details>
+
+---
 
 ## Install
 
 ```sh
-npm install --save-dev --save-exact telegram-bot-test-server
+npm install --save-dev --save-exact telegram-bot-test-server@0.14.0
 ```
 
 Requires Node.js 20 or newer. No runtime dependencies. Everything lives in memory and is gone when
 the server stops. The control API answers anyone who can reach its port, so keep it on localhost.
+
+---
 
 ## Quick start
 
@@ -130,17 +142,211 @@ Both grammY and Telegraf are tested against the server, with polling and with a 
 written in another language, such as Python, points at the server the same way; its tests drive
 the server over HTTP ([Other languages](#other-languages-command-line-and-http)).
 
+---
+
 ## How it works
 
 Your bot sends its Bot API calls to `server.origin` instead of `https://api.telegram.org`, and the
 server answers the way Telegram does, keeping the state a group bot depends on: members and their
 status, restrictions and bans, messages and deletions, invite links, join requests and profile
-photos. Your test plays the other side through **test actions**, methods such as `server.join`,
+photos.
+
+Your test plays the other side through **test actions**, methods such as `server.join`,
 `server.post` and `server.pressButton`: users join, leave, post, ask to join, press buttons and
 message the bot, and the server sends your bot the same updates Telegram would, by webhook or
-through `getUpdates` polling. Your bot handles those updates in its own time, so the test then
-waits for what it expects with `server.waitFor`, or reads the state with `server.getMessages`,
-`server.getMember` and `server.getCalls`.
+through `getUpdates` polling.
+
+Your bot handles those updates in its own time, so the test then waits for what it expects with
+`server.waitFor`, or reads the state with `server.getMessages`, `server.getMember` and
+`server.getCalls`.
+
+---
+
+## Recipes
+
+Short [Vitest](https://vitest.dev) tests for common jobs, with a grammY bot. Each one runs as it
+is. Put this setup at the top of the test file, then paste any recipe under it.
+
+```js
+// recipes.test.js
+import { Bot, InlineKeyboard } from "grammy";
+import { afterEach, expect, test } from "vitest";
+import { startTestServer } from "telegram-bot-test-server";
+
+const TOKEN = "123456:TEST";
+const BOT_ID = 123456; // the number before the colon in the token
+const GROUP = -1001000000001;
+let server;
+let bot;
+
+// A server with GROUP in it, and a bot pointed at it. Add handlers, then start().
+async function setup(options = {}) {
+  server = await startTestServer({
+    botToken: TOKEN,
+    chats: [{ id: GROUP, title: "Test Group", ownerId: 5000000001 }],
+    ...options,
+  });
+  bot = new Bot(TOKEN, { client: { apiRoot: server.origin } });
+}
+
+// Resolves once the bot is polling.
+function start(options = {}) {
+  return new Promise((resolve) => bot.start({ ...options, onStart: resolve }));
+}
+
+afterEach(async () => {
+  if (bot?.isRunning()) await bot.stop();
+  await server?.stop();
+});
+```
+
+### Delete a spam link and ban
+
+```js
+test("deletes a link and bans whoever posted it", async () => {
+  await setup();
+  bot.on("message:entities:url", async (ctx) => {
+    await ctx.deleteMessage();
+    await ctx.banChatMember(ctx.from.id);
+  });
+  await start();
+
+  const ann = await server.createUser({ first_name: "Ann" });
+  await server.join(GROUP, ann);
+  const spam = await server.post(GROUP, ann, "cheap followers at example.com");
+
+  await server.waitFor({ kind: "message", chatId: GROUP, messageId: spam, deleted: true });
+  await server.waitFor({ kind: "member", chatId: GROUP, userId: ann, status: "kicked" });
+});
+```
+
+### Approve a join request after a button press
+
+The bot asks each requester to press a button in a private chat, then approves them.
+
+```js
+test("approves a join request once the button is pressed", async () => {
+  await setup();
+  bot.on("chat_join_request", (ctx) =>
+    ctx.api.sendMessage(ctx.from.id, "Press the button to join.", {
+      reply_markup: new InlineKeyboard().text("I'm human", `approve:${ctx.chat.id}`),
+    }),
+  );
+  bot.callbackQuery(/^approve:(-\d+)$/, async (ctx) => {
+    await ctx.api.approveChatJoinRequest(Number(ctx.match[1]), ctx.from.id);
+    await ctx.answerCallbackQuery("Welcome!");
+  });
+  await start();
+
+  const link = await bot.api.createChatInviteLink(GROUP, { creates_join_request: true });
+  const bob = await server.createUser({ first_name: "Bob" });
+  await server.joinByLink(link.invite_link, bob);
+
+  // The bot's private message to Bob, found by its button.
+  const { message } = await server.waitFor({
+    kind: "message",
+    chatId: bob,
+    buttonData: `approve:${GROUP}`,
+  });
+  const answer = await server.pressDirectButton(bob, message.message_id, `approve:${GROUP}`);
+  expect(answer.text).toBe("Welcome!");
+  await server.waitFor({ kind: "joinRequest", chatId: GROUP, userId: bob, state: "approved" });
+});
+```
+
+### Check that a mute ends
+
+The bot mutes newcomers for an hour. A manual clock lets the test skip the hour.
+
+```js
+test("a newcomer's mute ends after an hour", async () => {
+  await setup({ clock: { now: Date.now() } });
+  bot.on("message:new_chat_members", async (ctx) => {
+    for (const member of ctx.message.new_chat_members) {
+      await ctx.restrictChatMember(
+        member.id,
+        { can_send_messages: false },
+        { until_date: ctx.message.date + 60 * 60 }, // the message date follows the server clock
+      );
+    }
+  });
+  await start();
+
+  const ann = await server.createUser({ first_name: "Ann" });
+  await server.join(GROUP, ann);
+  await server.waitFor({ kind: "member", chatId: GROUP, userId: ann, status: "restricted" });
+
+  await server.advanceTime(2 * 60 * 60 * 1000); // two hours later
+  await server.waitFor({ kind: "member", chatId: GROUP, userId: ann, status: "member" });
+});
+```
+
+### Prove a bot did not receive something
+
+`getBotUpdates` lists every update the server sent a bot. Here the bot asks only for
+`my_chat_member` updates, so the group's messages never reach it.
+
+```js
+test("a bot that asks only for my_chat_member gets no messages", async () => {
+  await setup();
+  await start({ allowed_updates: ["my_chat_member"] });
+  // allowed_updates applies from the bot's first getUpdates, so wait for that call.
+  await server.waitFor({ kind: "call", botId: BOT_ID, method: "getUpdates" });
+
+  const ann = await server.createUser({ first_name: "Ann" });
+  await server.join(GROUP, ann);
+  await server.post(GROUP, ann, "hello");
+  await server.setBotMembership(GROUP, BOT_ID, { status: "member" }); // demoted
+
+  const { updates } = await server.getBotUpdates(BOT_ID, { chatId: GROUP });
+  expect(updates.map((update) => update.type)).toEqual(["my_chat_member"]);
+});
+```
+
+### Report a scenario to the viewer
+
+A test can tell the server where a scenario starts and how it ends. The viewer and recordings then
+show it among the chats, and a failure points at the messages involved.
+
+```js
+// Reports a scenario's start and result. A failure names the messages it stored.
+async function reported(scenarioId, body) {
+  const run = { runId: "local", scenarioId };
+  await server.startScenario({ ...run, chats: [GROUP] });
+  const mark = await server.getMessageLog(GROUP);
+  try {
+    await body();
+  } catch (error) {
+    const log = await server.getMessageLog(GROUP, { since: mark.cursor, includeDeleted: true });
+    const evidence = log.messages.map((entry) => ({ kind: "message", seq: entry.seq }));
+    const failure = { message: error.message.slice(0, 200), evidence };
+    await server.finishScenario({ ...run, result: "failed", failure });
+    throw error;
+  }
+  await server.finishScenario({ ...run, result: "passed" });
+}
+
+test("says hello, reported to the viewer", async () => {
+  await setup({ recordDir: "test-results/recordings" });
+  bot.on("message:text", (ctx) => ctx.reply("Hi!"));
+  await start();
+
+  await server.startRecording("says-hello");
+  await reported("says hello", async () => {
+    const ann = await server.createUser({ first_name: "Ann" });
+    await server.join(GROUP, ann);
+    await server.post(GROUP, ann, "hello");
+    await server.waitFor({ kind: "message", chatId: GROUP, botId: BOT_ID, text: "Hi!" });
+  });
+  const { files } = await server.stopRecording("says-hello");
+  console.log(files.html); // open it in a browser: the scenario's cards sit among the messages
+
+  const { scenarios } = await server.getScenarios({ runId: "local" });
+  expect(scenarios.map((each) => each.result)).toEqual(["passed"]);
+});
+```
+
+---
 
 ## Guide
 
@@ -213,13 +419,15 @@ The rest of this guide shows parts of tests like this one, with `server`, `bot`,
 
 ### Make users act
 
-Test actions play people on Telegram. Each one resolves once the update it causes has been handed
-to the bot: its first webhook attempt has finished (with any call the webhook answered with), it
-waits behind an update the webhook refused, or it is queued for `getUpdates`. A webhook gets a
-minute to answer, so one that never answers holds the action for a minute. What the bot does in
-response happens after that, so wait for the outcome rather than checking it immediately. An action
-fails where Telegram would refuse the person: `post` fails if the user is not allowed to post, for
-example.
+Test actions play people on Telegram. Each one resolves once the update it causes has been handed to
+the bot: its first webhook attempt has finished (with any call the webhook answered with), it waits
+behind an update the webhook refused, or it is queued for `getUpdates`.
+
+A webhook gets a minute to answer, so one that never answers holds the action for a minute.
+
+What the bot does in response happens after that, so wait for the outcome rather than checking it
+immediately. An action fails where Telegram would refuse the person: `post` fails if the user is not
+allowed to post, for example.
 
 ```js
 const ann = await server.createUser({ first_name: "Ann", username: "ann" });
@@ -356,9 +564,41 @@ Such a post's `from` is `@GroupAnonymousBot` or `@Channel_Bot`, as the Bot API w
 failure rules and the [message log](#message-log-and-delivered-updates) still name the person who
 posted it.
 
+Reactions follow TDLib's rule: an anonymous administrator reacts as the group, and only the owner
+may. So `react` refuses any other anonymous administrator, and a group whose owner stays anonymous
+(`createChat({ ownerAnonymous: true })`) sends `message_reaction` with `actor_chat`, not `user`:
+
+```js
+const olga = await server.createUser({ first_name: "Olga" });
+const club = await server.createChat({ ownerId: olga, ownerAnonymous: true });
+const notice = await server.post(club, olga, "Meeting at six"); // sender_chat is the group
+await server.react(club, notice, olga, "👍"); // message_reaction has actor_chat
+```
+
+No source shows how Telegram shows the service messages of an anonymous owner or administrator,
+so their pins, title and photo changes, topics, and adding or removing members fail in a test.
+So in a group whose owner is anonymous, `setBotMembership` needs `by`, an administrator who is not
+anonymous: `setBotMembership(club, botId, { by: ada })`.
+
+A bot bans a channel that members post as with `banChatSenderChat`. Until `unbanChatSenderChat`, the
+channel's owner posts on behalf of none of their channels there.
+
+People delete messages too. A member deletes their own message, and an administrator with
+`can_delete_messages` (in a basic group, any administrator) anyone's. In their private chat with a
+bot, a user deletes any message, for both sides. Bots get no update for a deletion, as on Telegram;
+the message log and the viewer name who deleted it:
+
+```js
+const typo = await server.post(GROUP, ann, "helo");
+await server.deleteMessage(GROUP, typo, ann); // { message_id, deleted: true }
+```
+
+In a business chat, `deleteBusinessMessage` deletes a message for both sides, and the connected bot
+gets `deleted_business_messages`.
+
 Users can also post photos, media, albums and forwards (of a user, a channel or a supergroup),
 edit their messages, react, pin, press buttons in private chats and on ephemeral messages, change
-their profile, and rename the chat or change its photo. [Test actions](#test-actions) lists them
+their profile, and rename the chat or change its photo. [Test actions][ref-actions] lists them
 all.
 
 ### Check what the bot did
@@ -407,13 +647,16 @@ skip messages from earlier in the test, add `since`, a cursor from the
 [message log](#message-log-and-delivered-updates).
 
 A wait fails after 1000 ms by default; `{ timeoutMs }` sets 1 to 30000 ms of wall time. Its error
-names the exact expectation, what was observed (or up to eight matching requests) and the work
-still outstanding, in at most 8000 characters with credentials redacted. The outstanding work
-counts what is in progress: `controls` (test actions), `http` (open HTTP requests to the server),
-`owners` (owner client calls), `deliveries` (webhook attempts queued or running), `polls` (open
-long polls), `delayedOrNetworkRequests` (webhook connections and response delays) and `waits`
-(waits, this one included). A polling bot always has a long poll open, so `http: 1` and `polls: 1`
-are normal. [Wait conditions](#wait-conditions) lists every condition.
+names the exact expectation, what was observed (or up to eight matching requests) and the work still
+outstanding, in at most 8000 characters with credentials redacted.
+
+The outstanding work counts what is in progress: `controls` (test actions), `http` (open HTTP
+requests to the server), `owners` (owner client calls), `deliveries` (webhook attempts queued or
+running), `polls` (open long polls), `delayedOrNetworkRequests` (webhook connections and response
+delays) and `waits` (waits, this one included). A polling bot always has a long poll open, so `http:
+1` and `polls: 1` are normal.
+
+[Wait conditions][ref-waits] lists every condition.
 
 Once the outcome is there, read the state directly:
 
@@ -428,6 +671,7 @@ Messages are kept the way Telegram returns them: `parse_mode` formatting becomes
 `entities`, and text is trimmed, so wait for the plain text the user would see. `getMessages` and
 `getDirectMessages` include service messages, such as `new_chat_members` for each join and
 `pinned_message` for each pin.
+
 `getCalls()` keeps requests as they came, fixture secrets included, so do not dump it
 indiscriminately. It returns copies, and so do `getMessage`, `getMessages`, `getEphemeralMessage`
 and `getDirectMessages`: changing what they return changes nothing on the server.
@@ -463,17 +707,20 @@ expect((await server.getMessage(GROUP, hello)).deleted).toBe(false);
 
 grammY's `bot.start()` and Telegraf's polling confirm an update with their next `getUpdates`, after
 handling it, and their webhooks answer after their handlers, so the wait holds while such a bot
-works on an update. The server sees only what reaches it: work a bot does after it confirmed an
-update, such as a job started in the background, looks quiet once `ms` has passed without a call.
-`botIds` limits the wait to some bots; leave out a bot that is not running, since it never
-confirms its updates. A deleted bot is not counted.
+works on an update.
+
+The server sees only what reaches it: work a bot does after it confirmed an update, such as a job
+started in the background, looks quiet once `ms` has passed without a call.
+
+`botIds` limits the wait to some bots; leave out a bot that is not running, since it never confirms
+its updates. A deleted bot is not counted.
 
 ### Message log and delivered updates
 
 Every message the server stores, in any chat, gets the next number of one server-wide sequence,
-its `seq`; so do events and deletions. `getMessageLog` reads a chat's messages after a mark on that
-sequence, deleted ones too when asked, so "everything since my mark" stays exact when the bot
-deletes messages:
+its `seq`; so do events, edits and deletions. `getMessageLog` reads a chat's messages after a mark
+on that sequence, deleted ones too when asked, so "everything since my mark" stays exact when the
+bot deletes messages:
 
 ```js
 // Your bot deletes links, as in the quick start.
@@ -494,40 +741,27 @@ console.log(messages.map((entry) => [entry.message.text, entry.deleted_by?.bot_i
 
 - It returns `{ chat_id, epoch, cursor, messages }`, oldest first. Pass `cursor` as the next
   `since` to read on from there.
-- Each entry has the stored `message` (with the first bot's file ids), its `seq`, `at` (server
+- Each entry has the stored `message` (with the first bot's file ids, and in a basic group the
+  chat's own message id, with each bot's in `bot_message_ids`), its `seq`, `at` (server
   time), `author` (the user id of who posted it, also when the message names only a chat: a
   channel post, or a post on behalf of a chat), `request_id` (the Bot API call that stored it, or
   `null` for a test action), `after_request` (how many Bot API requests had arrived when it was
   stored; the viewer places calls by it), `ephemeral`, and `deleted` with `deleted_by`:
-  `{ seq, bot_id, method, request_id, at }` of the deletion, or `null`. A poll that has votes has
-  `votes` by user id.
-- Without `includeDeleted`, only messages not deleted are listed. With it, a message stored before
-  the mark but deleted after it is listed too. Edits are not reported.
-- A user id instead of a chat id reads the user's private chats; `botId` keeps one bot's, a
-  deleted bot's too.
+  `{ seq, bot_id, user_id, method, request_id, at }` of the deletion, or `null`. A bot's deletion
+  has its `bot_id` and `method`; a person's has their `user_id`, and `bot_id` and `method` are
+  `null`. `edited_by` has the same fields for the latest edit, or is `null`. A poll that has votes
+  has `votes` by user id.
+- A message stored before the mark but edited after it is listed too, its `edited_by.seq` after
+  the mark. Without `includeDeleted`, only messages not deleted are listed. With it, a message
+  stored before the mark but deleted after it is listed too.
+- A user id instead of a chat id reads the user's private chat with a bot, and each entry has the
+  chat's `bot_id`. `botId` names the bot, a deleted bot's too; it is needed when the user has
+  private chats with more than one bot, as their message ids overlap.
 - After a `restore`, the sequence goes back with the state. Pass the mark's `epoch` and a read
   from an older epoch fails instead of mixing the two.
 
 `getBotUpdates` lists the updates the server sent a bot, as the bot got them, so a test can prove
-what a bot did **not** receive. Here a second bot asks only for `my_chat_member` updates:
-
-```js
-const notifier = await server.addBot({ token: "654321:NOTIFY", username: "notify_bot" });
-// The notifier bot under test, polling for my_chat_member updates only.
-const notifierBot = new Bot("654321:NOTIFY", { client: { apiRoot: server.origin } });
-notifierBot.start({ allowed_updates: ["my_chat_member"] });
-// allowed_updates applies from the bot's first getUpdates, so wait for that call.
-await server.waitFor({ kind: "call", botId: notifier.id, method: "getUpdates" });
-
-await server.setBotMembership(GROUP, notifier.id);
-const ann = await server.createUser({ first_name: "Ann" });
-await server.join(GROUP, ann);
-await server.post(GROUP, ann, "hello");
-
-const { updates } = await server.getBotUpdates(notifier.id, { chatId: GROUP });
-expect(updates.map((update) => update.type)).toEqual(["my_chat_member"]);
-await notifierBot.stop();
-```
+what a bot did **not** receive. The [recipe](#prove-a-bot-did-not-receive-something) shows it.
 
 - As on Telegram, `allowed_updates` applies from the `getUpdates` call that carries it, and
   updates made before that call still arrive. grammY's `onStart` runs before its first
@@ -557,6 +791,7 @@ import http from "node:http";
 import { Bot, webhookCallback } from "grammy";
 import { startTestServer } from "telegram-bot-test-server";
 
+const BOT_ID = 123456;
 const GROUP = -1001000000001;
 const server = await startTestServer({
   botToken: "123456:TEST",
@@ -576,7 +811,7 @@ await server.post(GROUP, ann, "hello");
 await server.waitFor({
   kind: "message",
   chatId: GROUP,
-  botId: 123456,
+  botId: BOT_ID,
   text: "You said: hello",
 });
 
@@ -609,14 +844,17 @@ The full rules, with Telegram's error texts, are under [Update delivery][behavio
 Three server methods help with webhooks. `drainDeliveries({ botId?, timeoutMs? })` waits until the
 server's queued and in-flight webhook attempts have settled, retries still due and calls a webhook
 answered with included. It does not empty `getUpdates` queues, check that the webhook answered 2XX,
-or wait for what the bot does after answering. `getDeliveries()` lists each attempt with its update
-and bot id, attempt number (each retry is one), `epoch` (the number of restores before it), when it
-was queued, started and completed, its status and outcome. Sent updates and this list are kept
-until a restore. `redeliverUpdate(updateId, { botId })` has Telegram deliver an update again, byte
-for byte, callback queries included, as it does when a webhook does not confirm one. Each bot
-numbers its own updates, and bots added in the same second start at the same number, so with more
-than one bot always pass `botId`. It sends the saved update, so do not restore an earlier snapshot
-between the steps of a replay.
+or wait for what the bot does after answering.
+
+`getDeliveries()` lists each attempt with its update and bot id, attempt number (each retry is one),
+`epoch` (the number of restores before it), when it was queued, started and completed, its status
+and outcome. Sent updates and this list are kept until a restore.
+
+`redeliverUpdate(updateId, { botId })` has Telegram deliver an update again, byte for byte, callback
+queries included, as it does when a webhook does not confirm one. Each bot numbers its own updates,
+and bots added in the same second start at the same number, so with more than one bot always pass
+`botId`. It sends the saved update, so do not restore an earlier snapshot between the steps of a
+replay.
 
 ### More than one bot
 
@@ -638,19 +876,44 @@ const secondBot = new Bot("654321:SECOND", { client: { apiRoot: server.origin } 
 `chat_member`, and a group a service message when the bot joins or leaves.
 
 `deleteBot(second.id)` deletes a bot that `addBot` added. It leaves every chat it is in, as when a
-bot leaves: its status there becomes `left`, the chat's administrator bots get `chat_member`, and
-a group gets a `left_chat_member` service message, which `getMessageLog` and `getBotUpdates` list.
-Its token then gets 401 `Unauthorized`. A waiting `getUpdates` answers at once with what is
-pending, and the next call gets the 401, so a polling library stops with an error (grammY's
-`bot.start()` rejects): have the app catch it. The first bot can't be deleted.
+bot leaves: its status there becomes `left`, the chat's administrator bots get `chat_member`, and a
+group gets a `left_chat_member` service message, which `getMessageLog` and `getBotUpdates` list.
+
+Its token then gets 401 `Unauthorized`. A waiting `getUpdates` answers at once with what is pending,
+and the next call gets the 401, so a polling library stops with an error (grammY's `bot.start()`
+rejects): have the app catch it. The first bot can't be deleted.
 
 Each bot has its own membership and rights in each chat, its own `update_id` sequence, its own
-`file_id`s, and hears only the button presses on keyboards it put on messages. Users write
-privately only to the first bot, so no other bot can message them (403), except a join requester:
-any bot that receives the request may message them for five minutes. `getMember` answers as
-`getChatMember` would to the first bot, and the control API shows messages with the first bot's
+`file_id`s, and hears only the button presses on keyboards it put on messages. `getMember` answers
+as `getChatMember` would to the first bot, and the control API shows messages with the first bot's
 file_ids. Name a bot with `botId` in waits, failure rules and `connectBusiness`. More under
 [More than one bot][behavior-bots].
+
+Each bot has its own private chat with a user, as on Telegram, and all of a bot's private chats
+share one message id sequence with its view of basic groups. A bot reaches only its own: it can
+message a user who wrote to it, or a join requester for five minutes, and gets 403 otherwise. Other
+calls, `getChat` and `sendChatAction` among them, find the chat of any user the bot knows, empty if
+they never wrote, and get 400 `chat not found` for anyone else. The private-chat actions take
+`{ botId }` (`bot_id` over HTTP), and the first bot is the default:
+
+```js
+await server.sendDirectMessage(ann, "/start", { botId: second.id });
+const replies = await server.getDirectMessages(ann, { botId: second.id });
+await server.waitFor({ kind: "message", chatId: ann, botId: second.id, text: "Welcome!" });
+```
+
+A `start` link to any bot opens that bot's chat. In a message wait on a private chat, `botId` names
+the bot's chat, and the author when `userId` does not.
+
+A bot runs in privacy mode with the `privacyMode` option (the first bot) or `addBot({ privacyMode:
+true })`. Off by default.
+
+In a group where such a bot is not an administrator, it gets only what the
+[Bot API docs][privacy-docs] list: service messages, commands meant for it (`/help@your_bot`),
+general commands (`/help`) when it was the last bot to send a message to the group, and replies to
+messages meant for it. A message reaches only one such bot: a reply before an explicit command, and
+that before a general one. It gets the edits of only the messages it received. `getMe` says
+`can_read_all_group_messages: false`. More under [Privacy mode][behavior-privacy].
 
 ### Channels, basic groups and forums
 
@@ -683,9 +946,28 @@ await server.post(forum, OWNER, { text: "How do I start?", threadId: topic });
 - **Basic groups** have a negative id without the `-100` prefix. `migrateToSupergroup(chatId)`
   upgrades one as its creator or an administrator would and returns the new supergroup's id; later
   calls to the old id fail as Telegram's do ([Basic groups and the upgrade][behavior-upgrade]).
+  As on Telegram, each bot numbers a basic group's messages from its own sequence, the one its
+  private chats use, so two bots know one message by different ids, and neither by the id test
+  actions use. Test actions, waits, failure rules, the message log and the viewer name a basic
+  group's message by the chat's own count, the id `post` returns. `getMessage` and the message log
+  give the id each bot knows it by, in `bot_message_ids`:
+
+  ```js
+  const basic = await server.createChat({ type: "group", ownerId: OWNER });
+  await server.setBotMembership(basic, BOT_ID);
+  const hello = await server.post(basic, OWNER, "hello");
+  const { bot_message_ids } = await server.getMessage(basic, hello);
+  // The id the bot got in its update, and names in its own calls.
+  const botsId = bot_message_ids[BOT_ID];
+  ```
 - **Forums.** `createTopic` and `renameTopic` create and rename topics with Telegram's service
   message, and `post` takes a `threadId`. A send to a thread that is not a topic fails with
-  `message thread not found`.
+  `message thread not found`. Bots close, reopen, rename and delete topics, and close, reopen,
+  hide, unhide and rename the General topic, with Telegram's rights, errors and service messages.
+  A call without the right on a topic the bot never sent to gets 404, as no source gives
+  Telegram's answer.
+  A closed topic refuses messages, with `TOPIC_CLOSED`, from everyone but administrators with
+  `can_manage_topics` and the topic's creator. Details under [Forum topics][behavior-topics].
 
 ### Failures, flood control and time
 
@@ -706,10 +988,12 @@ await server.failNext({ method: "sendMessage", errorCode: 429, retryAfter: 3 });
 ```
 
 A rule counts only calls with its `method` and, where given, its `chatId`, `botId`, `userId` and
-`messageId`; other calls do not use it up. `userId` is the user the call is about: its `user_id`,
-an ephemeral message's receiver, or the author of the message `deleteMessage` deletes. `messageId`
-also matches one id in a `deleteMessages` list. `attempt: 2` starts at the second matching call
-after the rule is added, and `times` (default 1) is how many matching calls in a row it applies to.
+`messageId`; other calls do not use it up. `userId` is the user the call is about: its `user_id`, an
+ephemeral message's receiver, or the author of the message `deleteMessage` deletes.
+
+`messageId` also matches one id in a `deleteMessages` list; in a basic group it is the chat's own
+id, whatever id the bot gave. `attempt: 2` starts at the second matching call after the rule is
+added, and `times` (default 1) is how many matching calls in a row it applies to.
 
 - With `errorCode`, the call fails before it runs. Without `description`, the error reads as
   Telegram's does for its code (`Bad Request`, `Forbidden`, `Conflict`, ...). A 429 needs
@@ -786,11 +1070,12 @@ A bot that lifts a mute itself calls `restrictChatMember` with every permission 
 API docs say; the member is then a `member` again.
 
 A manual clock stands still between advances. Messages posted a minute apart in real time get the
-same date, and anything that counts by dates, such as a rate window, sees no time pass. A running
-clock keeps moving instead. With `clock: { offset: milliseconds }`, the server's time is real time
-plus the offset; `{ offset: 0 }` starts on real time. `advanceTime(ms)` adds `ms` to the offset, so
-time jumps forward, and it keeps moving between jumps. `getClock()` then returns
-`{ mode: "running", now, offset, scheduled }`:
+same date, and anything that counts by dates, such as a rate window, sees no time pass.
+
+A running clock keeps moving instead. With `clock: { offset: milliseconds }`, the server's time is
+real time plus the offset; `{ offset: 0 }` starts on real time. `advanceTime(ms)` adds `ms` to the
+offset, so time jumps forward, and it keeps moving between jumps. `getClock()` then returns `{ mode:
+"running", now, offset, scheduled }`:
 
 ```js
 // With clock: { offset: 0 } in the options.
@@ -799,16 +1084,19 @@ await server.advanceTime(24 * 60 * 60 * 1000);
 await server.post(GROUP, ann, "second"); // dated a day later, and the clock keeps moving
 ```
 
-Advances run one at a time, and each runs what has come due, in deadline order: restriction and
-ban expiry, response delays (`delayMs`, and owner call delays), sends held by flood control, webhook
+Advances run one at a time, and each runs what has come due, in deadline order: restriction and ban
+expiry, response delays (`delayMs`, and owner call delays), sends held by flood control, webhook
 retries and delayed `getUpdates` conflicts. On a running clock, these also come due as real time
-passes. Message, login and business dates, the five minutes a bot may message a join requester,
-and flood control follow this clock too. A restore sets a manual clock back to the snapshot's time,
-and a running clock's offset back to the snapshot's offset. Real time is never rewound, so after a
-restore a running clock is later than the snapshot by the real time that passed. The global `Date`,
-timers and your app's jobs are untouched. Webhook connections and their one-minute timeout, long
-polling and `waitFor` deadlines use wall time, so an advance does not wait for deliveries or for
-your bot to act. To have your app follow this clock, see
+passes. Message, login and business dates, the five minutes a bot may message a join requester, and
+flood control follow this clock too.
+
+A restore sets a manual clock back to the snapshot's time, and a running clock's offset back to the
+snapshot's offset. Real time is never rewound, so after a restore a running clock is later than the
+snapshot by the real time that passed.
+
+The global `Date`, timers and your app's jobs are untouched. Webhook connections and their
+one-minute timeout, long polling and `waitFor` deadlines use wall time, so an advance does not wait
+for deliveries or for your bot to act. To have your app follow this clock, see
 [Testing time-based app logic](#testing-time-based-app-logic).
 
 ### Testing time-based app logic
@@ -831,6 +1119,7 @@ import {
   refreshFakeClock,
 } from "telegram-bot-test-server/clock";
 
+const BOT_ID = 123456;
 const GROUP = -1001000000001;
 const HOUR = 60 * 60 * 1000;
 
@@ -867,10 +1156,10 @@ await new Promise((resolve) => bot.start({ onStart: resolve }));
 const ann = await server.createUser({ first_name: "Ann" });
 await server.join(GROUP, ann);
 await server.post(GROUP, ann, "/remind");
-await server.waitFor({ kind: "message", chatId: GROUP, botId: 123456, contains: "an hour" });
+await server.waitFor({ kind: "message", chatId: GROUP, botId: BOT_ID, contains: "an hour" });
 await server.advanceTime(HOUR); // resolves once the app has the new time
 await server.waitFor(
-  { kind: "message", chatId: GROUP, botId: 123456, text: "Reminder!" },
+  { kind: "message", chatId: GROUP, botId: BOT_ID, text: "Reminder!" },
   { timeoutMs: 2000 },
 );
 
@@ -916,65 +1205,42 @@ origin after. So, in this order:
    `await refreshFakeClock()`, then starts its bot with the origin as its Bot API root.
 
 With a fixed port for the app's route, start the server first and spawn the app with
-`TELEGRAM_FAKE_CLOCK_URL` in its environment. An app in another language reads
-`GET <origin>/_fake/clock`, which answers `{ mode, now, scheduled }`, and uses `now` while `mode`
-is `manual`. While `mode` is `running`, the answer also has `offset`, and the app adds it to its
-own clock. A push that fails, or takes over 2 seconds, goes to the `log` option as
-`clock webhook failed: <reason>` and fails nothing. The bot's own webhook deliveries stay as
-Telegram sends them.
+`TELEGRAM_FAKE_CLOCK_URL` in its environment.
+
+An app in another language reads `GET <origin>/_fake/clock`, which answers `{ mode, now, scheduled
+}`, and uses `now` while `mode` is `manual`. While `mode` is `running`, the answer also has
+`offset`, and the app adds it to its own clock.
+
+A push that fails, or takes over 2 seconds, goes to the `log` option as `clock webhook failed:
+<reason>` and fails nothing. The bot's own webhook deliveries stay as Telegram sends them.
 
 ### Snapshots
 
 A snapshot saves the server's state so a test can return to it, instead of starting a fresh server.
-This example also makes a real Bot API call, as a bot would:
+A snapshot needs an idle server, so this bot makes its calls without polling:
 
 ```js
+import { Bot } from "grammy";
 import { startTestServer } from "telegram-bot-test-server";
 
-const GROUP = -1001234567890;
+const GROUP = -1001000000001;
 const server = await startTestServer({
   botToken: "123456:TEST",
-  clock: { now: 1_800_000_000_000 }, // optional; omit for real time
-  chats: [{ id: GROUP, title: "Test", ownerId: 5000000001 }],
+  chats: [{ id: GROUP, title: "Test Group", ownerId: 5000000001 }],
 });
-try {
-  const userId = await server.createUser();
-  await server.join(GROUP, userId);
-  const saved = await server.snapshot();
-  try {
-    const banned = server.waitFor(
-      { kind: "member", chatId: GROUP, userId, status: "kicked" },
-      { timeoutMs: 1000 },
-    );
-    await Promise.all([
-      banned,
-      (async () => {
-        // A real Bot API call, as a bot would make it.
-        const response = await fetch(
-          `${server.origin}/bot123456:TEST/banChatMember`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ chat_id: GROUP, user_id: userId }),
-          },
-        );
-        const answer = await response.json();
-        if (!answer.ok) throw new Error(answer.description);
-      })(),
-    ]);
-    await server.restore(saved);
-    await server.waitFor({
-      kind: "member",
-      chatId: GROUP,
-      userId,
-      status: "member",
-    });
-  } finally {
-    await server.releaseSnapshot(saved);
-  }
-} finally {
-  await server.stop();
-}
+const bot = new Bot("123456:TEST", { client: { apiRoot: server.origin } });
+
+const ann = await server.createUser({ first_name: "Ann" });
+await server.join(GROUP, ann);
+const saved = await server.snapshot();
+
+await bot.api.banChatMember(GROUP, ann);
+await server.waitFor({ kind: "member", chatId: GROUP, userId: ann, status: "kicked" });
+
+await server.restore(saved); // Ann is a member again
+await server.waitFor({ kind: "member", chatId: GROUP, userId: ann, status: "member" });
+await server.releaseSnapshot(saved);
+await server.stop();
 ```
 
 In a real test, trigger your app instead of calling the Bot API directly, and wait for the same
@@ -984,34 +1250,36 @@ condition.
 `restore(handle)` need the server to be idle: no Bot API, control or owner request in progress, no
 long poll, no webhook attempt (an update waiting for a retry counts until it is delivered, dropped
 or its webhook removed), no response delay, no send held by flood control and no clock advance.
-Pending restriction and ban expiries and unused failure rules are fine. Drain deliveries and finish
-requests before taking a snapshot; `restore` fails with outstanding work rather than mix it with
-the restored state.
+Pending restriction and ban expiries and unused failure rules are fine.
+
+Drain deliveries and finish requests before taking a snapshot; `restore` fails with outstanding work
+rather than mix it with the restored state.
 
 `restore` puts back users, bots, chats (groups, private and business chats, owner accounts), file
 bytes, members, messages, invite links and join requests, id counters, call receipts, failure rules
 and how far they have counted, sent updates with their bytes and queues, webhook and
 `allowed_updates` settings, login codes and flood control's recent sends. Expiries are scheduled
-again from the restored members. A snapshot can be restored any number of times;
-`releaseSnapshot(handle)` frees it. A restore cancels waits in progress and returns
-`{ restored: true, epoch }`, where `epoch` counts the restores so far; it keeps later `request_id`s
-apart from earlier ones although ids and receipts go back. The origin and the login signing key
-stay the same. Nothing outside the server is restored: your webhook receiver, its sockets and
-timers, your database and your app's state.
+again from the restored members.
+
+A snapshot can be restored any number of times; `releaseSnapshot(handle)` frees it. A restore
+cancels waits in progress and returns `{ restored: true, epoch }`, where `epoch` counts the restores
+so far; it keeps later `request_id`s apart from earlier ones although ids and receipts go back. The
+origin and the login signing key stay the same. Nothing outside the server is restored: your webhook
+receiver, its sockets and timers, your database and your app's state.
 
 Between independent scenarios, drop unused failure rules with `clearFailures()`, then restore a
 snapshot or start a fresh server.
 
 ### Watch the chats in a browser
 
-A server started with `ui: true` serves a live view of its chats at `server.viewerUrl`
-(`<origin>/_fake/ui`). It opens on **Activity**: every chat in one feed, drawn as a chat window,
-in the order things happened, so you never switch between chats. A small "In Book Club" line marks
-which chat the next items belong to. Messages are bubbles as in Telegram; each Bot API call is a
-bubble from the bot ("Bot API call", the method, whether Telegram accepted or refused it, and its
-error); a change to a member is a centered line like "Ann joined". It follows the test as it runs,
-with no reload, so you can watch a scenario or screenshot it with Playwright. The chat list, a
-single chat and its members panel are a toggle away.
+<img src="https://raw.githubusercontent.com/anatolyben/telegram-bot-test-server/v0.13.1/docs/images/viewer-as-member.png"
+  alt="The book club group on a phone, seen as Carol: the bot's welcome with its Rules button, the
+  messages and their reactions, and no deleted link" width="320">
+
+The viewer draws the server's chats the way Telegram's apps draw them, live, as the test runs.
+Above, a book club group on a phone, seen as its member Carol.
+
+Turn it on with `ui: true`. The server then serves the viewer at `server.viewerUrl`:
 
 ```js
 const server = await startTestServer({
@@ -1022,207 +1290,23 @@ const server = await startTestServer({
 console.log(server.viewerUrl); // http://127.0.0.1:54321/_fake/ui
 ```
 
-From the command line, `--ui` prints the address. The viewer is off by default, and it answers only
-on this computer: a request from another machine, through a proxy or tunnel, or under another host
-name gets 403. It never changes the server's state, adds nothing to Bot API answers or updates, and
-an open viewer does not hold up `snapshot()`, `restore()` or a wait.
+From the command line, `--ui` prints the address. The viewer answers only on this computer. It never
+changes the server's state, and Bot API answers and updates stay the same.
 
-To watch a test by eye, give the server a fixed `port` and open `server.viewerUrl` before the test
-runs. Keep the server running until you have looked: pause before `server.stop()`, with a long
-sleep and a test timeout to match, or `await page.pause()` in a Playwright test. A page whose
-server stopped keeps the last state and tries the address again every 2 seconds, so it misses a
-server that starts and stops in between, as a fast test's does. A Playwright script that opens
-`server.viewerUrl` from inside the test needs no fixed port. To look at a fast test afterwards,
-[record it](#record-a-scenario).
+To watch a test by eye, give the server a fixed `port` and open the address before the test runs.
+Keep the server running until you have looked, for example with `await page.pause()` in a
+Playwright test. To look at a fast test afterwards, [record it](#record-a-scenario).
 
-What it shows, only from what the server stores:
+It opens on **Activity**: every chat in one feed, in the order things happened. Messages are
+bubbles, as in Telegram. Each Bot API call is a bubble from the bot, with the method, the outcome
+and Telegram's error text. A change to a member is a centered line, such as "Ann joined". A deleted
+message stays, grayed and marked with who deleted it.
 
-- **Chats**: groups, supergroups, channels, forums and each user's private chat with each bot, a
-  deleted bot's included, most recently active first. The search box hides the chats whose title
-  does not match; their rows stay in the page, so count rows with Playwright's `:visible`.
-- **Messages**: the sender's name and initial, bots tagged as the first bot, an added bot, a
-  deleted bot or a guest bot; a channel post or a post on behalf of a chat as the chat, with its
-  signature and, in the test's view, who posted it; text with its entities (hover a text link for
-  its address, a text mention for the user), replies, forwards (from a user, a hidden user, a
-  channel or a supergroup, with the signature) and captions; photos as the images themselves, a
-  file posted again included; a contact as a card with the name, the phone and the account it
-  names; a location as a card with its point and accuracy, and for a live one how long it is
-  shared, its heading and alert radius (no map); other media as labeled placeholders; inline
-  keyboards as buttons (hover one for its callback data); edits (not a bot's change of only the
-  keyboard, which Telegram's apps do not mark either); and service messages: joins, leaves, pins,
-  title and photo changes, upgrades and topics. Times are UTC.
-- **Reactions** under each message: a chip for each emoji or custom emoji, with how many chose
-  it, the most chosen first, as TDLib sorts them. A custom emoji's image is not stored, so a mark
-  stands in for it (hover for its id). In the test's view, hover a chip for who chose it; seen
-  as a member, their own reaction is marked. A screen reader reads the same from each chip's
-  label. Unverified: the order of reactions chosen equally often. TDLib orders them by Telegram's
-  list of active reactions, which this server does not have; here they follow the members who
-  chose them, by when each first reacted to the message.
-- **Deletions**: a deleted message stays, grayed and marked with the bot that deleted it.
-- **Ephemeral messages**, marked with the member who sees them.
-- **Events** Telegram shows as no message: member changes by a bot or a person (restrictions,
-  bans, promotions, their expiry), join requests (pending, approved, declined) and unpins. When
-  events have a panel of their own, as in the `split` layout, it also lists the chat's service
-  messages, such as joins and leaves, so every change to the chat is in one list there.
-- **Members**: the chat's default permissions, then each member, the bots included, with their
-  status (creator, administrator, member, restricted or banned until a UTC time or forever, left),
-  what a restricted member cannot do and an administrator's rights; then pending join requests.
-  The count is of those in the chat now; the panel also lists those who left or were banned, up to
-  200 members in all.
+The toolbar switches to the chat list, one chat, its members, or the chats as one member sees them.
+Click a call to mark what it touched. The view lives in the URL, so a link opens the same view.
 
-The view lives in the URL, so a link, a test or a Playwright script reproduces it exactly, and
-everything changed on the page (panels, layout, view as, topic, theme, the open chat) updates the
-URL:
-
-- `chat`: a group id, `<user id>:<bot id>` for a private chat, a user id for their chat with the
-  first bot, or `all` for the Activity feed. Without it, Activity.
-- `chats`: up to four chats, comma-separated, shown side by side.
-- `show`: the panels, comma-separated: `list`, `chat`, `calls`, `events`, `members`. Default: all
-  for one chat; `chat,calls,events` for Activity, which has no members panel.
-  In the combined layout, `calls` and `events` turn the inline calls and events on or off.
-- `layout`: `combined` (calls and events inline in the chat; the default) or `split` (each in its
-  own panel).
-- `as`: a user id: the chats as that member sees them. Default: the test's view of everything.
-- `bots`, `methods`: comma-separated: calls from these bots or of these methods only. Default: all.
-- `topic`: a forum topic's `message_thread_id`, or `general`. Default: all topics.
-- `theme`: `light` or `dark`. Default: the system's.
-
-Unknown parameters and values are ignored, and the page drops them from the URL, so a typo such as
-`show=member` shows the default.
-
-For example, `/_fake/ui?chats=-1001000000001,-1001000000002&show=chat,calls,events` shows a group
-beside its log chat, each with its bot calls and events, and `?chat=-1001000000001&show=members`
-only the members. A page opened without `chat` shows Activity and writes `chat=all` into the URL.
-Each panel's ↗ opens it alone in a new tab, and × hides it; a panel alone on the page has neither.
-The dividers between columns resize them, with the mouse or the arrow keys. On a phone the panels
-that are on stack one under another on one scrolling page, a panel alone fills the screen, and the
-toolbar is one compact row.
-
-**View as a member.** `as=<user id>`, or the select in the toolbar, shows each chat as that member
-sees it (in Activity, only the chats they can open): no deleted messages, no other member's ephemeral messages (their own read "only you see
-this"), no events, calls or member panels, a reply to or pin of a deleted message as Telegram shows
-it, and a poll's results only once they have voted or it has closed. The chat list holds only their
-chats. They see everything in a channel, forum or supergroup they are in now and nothing in one they
-are not in (a note says why); in a basic group, what was posted while they were in it, and nothing
-after a ban with `revoke_messages`. Not modeled: whether a private supergroup hides its earlier
-history from new members (the view marks where that history would start), and members a chat was
-created with count as present from the start.
-
-Here a book club group is seen as its member Carol, in a phone-sized window. The link the bot
-deleted is gone, and her own reactions are marked:
-
-<img src="https://raw.githubusercontent.com/anatolyben/telegram-bot-test-server/v0.13.1/docs/images/viewer-as-member.png"
-  alt="The book club group on a phone, seen as Carol: the bot's welcome with its Rules button, the
-  messages and their reactions, and no deleted link" width="320">
-
-**Long chats.** A chat shows its latest 200 messages and events; "Load older messages" adds 200 at a
-time. At most 600 stay loaded: loading more drops the newest, and "Jump to latest", which says how
-many newer messages are not loaded, goes back to the end.
-
-**Live updates.** The page follows the server over a server-sent event stream: every change shows
-within a moment, without a reload, and after a `restore`, or with a new server on the same port,
-the page loads everything again. The status in the toolbar reads Live, Connecting… or Server
-stopped; a stopped page tries its address every 2 seconds and connects again once a server
-answers there. All viewer tabs of one browser share one event stream, so any number of them stay
-live.
-
-**Selecting with Playwright.** Chats, messages, buttons and members carry stable data attributes.
-A flag, such as `data-deleted` or `data-member-bot`, reads `true` when set and is left out
-otherwise. In a recording, items from before it carry `data-before-window`.
-
-- **The page**: `[data-role="app"]` with `data-instance`, `data-epoch`, `data-version`, and
-  `data-busy="true"` while loading.
-- **Chat list row**: `data-chat-key`, `data-chat-id`, `data-chat-type` (`supergroup`, `group`,
-  `channel`, `private`, `calls`), `data-forum`; for a private chat `data-user-id` and
-  `data-bot-id`; `aria-current="true"` when open.
-- **Column**: `data-column-id` (`list` or `<panel>:<chat>`), `data-panel`, `data-chat-key`,
-  `data-chat-id`, `data-view-as`.
-- **Message**: `data-kind="message"`, `data-chat-key`, `data-seq`, `data-message-id` or, for an
-  ephemeral message, `data-ephemeral-id` and `data-receiver-id`; `data-author-id`,
-  `data-author-kind` (`user`, `first-bot`, `added-bot` (a deleted one too), `guest-bot`, `bot`,
-  `channel` for a channel post or a post on behalf of a chat),
-  `data-deleted` and `data-deleted-by` (the user id of the bot that deleted it), `data-edited` and
-  `data-edit-hidden` (a bot changed only the keyboard), `data-service` (the service message's
-  field, such as `new_chat_members`), `data-thread-id`, `data-reply-to`, `data-reply-deleted`,
-  `data-pinned-deleted`, `data-request-id`.
-- **Inline button**: `data-button-text`, `data-button-data`, `data-button-url`, `data-button-row`,
-  `data-button-col`.
-- **Reaction** (inside its message): `data-reaction-type` (`emoji` or `custom_emoji`),
-  `data-reaction-emoji` or `data-custom-emoji-id`, `data-reaction-count`; in the test's view
-  `data-reaction-user-ids` (space-separated), and seen as a member `data-reaction-mine`.
-- **Event**: `data-kind="event"`, `data-chat-key`, `data-event-id`, `data-event-type` (`member`,
-  `join_request`, `unpin`), `data-user-id`, `data-request-id`.
-- **Call**: `data-kind="call"`, `data-chat-key` (`calls` for calls without a chat),
-  `data-request-id`, `data-request-number`, `data-call-seq` and `data-call-journal` (the receipt's
-  `seq` and its list: `calls` or `rejected_requests`), `data-call-bot-id`, `data-call-method`,
-  `data-call-outcome` (the receipt's `outcome`, such as `succeeded` or `rejected`, without the
-  status code), `data-target-messages` (`<chat id>:<message id>`, space-separated),
-  `data-target-user-id`, `data-target-ephemeral-id`.
-- **Member**: `data-chat-key`, `data-member-id`, `data-member-status` (the Bot API status:
-  `creator`, `administrator`, `member`, `restricted`, `left` or `kicked`, which the panel calls
-  banned), `data-member-in-chat` (always `true` or `false`), `data-member-bot`.
-- **Join request**: `data-chat-key`, `data-join-request-user-id`.
-
-`data-chat-key` tells a user's private chats with two bots apart. View as, the topic filter and the
-call filters leave what is hidden out of the page, so a count of zero means it is not shown; the
-chat search only hides rows.
-Whatever a clicked call touched carries `data-highlighted="true"`. The page keeps its event
-stream open, so Playwright's `networkidle` never settles; after acting, read the server's version
-and wait for the page to catch up:
-
-```js
-// The viewer's own address: with host "0.0.0.0" or "::", server.origin is not a local one.
-const viewer = new URL(server.viewerUrl).origin;
-const { version } = await (await fetch(`${viewer}/_fake/ui/api/state`)).json();
-await page.waitForFunction(
-  (wanted) =>
-    Number(document.body.dataset.version) >= wanted &&
-    !document.body.hasAttribute("data-busy"),
-  version,
-);
-const spam = page.locator(`[data-kind="message"][data-message-id="${spamId}"]`);
-console.log(await spam.getAttribute("data-deleted-by")); // the bot that deleted it
-```
-
-The viewer's routes, all `GET` and all on this computer only:
-
-- `/_fake/ui`: the page.
-- `/_fake/ui/assets/<file>`: its scripts and stylesheet.
-- `/_fake/ui/api/state`: the chat list (`?as=<user id>` for a member's).
-- `/_fake/ui/api/chats/<chat>`: a chat's messages and events, members and calls (`limit`,
-  `before`, `from`, `to`, `as`, `topic`, `members_limit`, `calls_before`). A message with
-  reactions has `reactions`: for each, its `type`, `emoji` or `custom_emoji_id`, `total_count`
-  and `user_ids`, the most chosen first.
-- `/_fake/ui/files/<file_id>`: a stored image's bytes.
-- `/_fake/ui/events`: the live event stream (server-sent events).
-
-#### Call timeline
-
-The viewer draws every Bot API call from the [call receipts](#call-receipts) beside the chat it
-acted on: the bot (first, added or deleted), the method, what it asked for in words (the user, the
-messages, `until_date` as a UTC time or "forever", the permissions as Telegram reads them (a
-permission left out is off; hover for what was sent) or the rights it grants, the text), its
-outcome (`succeeded`, `rejected 400`, `delayed`, `response lost`, ...), and,
-for every answer other than 200, Telegram's description exactly as the bot got it. A call a failure
-rule failed, delayed or dropped is tagged `injected`, and a method this server lacks
-`unimplemented`.
-
-- A call belongs to the chat its `chat_id` names (a private chat as the user's chat with the
-  calling bot); `answerCallbackQuery` and `answerChatJoinRequestQuery` to the chat of the button
-  press or join request they answer. The rest, such as `getUpdates`, `setWebhook`, business sends,
-  unknown tokens and requests that could not be read, are under **Bot calls without a chat**
-  (`chat=calls`).
-- In the `combined` layout the calls are in the chat in the order things happened, each right
-  before the messages and events it produced. `layout=split` lists them in a panel of their own,
-  and `show=calls` shows the timeline alone.
-- **Filter calls**, or `bots=` and `methods=` in the URL, keeps only some bots' calls or some
-  methods.
-- In a forum, a topic shows only its calls: those whose message landed in it, or that named it as
-  `message_thread_id`, or that acted on one of its messages. Any other call is under General.
-- Clicking a call marks what it touched: the messages it names (for a forward or a copy, in the chat
-  they came from), its ephemeral message, the member it acted on, and what it produced. A message
-  that is not loaded gets a note instead.
-- A chat's page holds at most 1000 calls; **Load older calls** fetches the earlier ones.
+The [viewer reference][ref-viewer] lists everything it shows, its URL parameters, the data
+attributes for Playwright and its routes.
 
 ### Record a scenario
 
@@ -1274,7 +1358,7 @@ afterEach(async ({ task }) => {
   making the directory if needed and replacing earlier files of that name, and returns their paths
   in `files` as `{ html, json }`. Only the option chooses the directory, never a request.
 - The page is the viewer in a single file: the same panels, layouts, call filters, view as and
-  highlights, and the same URL parameters (`spam-is-removed.html?chat=-1001234567890&layout=split`).
+  highlights, and the same URL parameters (`spam-is-removed.html?chat=-1001000000001&layout=split`).
   Its scripts, styles, data and images are inside it, and its content security policy lets it load
   nothing else. It needs JavaScript. Recording works with the `ui` option on or off.
 - The JSON twin has `format: "telegram-bot-test-server-recording"` and `format_version: 1`; the
@@ -1283,11 +1367,74 @@ afterEach(async ({ task }) => {
   `stop_request` on the count of Bot API requests, `started_at` and `stopped_at` in server time);
   the chat list in `state`; in `pages`, one page per chat, in the shape of the viewer's
   `/_fake/ui/api/chats/<chat>`, with all its items, members and calls (context items carry
-  `before_window: true`); and every image once, as a `data:` URI, in `files`.
+  `before_window: true`); every image once, as a `data:` URI, in `files`; and in `scenarios`, every
+  [scenario](#report-scenarios) with a start or finish in the window.
 - Recordings are not part of snapshots. One that started before a `restore` cannot be stopped:
   `stopRecording` fails and drops it, since its marks belong to the state the restore replaced.
   When tests restore a snapshot, restore first, then start recording. `stop()` drops recordings
   still running.
+
+### Report scenarios
+
+A test runner can tell the server which scenario is running and how it ended, so the viewer and
+recordings show each scenario's start, result, failure and labels among the chats. These are test
+controls only: Telegram and the bots see nothing of them. The runner decides every status and
+result; the server never infers one, and a scenario it was never told finished stays `running`.
+
+The [recipe](#report-a-scenario-to-the-viewer) has a helper that reports each test this way. A
+failed scenario names its evidence by message log seq, call `request_id` or event id:
+
+```js
+await server.startScenario({ runId: "nightly-42", scenarioId: "spam-is-removed", chats: [GROUP] });
+const mark = await server.getMessageLog(GROUP);
+// The scenario runs, and its wait for the bot fails.
+const { messages } = await server.getMessageLog(GROUP, { since: mark.cursor });
+await server.finishScenario({
+  runId: "nightly-42",
+  scenarioId: "spam-is-removed",
+  result: "failed",
+  failure: {
+    message: "the bot kept the spam",
+    evidence: [{ kind: "message", seq: messages[0].seq, labels: { role: "trigger" } }],
+  },
+});
+await server.finishScenario({ runId: "nightly-42", scenarioId: "photos", result: "skipped" });
+```
+
+- `startScenario({ runId, scenarioId, title, labels, chats })` reports a start. `runId` and
+  `scenarioId` (1 to 200 characters) name the scenario; another run may use the same
+  `scenarioId`, so runs that overlap on one server stay apart. A run reports each scenario once.
+  `title` defaults to `scenarioId`. `chats` names the chats it happens in, as the viewer's `chat`
+  parameter does.
+- `finishScenario({ runId, scenarioId, result, failure, labels, title })` reports the result:
+  `passed`, `failed` or `skipped`. A scenario that never started, such as a skipped one, is
+  reported here first. A failed one may carry `failure: { message, evidence }`. Each piece of
+  evidence names something the server stored: `{ kind: "message", seq }` (a
+  [message log](#message-log-and-delivered-updates) seq), `{ kind: "call", requestId }` (a
+  [call receipt][ref-receipts]'s `request_id`) or `{ kind: "event", eventId }` (an event's
+  `data-event-id` in the viewer), each with optional `labels`. Evidence that does not exist is
+  refused.
+- `labels` are free key and value pairs, such as `{ model: "local", mode: "fixture" }`; values are
+  kept as text, and a finish adds to the start's. The server gives no key a meaning.
+- `getScenarios({ runId })` lists the scenarios, one run's or all, in the order first reported,
+  with their status, result, labels, failure and the marks of their start and finish.
+
+In the viewer, a scenario's start and finish are cards among the chat's items, in the order things
+happened: the result, the title, the run, and the labels. Each card lists every label key its run
+uses, and `unknown` for one it lacks.
+
+A failure shows its message and a list of its evidence, each in words: a message's sender, a short
+quote and its chat; a call's bot, method and outcome; an event as the chat shows it, such as "Bob
+banned forever by Shop Guard". Each keeps its labels. **Show evidence** marks them on the page, as
+clicking a call marks what the call touched.
+
+The Activity feed shows every scenario. A chat shows those that name it, those whose evidence is in
+it, and, when a scenario names no chat, those with something in the chat between their start and
+finish. The **Run** select in the toolbar, or `runs=` in the URL, keeps one run's cards.
+
+Recordings keep the cards, their labels and evidence (older evidence as context), and list the
+scenarios in the twin's `scenarios`. Like recordings, scenario reports are not part of snapshots:
+after a `restore`, the viewer shows only those reported since.
 
 ### Telegram Login
 
@@ -1351,7 +1498,7 @@ It follows [Telegram's docs](https://core.telegram.org/bots/telegram-login) and 
 - A code works once, only with the same `redirect_uri`, and only with a `code_verifier` that
   matches its challenge; otherwise `/token` answers `invalid_grant`, and a wrong secret
   `invalid_client` (401). `grant_type` must be `authorization_code`. Codes expire after 60 seconds
-  (unverified: Telegram does not document how long).
+  here; Telegram does not document how long they last.
 - The ID token is signed RS256 with the published key and names it in `kid`. It has `iss`
   (`https://oauth.telegram.org`), `aud` (the bot id), `sub`, `iat`, `exp` (an hour later, as
   `expires_in: 3600` says) and `nonce` when the app sent one. `sub` is an opaque id that stays the
@@ -1443,12 +1590,15 @@ the server.
 | `--unimplemented-ok` | off             | Answer `true` to unsupported methods that return True.  |
 | `--ui`               | off             | Serve the [chat viewer](#watch-the-chats-in-a-browser). |
 | `--record-dir`       | none            | Where [recordings](#record-a-scenario) are written.     |
+| `--clock-now`        | real time       | A [manual clock](#time): Unix ms or an ISO date.        |
+| `--clock-offset`     | real time       | A [running clock](#time): real time plus ms.            |
+| `--clock-webhook`    | none            | Where clock changes go, as with `clockWebhook`.         |
 
 These are all the flags; there is no `--help`. Without `--token` it prints its usage line, and an
-unknown flag stops it with an error.
+unknown flag stops it with an error. So does a clock value it cannot read, or both clock flags.
 
 `chats.json` holds `{ "chats": [...], "publicChats": [...] }` in the shape of the
-[options](#options), with their camelCase keys:
+[options][ref-options], with their camelCase keys:
 
 ```json
 {
@@ -1463,7 +1613,7 @@ python-telegram-bot, call `.base_url(f"{origin}/bot")` and `.base_file_url(f"{or
 on `Application.builder()`; with aiogram, give the bot
 `session=AiohttpSession(api=TelegramAPIServer.from_base(origin))`.
 
-The test drives the test actions through the [control API](#control-api): JSON routes under
+The test drives the test actions through the [control API][ref-control]: JSON routes under
 `/_fake/`, a prefix no Bot API path uses. This pytest test starts the server on a free port and the
 bot under test (here `bot.py`, which takes the origin as its argument), then plays the quick
 start's user:
@@ -1532,609 +1682,24 @@ expected and what was observed.
 The control API takes snake_case fields, like the Bot API; the waits, snapshots, clock and
 deliveries routes take camelCase fields, like their JavaScript methods.
 
+---
+
 ## Reference
 
-### Options
-
-`startTestServer(options)` takes:
-
-- `botToken` (required): the first bot's token, `<numeric id>:<secret>`. The numeric id is the bot's
-  user id. Calls with any other token get 401.
-- `port`, `host` (default `0`, `127.0.0.1`): where to listen. Port 0 picks a free port.
-- `botUsername`, `botName` (default `example_bot`, `Example Bot`): returned by `getMe`.
-- `chats` (default `[]`): supergroups `{ id, title, ownerId, ownerName? }`. The bot is an
-  administrator with `can_manage_chat`, `can_change_info`, `can_delete_messages`,
-  `can_invite_users`, `can_restrict_members` and `can_pin_messages`.
-- `publicChats` (default `[]`): channels, groups and bots `{ username, type, title? }` resolvable by
-  `getChat("@username")`; `type` is `"channel"`, `"supergroup"` or `"bot"`, and `username` may
-  start with `@`.
-- `supportsJoinRequestQueries` (default `false`): a guard bot: where it has `can_invite_users`, join
-  requests reach it with a `query_id` ([Join request queries][behavior-join-queries]).
-- `loginClientSecret` (default random): the first bot's [Telegram Login](#telegram-login) client
-  secret.
-- `unimplemented` (default `"error"`): Telegram's 404 for an unsupported method, or `"ok"`: `true`
-  for one that returns True ([Supported Bot API methods](#supported-bot-api-methods)).
-- `floodControl` (default `false`): hold or refuse sends over Telegram's published limits
-  ([Flood control](#flood-control)).
-- `clock` (default real time): `{ now: <Unix ms> }`: a manual clock that only `advanceTime` moves;
-  or `{ offset: <ms> }`: a running clock, real time plus an offset that `advanceTime` adds to
-  ([Time](#time)).
-- `clockWebhook` (default none): an `http(s)` URL. With a manual or running clock, the server POSTs
-  `{ now, mode }` there, and `offset` for a running clock, after each `advanceTime` and each
-  restore, so the app under test can follow the clock
-  ([Testing time-based app logic](#testing-time-based-app-logic)). The bot's own webhook
-  deliveries stay as Telegram sends them.
-- `ui` (default `false`): serve the [chat viewer](#watch-the-chats-in-a-browser) at
-  `server.viewerUrl`, to this computer only. It needs a loopback or wildcard `host`; another throws
-  `ui needs a loopback or wildcard host`.
-- `recordDir` (default none): the directory `stopRecording` writes each recording into
-  ([Record a scenario](#record-a-scenario)).
-- `log` (default none): receives one line per notable event: unsupported methods, webhook
-  failures, internal errors.
-
-### Test actions
-
-`startTestServer()` returns the server with these methods; `server.origin` is its base URL, for
-the bot's Bot API root, and `server.viewerUrl` the [chat viewer](#watch-the-chats-in-a-browser)'s
-address (`null` without `ui: true`). Each action resolves once the update it causes has been
-handed to the bot ([Make users act](#make-users-act)). The owner account actions are in the
-[owner accounts reference][owner-docs].
-
-**Users**
-
-- `createUser({ first_name, last_name, username, language_code, bio, is_bot, is_premium })`: a new
-  Telegram user; returns their id. All fields are optional: `first_name` defaults to
-  `"Test Member"` and `language_code` to `"en"`; the user has no last name, username or bio, and
-  is neither a bot nor premium.
-- `updateProfile(userId, fields)`: the user changes their name, username or bio.
-- `addProfilePhoto(userId, bytes)`: the user adds a profile photo.
-
-**Joining and leaving**
-
-- `join(chatId, userId)`: the user joins the group.
-- `joinByLink(inviteLink, userId)`: the user opens an invite link: joins, or files a join request
-  if the link requires approval; returns `{ chat_id, status: "member" | "requested" }`. A revoked,
-  expired or full link fails with `INVITE_HASH_EXPIRED`.
-- `leave(chatId, userId)`: the user leaves.
-
-**Posting**
-
-- `post(chatId, userId, text)`: the user posts a message; returns its `message_id`. Fails if the
-  user is not allowed to post. Text and captions are trimmed as Telegram's apps send them, and
-  text that then shows nothing fails with `MESSAGE_EMPTY`. Instead of text, it takes an object
-  with `text` or one other kind of content, and the fields that go with it:
-  - `photo`: image bytes (a PNG, GIF or JPEG header gives its size). `media`:
-    `{ type, bytes, fileName?, mimeType? }` with `type` `video`, `animation`, `sticker`, `voice`,
-    `audio`, `video_note` or `document`. A `caption` goes with every kind but stickers and video
-    notes.
-  - `fileId`: a file from an earlier message, by any bot's `file_id` for it. The message keeps the
-    file's kind and `file_unique_id`, and needs the permission for that kind; a caption may go
-    with it.
-  - `poll`: a poll of the user's own, with `sendPoll`'s fields (`question`, `options`, `type`,
-    `is_anonymous`, `allows_multiple_answers`, `allows_revoting`, `correct_option_ids`,
-    `explanation`) and checks. It needs `can_send_polls`.
-  - `contact`: `{ phoneNumber, firstName, lastName?, vcard?, userId? }`, and `location`:
-    `{ latitude, longitude, horizontalAccuracy?, livePeriod?, heading?, proximityAlertRadius? }`
-    (live when `livePeriod` is not 0). Each needs `can_send_messages`. `horizontalAccuracy` is
-    kept in whole meters, rounded up, at most 1500. A contact without a phone number or first
-    name fails as incomplete; what Telegram answers is unverified.
-  - `entities` and `captionEntities`: `MessageEntity` objects for the text and the caption,
-    checked as Telegram checks a user's. Types Telegram finds by itself are ignored, except
-    `phone_number` and `bank_card_number`, which this server does not find. A `text_link` URL is
-    kept as Telegram rewrites it, so `https://example.com` comes back as `https://example.com/`.
-  - `replyTo`: the `message_id` it replies to. `threadId`: a forum topic.
-  - `forwardFrom`: where a forward comes from: `{ userId }`, `{ senderName }` (a hidden user),
-    `{ chatId, messageId? }` (a channel post) or `{ chatId }` of a supergroup (a post made on its
-    behalf), with `authorSignature?` for a channel or supergroup.
-  - `sendAs`: in a supergroup, the chat to post on behalf of: the group itself, for an anonymous
-    administrator, or a channel the user created. Others fail with `SEND_AS_PEER_INVALID`. An
-    administrator with `is_anonymous` posts as the group even without it, and anyone else may
-    name themselves. A channel needs Telegram Premium (`is_premium`), or the post fails with
-    `PREMIUM_ACCOUNT_REQUIRED` (unverified). Telegram offers only public channels; chats made in
-    a test have no public username, so here any channel the user created counts.
-- `vote(chatId, messageId, userId, optionIds)`: the user votes in a poll: option indexes, or `[]` to
-  take the vote back. Fails as Telegram's app refuses: `Can't answer closed poll`,
-  `Can't choose more than 1 option in the poll`, `Invalid option identifier specified`,
-  `Can't revote in a quiz` (or in any poll without `allows_revoting`),
-  `Can't retract vote in the poll`, `Can't access the chat` for someone not in it, and
-  `Message is not a poll`. Resolves with the poll once the bot that sent it has its updates.
-- `postAlbum(chatId, userId, items, { threadId })`: the user posts 2 to 10 photos or videos as one
-  album (`media_group_id`); `items` are `{ type: "photo" | "video", bytes, caption? }`. Returns
-  `{ media_group_id, message_ids }`.
-- `editMessage(chatId, messageId, userId, { text, caption })`: the author edits their message; bots
-  get `edited_message` (`edited_channel_post` in a channel). Text that shows nothing fails with
-  `MESSAGE_EMPTY`. Returns `{ message_id, edit_date }`.
-- `react(chatId, messageId, userId, emoji)`: the user reacts to a message, or takes the reaction
-  back with `null`. The emoji must be one of the Bot API's reactions
-  ([ReactionTypeEmoji](https://core.telegram.org/bots/api#reactiontypeemoji)); any other fails with
-  `The reaction isn't available for the message`. Returns `{ reactions }`.
-- `pinMessage(chatId, messageId, userId)`: a person with `can_pin_messages` (in a channel,
-  `can_edit_messages`) pins the message; bots get the `pinned_message` service message, whose
-  `{ message_id }` it returns.
-- `postGuestBotReply(chatId, userId, botUsername, text)`: the user calls a guest bot (Bot API 10.0
-  guest mode); its answer appears in the group from that bot, with `guest_bot_caller_user` set.
-  Returns its `message_id`.
-
-**Buttons**
-
-- `pressButton(chatId, messageId, userId, data, { deliverTwice })`: the user presses the inline
-  button whose `callback_data` is `data` (not its label); resolves with the bot's
-  `answerCallbackQuery` answer, `{ answered, text, show_alert }`. It fails at once if the message
-  has no button with that data. Once the press has reached the bot (for a webhook, once it
-  answered, within a minute), it waits up to 10 seconds for the answer, and resolves
-  `{ answered: false }` if none came. An answer Telegram refuses, such as text over 200
-  characters, does not count. The bot that put the keyboard on the message gets the press. With
-  `deliverTwice: true` (default off), its webhook then gets the same update again, as Telegram
-  sends an update its webhook did not confirm; a bot without a webhook is refused.
-- `pressEphemeralButton(chatId, ephemeralMessageId, userId, data, { deliverTwice })`: the receiver
-  presses an inline button on an ephemeral message; works like `pressButton`.
-- `pressDirectButton(userId, messageId, data, { deliverTwice })`: the user presses a button in
-  their private chat with the bot.
-- `openUrlButton(chatId, messageId, userId, button, { addToChatId })`: the user opens a URL
-  button, named by its text or its index (row by row, from 0). A link to one of the server's bots
-  does what Telegram's app does with it. `https://t.me/<bot>?start=<parameter>` (or
-  `tg://resolve?domain=<bot>&start=<parameter>`) sends `/start <parameter>` from the user in their
-  private chat with the bot. A `startgroup=<parameter>` or `startchannel` link adds the bot, as the
-  user, to the group or channel `addToChatId` names, with the rights its `admin=` asks for, as
-  `addBotViaLink` does. Resolves with `{ url }`, and for such a link also `link`, `bot_id`,
-  `chat_id` and, for `start`, the message's `message_id`. Any other URL changes nothing
-  ([URL buttons][behavior-url-buttons]). It fails for a button that is not a URL button, and for a
-  `start` link to a bot other than the first, since users write privately only to the first bot.
-- `openEphemeralUrlButton(chatId, ephemeralMessageId, userId, button, { addToChatId })`: the
-  receiver opens a URL button on an ephemeral message; works like `openUrlButton`.
-- `openDirectUrlButton(userId, messageId, button, { addToChatId })`: the user opens a URL button
-  in their private chat with the bot.
-
-**Private chats**
-
-- `sendDirectMessage(userId, message)`: the user messages the bot privately; returns the
-  `message_id`. `message` is text, or anything `post` takes but `threadId` and `sendAs`: a photo,
-  other media with a caption, a reply to one of the bot's messages, a forward, a poll, a contact,
-  a location or an earlier file. Empty text fails with `MESSAGE_EMPTY`.
-- `voteDirect(userId, messageId, optionIds)`: the user votes in a poll the bot sent to their private
-  chat; works like `vote`.
-- `getDirectMessages(userId)`: an array of the messages in the private chat between the user and
-  the bot, newest first.
-
-**Reading state**
-
-- `getMessages(chatId)`: an array of the chat's messages not deleted, newest first. Ephemeral
-  messages are included in their place, with `receiver_user`; all of them have `message_id` 0, so
-  tell them apart by `ephemeral_message_id`. File ids are the first bot's.
-- `getMessage(chatId, id)`: a regular message by `message_id`, as
-  `{ exists, deleted, message }`.
-- `getEphemeralMessage(chatId, ephemeralMessageId)`: an ephemeral message by its
-  `ephemeral_message_id`, as `{ exists, deleted, message }`.
-- `getMember(chatId, userId)`: the member as `getChatMember` returns them to the first bot:
-  status, restrictions, ban.
-- `getJoinRequests(chatId)`: user ids waiting for approval.
-- `getChat(chatId)`: the chat, its pinned message ids (newest first by sending date) and its
-  members.
-- `getCalls()`: every Bot API call received, with the bot that made it, and any unsupported
-  methods called ([Call receipts](#call-receipts)).
-- `getMessageLog(chatId, { since, includeDeleted, botId, epoch })`: the chat's messages stored
-  after the cursor `since` (default 0), oldest first, as `{ chat_id, epoch, cursor, messages }`;
-  with `includeDeleted`, deleted ones too, with who deleted them. A user id reads their private
-  chats, and `botId` keeps one bot's. An `epoch` other than the server's fails
-  ([Message log and delivered updates](#message-log-and-delivered-updates)).
-- `getBotUpdates(botId, { type, chatId, since, epoch })`: the updates the bot was sent after the
-  `update_id` `since`, in order, as `{ bot_id, epoch, updates }`, each with its type, chat, state
-  and the exact update.
-
-**Bots and chats**
-
-- `addBot({ token, username, firstName, loginClientSecret, supportsJoinRequestQueries })`: another
-  bot, with its own webhook or update queue; it is in no chat yet. Returns the bot's user, with
-  its `id`.
-- `deleteBot(botId)`: a bot `addBot` added is deleted. Its token gets 401 `Unauthorized` from then
-  on, and a waiting `getUpdates` answers at once with what is pending. It leaves every chat it is
-  in, as with `leaveChat`, and is `left` there; Telegram does not document what a deleted bot's
-  chats see, so this is unverified.
-  It stays a user that earlier messages name, and a press on its buttons goes unanswered. The
-  message log, the viewer and recordings keep its messages, calls and private chats, and the
-  viewer tags it as a deleted bot; `getBotUpdates` no longer takes its id. The first bot can't be
-  deleted. Returns `{ deleted: true }`.
-- `createChat({ ownerId, title, type, ownerName, isForum })`: a new supergroup, forum (`isForum`),
-  basic group (`type: "group"`) or channel (`type: "channel"`) with no bot in it; returns its id.
-- `setBotMembership(chatId, botId, { status, rights, by })`: the owner (or `by`) adds, promotes,
-  demotes or removes a bot; `status` is `administrator` (default), `member`, `left` or `kicked`.
-  The bot gets `my_chat_member`. Returns its membership.
-- `promoteMember(chatId, userId, { by, rights })`: a person (`by`, default the creator) makes a
-  member an administrator with `rights`, such as `{ can_delete_messages: true }`. Rights left out
-  are not granted, and no right at all makes them a member. The person must be the creator or an
-  administrator with `can_promote_members`, who grants only rights they hold and edits only
-  administrators they promoted. Refusals carry Telegram's texts, such as `Not enough rights`,
-  `RIGHT_FORBIDDEN` or `CHAT_ADMIN_REQUIRED`. An edit keeps the custom title. In a basic group only
-  the creator promotes, with the group's fixed rights. The chat's administrator bots get
-  `chat_member`. Returns the member. Unverified: someone outside a supergroup or channel is
-  refused (`USER_NOT_PARTICIPANT`). Telegram's apps add someone outside a basic group first; this
-  server refuses them, so add them first.
-- `demoteMember(chatId, userId, { by })`: a person makes an administrator a member again, under
-  the same rules; an administrator may also step down, which is unverified. Demoting someone who
-  is not an administrator changes nothing.
-- `addBotViaLink(chatId, botId, { by, startParameter, rights })`: a person adds the bot through its
-  `startgroup` link (as an administrator with `rights`), then `/start@<bot> <startParameter>` is
-  posted; or its `startchannel` link. Returns the bot's membership.
-- `migrateToSupergroup(chatId, { by })`: the creator or an administrator upgrades a basic group;
-  returns the supergroup's id.
-- `renameChat(chatId, { by, title })`, `changeChatPhoto(chatId, { by, bytes })`: a person with
-  `can_change_info` renames the chat or sets its photo; returns the service message's
-  `{ message_id }`.
-- `createTopic(chatId, name, { by })`, `renameTopic(chatId, threadId, name, { by })`: a forum topic
-  is created or renamed, with Telegram's service message; `createTopic` returns its
-  `message_thread_id`.
-
-**Business accounts**
-
-- `connectBusiness({ ownerId, rights, id, isEnabled, botId })`: the owner connects a bot (by
-  default the first) to their business account, or changes the connection with `id`; the bot gets
-  `business_connection`. Returns `{ connection, update_id }`; `update_id` is `null` when the bot's
-  `allowed_updates` leave that update out.
-- `getBusinessConnection(connectionId)`: the `BusinessConnection`.
-- `sayInBusinessChat(connectionId, userId, sender, text)`: `"person"` writes to the owner, or
-  `"owner"` answers by hand; the bot gets `business_message` unless the connection is disabled.
-  Returns `{ message_id, date, update_id }`.
-- `getBusinessChat(connectionId, userId)`: the business chat, newest first:
-  `[{ direction: "inbound" | "owner" | "bot", deleted, message }]`.
-
-**Telegram Login**
-
-- `approveLogin(authUrl, userId)`: the user logs in on the Telegram Login page for that `/auth`
-  URL; returns the `redirect_uri` URL with `code` and `state`.
-- `cancelLogin(authUrl)`: the user cancels; returns the `redirect_uri` URL with
-  `error=access_denied` and `state`.
-
-**Failures and deliveries**
-
-- `failNext({ method, chatId, botId, userId, messageId, attempt, times, errorCode, description,
-  retryAfter, dropAfterApply, delayMs })`: the next matching Bot API calls fail with that error, or
-  (`dropAfterApply`) take effect and never answer ([Injected failures](#injected-failures)).
-- `clearFailures()`: drop failure rules not used up.
-- `redeliverUpdate(updateId, { botId })`: Telegram delivers that update again, byte for byte, to the
-  same bot's webhook. `botId` names the bot; with more than one bot, always pass it, since two bots
-  can get the same `update_id`.
-- `drainDeliveries({ botId, timeoutMs })`, `getDeliveries()`: wait for webhook attempts to settle;
-  list them ([Webhooks and polling](#webhooks-and-polling)).
-
-**Waits, snapshots and time** (test controls, not Telegram methods)
-
-- `waitFor(condition, { timeoutMs })`: resolves with what matched ([Wait
-  conditions](#wait-conditions)).
-- `snapshot()`, `restore(handle)`, `releaseSnapshot(handle)`: save and restore the server's state
-  ([Snapshots](#snapshots)).
-- `getClock()`, `advanceTime(ms)`: read the clock, and move a manual or running one
-  ([Time](#time)).
-
-**Recordings**
-
-- `startRecording(name, { chats })`, `stopRecording(name)`: record what happens between the two as
-  an HTML page and its JSON twin ([Record a scenario](#record-a-scenario)).
-
-**Stopping**
-
-- `stop()`: shut the server down. It cancels waits and delays, aborts deliveries in progress,
-  starts no queued ones, clears scheduled work and closes connections. Read-only controls still
-  answer in-process after `stop()`, for diagnostics.
-
-### Wait conditions
-
-`waitFor(condition, { timeoutMs })` takes one of these conditions (`POST /_fake/wait` takes the
-same):
-
-- `{ kind: "message", chatId, ... }` needs `messageId`, or an author (`userId` or `botId`) plus
-  exact `text` or `caption`. `deleted` checks whether it was deleted, and author, text and caption
-  can also narrow a `messageId`. `userId` or `botId` identifies the author also in a channel post
-  or a post on behalf of a chat, where the message itself names only the chat. It resolves with
-  `{ exists, deleted, message, author }`, where `author` is the author's user id, and finds
-  ephemeral messages by author and text too. To tell apart the same ephemeral text sent to two
-  members, read each one with `getEphemeralMessage`. It can instead, with or without an author,
-  match `contains` (a part of the text or caption), `matches` (a `RegExp`, or `{ source, flags }`
-  over HTTP; the `g` and `y` flags are dropped), `buttonText` and `buttonData` (an inline button's
-  exact text and `callback_data`, the same button when both are given). Every field given must
-  hold. With these, it resolves with the oldest match, ephemeral messages included, and `since`
-  (a [message log](#message-log-and-delivered-updates) cursor) skips messages stored up to it.
-- `{ kind: "member", chatId, userId, status }` reads the member's status in the chat, which every
-  bot in it shares. `permissions` compares the returned `ChatMember`'s permission fields. It
-  resolves with the `ChatMember`.
-- `{ kind: "joinRequest", chatId, userId, state }`, with `state` `pending`, `approved` or
-  `declined`, is what the test observed, not a `ChatMember` status; a declined requester stays
-  outside. `botId` identifies the resolving bot. It resolves with `{ state, member, botId }`.
-- `{ kind: "call", botId, method, ... }` looks in `calls`; with `includeRejectedRequests: true`, in
-  `rejected_requests` too. It narrows by `chatId`, `userId`, `messageId`, exact `params` fields
-  (as text: [Call receipts](#call-receipts)), `afterSeq` (which counts within each list),
-  `requestId`, `outcome` and `stage`. Without `outcome` or `stage`, it can resolve as soon as the
-  call is received, before it runs. A long poll stays `pending`, with only `received` in its
-  timeline, until it answers; its `offset` and `allowed_updates` apply as it arrives. It resolves
-  with the receipt.
-- `{ kind: "quiet", ms, botIds }` holds when no bot has an update it has not confirmed, a Bot API
-  call in progress (a long poll aside, a delayed or held call included) or a webhook attempt
-  running; no test action, owner client call, clock advance or restore is under way; and `ms`
-  milliseconds of wall time have passed since a bot's last call arrived or was answered. `ms` is 1
-  to 30000 and below the wait's `timeoutMs`. `botIds` limits it to those bots (`[]`: test-side
-  work only). It resolves with `{ quiet: true, idleMs }`; a timeout reports what was still in
-  progress.
-- `{ kind: "update", botId, type, chatId, afterUpdateId, state }` looks at the updates the bot was
-  sent ([getBotUpdates](#message-log-and-delivered-updates)) after `afterUpdateId`: `type` is one
-  type or a list, and `state` is `pending`, `delivered` or `dropped`. It resolves with the first
-  match.
-
-### Control API
-
-The test actions, over HTTP, for tests written in other languages. All routes live under
-`/_fake/`, a prefix no Bot API path uses, take and return JSON and use snake_case fields. A route
-that fails answers `{ error }` with an HTTP status.
-
-These routes have no authentication and answer anyone who can reach the server's port, as the Bot
-API routes do; only the viewer (`/_fake/ui`) answers this computer alone. Keep the default host,
-`127.0.0.1`.
-
-**Users**
-
-- `POST users`: create a user
-  `{ first_name?, last_name?, username?, language_code?, bio?, is_bot?, is_premium? }`; returns
-  `{ id }`.
-- `GET users/:id`: the user, with bio and photos.
-- `POST users/:id/profile`: change `first_name`, `last_name`, `bio` or `username`.
-- `POST users/:id/photos`: add a profile photo `{ base64 }`.
-- `DELETE users/:id/photos/:fileId`: remove a profile photo.
-
-**Joining and leaving**
-
-- `POST chats/:id/join`: the user `{ user_id }` joins.
-- `POST chats/:id/leave`: the user `{ user_id }` leaves.
-- `POST invites/:hash/join`: the user `{ user_id }` opens `https://t.me/+<hash>`: joins, or files a
-  join request if the link requires one. A revoked, expired or full link answers 400
-  `INVITE_HASH_EXPIRED`.
-- `POST invites/:hash/check`: whether the user `{ user_id }` is in the link's chat.
-- `GET chats/:id/join-requests`: user ids with a pending join request.
-
-**Messages**
-
-- `POST chats/:id/messages`: the user posts, as `post` does, `{ user_id, text }`,
-  `{ user_id, photo_base64, caption? }`,
-  `{ user_id, media: { type, base64, file_name?, mime_type? }, caption? }`,
-  `{ user_id, file_id, caption? }`, a poll `{ user_id, poll: { question, options, ... } }`,
-  `{ user_id, contact: { phone_number, first_name, last_name?, vcard?, user_id? } }` or
-  `{ user_id, location: { latitude, longitude, horizontal_accuracy?, live_period?, heading?,
-  proximity_alert_radius? } }`; optionally with `entities` or `caption_entities`, `reply_to`,
-  `message_thread_id`, `forward_from: { user_id | sender_name | chat_id, message_id?,
-  author_signature? }` or `send_as`. Returns `{ message_id }`.
-- `POST chats/:id/messages/:messageId/vote`: the user `{ user_id, option_ids }` votes in a poll
-  (`option_ids: []` takes the vote back); returns the poll.
-- `POST chats/:id/albums`: the user posts an album
-  `{ user_id, items: [{ type: "photo" | "video", base64, caption? }] }`; returns
-  `{ media_group_id, message_ids }`.
-- `POST chats/:id/messages/:messageId/edit`: the author `{ user_id }` edits the `text` or
-  `caption`.
-- `POST chats/:id/messages/:messageId/reactions`: the user `{ user_id, emoji }` reacts, or takes
-  the reaction back with `emoji: null`.
-- `POST chats/:id/messages/:messageId/pin`: the user `{ user_id }` pins the message, with
-  `can_pin_messages` (in a channel, `can_edit_messages`); returns the service message's
-  `{ message_id }`.
-- `POST chats/:id/guest-bot-reply`: a guest bot answers the user
-  `{ caller_user_id, bot_username, text }` in the group; returns `{ message_id }`.
-- `GET chats/:id/messages`: an array of the messages not deleted, newest first, as
-  `getMessages` returns it.
-- `GET chats/:id/messages?since=&include_deleted=&epoch=`: with any of these, the message log as
-  `getMessageLog` returns it: `{ chat_id, epoch, cursor, messages }`. `include_deleted` is `true`
-  or `1`. A bad `since` answers 400, and an `epoch` other than the server's 409.
-- `GET chats/:id/messages/:messageId`: `{ exists, deleted, message, reactions }`, reactions by user
-  id, each a list of emoji; a custom emoji is `#` and its `custom_emoji_id`, such as
-  `#5368324170671202286`.
-- `GET chats/:id/ephemeral-messages/:eid`: `{ exists, deleted, message }` for the ephemeral message
-  with `ephemeral_message_id` `:eid`.
-- `GET chats/:id/members/:userId`: the member as `getChatMember` would return it.
-
-**Buttons**
-
-- `POST chats/:id/messages/:messageId/callback`: the user `{ user_id, data }` presses an inline
-  button; returns the bot's answer.
-- `POST chats/:id/ephemeral-messages/:eid/callback`: its receiver `{ user_id, data }` presses an
-  inline button; returns the bot's answer.
-- `POST users/:id/dm/:messageId/callback`: the user presses a button in the private chat
-  `{ data }`.
-
-`data` is the button's `callback_data`; a message with no button with that data answers 400 at
-once. A press waits as `pressButton` does, up to 10 seconds once it has reached the bot, for the
-bot to call `answerCallbackQuery`, and returns `{ answered, text, show_alert }`, or
-`{ answered: false }`. An answer Telegram refuses, such as text over 200 characters, does not
-count. With `deliver_twice: true`, the bot's webhook gets the same update twice, as `deliverTwice`
-does; a bot without a webhook answers 409.
-
-- `POST chats/:id/messages/:messageId/open-url`: the user `{ user_id, button, add_to_chat_id? }`
-  opens a URL button, as `openUrlButton` does.
-- `POST chats/:id/ephemeral-messages/:eid/open-url`: its receiver
-  `{ user_id, button, add_to_chat_id? }` opens a URL button.
-- `POST users/:id/dm/:messageId/open-url`: the user opens a URL button in the private chat
-  `{ button, add_to_chat_id? }`.
-
-`button` is the button's text, or its index counted row by row from 0. Each returns `{ url }`, and
-for a link to one of the server's bots also `link`, `bot_id`, `chat_id` and, for `start`,
-`message_id`. A button that is not a URL button, an ephemeral message's button opened by anyone
-but its receiver, and a `startgroup` or `startchannel` link without `add_to_chat_id` answer 400.
-
-**Private chats**
-
-- `POST users/:id/dm`: the user sends the bot a direct message, with the same body as
-  `POST chats/:id/messages` without `user_id`, `message_thread_id` and `send_as`: `{ text }`,
-  `{ photo_base64, caption? }`, `{ media, caption? }`, `reply_to`, `forward_from`, `poll`,
-  `contact`, `location`, `file_id`, `entities` or `caption_entities`.
-- `POST users/:id/dm/:messageId/vote`: the user `{ option_ids }` votes in a poll the bot sent
-  privately.
-- `GET users/:id/dm`: an array of the private chat's messages, newest first.
-- `GET users/:id/dm?since=&include_deleted=&bot_id=&epoch=`: with any of these, the user's
-  private chats as a message log, like `GET chats/:id/messages?since=`; `bot_id` keeps one bot's.
-
-**Bots and chats**
-
-- `GET bot`: the first bot's user, with its `login_client_secret`.
-- `GET webhook`: the first bot's registered webhook.
-- `POST bots`: add a bot
-  `{ token, username, first_name?, login_client_secret?, supports_join_request_queries? }`; it is
-  in no chat yet.
-- `GET bots`: every bot, with its webhook URL and `login_client_secret`.
-- `DELETE bots/:id`: delete a bot added with `POST bots`, as `deleteBot` does; returns
-  `{ deleted: true }`.
-- `POST chats`: create
-  `{ owner_id, title?, type?: "supergroup" | "group" | "channel", owner_name?, is_forum? }`;
-  returns the chat.
-- `GET chats/:id`: the chat with its pinned message ids and members.
-- `POST chats/:id/bots`: add, promote, demote or remove a bot `{ bot_id, status?, rights?, by? }`,
-  as the owner would.
-- `POST chats/:id/bots` with `start_parameter`: a person `{ by?, bot_id, start_parameter, rights? }`
-  adds the bot through its `startgroup` link, or, with `rights` and an empty `start_parameter`, a
-  channel's `startchannel` link.
-- `POST chats/:id/members/:userId/promote`: a person `{ by?, rights }` makes the member an
-  administrator, as `promoteMember` does; returns the member.
-- `POST chats/:id/members/:userId/demote`: a person `{ by? }` makes the administrator a member
-  again; returns the member.
-- `POST chats/:id/migrate`: upgrade a basic group `{ by? }`; returns the new supergroup.
-- `POST chats/:id/title`: a person renames the chat `{ by?, title }`.
-- `POST chats/:id/photo`: a person sets the chat photo `{ by?, base64 }`.
-- `POST chats/:id/topics`: create a forum topic `{ name, by? }`; returns
-  `{ message_thread_id, name }`.
-- `POST chats/:id/topics/:threadId/edit`: rename a topic `{ name, by? }`.
-- `GET chats/:id/topics`: the forum's topics.
-
-**Business accounts**
-
-- `POST business/connections`: connect `{ owner_id, rights, id?, is_enabled?, bot_id? }`, or change
-  the connection with `id`; returns `{ connection, update_id }`.
-- `GET business/connections/:id`: the `BusinessConnection`.
-- `POST business/connections/:id/chats/:userId/messages`: `{ sender: "person" | "owner", text }`;
-  returns `{ message_id, date, update_id }`.
-- `GET business/connections/:id/chats/:userId/messages`: the business chat, newest first, as
-  `[{ direction, deleted, message }]`.
-
-**Telegram Login**
-
-- `POST login/approve`: the user `{ auth_url, user_id }` logs in; returns `{ redirect_url }` with
-  the code and state.
-- `POST login/cancel`: the user cancels `{ auth_url }`; returns `{ redirect_url }` with
-  `error=access_denied`.
-
-**Failures, calls and updates**
-
-- `POST failures`: fail the next calls `{ method, chat_id?, bot_id?, user_id?, message_id?,
-  attempt?, times?, error_code?, description?, retry_after?, drop_after_apply?, delay_ms? }`.
-- `GET failures`, `DELETE failures`: the failure rules still waiting, or clear them.
-- `GET calls`: every Bot API call received, with the bot that made it, and the unsupported methods
-  called.
-- `GET bots/:id/updates?type=&chat_id=&since=&epoch=`: the updates the bot was sent, as
-  `getBotUpdates` returns them; `type` is comma-separated. An unknown bot answers 400.
-- `POST updates/:updateId/redeliver`: deliver that update again to its bot's webhook
-  `{ bot_id? }`; 404 for an unknown update, 409 when the bot has no webhook or `bot_id` must name
-  one of several bots that got it. Returns `{ update_id }`.
-
-**Recordings**
-
-- `POST record/start`: start recording `{ name, chats? }`; returns
-  `{ name, started_at, epoch, start_seq, start_request }`. A bad name or chat answers 400, and a
-  name already recording 409.
-- `POST record/stop`: stop `{ name }`; returns `{ name, html, json, files? }`. An unknown name
-  answers 404, and a recording that started before a restore 409.
-
-**Waits, snapshots, time and deliveries**
-
-These controls take camelCase fields:
-
-| Request                           | Body/result                                          |
-| --------------------------------- | ---------------------------------------------------- |
-| `POST /_fake/wait`                | `{ condition, timeoutMs? }` → matching observation   |
-| `POST /_fake/snapshots`           | `{}` → JSON string handle                            |
-| `POST /_fake/restore`             | `{ snapshot: handle }` → `{ restored: true, epoch }` |
-| `DELETE /_fake/snapshots/:handle` | release handle                                       |
-| `GET /_fake/clock`                | `{ mode, now, scheduled }`, and `offset` if running  |
-| `POST /_fake/clock`               | `{ ms }` → advanced clock; manual or running clock   |
-| `GET /_fake/deliveries`           | the deliveries `getDeliveries()` lists               |
-| `POST /_fake/deliveries`          | `{ botId?, timeoutMs? }` → drain deliveries          |
-
-A wait, drain or clock advance that fails answers `{ error }`: 400 for bad input, 408 when the
-deadline passes, and 409 when the wait is canceled or the server runs on real time. A snapshot or
-restore while the server is busy answers 409, and an unknown handle 404.
-
-**Owner accounts** have their routes under `/_fake/owners`, listed in the
-[owner accounts reference][owner-docs].
-
-### Supported Bot API methods
-
-These read or change the server's state:
-
-- **Updates and the bot:** `getMe`, `getUpdates`, `setWebhook`, `deleteWebhook`, `getWebhookInfo`,
-  `setMyCommands`, `deleteMyCommands`, `getMyCommands`.
-- **Chats and members:** `getChat`, `getChatMember`, `getChatAdministrators`, `getChatMemberCount`,
-  `getUserProfilePhotos`, `leaveChat`, `restrictChatMember`, `banChatMember`, `unbanChatMember`,
-  `promoteChatMember`, `setChatAdministratorCustomTitle`, `setChatPermissions`, `setChatTitle`,
-  `setChatDescription`, `setChatPhoto`, `deleteChatPhoto`.
-- **Join requests and invite links:** `approveChatJoinRequest`, `declineChatJoinRequest`,
-  `answerChatJoinRequestQuery`, `createChatInviteLink`, `exportChatInviteLink`,
-  `editChatInviteLink`, `revokeChatInviteLink`.
-- **Sending:** `sendMessage`, `sendPhoto`, `sendDocument`, `sendVideo`, `sendAnimation`,
-  `sendSticker`, `sendVoice`, `sendAudio`, `sendVideoNote`, `sendMediaGroup`, `sendLocation`,
-  `sendVenue`, `sendContact`, `sendDice`, `sendPoll`, `stopPoll`, `sendChatAction`,
-  `forwardMessage`, `copyMessage`, `getFile`.
-- **Editing and deleting:** `editMessageText`, `editMessageReplyMarkup`, `editMessageCaption`,
-  `editMessageMedia`, `deleteMessage`, `deleteMessages`.
-- **Ephemeral messages:** `editEphemeralMessageText`, `editEphemeralMessageCaption`,
-  `editEphemeralMessageMedia`, `editEphemeralMessageReplyMarkup`, `deleteEphemeralMessage`.
-- **Pins, reactions and buttons:** `pinChatMessage`, `unpinChatMessage`, `unpinAllChatMessages`,
-  `setMessageReaction`, `deleteMessageReaction`, `answerCallbackQuery`.
-- **Business:** `getBusinessConnection`, and `sendMessage`, `editMessageText` and
-  `editMessageReplyMarkup` with `business_connection_id`.
-
-These are not modeled: `setMyDescription`, `setMyShortDescription`, `setChatMenuButton`,
-`setMyDefaultAdministratorRights`.
-
-They, any other method not listed, and `editMessageCaption` and `editMessageMedia` with
-`business_connection_id` get Telegram's answer to a method it does not know: 404
-`Not Found: method not found`, so a test cannot pass against behavior the server does not have.
-`getCalls()` (`GET /_fake/calls`) lists the unsupported methods called (the business edits as, for
-example, `editMessageCaption with business_connection_id`), and `log` reports each once. With
-`unimplemented: "ok"`, an unsupported method that Telegram documents as returning `True` answers
-`true` instead; any other still gets the 404. Methods are added when a real bot needs them; the
-goal is not full coverage of the Bot API.
-
-Method names are case-insensitive. Parameters come as a query string, JSON, or URL-encoded or
-multipart form data, read as Telegram's server reads them: a body of any other type is ignored, a
-JSON body keeps the fields read before anything malformed, and only form data that cannot be read
-is refused, with an empty 400. A JSON body's values are text, as a query string's are: `null` is
-the text `null`, `1.50` stays `1.50`, and a string may hold raw control characters. A parameter
-given twice keeps its first value, and the query string comes before the body. How each kind of
-parameter is then read is under [Parameters][behavior-parameters].
-
-### Call receipts
-
-`getCalls()` (`GET /_fake/calls`) returns copies, so changing them changes nothing on the server.
-`calls` lists every Bot API call made with a known token and a body that could be read.
-`rejected_requests` lists the calls refused before that: an unknown token (its numeric part as
-`bot_id`; the token itself is not kept) or form data that cannot be read (kept as `raw_body`, and
-left out of wait failure reports). `unimplemented` names the unsupported methods called.
-
-Each receipt has `seq` (its place in its list), `method`, `bot_id`, `params`, `at`, `outcome`,
-`status`, `completed_at`, `description`, the text the answer carried (Telegram's error text for a
-refusal, or a success's such as `Webhook was set`), and `target_user_id`, the user the call is
-about (as `userId` in [failure rules](#injected-failures)), read before the call runs. `params` are
-the parameters as Telegram's server reads them: text, with the JSON-serialized ones
-(`reply_markup`, `media`, `permissions`, ...) parsed, so a call wait that narrows by `params` gives
-`chat_id` as text, such as `"-100123"`.
-
-- `outcome` is `pending`, `succeeded`, `delayed`, `response_lost`, `failed_after_apply`,
-  `rejected` or `unimplemented_ok`.
-- `applied` is true once the call took effect, or, for a read or a call that changes nothing, once
-  it succeeded. It stays true when the call fails after taking effect (`failed_after_apply`).
-- A call refused, by Telegram's rules or by a failure rule, is `rejected`, with its status in
-  `failed`, and is never `applied`. `response_lost` (with `dropped: true`) means the call took
-  effect and its answer never reached the bot.
-- A call a failure rule matched carries the rule's `fault_id`, `attempt` and `delay_ms`, and
-  `fault_injected` says whether the rule had started failing calls yet.
-- `request_id` is unique across both lists, also after a restore. `timeline` holds the stages the
-  call reached, with their times: `received` (when the request arrived), `validated`,
-  `state_applied` (when a message or member changed), `handler_completed`, then `response_sent`
-  (written out, not necessarily read by the bot) or `response_lost`. `completed_at` includes any
-  injected delay.
-
-Not every change records `state_applied`, so prove what a call changed with a `message` or `member`
-wait, `getMember` or `getMessage`.
+The full reference is in [docs/reference.md][ref]:
+
+- [Options][ref-options]: everything `startTestServer` takes.
+- [Test actions][ref-actions]: every method that plays a person on Telegram or reads the state.
+- [Wait conditions][ref-waits]: every condition `waitFor` takes.
+- [Control API][ref-control]: the test actions over HTTP, for other languages.
+- [Supported Bot API methods][ref-methods]: what the server answers, and how it reads requests.
+- [Call receipts][ref-receipts]: what `getCalls()` records about each Bot API call.
+- [Viewer][ref-viewer]: what the viewer shows, its URL parameters, data attributes and routes.
+
+How the server follows Telegram, rule by rule, with Telegram's error texts, is in
+[Telegram behavior][behavior].
+
+---
 
 ## Development
 
@@ -2143,11 +1708,10 @@ pnpm install
 pnpm test
 ```
 
-`npm run bench`, `node bench/reuse.mjs` and `node --expose-gc bench/scaling.mjs` measure the server.
+`pnpm bench`, `node bench/reuse.mjs` and `node --expose-gc bench/scaling.mjs` measure the server.
 The scaling benchmark accepts `BENCH_HISTORY`, `BENCH_MESSAGES`, `BENCH_OBSERVERS` and
 `BENCH_ROUNDS` for larger runs; a small sample is not a throughput guarantee. The
-[measurements and regression record][performance] has the commands, raw samples and observed
-costs.
+[performance measurements][performance] give the observed costs.
 
 `node scripts/screenshots.mjs` makes the two screenshots in `docs/images` again. A small grammY bot
 looks after a book club while the script plays its members, and Playwright takes the pictures.
@@ -2163,18 +1727,27 @@ PLAYWRIGHT=/tmp/shots/node_modules/playwright node scripts/screenshots.mjs
 The README links the pictures at a release tag, so each release's README on npm keeps its own.
 Change the tag in those links when the pictures change.
 
+---
+
 ## License
 
 MIT
 
-[behavior]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md
-[behavior-admins]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#administrators-and-chat-settings
 [behavior-bots]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#more-than-one-bot
 [behavior-channels]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#channels
 [behavior-delivery]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#update-delivery
-[behavior-join-queries]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#join-request-queries-bot-api-10x
-[behavior-parameters]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#parameters
+[behavior-privacy]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#privacy-mode
+[behavior-topics]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#forum-topics
 [behavior-upgrade]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#basic-groups-and-the-upgrade
-[behavior-url-buttons]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md#url-buttons
+[behavior]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/telegram-behavior.md
 [owner-docs]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/owner-accounts.md
 [performance]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/performance.md
+[privacy-docs]: https://core.telegram.org/bots/features#privacy-mode
+[ref-actions]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/reference.md#test-actions
+[ref-control]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/reference.md#control-api
+[ref-methods]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/reference.md#supported-bot-api-methods
+[ref-options]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/reference.md#options
+[ref-receipts]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/reference.md#call-receipts
+[ref-viewer]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/reference.md#viewer
+[ref-waits]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/reference.md#wait-conditions
+[ref]: https://github.com/anatolyben/telegram-bot-test-server/blob/main/docs/reference.md
